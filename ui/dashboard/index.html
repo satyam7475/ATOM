@@ -1,0 +1,718 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>A.T.O.M. v15</title>
+<style>
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+@import url('https://fonts.googleapis.com/css2?family=Sora:wght@300;400;500;600;700&family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap');
+
+:root{
+  --bg:#06060a;
+  --accent:#818cf8;
+  --accent-glow:rgba(129,140,248,0.35);
+  --green:#34d399;
+  --orange:#fbbf24;
+  --red:#f87171;
+  --purple:#a78bfa;
+  --text:#f0f0f4;
+  --text-dim:#9898aa;
+  --text-muted:#55556a;
+  --pod-bg:rgba(16,16,28,0.7);
+  --pod-border:rgba(129,140,248,0.12);
+  --pod-glow:rgba(129,140,248,0.06);
+  --font-display:'Sora',sans-serif;
+  --font-body:'Inter',sans-serif;
+  --font-mono:'JetBrains Mono',monospace;
+}
+
+html,body{
+  height:100%;width:100%;overflow:hidden;
+  background:var(--bg);color:var(--text);
+  font-family:var(--font-body);font-size:13px;
+}
+
+/* ── Ambient background ─────────────────── */
+.ambient{
+  position:fixed;inset:0;z-index:0;pointer-events:none;
+  background:
+    radial-gradient(ellipse 60% 50% at 50% 50%, rgba(129,140,248,0.06) 0%, transparent 70%),
+    radial-gradient(ellipse 40% 40% at 20% 80%, rgba(52,211,153,0.03) 0%, transparent 60%),
+    radial-gradient(ellipse 40% 40% at 80% 20%, rgba(167,139,250,0.03) 0%, transparent 60%);
+}
+
+/* ── Full-page HUD ──────────────────────── */
+.hud{
+  position:relative;z-index:1;
+  width:100vw;height:100vh;height:100dvh;
+  display:grid;
+  grid-template-rows:48px 1fr;
+  perspective:1200px;
+}
+
+/* ── Top bar ─────────────────────────────── */
+.topbar{
+  display:flex;align-items:center;
+  padding:0 28px;
+  background:rgba(6,6,10,0.85);
+  border-bottom:1px solid rgba(255,255,255,0.04);
+  backdrop-filter:blur(16px);z-index:30;
+}
+.brand{
+  font-family:var(--font-display);font-size:22px;font-weight:700;
+  letter-spacing:6px;color:var(--text);
+}
+.brand span{color:var(--accent);}
+.topbar-right{
+  margin-left:auto;display:flex;align-items:center;gap:16px;
+}
+.topbar-state{
+  font-family:var(--font-mono);font-size:14px;font-weight:500;
+  letter-spacing:1.5px;color:var(--text-dim);
+  display:flex;align-items:center;gap:8px;
+}
+.state-dot{
+  width:8px;height:8px;border-radius:50%;
+  background:var(--green);
+  box-shadow:0 0 8px rgba(52,211,153,0.6);
+  transition:all .4s;
+}
+.unstick-btn{
+  font-family:var(--font-mono);font-size:10px;
+  padding:5px 12px;border-radius:5px;cursor:pointer;
+  border:1px solid rgba(255,255,255,0.08);
+  background:transparent;color:var(--text-dim);transition:all .2s;
+}
+.unstick-btn:hover{background:rgba(255,255,255,0.05);color:var(--text);}
+
+/* ── HUD Field: orb + pods ──────────────── */
+.hud-field{
+  position:relative;overflow:hidden;
+  display:flex;align-items:center;justify-content:center;
+}
+
+/* ── Central Orb ────────────────────────── */
+.orb-center{
+  position:absolute;
+  top:18%;
+  display:flex;flex-direction:column;align-items:center;
+  z-index:10;
+}
+.orb-wrap{
+  width:220px;height:220px;
+  display:flex;align-items:center;justify-content:center;
+  position:relative;
+}
+#orbCanvas{
+  display:block;
+  filter:drop-shadow(0 0 30px var(--accent-glow));
+  animation:orbIn 1s cubic-bezier(0.34,1.56,0.64,1) forwards;
+}
+@keyframes orbIn{0%{opacity:0;transform:scale(0.5);}100%{opacity:1;transform:scale(1);}}
+.orb-wrap[data-state="listening"] #orbCanvas{animation:orbPulse 2s ease-in-out infinite;}
+@keyframes orbPulse{0%,100%{transform:scale(1);}50%{transform:scale(1.04);}}
+.orb-wrap[data-state="thinking"] #orbCanvas{animation:orbThink 0.8s ease-in-out infinite;}
+@keyframes orbThink{0%,100%{transform:scale(1);filter:drop-shadow(0 0 30px rgba(251,191,36,0.5));}50%{transform:scale(1.05);filter:drop-shadow(0 0 50px rgba(251,191,36,0.7));}}
+.orb-wrap[data-state="speaking"] #orbCanvas{animation:orbSpeak 1.5s ease-in-out infinite;}
+@keyframes orbSpeak{0%,100%{filter:drop-shadow(0 0 25px rgba(167,139,250,0.5));}50%{filter:drop-shadow(0 0 45px rgba(167,139,250,0.7));}}
+
+.orb-label{text-align:center;margin-top:6px;}
+.orb-state-text{
+  font-family:var(--font-display);font-size:18px;font-weight:600;
+  letter-spacing:5px;color:var(--accent);transition:color .4s;
+}
+.orb-status-text{
+  font-family:var(--font-mono);font-size:13px;color:var(--text-muted);
+  margin-top:2px;
+}
+.hearing-text{
+  font-family:var(--font-mono);font-size:13px;
+  color:var(--accent);opacity:0.7;margin-top:4px;min-height:16px;
+}
+.thinking-progress{
+  font-family:var(--font-mono);font-size:12px;
+  color:var(--orange);margin-top:4px;min-height:16px;
+  opacity:0;transition:opacity .3s;
+}
+.thinking-progress.visible{opacity:1;}
+.progress-bar-wrap{
+  width:160px;height:3px;background:rgba(255,255,255,0.08);
+  border-radius:2px;margin:6px auto 0;overflow:hidden;
+}
+.progress-bar-fill{
+  height:100%;background:var(--orange);border-radius:2px;
+  transition:width .5s linear;
+}
+
+/* ── Circular Pods ──────────────────────── */
+.pod{
+  position:absolute;
+  width:220px;height:220px;
+  border-radius:50%;
+  background:var(--pod-bg);
+  border:1px solid var(--pod-border);
+  backdrop-filter:blur(20px);
+  box-shadow:
+    0 0 40px var(--pod-glow),
+    inset 0 1px 0 rgba(255,255,255,0.04),
+    0 20px 40px rgba(0,0,0,0.4);
+  display:flex;flex-direction:column;
+  align-items:center;justify-content:center;
+  padding:24px;
+  transition:transform .4s,box-shadow .4s;
+  z-index:5;
+  text-align:center;
+}
+.pod:hover{
+  transform:scale(1.05);
+  box-shadow:0 0 60px rgba(129,140,248,0.12),0 25px 50px rgba(0,0,0,0.5);
+}
+.pod-title{
+  font-family:var(--font-mono);font-size:12px;font-weight:500;
+  letter-spacing:2.5px;color:var(--text-muted);
+  margin-bottom:10px;text-transform:uppercase;
+}
+
+/* Pod positions (4 corners) */
+.pod-system{top:6%;left:3%;}
+.pod-conn{top:6%;right:3%;}
+.pod-perf{bottom:18%;left:3%;}
+.pod-runtime{bottom:18%;right:3%;}
+
+/* Pod content styles */
+.pod-row{
+  display:flex;justify-content:space-between;width:100%;
+  padding:1px 0;
+}
+.pod-label{font-size:13px;color:var(--text-dim);}
+.pod-value{font-family:var(--font-mono);font-size:13px;font-weight:500;color:var(--text);}
+
+.pod-bar{
+  width:100%;height:2px;background:rgba(255,255,255,0.06);
+  border-radius:1px;margin-top:1px;overflow:hidden;
+}
+.pod-bar-fill{height:100%;border-radius:1px;transition:width .6s,background .4s;}
+
+.mini-pills{display:flex;gap:4px;flex-wrap:wrap;justify-content:center;}
+.mini-pill{
+  font-family:var(--font-mono);font-size:12px;
+  padding:4px 8px;border-radius:4px;
+  background:rgba(255,255,255,0.04);color:var(--text-dim);
+  display:flex;align-items:center;gap:4px;
+}
+.mini-dot{width:4px;height:4px;border-radius:50%;}
+.mini-dot.on{background:var(--green);}
+.mini-dot.off{background:var(--red);}
+
+.pod-btn{
+  font-family:var(--font-mono);font-size:12px;font-weight:500;
+  padding:5px 10px;border-radius:5px;cursor:pointer;
+  border:1px solid rgba(255,255,255,0.06);
+  background:transparent;color:var(--text-dim);transition:all .2s;
+}
+.pod-btn:hover{border-color:rgba(255,255,255,0.15);color:var(--text);}
+.pod-btn.active{
+  background:rgba(129,140,248,0.12);color:var(--accent);
+  border-color:rgba(129,140,248,0.25);
+}
+
+.perf-restart-msg{display:none;font-family:var(--font-mono);font-size:11px;color:var(--orange);}
+
+/* ── Clock (below orb) ──────────────────── */
+.clock-area{
+  text-align:center;z-index:8;margin-top:8px;
+}
+.clock-time{
+  font-family:var(--font-mono);font-size:40px;font-weight:600;
+  color:var(--text);letter-spacing:4px;
+}
+.clock-sec{font-size:18px;color:var(--text-muted);}
+.clock-date{
+  font-family:var(--font-mono);font-size:13px;
+  color:var(--text-muted);letter-spacing:2px;
+  margin-top:3px;text-transform:uppercase;
+}
+
+/* ── Text input ────────────────────────────── */
+.text-input-wrap{
+  position:absolute;bottom:16px;left:50%;transform:translateX(-50%);
+  width:min(90vw,680px);z-index:20;
+  display:flex;gap:8px;
+}
+.text-input{
+  flex:1;
+  font-family:var(--font-body);font-size:14px;
+  padding:12px 18px;border-radius:24px;
+  background:rgba(16,16,28,0.8);color:var(--text);
+  border:1px solid rgba(129,140,248,0.15);
+  outline:none;
+  backdrop-filter:blur(16px);
+  transition:border-color .2s;
+}
+.text-input::placeholder{color:var(--text-muted);}
+.text-input:focus{border-color:rgba(129,140,248,0.4);}
+.text-send-btn{
+  font-family:var(--font-display);font-size:13px;font-weight:600;
+  padding:12px 20px;border-radius:24px;cursor:pointer;
+  background:rgba(129,140,248,0.12);color:var(--accent);
+  border:1px solid rgba(129,140,248,0.2);
+  transition:all .2s;letter-spacing:1px;
+}
+.text-send-btn:hover{background:rgba(129,140,248,0.25);}
+
+/* ── Conversation (bottom center) ────────── */
+.conv-zone{
+  position:absolute;bottom:72px;left:50%;transform:translateX(-50%);
+  width:min(90vw,680px);z-index:15;
+  display:flex;flex-direction:column;gap:8px;
+}
+.conv-bubble{
+  padding:16px 24px;border-radius:18px;
+  font-size:15px;line-height:1.65;
+  opacity:0;transform:translateY(12px);
+  transition:opacity .4s,transform .4s;
+  word-break:break-word;
+  backdrop-filter:blur(16px);
+}
+.conv-bubble.visible{opacity:1;transform:translateY(0);}
+.conv-bubble.user-msg{
+  align-self:flex-end;max-width:65%;
+  background:rgba(129,140,248,0.1);color:var(--text);
+  border:1px solid rgba(129,140,248,0.15);
+  border-bottom-right-radius:4px;
+}
+.conv-bubble.atom-msg{
+  align-self:flex-start;max-width:75%;
+  background:rgba(52,211,153,0.06);color:var(--text);
+  border:1px solid rgba(52,211,153,0.1);
+  border-bottom-left-radius:4px;
+}
+.conv-tag{
+  font-family:var(--font-mono);font-size:11px;font-weight:500;
+  letter-spacing:1.5px;margin-bottom:4px;
+}
+.conv-bubble.user-msg .conv-tag{color:var(--accent);}
+.conv-bubble.atom-msg .conv-tag{color:var(--green);}
+.conv-bubble.atom-msg.streaming::after{
+  content:'▊';animation:blink 1s steps(1) infinite;color:var(--green);margin-left:2px;
+}
+@keyframes blink{0%,100%{opacity:1;}50%{opacity:0;}}
+
+/* ── Responsive ─────────────────────────── */
+@media(max-width:900px){
+  .pod{width:170px;height:170px;padding:16px;}
+  .pod-title{font-size:10px;}
+  .pod-label,.pod-value,.mini-pill,.pod-btn{font-size:10px;}
+  .orb-wrap{width:180px;height:180px;}
+  .conv-zone{width:min(94vw,500px);}
+  .text-input-wrap{width:min(94vw,500px);}
+  .text-input{font-size:13px;padding:10px 14px;}
+}
+@media(max-width:600px){
+  .pod{width:130px;height:130px;padding:12px;}
+  .pod-system{top:4%;left:2%;}
+  .pod-conn{top:4%;right:2%;}
+  .pod-perf{bottom:14%;left:2%;}
+  .pod-runtime{bottom:14%;right:2%;}
+  .orb-center{top:12%;}
+  .orb-wrap{width:140px;height:140px;}
+  .clock-time{font-size:26px;}
+  .conv-bubble{font-size:13px;padding:12px 18px;}
+}
+</style>
+</head>
+<body>
+
+<div class="ambient"></div>
+
+<div class="hud">
+  <header class="topbar">
+    <div class="brand">A<span>.</span>T<span>.</span>O<span>.</span>M<span>.</span></div>
+    <div class="topbar-right">
+      <button class="unstick-btn" id="unstickBtn">UNSTICK</button>
+      <div class="topbar-state">
+        <span id="topbarState">IDLE</span>
+        <div class="state-dot" id="topbarDot"></div>
+      </div>
+    </div>
+  </header>
+
+  <div class="hud-field">
+    <!-- Central Orb -->
+    <div class="orb-center">
+      <div class="orb-wrap" id="orbWrap" data-state="idle">
+        <canvas id="orbCanvas" width="440" height="440"></canvas>
+      </div>
+      <div class="orb-label">
+        <div class="orb-state-text" id="orbStateText">IDLE</div>
+        <div class="orb-status-text" id="orbStatusText">Waiting...</div>
+      </div>
+      <div class="hearing-text" id="hearingText"></div>
+      <div class="thinking-progress" id="thinkingProgress">
+        <span id="thinkingText"></span>
+        <div class="progress-bar-wrap"><div class="progress-bar-fill" id="thinkingBar" style="width:0%"></div></div>
+      </div>
+      <!-- Clock (flows below orb label) -->
+      <div class="clock-area">
+        <div><span class="clock-time" id="bubbleClock">00:00</span><span class="clock-sec" id="bubbleSec"> :00 PM</span></div>
+        <div class="clock-date" id="bubbleDate">---</div>
+      </div>
+    </div>
+
+    <!-- Pod: System (top-left) -->
+    <div class="pod pod-system">
+      <div class="pod-title">System</div>
+      <div class="pod-row"><span class="pod-label">CPU</span><span class="pod-value" id="cpuVal">0%</span></div>
+      <div class="pod-bar"><div class="pod-bar-fill" id="cpuBar" style="width:0%;background:var(--accent)"></div></div>
+      <div class="pod-row"><span class="pod-label">RAM</span><span class="pod-value" id="ramVal">0%</span></div>
+      <div class="pod-bar"><div class="pod-bar-fill" id="ramBar" style="width:0%;background:var(--accent)"></div></div>
+      <div class="pod-row"><span class="pod-label">BAT</span><span class="pod-value" id="batteryVal">--</span></div>
+      <div class="pod-bar"><div class="pod-bar-fill" id="batteryBar" style="width:0%;background:var(--green)"></div></div>
+      <div class="pod-row"><span class="pod-label">DSK</span><span class="pod-value" id="diskVal">--</span></div>
+    </div>
+
+    <!-- Pod: Connections (top-right) -->
+    <div class="pod pod-conn">
+      <div class="pod-title">Connections</div>
+      <div class="mini-pills">
+        <span class="mini-pill"><span class="mini-dot on" id="connStt"></span>STT</span>
+        <span class="mini-pill"><span class="mini-dot on" id="connTts"></span>TTS</span>
+        <span class="mini-pill"><span class="mini-dot on" id="connAi"></span><span id="connAiVal">AI</span></span>
+        <span class="mini-pill"><span class="mini-dot on" id="connWs"></span><span id="connWsVal">LINK</span></span>
+      </div>
+      <div style="margin-top:8px;font-size:11px;color:var(--text-dim);max-width:160px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" id="micName">Detecting...</div>
+    </div>
+
+    <!-- Pod: Performance (bottom-left) -->
+    <div class="pod pod-perf">
+      <div class="pod-title">Performance</div>
+      <div style="display:flex;gap:3px;flex-wrap:wrap;justify-content:center">
+        <button class="pod-btn perf-btn" data-mode="full">FULL</button>
+        <button class="pod-btn perf-btn active" data-mode="lite">LITE</button>
+        <button class="pod-btn perf-btn" data-mode="ultra_lite">ULTRA</button>
+        <button class="pod-btn perf-btn" data-mode="auto">AUTO</button>
+      </div>
+      <div style="font-family:var(--font-mono);font-size:11px;color:var(--text-muted);margin-top:5px" id="govStatus">GOV: NORMAL</div>
+      <div class="perf-restart-msg" id="perfRestartMsg">RESTARTING...</div>
+    </div>
+
+    <!-- Hidden: Session data elements (JS compatibility) -->
+    <span class="hidden" id="uptimeVal" style="display:none">0m</span>
+    <span class="hidden" id="queriesVal" style="display:none">0</span>
+    <span class="hidden" id="lastIntentSpan" style="display:none">—</span>
+    <span class="hidden" id="lastLatencySpan" style="display:none"></span>
+
+    <!-- Pod: Runtime (left-center) -->
+    <div class="pod pod-runtime">
+      <div class="pod-title">Runtime</div>
+      <div style="display:flex;gap:3px;flex-wrap:wrap;justify-content:center">
+        <button class="pod-btn" data-brain="atom" onclick="setBrainProfile('atom')">ATM</button>
+        <button class="pod-btn" data-brain="balanced" onclick="setBrainProfile('balanced')">BAL</button>
+        <button class="pod-btn" data-brain="brain" onclick="setBrainProfile('brain')">BRN</button>
+      </div>
+      <div style="display:flex;gap:3px;flex-wrap:wrap;justify-content:center;margin-top:4px">
+        <button class="pod-btn" data-asst="command_only" onclick="setAssistantMode('command_only')">CMD</button>
+        <button class="pod-btn" data-asst="hybrid" onclick="setAssistantMode('hybrid')">HYB</button>
+        <button class="pod-btn" data-asst="conversational" onclick="setAssistantMode('conversational')">CHT</button>
+      </div>
+      <div id="runtimeInfo" style="font-family:var(--font-mono);font-size:11px;color:var(--text-muted);margin-top:4px"></div>
+    </div>
+
+    <!-- Hidden: Last Query data elements (JS compatibility) -->
+    <span class="hidden" id="lastQueryText" style="display:none">—</span>
+    <span class="hidden" id="modeInfo" style="display:none"></span>
+
+    <!-- Conversation (bottom center, latest only) -->
+    <div class="conv-zone" id="convZone">
+      <div class="conv-bubble user-msg" id="liveBubbleUser">
+        <div class="conv-tag">YOU</div>
+        <div id="liveUserText"></div>
+      </div>
+      <div class="conv-bubble atom-msg" id="liveBubbleAtom">
+        <div class="conv-tag">A.T.O.M.</div>
+        <div id="liveAtomText"></div>
+      </div>
+    </div>
+
+    <!-- Text input fallback -->
+    <div class="text-input-wrap">
+      <input class="text-input" id="textInput" type="text" placeholder="Type a command or question..." autocomplete="off">
+      <button class="text-send-btn" id="textSendBtn">SEND</button>
+    </div>
+  </div>
+</div>
+
+<!-- ── Three.js Orb ─────────────────────── -->
+<script type="importmap">{"imports":{"three":"https://esm.sh/three@0.160.0"}}</script>
+<script type="module">
+import * as THREE from 'three';
+
+const canvas=document.getElementById('orbCanvas');
+const renderer=new THREE.WebGLRenderer({canvas,alpha:true,antialias:true});
+function layout(){
+  const w=document.getElementById('orbWrap');
+  if(!w)return;
+  const d=Math.min(w.clientWidth,w.clientHeight);
+  const s=Math.max(120,Math.min(d||220,220));
+  renderer.setPixelRatio(Math.min(devicePixelRatio||1,2));
+  renderer.setSize(s,s);
+}
+layout();window.addEventListener('resize',layout);
+
+const scene=new THREE.Scene();
+const cam=new THREE.PerspectiveCamera(45,1,0.1,100);cam.position.z=4;
+
+const SC={
+  sleep:{c:0x52525b,g:0x3f3f46,r:0x52525b,p:0x52525b},
+  idle:{c:0x818cf8,g:0x4338ca,r:0x818cf8,p:0xa5b4fc},
+  listening:{c:0x818cf8,g:0x4f46e5,r:0xa5b4fc,p:0x818cf8},
+  thinking:{c:0xfbbf24,g:0x92400e,r:0xfbbf24,p:0xfde68a},
+  speaking:{c:0xa78bfa,g:0x6d28d9,r:0xc4b5fd,p:0xa78bfa},
+  error_recovery:{c:0xf87171,g:0x991b1b,r:0xfca5a5,p:0xf87171},
+};
+const SS={
+  sleep:{o:0.1,p:0.3,rb:0.005},idle:{o:0.3,p:0.6,rb:0.015},
+  listening:{o:0.8,p:1.2,rb:0.04},thinking:{o:2.0,p:2.5,rb:0.08},
+  speaking:{o:1.0,p:1.5,rb:0.03},error_recovery:{o:1.5,p:3.0,rb:0.06},
+};
+let cs='idle',tc=SC.idle,ts=SS.idle;
+
+const cm=new THREE.ShaderMaterial({
+  uniforms:{uTime:{value:0},uColor:{value:new THREE.Color(0x818cf8)},uGlow:{value:new THREE.Color(0x4338ca)},uPulseSpeed:{value:0.6},uDistortion:{value:0}},
+  vertexShader:`uniform float uTime;uniform float uDistortion;varying vec3 vN;varying vec3 vP;
+    void main(){vN=normalize(normalMatrix*normal);vP=position;
+    float d=sin(position.x*5.0+uTime*2.0)*sin(position.y*5.0+uTime*1.5)*sin(position.z*5.0+uTime)*0.04*(1.0+uDistortion*2.0);
+    gl_Position=projectionMatrix*modelViewMatrix*vec4(position+normal*d,1.0);}`,
+  fragmentShader:`uniform float uTime;uniform vec3 uColor;uniform vec3 uGlow;uniform float uPulseSpeed;varying vec3 vN;
+    void main(){float f=pow(1.0-abs(dot(vN,vec3(0,0,1))),2.5);float p=0.85+0.15*sin(uTime*uPulseSpeed);
+    vec3 b=mix(uGlow,uColor,0.5+0.5*f)*p+uColor*f*0.6;gl_FragColor=vec4(b,0.92+f*0.08);}`,
+  transparent:true
+});
+const core=new THREE.Mesh(new THREE.SphereGeometry(0.6,64,64),cm);scene.add(core);
+
+const rm=new THREE.MeshBasicMaterial({color:0x818cf8,transparent:true,opacity:0.4});
+const ring=new THREE.Mesh(new THREE.TorusGeometry(1.1,0.015,16,100),rm);
+ring.rotation.x=Math.PI/2.3;scene.add(ring);
+
+const ring2=new THREE.Mesh(new THREE.TorusGeometry(1.3,0.008,16,80),
+  new THREE.MeshBasicMaterial({color:0x818cf8,transparent:true,opacity:0.15}));
+ring2.rotation.x=Math.PI/3;ring2.rotation.y=Math.PI/4;scene.add(ring2);
+
+const pc=50,pp=new Float32Array(pc*3);
+for(let i=0;i<pc;i++){const a=Math.random()*Math.PI*2,r=1.2+Math.random()*0.6;
+pp[i*3]=Math.cos(a)*r;pp[i*3+1]=(Math.random()-0.5)*1.4;pp[i*3+2]=Math.sin(a)*r;}
+const pg=new THREE.BufferGeometry();pg.setAttribute('position',new THREE.BufferAttribute(pp,3));
+const pm=new THREE.PointsMaterial({color:0x818cf8,size:0.035,transparent:true,opacity:0.5});
+const pts=new THREE.Points(pg,pm);scene.add(pts);
+
+const clk=new THREE.Clock();
+function anim(){
+  requestAnimationFrame(anim);const t=clk.getElapsedTime();
+  cm.uniforms.uTime.value=t;
+  cm.uniforms.uColor.value.lerp(new THREE.Color(tc.c),0.03);
+  cm.uniforms.uGlow.value.lerp(new THREE.Color(tc.g),0.03);
+  cm.uniforms.uPulseSpeed.value+=(ts.p-cm.uniforms.uPulseSpeed.value)*0.05;
+  const dt=cs==='thinking'?1:cs==='speaking'?0.3:0;
+  cm.uniforms.uDistortion.value+=(dt-cm.uniforms.uDistortion.value)*0.05;
+  core.rotation.y+=ts.o*0.01;core.rotation.x=Math.sin(t*0.3)*0.1;
+  ring.rotation.z+=0.003;ring.scale.setScalar(1+Math.sin(t*ts.rb*10)*0.06);
+  rm.color.lerp(new THREE.Color(tc.r),0.03);
+  ring2.rotation.z-=0.002;ring2.rotation.x+=0.001;
+  pts.rotation.y+=ts.o*0.005;pm.color.lerp(new THREE.Color(tc.p),0.03);
+  renderer.render(scene,cam);
+}
+anim();
+
+window.setOrbState=s=>{cs=s;tc=SC[s]||SC.idle;ts=SS[s]||SS.idle;};
+window.setOrbModeTheme=mt=>{
+  SC.idle.c=mt.orbCore;SC.idle.g=mt.orbGlow;SC.idle.r=mt.orbRing;SC.idle.p=mt.orbParticle;
+  SC.listening.c=mt.orbCore;SC.listening.g=mt.orbGlow;SC.listening.r=mt.orbRing;SC.listening.p=mt.orbParticle;
+  if(cs==='idle'||cs==='listening')tc=SC[cs];
+};
+</script>
+
+<script>
+(function(){
+const $=id=>document.getElementById(id);
+const WS='ws://'+location.host+'/ws';
+let ws,startTime=Date.now(),queryCount=0;
+
+/* ── Conversation history (in-memory, latest on screen) ── */
+const convHistory=[];
+const MAX_HISTORY=10;
+
+function tickClock(){
+  const n=new Date();
+  let h=n.getHours(),m=n.getMinutes(),s=n.getSeconds();
+  const ap=h>=12?'PM':'AM';h=h%12||12;
+  $('bubbleClock').textContent=String(h).padStart(2,'0')+':'+String(m).padStart(2,'0');
+  $('bubbleSec').textContent=' :'+String(s).padStart(2,'0')+' '+ap;
+  const d=['Sun','Mon','Tue','Wed','Thu','Fri','Sat'];
+  const mo=['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+  $('bubbleDate').textContent=d[n.getDay()]+' · '+mo[n.getMonth()]+' '+n.getDate()+', '+n.getFullYear();
+  const up=Math.floor((Date.now()-startTime)/60000);
+  $('uptimeVal').textContent=up<60?up+'m':Math.floor(up/60)+'h '+up%60+'m';
+}
+tickClock();setInterval(tickClock,1000);
+
+const stColors={idle:'var(--accent)',listening:'var(--accent)',thinking:'var(--orange)',speaking:'var(--purple)',error_recovery:'var(--red)',sleep:'var(--text-muted)'};
+const dotColors={idle:'var(--green)',listening:'var(--green)',thinking:'var(--orange)',speaking:'var(--purple)',error_recovery:'var(--red)',sleep:'var(--text-muted)'};
+
+function setAppState(state,label,status){
+  $('topbarState').textContent=label||state.toUpperCase();
+  $('orbStateText').textContent=label||state.toUpperCase();
+  $('orbStateText').style.color=stColors[state]||'var(--accent)';
+  $('orbStatusText').textContent=status||'';
+  const d=$('topbarDot');d.style.background=dotColors[state]||'var(--green)';
+  d.style.boxShadow='0 0 8px '+(dotColors[state]||'var(--green)');
+  $('orbWrap').setAttribute('data-state',state);
+  if(window.setOrbState)window.setOrbState(state);
+  if(state!=='thinking'){
+    const tp=$('thinkingProgress');if(tp)tp.classList.remove('visible');
+    const tb=$('thinkingBar');if(tb)tb.style.width='0%';
+  }
+}
+
+/* ── Show only latest conversation, save previous ── */
+function showUserBubble(text){
+  if(window._tw)clearInterval(window._tw);
+  const prevU=$('liveUserText').textContent;
+  const prevA=$('liveAtomText').textContent;
+  if(prevU&&prevA){
+    convHistory.push({q:prevU,a:prevA,ts:Date.now()});
+    if(convHistory.length>MAX_HISTORY)convHistory.shift();
+  }
+  $('liveUserText').textContent=text;
+  $('liveBubbleUser').classList.add('visible');
+  $('liveBubbleAtom').classList.remove('visible');
+  $('liveBubbleAtom').classList.remove('streaming');
+  $('liveAtomText').textContent='';
+}
+
+function showAtomBubble(text){
+  const el=$('liveAtomText'),b=$('liveBubbleAtom');
+  b.classList.add('visible','streaming');
+  if(window._tw)clearInterval(window._tw);
+  el.textContent='';
+  const words=text.split(' ');let i=0;
+  window._tw=setInterval(()=>{
+    if(i<words.length){el.textContent+=(i>0?' ':'')+words[i];i++;}
+    else{clearInterval(window._tw);window._tw=null;b.classList.remove('streaming');}
+  },100);
+}
+
+function updateLastQuery(q,intent,ms){
+  if($('lastQueryText'))$('lastQueryText').textContent=q||'—';
+  if($('lastIntentSpan'))$('lastIntentSpan').textContent=intent?'→ '+intent:'—';
+  if($('lastLatencySpan'))$('lastLatencySpan').textContent=ms!=null?' '+Math.round(ms)+'ms':'';
+}
+
+function updateSystem(d){
+  $('cpuVal').textContent=d.cpu+'%';$('cpuBar').style.width=d.cpu+'%';
+  $('cpuBar').style.background=d.cpu>80?'var(--red)':d.cpu>60?'var(--orange)':'var(--accent)';
+  $('ramVal').textContent=d.ram+'%';$('ramBar').style.width=d.ram+'%';
+  $('ramBar').style.background=d.ram>85?'var(--red)':d.ram>70?'var(--orange)':'var(--accent)';
+  if(d.battery!=null){
+    $('batteryVal').textContent=d.battery+'%'+(d.charging?' ⚡':'');
+    $('batteryBar').style.width=d.battery+'%';
+    $('batteryBar').style.background=d.battery<20?'var(--red)':d.battery<40?'var(--orange)':'var(--green)';
+  }
+  if(d.disk_free_gb!=null)$('diskVal').textContent=d.disk_free_gb+'GB';
+}
+
+let curPerf='lite';
+const MT={
+  full:{accent:'#818cf8',glow:'rgba(129,140,248,0.5)',dim:'rgba(129,140,248,0.12)',orbCore:0x818cf8,orbGlow:0x4338ca,orbRing:0x818cf8,orbParticle:0xa5b4fc},
+  lite:{accent:'#34d399',glow:'rgba(52,211,153,0.5)',dim:'rgba(52,211,153,0.12)',orbCore:0x34d399,orbGlow:0x065f46,orbRing:0x34d399,orbParticle:0x6ee7b7},
+  ultra_lite:{accent:'#fbbf24',glow:'rgba(251,191,36,0.5)',dim:'rgba(251,191,36,0.12)',orbCore:0xfbbf24,orbGlow:0x92400e,orbRing:0xfbbf24,orbParticle:0xfde68a},
+  auto:{accent:'#fb923c',glow:'rgba(251,146,60,0.5)',dim:'rgba(251,146,60,0.12)',orbCore:0xfb923c,orbGlow:0x9a3412,orbRing:0xfb923c,orbParticle:0xfdba74},
+};
+function setPerfUI(mode){
+  curPerf=mode;
+  document.querySelectorAll('.perf-btn').forEach(b=>b.classList.toggle('active',b.dataset.mode===mode));
+  const t=MT[mode]||MT.lite;
+  document.documentElement.style.setProperty('--accent',t.accent);
+  document.documentElement.style.setProperty('--accent-glow',t.glow);
+  if(window.setOrbModeTheme)window.setOrbModeTheme(t);
+}
+document.querySelectorAll('.perf-btn').forEach(b=>b.addEventListener('click',function(){
+  const m=this.dataset.mode;if(m===curPerf)return;
+  if(!confirm('Switch to '+m.toUpperCase().replace('_',' ')+'? ATOM will restart.'))return;
+  setPerfUI(m);$('perfRestartMsg').style.display='block';
+  if(ws&&ws.readyState===1)ws.send(JSON.stringify({action:'change_mode',mode:m}));
+}));
+
+function connect(){
+  ws=new WebSocket(WS);
+  ws.onopen=()=>{$('connWs').className='mini-dot on';if($('connWsVal'))$('connWsVal').textContent='LIVE';$('perfRestartMsg').style.display='none';};
+  ws.onmessage=e=>{try{
+    const d=JSON.parse(e.data);
+    switch(d.type){
+      case 'init':
+        if(d.mic)$('micName').textContent=d.mic;
+        if(d.brain&&$('connAiVal'))$('connAiVal').textContent=d.brain;
+        if(d.last_query!==undefined)updateLastQuery(d.last_query,d.last_intent,d.last_latency_ms);
+        if(d.state)setAppState(d.state,d.label,d.status);
+        if(d.perf_mode)setPerfUI(d.perf_mode);
+        if(d.brain_profile||d.assistant_mode)updateRuntimeUI(d.brain_profile,d.assistant_mode);
+        startTime=Date.now();break;
+      case 'last_query':updateLastQuery(d.query,d.intent,d.latency_ms);break;
+      case 'state':setAppState(d.state,d.label,d.status);break;
+      case 'log':
+        if(d.tag==='heard'){queryCount++;$('queriesVal').textContent=queryCount;showUserBubble(d.message);}
+        else if(d.tag==='speaking'||d.tag==='action')showAtomBubble(d.message);
+        break;
+      case 'system':updateSystem(d);break;
+      case 'hearing':$('hearingText').textContent=d.text?'"'+d.text+'"':'';break;
+      case 'mic':$('micName').textContent=d.name;break;
+      case 'status_text':$('orbStatusText').textContent=d.text;break;
+      case 'thinking_progress':
+        {const tp=$('thinkingProgress'),tt=$('thinkingText'),tb=$('thinkingBar');
+        tp.classList.add('visible');
+        const rem=Math.ceil(d.remaining_s);
+        tt.textContent='Thinking... ~'+rem+'s remaining';
+        const pct=Math.min(100,d.estimate_s>0?(d.elapsed_s/d.estimate_s)*100:0);
+        tb.style.width=pct+'%';}
+        break;
+      case 'perf_mode':setPerfUI(d.mode);break;
+      case 'governor':$('govStatus').textContent=d.throttled?'GOV: THROTTLED':'GOV: NORMAL';break;
+      case 'restarting':$('perfRestartMsg').style.display='block';showAtomBubble('Switching to '+d.mode.toUpperCase().replace('_',' ')+' mode...');break;
+      case 'runtime_settings':updateRuntimeUI(d.brain_profile,d.assistant_mode);break;
+      case 'mode_update':
+        document.querySelectorAll('.pod-btn[data-mode]').forEach(b=>{if(!b.classList.contains('perf-btn'))b.classList.toggle('active',b.dataset.mode===d.current);});
+        break;
+    }
+  }catch(ex){}};
+  ws.onclose=()=>{$('connWs').className='mini-dot off';if($('connWsVal'))$('connWsVal').textContent='LOST';setTimeout(connect,2000);};
+  ws.onerror=()=>ws.close();
+}
+connect();
+
+$('unstickBtn').addEventListener('click',()=>{if(ws&&ws.readyState===1)ws.send(JSON.stringify({type:'unstick'}));});
+
+function sendTextInput(){
+  const inp=$('textInput'),txt=(inp.value||'').trim();
+  if(!txt)return;
+  if(ws&&ws.readyState===1){
+    ws.send(JSON.stringify({type:'text_input',text:txt}));
+    showUserBubble(txt);
+    inp.value='';
+  }
+}
+$('textSendBtn').addEventListener('click',sendTextInput);
+$('textInput').addEventListener('keydown',e=>{if(e.key==='Enter'){e.preventDefault();sendTextInput();}});
+
+function updateRuntimeUI(brain,asst){
+  const ri=$('runtimeInfo');
+  if(brain||asst){const p=[];if(asst)p.push(asst.replace(/_/g,' '));if(brain)p.push(brain);if(ri)ri.textContent=p.join(' · ');}
+  document.querySelectorAll('.pod-btn[data-asst]').forEach(b=>b.classList.toggle('active',b.dataset.asst===asst));
+  document.querySelectorAll('.pod-btn[data-brain]').forEach(b=>b.classList.toggle('active',b.dataset.brain===brain));
+}
+window.setAssistantMode=m=>{if(ws&&ws.readyState===1)ws.send(JSON.stringify({type:'set_assistant_mode',mode:m}));};
+window.setBrainProfile=p=>{if(ws&&ws.readyState===1)ws.send(JSON.stringify({type:'set_brain_profile',profile:p}));};
+window.switchMode=m=>{if(ws&&ws.readyState===1)ws.send(JSON.stringify({type:'switch_mode',mode:m}));};
+})();
+</script>
+</body>
+</html>

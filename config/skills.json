@@ -1,0 +1,59 @@
+{
+    "version": 2,
+    "description": "Phrase triggers expand to utterances, or chain multiple steps.",
+    "skills": [
+        {
+            "id": "atom_health",
+            "triggers": ["run atom health check", "atom health check", "how is atom doing"],
+            "expand_to": "self check"
+        },
+        {
+            "id": "atom_diagnostics",
+            "triggers": ["run diagnostics", "full system diagnostic", "atom diagnostics"],
+            "expand_to": "self diagnostic"
+        },
+        {
+            "id": "resource_snapshot",
+            "triggers": ["resource report", "system resources", "cpu and ram report"],
+            "expand_to": "resource report"
+        },
+        {
+            "id": "quiet_mode",
+            "triggers": ["go silent", "stop listening for a while", "quiet mode"],
+            "expand_to": "go silent"
+        },
+        {
+            "id": "morning_stack",
+            "triggers": ["start my day", "morning routine", "open my work apps"],
+            "expand_to": "open chrome",
+            "chain": ["open teams", "open outlook"]
+        },
+        {
+            "id": "dev_stack",
+            "triggers": ["start dev mode", "open dev apps", "coding mode"],
+            "expand_to": "open cursor",
+            "chain": ["open chrome"]
+        },
+        {
+            "id": "system_check",
+            "triggers": ["full system check", "check everything", "system status"],
+            "expand_to": "resource report",
+            "chain": ["self check"]
+        },
+        {
+            "id": "focus_mode",
+            "triggers": ["focus mode", "do not disturb", "deep work mode"],
+            "expand_to": "go silent"
+        },
+        {
+            "id": "lock_and_go",
+            "triggers": ["lock and go", "im leaving", "stepping away"],
+            "expand_to": "lock screen"
+        },
+        {
+            "id": "whats_up",
+            "triggers": ["whats up atom", "status report", "give me a summary"],
+            "expand_to": "self check"
+        }
+    ]
+}

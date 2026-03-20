@@ -1,0 +1,173 @@
+{
+    "_doc": "ATOM v13 Command Registry. Router loads actions from this file. Each entry maps an action name to its metadata.",
+    "commands": [
+        {
+            "action": "open_app",
+            "category": "app",
+            "confirm": false,
+            "description": "Open an application by name"
+        },
+        {
+            "action": "close_app",
+            "category": "app",
+            "confirm": true,
+            "description": "Force-close an application"
+        },
+        {
+            "action": "list_apps",
+            "category": "app",
+            "confirm": false,
+            "description": "List installed applications"
+        },
+        {
+            "action": "search",
+            "category": "network",
+            "confirm": false,
+            "description": "Web search via default browser"
+        },
+        {
+            "action": "play_youtube",
+            "category": "media",
+            "confirm": false,
+            "description": "Search and play on YouTube"
+        },
+        {
+            "action": "stop_music",
+            "category": "media",
+            "confirm": false,
+            "description": "Toggle media play/pause"
+        },
+        {
+            "action": "set_volume",
+            "category": "media",
+            "confirm": false,
+            "description": "Set system volume percentage"
+        },
+        {
+            "action": "mute",
+            "category": "media",
+            "confirm": false,
+            "description": "Mute system audio"
+        },
+        {
+            "action": "unmute",
+            "category": "media",
+            "confirm": false,
+            "description": "Unmute system audio"
+        },
+        {
+            "action": "lock_screen",
+            "category": "system",
+            "confirm": false,
+            "description": "Lock the Windows workstation"
+        },
+        {
+            "action": "screenshot",
+            "category": "system",
+            "confirm": false,
+            "description": "Capture screenshot to Desktop"
+        },
+        {
+            "action": "set_brightness",
+            "category": "system",
+            "confirm": false,
+            "description": "Set or adjust screen brightness"
+        },
+        {
+            "action": "shutdown_pc",
+            "category": "system",
+            "confirm": true,
+            "description": "Shutdown PC in 30 seconds"
+        },
+        {
+            "action": "restart_pc",
+            "category": "system",
+            "confirm": true,
+            "description": "Restart PC in 30 seconds"
+        },
+        {
+            "action": "logoff",
+            "category": "system",
+            "confirm": true,
+            "description": "Log off current user session"
+        },
+        {
+            "action": "sleep_pc",
+            "category": "system",
+            "confirm": true,
+            "description": "Put PC to sleep"
+        },
+        {
+            "action": "empty_recycle_bin",
+            "category": "system",
+            "confirm": true,
+            "description": "Empty the Windows Recycle Bin"
+        },
+        {
+            "action": "flush_dns",
+            "category": "system",
+            "confirm": false,
+            "description": "Flush DNS resolver cache"
+        },
+        {
+            "action": "create_folder",
+            "category": "file",
+            "confirm": true,
+            "description": "Create a new folder"
+        },
+        {
+            "action": "move_path",
+            "category": "file",
+            "confirm": true,
+            "description": "Move a file or folder"
+        },
+        {
+            "action": "copy_path",
+            "category": "file",
+            "confirm": true,
+            "description": "Copy a file or folder"
+        },
+        {
+            "action": "minimize_window",
+            "category": "utility",
+            "confirm": false,
+            "description": "Minimize the active window"
+        },
+        {
+            "action": "maximize_window",
+            "category": "utility",
+            "confirm": false,
+            "description": "Maximize the active window"
+        },
+        {
+            "action": "switch_window",
+            "category": "utility",
+            "confirm": false,
+            "description": "Switch to next window (Alt+Tab)"
+        },
+        {
+            "action": "timer",
+            "category": "utility",
+            "confirm": false,
+            "description": "Set a countdown timer"
+        },
+        {
+            "action": "read_clipboard",
+            "category": "utility",
+            "confirm": false,
+            "description": "Read clipboard contents aloud"
+        },
+        {
+            "action": "open_url",
+            "category": "network",
+            "confirm": false,
+            "description": "Open a URL in default browser"
+        },
+        {
+            "action": "weather",
+            "category": "network",
+            "confirm": false,
+            "description": "Get current weather information"
+        }
+    ]
+}

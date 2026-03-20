@@ -1,0 +1,50 @@
+# ATOM v15 -- Pinned dependencies
+# Python 3.11+
+#
+# Regenerate after upgrading:
+#   pip freeze --local | findstr /i "vosk speech numpy comtypes edge-tts pygame psutil keyboard jsonschema aiohttp truststore mss pillow llama-cpp cffi pyaudio"
+
+# ─── Core (required for default run) ─────────────────────────────────────
+# Voice: STT (faster-whisper offline -- primary, Vosk -- legacy, Google -- fallback)
+faster-whisper==1.2.1
+vosk==0.3.45
+SpeechRecognition==3.14.6
+PyAudio==0.2.14
+cffi==2.0.0
+
+# Audio pipeline (Edge TTS postprocess, resampling)
+numpy==2.4.3
+
+# TTS: SAPI fallback
+comtypes==1.4.15
+
+# TTS: Edge Neural (primary)
+edge-tts==7.2.7
+pygame==2.6.1
+
+# System monitoring
+psutil==7.2.2
+
+# Global hotkey Ctrl+Alt+A
+keyboard==0.13.5
+
+# Config validation (optional at runtime; basic validation used if missing)
+jsonschema==4.26.0
+
+# Web dashboard
+aiohttp==3.13.3
+
+# Corporate SSL (Windows certificate store)
+truststore==0.10.4
+
+# Desktop capture (screenshot intent, automation)
+mss==10.1.0
+Pillow==12.1.1
+
+# ─── Local LLM Brain (brain.enabled=true) ──────────────────────────────────
+# Requires a C++ compiler (Visual Studio Build Tools) or a pre-built wheel.
+# After install, place GGUF model in models/ and set brain.model_path in settings.json.
+llama-cpp-python==0.3.2
+
+# ─── Optional: install only if you use the feature ─────────────────────────
+# soxr>=0.3.0         # Optional: better audio resample quality
