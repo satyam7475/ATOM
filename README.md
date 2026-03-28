@@ -1,119 +1,127 @@
-# ATOM v13 — Your JARVIS-Level AI Assistant
+# ATOM — Personal Cognitive AI Operating System
 
-Enterprise-grade voice assistant owned by **Satyam**. ATOM helps with everything on your company laptop: system control, apps, files, queries, and more. Optional camera-based owner recognition keeps it secure and personal.
+**Owner:** Satyam (“Boss”)  
+**What it is:** A local-first, JARVIS-style voice OS — not a thin chatbot. It perceives (voice, system state), reasons (intent → cache/memory → optional RAG/graph → local LLM), acts (security-gated tools), and learns (behavior, habits, V7 feedback metrics).
 
-## Features
+**Docs:** Deep architecture → [`ATOM_ARCHITECTURE_BLUEPRINT.md`](ATOM_ARCHITECTURE_BLUEPRINT.md)  
+**Code review & desktop plan:** [`docs/ATOM_CODE_REVIEW_AND_DESKTOP_PLAN.md`](docs/ATOM_CODE_REVIEW_AND_DESKTOP_PLAN.md)
 
-- **Owner-first**: Configured for Satyam; ATOM addresses you by name and title (Boss).
-- **Instant Brain**: Local Intent Engine handles most commands in &lt;5 ms (open/close apps, volume, lock, screenshot, timer, etc.).
-- **Offline brain**: Local GGUF LLM (`brain.*` in settings) — no Gemini/Groq; JARVIS-style personality and system awareness.
-- **Faster**: Cache, preload, layered routing (intent → cache/memory → local LLM).
-- **Secured**: Privacy filter for clipboard/context; optional “only when I see you” for sensitive actions.
-- **Vision (optional)**: Local-only camera face recognition to detect you (Satyam). No images leave the machine.
+---
 
-## Quick Start
+## Features (summary)
 
-### 1. Prerequisites
+| Area | Description |
+|------|-------------|
+| **Owner-first** | Configured in `config/settings.json` (`owner.name`, `owner.title`). |
+| **Instant path** | Intent engine + cache for sub-millisecond-class command routing where applicable. |
+| **Offline brain** | Local GGUF via `llama-cpp-python` when `brain.enabled` and model path set. |
+| **V7 intelligence** | Runtime modes (FAST/SMART/DEEP/SECURE), `V7RuntimeContext`, feedback engine, mode stability, bounded prefetch, graph-first RAG with validation, `/v7/health` observability. |
+| **Security** | `SecurityPolicy` + `allow_action` on routed actions; treat policy changes as high-risk. |
+| **UI** | aiohttp web dashboard (default) + WebSocket; optional floating indicator mode. |
 
-- Python 3.11+
-- Microphone
-- **No cloud LLM keys required** — ATOM v15 is offline-first. Optional: `%USERPROFILE%\.atom\env` for future integrations (see `.env.example`).
+---
 
-### 2. Install
+## Requirements
+
+- **Python 3.11+** (64-bit recommended)
+- **Microphone** for voice
+- **No cloud API keys** for core offline operation (optional Edge TTS uses network if selected)
+
+---
+
+## Install (personal desktop)
+
+Use a dedicated virtual environment.
 
 ```bash
 cd ATOM
 python -m venv .venv
-.venv\Scripts\activate   # Windows
-pip install -r requirements.txt
+.venv\Scripts\activate
+python -m pip install --upgrade pip
+pip install -r requirements-desktop.txt
 ```
 
-### 3. Configure
+- **Canonical pinned set:** [`requirements-desktop.txt`](requirements-desktop.txt) (keep in sync with [`requirements.txt`](requirements.txt) when bumping versions).
+- **Optional dev tools (tests):** [`requirements-dev.txt`](requirements-dev.txt)
 
-Edit `config/settings.json`:
+---
 
-- **Owner**: `"owner": { "name": "Satyam", "title": "Boss" }`
-- **Vision** (camera): Set `"vision": { "enabled": true }` when you want face detection. Run enrollment once (see below).
+## Configure
 
-### 4. Run
+1. Copy or edit **`config/settings.json`**.
+2. For a desktop-oriented baseline, see **`config/settings.desktop.example.json`**.
+3. For corporate-style restrictions, see **`config/settings.corporate.example.json`** and [`docs/ATOM_Deployment_Profiles.md`](docs/ATOM_Deployment_Profiles.md).
+4. Set **`brain.model_path`** to your GGUF file when using the local LLM.
+5. **`v7_intelligence`** — thresholds for health, prefetch, mode stability, observability (see schema in `core/config_schema.py`).
+
+---
+
+## Run
 
 ```bash
 python main.py
 ```
 
-Dashboard opens at http://127.0.0.1:8765. ATOM uses **always-on listening** by default; use **Ctrl+Alt+A** to toggle idle / resume listening, or **UNSTICK** on the dashboard if the state machine hangs.
+- Dashboard (default): `http://127.0.0.1:<port>/` — port from `ui.web_port` in settings (often **8765**).
+- **V7 health (JSON):** `GET http://127.0.0.1:<port>/v7/health` when the dashboard is running.
+- **Hotkey:** Ctrl+Alt+A toggles listening / resume; use dashboard **UNSTICK** if the state machine hangs.
 
-**If the browser tab does not open:** use Cursor **Simple Browser** or tasks — see **[docs/CURSOR_DASHBOARD.md](docs/CURSOR_DASHBOARD.md)**.
+If the browser does not open automatically, use Cursor Simple Browser or open the URL manually — see [`docs/CURSOR_DASHBOARD.md`](docs/CURSOR_DASHBOARD.md) if present.
 
-## Owner & Vision (Camera)
+---
 
-- **Owner** is set in `config/settings.json` under `owner.name` and `owner.title`. ATOM uses this in greetings and responses.
-- **Face recognition** is optional and runs entirely on your machine:
-  1. Install: `pip install opencv-python face_recognition numpy`
-  2. Enroll once: `python scripts/enroll_owner_face.py` — capture your face with SPACE, quit with Q. This creates `config/owner_face.npy`.
-  3. In `settings.json` set `"vision": { "enabled": true }`. Optionally set `"require_owner_for_sensitive": true` so lock/sleep/shutdown/close app etc. only run when the camera recognizes you.
-
-The dashboard shows an **OWNER** panel (e.g. “Satyam” / “Recognized ✓” or “Unknown” / “Camera off”).
-
-## Deployment profiles (company laptop vs future PC)
-
-See **[docs/ATOM_Deployment_Profiles.md](docs/ATOM_Deployment_Profiles.md)** for:
-
-- How to align ATOM for **corporate laptop testing** (security, CPU-only brain, performance).
-- A **~₹1 lakh** India PC parts list oriented toward **local LLM + ATOM** when you build your own machine.
-
-**Staged evolution (corporate → incredible):** **[docs/ATOM_Corporate_Evolution.md](docs/ATOM_Corporate_Evolution.md)** — trust, performance, context, skills, safe proactivity. Copy **`config/settings.corporate.example.json`** as a baseline for work machines.
-
-**Rating & full review:** **[docs/ATOM_OS_Review.md](docs/ATOM_OS_Review.md)** — scores by dimension + **recent enhancements**. Production-style metrics: **[docs/ATOM_Production_Readiness_Scorecard.md](docs/ATOM_Production_Readiness_Scorecard.md)**.
-
-**Verbal shortcuts:** edit **`config/skills.json`** — phrases expand before intent classification (e.g. “atom health check” → “self check”).
-
-## Security
-
-- **Secrets**: Offline build needs no API keys. If you add integrations later, keep secrets out of the repo (see `.env.example`).
-- **Privacy**: Clipboard and context are redacted before prompts (`context/privacy_filter.py`).
-- **Vision**: Camera frames are never stored or sent; only a local face encoding is used for recognition.
-- **Sensitive actions**: With `require_owner_for_sensitive: true`, actions like lock screen, shutdown, restart, logoff, sleep, empty recycle bin, close app, move/copy path require owner detection.
-
-## Configuration (main keys)
-
-| Key | Purpose |
-|-----|--------|
-| `owner.name` | Your name (e.g. Satyam). |
-| `owner.title` | How ATOM addresses you (e.g. Boss). |
-| `vision.enabled` | Turn on camera-based owner detection. |
-| `vision.require_owner_for_sensitive` | Require face recognition for sensitive commands. |
-| `brain.enabled` / `brain.model_path` | Local GGUF model (llama.cpp). |
-| `tts.engine` | `sapi` (offline, default) or `edge` (neural, needs network). |
-| `features.web_research` / `online_weather` | `false` by default for offline use. |
-
-## Project Structure
+## Project layout (abbreviated)
 
 ```
 ATOM/
-├── main.py                    # Entry point, wires bus & modules
-├── config/settings.json       # Owner, vision, STT/TTS/AI, etc.
-├── core/                      # State, router, intent engine, cache, memory
-├── voice/                     # STT, TTS, mic
-├── brain/                     # Mini LLM prompt engine
-├── cursor_bridge/             # Prompt builder + local brain controller
-├── context/                   # Context engine, privacy filter
-├── vision/                    # Face recognizer (local-only camera)
-├── ui/                        # Web dashboard (JARVIS-style)
-├── scripts/enroll_owner_face.py  # One-time face enrollment
-└── logs/
+├── main.py                 # Entry: run_atom() / asyncio main
+├── config/
+│   ├── settings.json       # Active config
+│   └── *.example.json      # Desktop / corporate templates
+├── core/                   # Router, state, cognition, RAG, GPU, observability
+├── brain/                  # Mini LLM, memory graph, pipelines
+├── cursor_bridge/          # Local brain controller, prompts
+├── voice/                  # STT, TTS, mic
+├── ui/                     # Web dashboard (aiohttp)
+├── docs/                   # Reports, deployment, benchmarks
+├── requirements.txt
+├── requirements-desktop.txt
+└── ATOM_ARCHITECTURE_BLUEPRINT.md
 ```
 
-## Usage
+---
 
-| Action | Example |
+## V7 observability (quick reference)
+
+| Signal | Where |
 |--------|--------|
-| Activate | “Hey Atom” or Ctrl+Alt+A |
-| Greeting | “Hi”, “Good morning” |
-| System | “Check CPU”, “Battery”, “Lock screen”, “Screenshot” |
-| Apps | “Open Notepad”, “Close Chrome” |
-| Media | “Set volume to 50”, “Play X on YouTube”, “Mute” |
-| Power | “Shutdown”, “Restart”, “Sleep” (with optional face check) |
-| Exit ATOM | “Bye”, “Shutdown”, “Go silent” |
+| Health + metrics + warnings | `GET /v7/health` |
+| Periodic snapshot | Log tag `v7_debug_snapshot` |
+| Mode decisions | `v7_mode_selected`, `v7_mode_switch` |
+| RAG / graph | `v7_rag_retrieval`, `v7_graph_*`, `v7_rag_fallback` |
+| Prefetch | `v7_prefetch_*` |
 
-ATOM is your dedicated assistant: smarter, faster, and secured for your company laptop.
+---
+
+## Security & privacy (short)
+
+- Clipboard/context redaction: `context/privacy_filter.py`
+- Sensitive actions can be tied to optional vision / owner recognition — see settings and deployment docs
+- **Do not** weaken `SecurityPolicy` or authentication paths without a full review
+
+---
+
+## More documentation
+
+| Document | Content |
+|----------|---------|
+| [`docs/ATOM_CODE_REVIEW_AND_DESKTOP_PLAN.md`](docs/ATOM_CODE_REVIEW_AND_DESKTOP_PLAN.md) | Review summary, V7 map, desktop migration, static validation |
+| [`docs/README.md`](docs/README.md) | Index of benchmarks and reports |
+| [`docs/ATOM_Deployment_Profiles.md`](docs/ATOM_Deployment_Profiles.md) | Corporate vs home hardware |
+| [`ATOM_ARCHITECTURE_BLUEPRINT.md`](ATOM_ARCHITECTURE_BLUEPRINT.md) | Full system blueprint |
+
+---
+
+## License / ownership
+
+ATOM is Satyam’s personal cognitive OS project; use and deployment are subject to your environment’s policies.

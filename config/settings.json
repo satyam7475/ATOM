@@ -28,8 +28,8 @@
     },
     "stt": {
         "engine": "faster_whisper",
-        "whisper_model_size": "base.en",
-        "vosk_model_path": "models/vosk-model-en-us-0.22",
+        "whisper_model_size": "small",
+        "bilingual": true,
         "sample_rate": 16000,
         "chunk_size": 2048,
         "post_tts_cooldown_ms": 800,
@@ -38,12 +38,12 @@
         "min_energy_threshold": 400
     },
     "tts": {
-        "engine": "sapi",
+        "engine": "edge",
         "max_lines": 4,
         "rate": 2,
         "edge_voice": "en-GB-RyanNeural",
         "edge_rate": "+0%",
-        "edge_postprocess": false,
+        "edge_postprocess": true,
         "edge_ack_cache": true
     },
     "context": {
@@ -56,23 +56,33 @@
         "ttl_seconds": 300
     },
     "memory": {
+        "graph_db_path": "data/atom_memory.db",
         "max_entries": 500,
-        "top_k": 3
+        "top_k": 3,
+        "semantic_weight": 0.7,
+        "v7_scoring": {
+            "enabled": true,
+            "recency_weight": 0.3,
+            "importance_weight": 0.3,
+            "success_rate_weight": 0.2,
+            "similarity_weight": 0.2
+        }
     },
     "brain": {
         "enabled": true,
-        "model_path": "models/Llama-3.2-3B-Instruct-Q4_K_M.gguf",
-        "model_path_1b": "models/Llama-3.2-1B-Instruct-Q4_K_M.gguf",
-        "dual_model": true,
-        "n_ctx": 2048,
-        "n_threads": 8,
-        "n_gpu_layers": 0,
-        "max_tokens": 80,
-        "temperature": 0.4,
-        "timeout_seconds": 90
+        "model_path": "models/qwen3-8b-q4_k_m.gguf",
+        "n_ctx": 8192,
+        "n_threads": 4,
+        "n_gpu_layers": -1,
+        "n_batch": 512,
+        "max_tokens": 512,
+        "temperature": 0.7,
+        "top_p": 0.9,
+        "repeat_penalty": 1.1,
+        "timeout_seconds": 30
     },
     "assistant_brain": {
-        "active_profile": "balanced",
+        "active_profile": "brain",
         "restore_persisted_profile": true,
         "persist_active_profile": true,
         "audit_profile_changes": true,
@@ -96,31 +106,38 @@
         },
         "profiles": {
             "atom": {
-                "max_tokens": 80,
-                "n_ctx": 1024,
-                "n_threads": 8,
-                "timeout_seconds": 45,
+                "max_tokens": 256,
+                "n_ctx": 4096,
+                "n_threads": 4,
+                "n_gpu_layers": -1,
+                "n_batch": 512,
+                "timeout_seconds": 20,
                 "extra_stop_sequences": ["\n\nUser:", "\nUser:", "\n\nBoss:"]
             },
             "balanced": {
-                "max_tokens": 80,
-                "n_ctx": 1536,
-                "n_threads": 8,
-                "timeout_seconds": 90
+                "max_tokens": 512,
+                "n_ctx": 8192,
+                "n_threads": 4,
+                "n_gpu_layers": -1,
+                "n_batch": 512,
+                "timeout_seconds": 30
             },
             "brain": {
-                "max_tokens": 100,
-                "n_ctx": 2048,
-                "n_threads": 8,
-                "timeout_seconds": 120,
-                "temperature": 0.45
+                "max_tokens": 768,
+                "n_ctx": 16384,
+                "n_threads": 4,
+                "n_gpu_layers": -1,
+                "n_batch": 512,
+                "timeout_seconds": 45,
+                "temperature": 0.65
             }
         }
     },
     "ui": {
-        "mode": "web",
+        "mode": "desktop",
         "web_port": 8765,
-        "auto_open_browser": true
+        "auto_open_browser": false,
+        "password_auth_enabled": false
     },
     "executor": {
         "max_workers": 2
@@ -202,6 +219,161 @@
         "max_goals": 20,
         "max_predictions": 5,
         "optimizer_check_interval_s": 1800,
-        "energy_inference_interval_s": 120
+        "energy_inference_interval_s": 120,
+        "dream_enabled": true,
+        "dream_idle_minutes": 30,
+        "dream_interval_hours": 6,
+        "curiosity_enabled": true,
+        "curiosity_max_per_hour": 2,
+        "curiosity_cooldown_minutes": 15
+    },
+    "conversation_memory": {
+        "max_turns": 20
+    },
+    "embedding": {
+        "model": "all-MiniLM-L6-v2",
+        "dimension": 384,
+        "device": "cpu"
+    },
+    "vector_store": {
+        "path": "data/vector_db",
+        "backend": "chroma"
+    },
+    "documents": {
+        "chunk_size": 500,
+        "chunk_overlap": 50
+    },
+    "reasoning": {
+        "max_plan_steps": 10,
+        "max_retries": 2
+    },
+    "sandbox": {
+        "enabled": true,
+        "timeout_seconds": 5,
+        "max_output_chars": 2000
+    },
+    "workflow": {
+        "max_workflows": 50,
+        "max_steps_per_workflow": 30
+    },
+    "wake_word": {
+        "enabled": false,
+        "sensitivity": 0.6
+    },
+    "emotion": {
+        "enabled": true
+    },
+    "screen_reader": {
+        "enabled": true
+    },
+    "gpu": {
+        "enabled": true,
+        "thermal_threshold": 85,
+        "memory_threshold_pct": 90,
+        "poll_interval_s": 30
+    },
+    "v7_intelligence": {
+        "default_mode": "SMART",
+        "auto_mode": true,
+        "mode_stability_enabled": true,
+        "simple_query_max_chars": 48,
+        "timeline_max_events": 500,
+        "max_timeline_size": 500,
+        "timeline_summarize_on_prune": false,
+        "prediction_prefetch_enabled": true,
+        "gpu_util_fast_threshold": 92,
+        "deep_query_min_chars": 140,
+        "prefer_secure_when_paranoid_ui": false,
+        "secure_rag_budget_factor": 0.75,
+        "cpu_force_fast_above": 88,
+        "cpu_idle_deep_below": 28,
+        "low_prediction_accuracy_deep_threshold": 0.35,
+        "mode_stability": {
+            "cooldown_turns": 3,
+            "significant_cpu_delta": 12.0,
+            "significant_gpu_delta": 15.0
+        },
+        "observability": {
+            "debug_snapshot_interval_s": 120.0,
+            "debug_snapshot_cache_ttl_s": 3.0
+        },
+        "prefetch": {
+            "max_prefetch_candidates": 12,
+            "hard_abort_gpu_above": 98.0,
+            "soft_scale_gpu_above": 85.0,
+            "soft_scale_factor": 0.55,
+            "soft_delay_s": 0.25,
+            "gpu_soft_extra_delay_s": 0.2,
+            "min_prediction_confidence": 0.22,
+            "low_conf_extra_delay_s": 0.15
+        },
+        "feedback": {
+            "max_records": 2000,
+            "learn_rate": 0.04,
+            "rolling_window_50": 50,
+            "rolling_window_100": 100,
+            "trend_flat_epsilon": 0.04,
+            "min_query_chars": 4,
+            "learn_confidence_threshold": 0.35
+        },
+        "health": {
+            "prediction_good_above": 0.55,
+            "prediction_poor_below": 0.38,
+            "prediction_unstable_low": 0.4,
+            "prediction_unstable_high": 0.52,
+            "prefetch_good_above": 0.35,
+            "prefetch_poor_below": 0.15,
+            "memory_relevance_good_above": 0.35,
+            "memory_relevance_poor_below": 0.15,
+            "system_load_cpu_low_below": 55.0,
+            "system_load_cpu_high_above": 88.0,
+            "system_load_ram_high_above": 90.0
+        },
+        "warnings": {
+            "warn_on_degrading_prediction": true,
+            "graph_miss_rate_above": 0.35,
+            "prefetch_waste_above": 0.72
+        },
+        "preemption": {
+            "restart_cost": 0.45,
+            "relevance_scale": 1.0,
+            "context_scale": 0.25,
+            "min_improvement_score": 0.25,
+            "max_preemptions_per_query": 2
+        }
+    },
+    "rag": {
+        "enabled": true,
+        "prefetch_enabled": true,
+        "first_token_budget_ms": 120,
+        "graph_first": {
+            "enabled": true,
+            "min_confidence": 0.68,
+            "min_snippets": 2,
+            "project_boost": 0.12,
+            "relevance_validation_min": 0.74
+        }
+    },
+    "v7_gpu": {
+        "enabled": true,
+        "strict_control": false,
+        "deployment_mode": "distributed",
+        "vram_reserve_mb": 512,
+        "model_slots_mb": {
+            "llm": 8192,
+            "stt": 3072,
+            "embeddings": 512
+        },
+        "eviction_order": ["embeddings", "stt", "llm"],
+        "idle_unload_stt_s": 60,
+        "idle_unload_llm_s": 180,
+        "idle_sleep_s": 600,
+        "fused_gpu_worker": false,
+        "gpu_stall_timeout_s": 120,
+        "allow_cuda_reset": false,
+        "degradation_default": "full",
+        "event_replay_max": 32,
+        "speculative_response": false,
+        "simulation_mode": "hybrid"
     }
 }

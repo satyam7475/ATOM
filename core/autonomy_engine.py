@@ -1,5 +1,5 @@
 """
-ATOM v14 -- Autonomy Engine (AI OS Decision Layer).
+ATOM -- Autonomy Engine (AI OS Decision Layer).
 
 The central brain for autonomous decision-making. Runs as a periodic
 background task that:
@@ -222,6 +222,15 @@ class AutonomyEngine:
 
     # ── Habit-based decisions ─────────────────────────────────────────
 
+    def _is_reversible(self, action: str) -> bool:
+        """Check if an action can be easily undone."""
+        irreversible_actions = {
+            "delete_file", "empty_recycle_bin", "kill_process",
+            "send_email", "commit_code", "format_drive",
+            "drop_table", "uninstall_app"
+        }
+        return action not in irreversible_actions
+
     async def _check_habits(self, ctx: dict, now: float) -> None:
         auto_habits = self._behavior.get_auto_habits(ctx)
         for habit in auto_habits:
@@ -234,9 +243,18 @@ class AutonomyEngine:
             if now - last_exec < 3600:
                 continue
 
-            allowed, reason = self._security.allow_action(
-                habit["action"], {"name": habit.get("target", "")},
-            )
+            # Reversibility Check
+            if not self._is_reversible(habit["action"]):
+                self._log_decision("auto_blocked", hid, "Action is irreversible. Requires confirmation.")
+                # Fallback to suggestion instead of auto-execute
+                self._suggest_habit(habit, now)
+                continue
+
+            from core.security.action_signing import merge_signed_args
+
+            hargs = {"name": habit.get("target", "")}
+            hargs = merge_signed_args(self._security, habit["action"], hargs)
+            allowed, reason = self._security.allow_action(habit["action"], hargs)
             if not allowed:
                 self._log_decision("auto_blocked", hid, reason)
                 continue
@@ -261,40 +279,42 @@ class AutonomyEngine:
 
         suggest_habits = self._behavior.get_active_habits(ctx)
         for habit in suggest_habits:
-            hid = habit["id"]
             if habit["confidence"] < self._suggest_threshold:
                 continue
-            if habit["confidence"] >= self._auto_threshold:
-                continue
-
-            if hid in _NEVER_AUTO_EXECUTE or habit["action"] in _NEVER_AUTO_EXECUTE:
-                continue
-
-            last_sugg = self._last_suggested.get(hid, 0)
-            if now - last_sugg < 1800:
-                continue
-
-            self._last_suggested[hid] = now
-            suggestion_text = self._behavior.format_habit_suggestion(habit)
-            if not suggestion_text:
-                continue
-
-            self._pending_suggestion = habit
-            self._log_decision("suggest", hid,
-                               f"confidence={habit['confidence']:.2f}")
-            self._bus.emit_fast(
-                "habit_suggestion",
-                text=suggestion_text,
-                habit_id=hid,
-                confidence=habit["confidence"],
-            )
-            self._bus.emit_fast(
-                "autonomy_decision_log",
-                decision="suggest",
-                detail=suggestion_text,
-                confidence=habit["confidence"],
-            )
+            if habit["confidence"] >= self._auto_threshold and self._is_reversible(habit["action"]):
+                continue # Already handled by auto_habits
+            self._suggest_habit(habit, now)
             return
+
+    def _suggest_habit(self, habit: dict, now: float) -> None:
+        hid = habit["id"]
+        if hid in _NEVER_AUTO_EXECUTE or habit["action"] in _NEVER_AUTO_EXECUTE:
+            return
+
+        last_sugg = self._last_suggested.get(hid, 0)
+        if now - last_sugg < 1800:
+            return
+
+        self._last_suggested[hid] = now
+        suggestion_text = self._behavior.format_habit_suggestion(habit)
+        if not suggestion_text:
+            return
+
+        self._pending_suggestion = habit
+        self._log_decision("suggest", hid,
+                           f"confidence={habit['confidence']:.2f}")
+        self._bus.emit_fast(
+            "habit_suggestion",
+            text=suggestion_text,
+            habit_id=hid,
+            confidence=habit["confidence"],
+        )
+        self._bus.emit_fast(
+            "autonomy_decision_log",
+            decision="suggest",
+            detail=suggestion_text,
+            confidence=habit["confidence"],
+        )
 
     # ── Dashboard data ────────────────────────────────────────────────
 

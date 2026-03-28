@@ -1,5 +1,5 @@
 """
-ATOM v14 -- System-level action handlers.
+ATOM -- System-level action handlers.
 
 Handles: lock_screen, screenshot, brightness, shutdown, restart,
          logoff, sleep_pc, empty_recycle_bin, flush_dns

@@ -1,5 +1,5 @@
 """
-ATOM v15 -- Personal Behavior Model + Energy Awareness.
+ATOM -- Personal Behavior Model + Energy Awareness.
 
 Builds a dynamic user profile from observed behavior:
   - Peak productivity hours

@@ -1,5 +1,5 @@
 """
-ATOM v13 -- Command result cache for instant repeat commands.
+ATOM -- Command result cache for instant repeat commands.
 
 LRU cache that stores recent intent classification results.
 If the same command text is seen again within the TTL window,

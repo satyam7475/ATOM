@@ -1,0 +1,249 @@
+{
+    "deployment": {
+        "profile": "desktop_jarvis",
+        "dashboard_badge": true
+    },
+    "session": {
+        "enabled": true,
+        "max_query_snippet_chars": 120
+    },
+    "skills": {
+        "enabled": true,
+        "path": "config/skills.json"
+    },
+    "owner": {
+        "name": "Satyam",
+        "title": "Boss"
+    },
+    "vision": {
+        "enabled": false,
+        "camera_index": 0,
+        "check_interval_seconds": 5,
+        "require_owner_for_sensitive": false,
+        "owner_encoding_path": "config/owner_face.npy"
+    },
+    "mic": {
+        "device_name": null,
+        "prefer_bluetooth": true
+    },
+    "stt": {
+        "engine": "faster_whisper",
+        "whisper_model_size": "large-v3-turbo",
+        "bilingual": true,
+        "sample_rate": 16000,
+        "chunk_size": 2048,
+        "post_tts_cooldown_ms": 600,
+        "preload": true,
+        "calibration_delay_s": 2.0,
+        "min_energy_threshold": 400
+    },
+    "tts": {
+        "engine": "kokoro",
+        "kokoro_voice": "af_heart",
+        "max_lines": 4,
+        "rate": 2,
+        "edge_voice": "en-GB-RyanNeural",
+        "edge_rate": "+0%",
+        "edge_postprocess": false,
+        "edge_ack_cache": true
+    },
+    "context": {
+        "enable_clipboard": true,
+        "enable_active_window": true,
+        "clipboard_max_chars": 800
+    },
+    "cache": {
+        "max_size": 128,
+        "ttl_seconds": 300
+    },
+    "memory": {
+        "max_entries": 1000,
+        "top_k": 5
+    },
+    "brain": {
+        "enabled": true,
+        "model_path": "models/qwen3.5-4b-q5_k_m.gguf",
+        "n_ctx": 32768,
+        "n_threads": 8,
+        "n_gpu_layers": -1,
+        "max_tokens": 1024,
+        "temperature": 0.7,
+        "timeout_seconds": 30
+    },
+    "assistant_brain": {
+        "active_profile": "balanced",
+        "restore_persisted_profile": true,
+        "persist_active_profile": true,
+        "audit_profile_changes": true,
+        "quick_replies_enabled": true,
+        "quick_replies": {
+            "how are you": "I'm good, Boss. Systems nominal and ready.",
+            "hello atom": "Yes, Boss? What do you need?",
+            "hey atom": "Listening, Boss.",
+            "thank you": "Anytime, Boss.",
+            "thanks atom": "Happy to help, Boss."
+        },
+        "profiles": {
+            "atom": {
+                "max_tokens": 256,
+                "n_ctx": 8192,
+                "n_threads": 8,
+                "n_gpu_layers": -1,
+                "timeout_seconds": 20,
+                "extra_stop_sequences": ["\n\nUser:", "\nUser:", "\n\nBoss:"]
+            },
+            "balanced": {
+                "max_tokens": 512,
+                "n_ctx": 16384,
+                "n_threads": 8,
+                "n_gpu_layers": -1,
+                "timeout_seconds": 30
+            },
+            "brain": {
+                "max_tokens": 1024,
+                "n_ctx": 32768,
+                "n_threads": 8,
+                "n_gpu_layers": -1,
+                "timeout_seconds": 60,
+                "temperature": 0.65
+            }
+        }
+    },
+    "ui": {
+        "mode": "web",
+        "web_port": 8765,
+        "auto_open_browser": true
+    },
+    "executor": {
+        "max_workers": 4
+    },
+    "developer": {
+        "role": "Personal AI Operating System",
+        "focus": "system management, desktop automation, productivity",
+        "project_name": "ATOM OS"
+    },
+    "security": {
+        "mode": "strict",
+        "audit_to_file": true,
+        "require_confirmation_for": [
+            "shutdown_pc", "restart_pc", "logoff", "sleep_pc",
+            "empty_recycle_bin", "kill_process", "close_app",
+            "open_url", "play_youtube", "lock_screen", "screenshot",
+            "move_path", "copy_path", "create_folder"
+        ]
+    },
+    "features": {
+        "desktop_control": true,
+        "file_ops": true,
+        "llm": true,
+        "system_analyze": true,
+        "web_research": true,
+        "online_weather": true,
+        "proactive_awareness": true
+    },
+    "control": {
+        "lock_mode": "off",
+        "assistant_mode": "hybrid",
+        "allow_runtime_mode_switch": true,
+        "persist_assistant_mode": true,
+        "restore_persisted_assistant_mode": true,
+        "audit_assistant_mode_changes": true,
+        "command_only_message": "Command-only mode is on, Boss — no chat brain for open questions. Try time, cpu, open notepad, or say hybrid mode to bring the brain back."
+    },
+    "performance": {
+        "mode": "auto",
+        "auto_threshold_high": 70,
+        "auto_threshold_mid": 40,
+        "health_check_interval_s": 120,
+        "stuck_state_threshold_s": 75,
+        "system_watcher_interval_s": 30,
+        "maintenance_interval_s": 180,
+        "proactive_alerts": true,
+        "idle_reminder": false,
+        "cpu_governor": true,
+        "cpu_governor_threshold": 85,
+        "watchdog_thinking_timeout_s": 120,
+        "watchdog_speaking_timeout_s": 300,
+        "supervisor_restart_cooldown_s": 8,
+        "watchdog_poll_interval_s": 2,
+        "use_priority_scheduler": true
+    },
+    "autonomy": {
+        "enabled": true,
+        "auto_execute_threshold": 0.95,
+        "suggest_threshold": 0.72,
+        "idle_timeout_minutes": 10,
+        "habit_decay_days": 7,
+        "habit_decay_rate": 0.02,
+        "max_habits": 50,
+        "check_interval_s": 90,
+        "log_all_decisions": true
+    },
+    "cognitive": {
+        "enabled": true,
+        "goals_enabled": true,
+        "predictions_enabled": true,
+        "behavior_model_enabled": true,
+        "self_optimizer_enabled": true,
+        "prediction_check_interval_s": 120,
+        "behavior_update_interval_s": 900,
+        "goal_evaluation_interval_s": 3600,
+        "prediction_min_confidence": 0.6,
+        "auto_mode_switching": true,
+        "default_mode": "work",
+        "max_goals": 20,
+        "max_predictions": 5,
+        "optimizer_check_interval_s": 1800,
+        "energy_inference_interval_s": 120,
+        "dream_enabled": true,
+        "dream_idle_minutes": 30,
+        "dream_interval_hours": 6,
+        "curiosity_enabled": true,
+        "curiosity_max_per_hour": 2,
+        "curiosity_cooldown_minutes": 15
+    },
+    "conversation_memory": {
+        "max_turns": 30
+    },
+    "embedding": {
+        "model": "all-MiniLM-L6-v2",
+        "dimension": 384,
+        "device": "cuda"
+    },
+    "vector_store": {
+        "path": "data/vector_db"
+    },
+    "documents": {
+        "chunk_size": 500,
+        "chunk_overlap": 50
+    },
+    "reasoning": {
+        "max_plan_steps": 10,
+        "max_retries": 2
+    },
+    "sandbox": {
+        "enabled": true,
+        "timeout_seconds": 5,
+        "max_output_chars": 2000
+    },
+    "workflow": {
+        "max_workflows": 50,
+        "max_steps_per_workflow": 30
+    },
+    "wake_word": {
+        "enabled": false,
+        "sensitivity": 0.6
+    },
+    "emotion": {
+        "enabled": true
+    },
+    "screen_reader": {
+        "enabled": true
+    },
+    "gpu": {
+        "enabled": true,
+        "thermal_threshold": 85,
+        "memory_threshold_pct": 90,
+        "poll_interval_s": 30
+    }
+}

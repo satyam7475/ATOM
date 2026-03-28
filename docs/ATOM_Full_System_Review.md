@@ -2,7 +2,7 @@
 
 > **Performance, voice pipeline timings, buddy/learning scenarios, ChatGPT-ready summary:**  
 > See **[ATOM_End_to_End_Performance_Report.md](./ATOM_End_to_End_Performance_Report.md)** and **[ATOM_System_Diagram.svg](./ATOM_System_Diagram.svg)**.  
-> **v15 offline build:** cloud Gemini/Groq and `brain_selector` are removed; inference is **local GGUF only** when `brain.enabled=true`. Align with `config/settings.json`.
+> **Offline build:** All inference is **local GGUF only** when `brain.enabled=true`. No cloud dependencies. Align with `config/settings.json`.
 
 **Owner:** Satyam  
 **Version:** v15 (Cognitive + local LLM brain; this doc’s body still describes v14-era architecture in places)  
@@ -38,11 +38,11 @@ ATOM is designed as a **brain that can be embedded** — it has a single `run_at
 │  ┌──────────┐   ┌──────────┐   ┌────────────────────────────────┐  │
 │  │  Voice    │   │ Security │   │         Router                 │  │
 │  │  Input    │──▶│  Gate    │──▶│  (3-layer intelligence)        │  │
-│  │(Vosk STT)│   │          │   │                                 │  │
+│  │(Whisper) │   │          │   │                                 │  │
 │  └──────────┘   └──────────┘   │  Layer 1: Intent Engine (<5ms) │  │
 │                                 │  Layer 2: Cache + Memory        │  │
 │       ┌─────────────────────── │  Layer 3: Smart Brain Selector  │  │
-│       │                        │           (Groq / Gemini)        │  │
+│       │                        │           (Local GGUF LLM)       │  │
 │       ▼                        └───────────┬─────────────────────┘  │
 │  ┌──────────┐                              │                        │
 │  │  Voice   │◀─────────────────────────────┘                        │
@@ -70,7 +70,7 @@ ATOM is designed as a **brain that can be embedded** — it has a single `run_at
 
 1. **Event-driven (pub/sub):** Every module communicates through `AsyncEventBus`. No module directly calls another — they emit events and subscribe to events. This gives loose coupling, easy testing, and the ability to add/remove features without changing other code.
 
-2. **3-layer routing:** 80-90% of commands are handled locally by the Intent Engine (regex) in <5ms. Only open-ended questions reach the cloud LLM. This keeps ATOM fast and reduces API costs.
+2. **3-layer routing:** 80-90% of commands are handled locally by the Intent Engine (regex) in <5ms. Only open-ended questions reach the local LLM brain. This keeps ATOM fast and fully offline.
 
 3. **Single-process async:** Everything runs in one Python process with `asyncio`. Blocking operations (STT, LLM HTTP calls) run in a `ThreadPoolExecutor(2)`. This avoids IPC complexity while staying responsive.
 
@@ -126,13 +126,12 @@ ATOM has 6 states managed by `StateManager`:
 
 | Engine | Latency | Network | Notes |
 |--------|---------|---------|-------|
-| **Vosk** (default) | 100-200ms | Offline | Small English model (~50 MB), runs on CPU |
-| Google Web Speech | 300-700ms | Required | Free, no API key, higher accuracy |
-| vosk_with_fallback | 100-700ms | Optional | Vosk first, Google on low confidence |
+| **faster-whisper** (only) | 300-500ms (CPU), 100-200ms (GPU) | Offline | Small multilingual model (~460MB), bilingual en+hi |
 
-**Why Vosk as default?**
-- 100-200ms latency vs 300-700ms for Google — this alone makes ATOM feel 2-3× faster
+**Why faster-whisper?**
+- 3.4% WER English, ~7% multilingual — best accuracy in class
 - Fully offline — no network dependency, no corporate firewall issues
+- GPU acceleration available (0.036 RTF = 27x real-time)
 - Low CPU usage with the small model
 - Deterministic — same audio always gives same text
 
@@ -145,7 +144,7 @@ ATOM has 6 states managed by `StateManager`:
 - **BT-specific tuning:** Minimum threshold 3500 for BT mics, dynamic energy disabled (prevents threshold drift from HVAC/keyboard noise)
 - **Minimum audio duration (0.6s):** Rejects clicks, pops, and accidental noises
 
-**Dependencies:** `SpeechRecognition`, `PyAudio`, `vosk` (optional)
+**Dependencies:** `SpeechRecognition`, `PyAudio`, `faster-whisper`
 
 **Events emitted:** `speech_partial`, `speech_final`, `silence_timeout`, `stt_did_not_catch`, `stt_too_noisy`, `mic_changed`
 
@@ -222,7 +221,7 @@ ATOM has 6 states managed by `StateManager`:
 - **Priority ordering:** `meta_intents` → `os_intents.check_self_check` → `info_intents` → `system_intents` → `media_intents` → `desktop_intents` → `file_intents` → `network_intents` → `os_intents` → `app_intents`. More specific patterns checked first.
 - **Entity extraction:** Extracts app names, queries, numbers from matched text
 - **Calculator:** Safe `eval()` with a strict character whitelist (digits, operators, parentheses only)
-- **Grammar words:** Exports a vocabulary list for Vosk integration
+- **Grammar words:** Exports a vocabulary list for intent matching
 
 ---
 
@@ -233,7 +232,7 @@ ATOM has 6 states managed by `StateManager`:
 **3-layer intelligence pipeline:**
 1. **Intent Engine:** Instant regex match → direct action
 2. **Cache + Memory:** If the query was asked before, serve cached answer
-3. **Smart Brain Selector:** If no local answer, pick the best LLM (Groq or Gemini) and stream the response
+3. **Local LLM Brain:** If no cached answer, query the local GGUF model and stream the response
 
 **Why 3 layers?**
 - Layer 1 handles 80-90% instantly (no network)
@@ -258,7 +257,7 @@ ATOM has 6 states managed by `StateManager`:
 
 ### 4.5 Local LLM path (v15 offline)
 
-**Removed:** `core/brain_selector.py`, Gemini (`cursor_controller`), Groq (`groq_controller`), and Gemini Vision (`screen_analyzer`). ATOM no longer opens cloud LLM connections.
+ATOM uses a fully local LLM path with no cloud connections.
 
 **Current path:** `cursor_bridge/local_brain_controller.py` → `brain/mini_llm.py` (llama.cpp GGUF). Optional warm-up at startup; fake streaming via sentence chunks for responsive TTS.
 
@@ -525,7 +524,7 @@ When `cpu_governor: true`, the HealthMonitor watches system-wide CPU usage. This
 **What it does:** Redacts sensitive patterns from text before it reaches LLMs or logs.
 
 **Patterns redacted:**
-- API keys (GEMINI_API_KEY=xxx, Bearer tokens, x-api-key headers)
+- API keys (key=value patterns, Bearer tokens, auth headers)
 - PEM certificates
 - GitHub PATs
 - JDBC connection strings
@@ -566,7 +565,7 @@ When `cpu_governor: true`, the HealthMonitor watches system-wide CPU usage. This
 User speaks: "Open Chrome"
        │
        ▼
-[STT] Captures audio → Vosk offline model → "open chrome"
+[STT] Captures audio → faster-whisper (bilingual) → "open chrome"
        │
        ▼
 [EventBus] emit("speech_final", text="open chrome")
@@ -650,7 +649,7 @@ User clicks "ULTRA" on dashboard
                            │ audio
                            ▼
                     ┌─────────────┐
-                    │  STT Async  │ ←── Vosk (offline) / Google (cloud)
+                    │  STT Async  │ ←── faster-whisper (offline, bilingual)
                     └──────┬──────┘
                            │ text
                            ▼
@@ -679,8 +678,8 @@ User clicks "ULTRA" on dashboard
               └────┬───┘        │ miss
                    │            ▼
                    │   ┌─────────────────┐
-                   │   │ Brain Selector   │
-                   │   │ (Groq / Gemini)  │
+                   │   │ Local LLM Brain  │
+                   │   │ (GGUF / llama)   │
                    │   └────────┬────────┘
                    │            │ streaming
                    ▼            ▼
@@ -744,12 +743,10 @@ User clicks "ULTRA" on dashboard
 | **Python 3.11+** | Runtime | Async support, rich ecosystem, fast development | Node.js (weaker audio libs), Go (less flexible) |
 | **asyncio** | Concurrency | Native Python async, no extra dependency | threading (GIL issues), multiprocessing (IPC overhead) |
 | **AsyncEventBus** | IPC | Custom, lightweight, <200 lines, fits exactly | Redis pub/sub (overkill), RxPY (heavy) |
-| **Vosk** | STT (default) | Offline, 100-200ms, no API key, low CPU | Whisper (heavy, 1GB+), Azure Speech (paid) |
-| **Google Web Speech** | STT (fallback) | Free, no API key, higher accuracy | DeepSpeech (discontinued), Bing Speech (paid) |
+| **faster-whisper** | STT | Offline, 300-500ms CPU / 100-200ms GPU, bilingual, 3.4% WER | Azure Speech (paid), DeepSpeech (discontinued) |
 | **Edge TTS** | TTS | Free, neural quality, HTTPS-only | ElevenLabs (paid), SAPI (low quality) |
 | **pygame** | Audio playback | Cross-platform, supports Bluetooth | sounddevice (less reliable on Windows) |
-| **Gemini Flash** | Cloud LLM | Free tier, streaming SSE, good quality | GPT-4 (paid), Claude (paid) |
-| **Groq** | Cloud LLM | Extremely fast (200-500ms), free tier | Mistral (slower), OpenAI (paid) |
+| **llama.cpp** | Local LLM | Fully offline, GGUF models, GPU-accelerated | Cloud APIs (require keys, latency) |
 | **psutil** | System monitoring | Cross-platform, comprehensive | WMI (Windows-only, slow) |
 | **pyautogui** | Desktop control | Simple API, screenshot support | win32api (lower-level, more code) |
 | **aiohttp** | Web server | Async, WebSocket support, lightweight | FastAPI (heavier), Flask (sync) |
@@ -769,8 +766,8 @@ User clicks "ULTRA" on dashboard
     "owner": { "name": "Satyam", "title": "Boss" },
     "mic": { "device_name": null, "prefer_bluetooth": true },
     "stt": {
-        "engine": "vosk",
-        "vosk_model_path": "models/vosk-model-small-en-us-0.15",
+        "engine": "faster_whisper",
+        "whisper_model_size": "small",
         "sample_rate": 16000, "chunk_size": 2048,
         "post_tts_cooldown_ms": 800, "preload": true,
         "calibration_delay_s": 2.0, "min_energy_threshold": 600
@@ -780,8 +777,7 @@ User clicks "ULTRA" on dashboard
         "edge_rate": "+0%", "edge_postprocess": false,
         "edge_ack_cache": true, "max_lines": 4
     },
-    "ai": { "enabled": true, "model": "gemini-2.5-flash-lite", ... },
-    "groq": { "model": "llama-3.1-8b-instant", ... },
+    "brain": { "enabled": true, "model_path": "models/qwen3-8b-q4_k_m.gguf", ... },
     "security": {
         "mode": "strict", "audit_to_file": true,
         "require_confirmation_for": ["shutdown_pc", "restart_pc", ...]
@@ -807,15 +803,9 @@ User clicks "ULTRA" on dashboard
 
 Defines action metadata (category, confirmation requirement, description). Used by the command registry for runtime lookup.
 
-### API keys (not in repo)
+### Offline Architecture
 
-Do **not** keep secrets in a project `.env` file (avoids OneDrive/git accidents). Options:
-
-- Windows **User** environment variables: `GEMINI_API_KEY`, `GROQ_API_KEY`
-- Private file: `%USERPROFILE%\.atom\env` (KEY=value lines)
-- Or `ATOM_ENV_FILE` pointing to a secrets file
-
-See **`.env.example`** in the repo. Optional dev-only: `ATOM_ALLOW_DOTENV=1` enables loading `./.env` locally (never commit).
+ATOM is fully offline — no cloud API keys are needed. All intelligence runs locally via GGUF models.
 
 ### Schema Validation
 
@@ -829,7 +819,6 @@ See **`.env.example`** in the repo. Optional dev-only: `ATOM_ALLOW_DOTENV=1` ena
 ATOM/
 ├── main.py                          # Entry point, run_atom(), event wiring (1,037 lines)
 ├── requirements.txt                 # Python dependencies
-├── .env.example                     # Template for where to put keys (no secrets)
 ├── .gitignore
 ├── README.md
 │
@@ -887,11 +876,11 @@ ATOM/
 │
 ├── voice/
 │   ├── __init__.py
-│   ├── stt_async.py                 # Vosk/Google STT (837 lines)
+│   ├── stt_async.py                 # faster-whisper STT (bilingual)
 │   ├── tts_edge.py                  # Edge Neural TTS (775 lines)
 │   ├── tts_async.py                 # SAPI TTS fallback (251 lines)
 │   ├── mic_manager.py               # Mic ownership (89 lines)
-│   ├── mic_selector.py              # Auto mic selection (373 lines)
+│   ├── audio_preprocessor.py        # Audio conditioning (384 lines)
 │   ├── audio_pipeline.py            # Audio processing (143 lines)
 │   ├── speech_detector.py           # Text corrections (104 lines)
 │   └── voice_profiles.py            # SSML emotion (76 lines)
@@ -923,7 +912,7 @@ ATOM/
 │       └── index.html               # Web UI + 3D orb + perf controls (913 lines)
 │
 ├── models/
-│   └── vosk-model-small-en-us-0.15/ # Vosk offline speech model (~50 MB)
+│   └── qwen3-8b-q4_k_m.gguf        # Qwen3 8B brain model (~5GB)
 │
 ├── scripts/
 │   └── enroll_owner_face.py         # Face enrollment (83 lines)
@@ -962,9 +951,9 @@ ATOM/
 ### Core (required)
 | Package | Version | Purpose |
 |---------|---------|---------|
-| SpeechRecognition | ≥3.10 | Microphone capture + Google Web Speech fallback |
+| SpeechRecognition | ≥3.10 | Microphone capture (energy threshold, VAD) |
 | PyAudio | ≥0.2.14 | Microphone capture |
-| vosk | ≥0.3.45 | Offline speech recognition (default STT engine) |
+| faster-whisper | ≥1.0 | Offline speech recognition (primary STT engine) |
 | numpy | ≥1.24 | Audio post-processing |
 | edge-tts | ≥6.1 | Microsoft Neural TTS |
 | pygame | ≥2.5 | Audio playback |
@@ -1045,7 +1034,7 @@ run_atom({
 # Custom voice and model
 run_atom({
     "tts": {"edge_voice": "en-US-GuyNeural"},
-    "ai": {"model": "gemini-2.0-flash"},
+    "brain": {"model_path": "models/my-model.gguf"},
 })
 ```
 
@@ -1179,9 +1168,9 @@ No process leaks, no partial state corruption, no zombie processes.
 
 | Area | Limitation | Potential improvement |
 |------|-----------|---------------------|
-| **STT** | Vosk small model; accuracy lower than Whisper for complex speech | Whisper (GPU needed) or Vosk large model |
+| **STT** | faster-whisper small model; medium+ unlocks better Hindi accuracy | Upgrade to medium model on GPU desktop |
 | **TTS** | Edge TTS is cloud-dependent; occasional network failures | Local Piper TTS or Coqui TTS |
-| **LLM** | Free tier rate limits (25-30 req/min) | Self-hosted Ollama with Llama 3 |
+| **LLM** | Q4_K_M quantization loses some nuance vs full precision | Q5_K_M or Q6_K for higher quality |
 | **Memory** | Keyword-based, no semantic search | Add sentence embeddings (all-MiniLM-L6-v2) |
 | **Vision** | Disabled, requires opencv + face_recognition | Enable for owner authentication |
 | **Multi-modal** | Text-only LLM interaction | Add image/document understanding |
@@ -1201,7 +1190,7 @@ These are known areas where shared logic could be extracted to reduce duplicatio
 
 | Area | Files involved | Suggestion |
 |------|---------------|------------|
-| (removed) | Cloud SSE clients | Replaced by local LLM only |
+| Local LLM | local_brain_controller | All inference via local GGUF models |
 | URL opening | network_actions, media_actions | `open_url_in_browser()` helper |
 | Key simulation | media_actions, utility_actions | `send_key_press(vk)` helper |
 
@@ -1213,7 +1202,7 @@ These are known areas where shared logic could be extracted to reduce duplicatio
 
 - **Event-driven** — AsyncEventBus pub/sub, 6-state state machine, ~25 distinct event types
 - **3-layer intelligent** — Regex intent (<5ms) → Cache/memory → **Local LLM** (GGUF via llama.cpp when `brain.enabled=true`)
-- **Voice-controlled** — Vosk offline STT → TTS: SAPI offline by default, or Edge (optional, needs network)
+- **Voice-controlled** — faster-whisper offline bilingual STT → TTS: SAPI offline by default, or Edge (optional, needs network)
 - **Security-first** — Single security gate, allowlists, audit logging, config-driven policies, input sanitization
 - **Desktop-aware** — pyautogui control, psutil monitoring, Win32 APIs for context, Bluetooth mic/speaker handling
 - **Self-adaptive** — 4-tier performance modes (full/lite/ultra_lite/auto) + closed-loop CPU governor that throttles HealthMonitor (×2.5), SystemWatcher (×3.0), and TTS post-processing

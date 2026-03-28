@@ -1,5 +1,5 @@
 """
-ATOM v14 -- Process Manager (AI OS Kernel Service).
+ATOM -- Process Manager (AI OS Kernel Service).
 
 Provides OS-level process management capabilities:
   - List top processes by CPU/memory

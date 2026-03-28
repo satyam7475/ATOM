@@ -1,32 +1,36 @@
 """
-ATOM v16 -- Multi-engine STT orchestrator.
+ATOM -- Speech-to-Text Engine (faster-whisper only).
 
-Supports:
-    - faster-whisper (offline, ~300ms, default -- base.en model, ~140MB)
-    - Vosk (offline, 100-200ms, legacy fallback)
-    - Google Web Speech API (cloud, 300-700ms, fallback)
+Production-grade STT pipeline:
+    - Engine: faster-whisper (offline, GPU-accelerated, ~300ms)
+    - Bilingual: English + Hindi with auto-language detection
+    - Audio preprocessing: DC removal, pre-emphasis, spectral noise gate
+    - Active noise handling with learned ambient profile
+    - Garbage sound rejection (spectral + energy + confidence)
+    - Whisper hallucination detection
+    - Language-aware response routing
 
 Pipeline:
-    sr.Microphone -> sr.Recognizer.listen() -> faster-whisper/Vosk/Google -> text
+    sr.Microphone -> AudioPreprocessor (noise gate + normalization)
+    -> faster-whisper (multilingual, auto-detect language)
     -> text corrections -> command filter -> Intent Engine
+    -> language tag emitted for response routing
 
-Noise hardening (corporate office environment):
-    - BT mic minimum threshold 1800 (filters HVAC, keyboard, chatter)
-    - Dynamic energy disabled for BT (prevents threshold drift)
-    - Minimum audio duration 0.5s (rejects clicks/pops)
-    - Aggressive noise flood: escalate after 2 fails, +50% threshold
-    - Periodic recalibration every 90s without successful speech
-    - Post-TTS cooldown 600ms to absorb earbuds echo
+Recommended model: 'small' (multilingual, 244M params, ~460MB)
+    - English WER: 3.4%
+    - Multilingual WER: ~7%
+    - Speed: 0.036 RTF on GPU (27x real-time)
+    - CPU int8: ~300-500ms per utterance
 
-Dependencies: SpeechRecognition, pyaudio, faster-whisper (primary), vosk (optional)
+Dependencies: SpeechRecognition (mic capture), pyaudio, faster-whisper
+
+Owner: Satyam
 """
 
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
-import os
 import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import TYPE_CHECKING, Any
@@ -44,16 +48,19 @@ MAX_RECORD_S = 10.0
 MIN_AUDIO_DURATION_S = 0.5
 _BT_MIN_THRESHOLD = 1800.0
 _RECALIBRATE_AFTER_S = 90.0
+_MIN_AUDIO_QUALITY_SCORE = 0.15
 
 
 class STTAsync:
-    """Multi-engine speech-to-text: Vosk (offline) or Google Web Speech (cloud)."""
+    """faster-whisper STT with bilingual support and audio preprocessing."""
 
     _BT_KEYWORDS = ("headset", "hands-free", "bluetooth", "bt", "buds",
                      "airpods", "earbuds", "jbl", "bose", "sony", "mivi",
                      "oneplus", "realme", "yealink", "blaupunkt", "jabra")
 
     _MAX_ENERGY_THRESHOLD: float = 6000.0
+
+    _SUPPORTED_LANGUAGES = {"en", "hi"}
 
     def __init__(
         self,
@@ -80,12 +87,19 @@ class STTAsync:
         self._calibrated_threshold: float = 300.0
         self._base_threshold: float = 300.0
         self._recognizer: Any = None
+        
+        # Apple CoreAudio-style persistent mic (zero-latency wake)
+        self._persistent_mic: Any = None
+        self._persistent_source: Any = None
+        
         self._rejected_bt_indices: set[int] = set()
         self._last_successful_speech: float = 0.0
         self._threshold_elevated: bool = False
         self._too_noisy_emitted: bool = False
         self._last_confidence: float = 0.85
         self._is_bt_mic: bool = False
+        self._detected_language: str = "en"
+        self._language_history: list[str] = []
 
         stt_cfg = self._config.get("stt", {})
         self.POST_TTS_COOLDOWN: float = stt_cfg.get("post_tts_cooldown_ms", 600) / 1000
@@ -94,16 +108,13 @@ class STTAsync:
         mic_cfg = self._config.get("mic", {})
         self.PREFER_BLUETOOTH: bool = mic_cfg.get("prefer_bluetooth", True)
 
-        self._stt_engine: str = stt_cfg.get("engine", "faster_whisper")
-        self._vosk_model_path: str = stt_cfg.get("vosk_model_path",
-                                                   "models/vosk-model-en-us-0.22")
-        self._vosk_model: Any = None
-        self._vosk_recognizer: Any = None
-        self._vosk_available: bool = False
-
         self._whisper_model: Any = None
         self._whisper_available: bool = False
-        self._whisper_model_size: str = stt_cfg.get("whisper_model_size", "base.en")
+        self._whisper_model_size: str = stt_cfg.get("whisper_model_size", "small")
+        self._whisper_bilingual: bool = stt_cfg.get("bilingual", True)
+
+        from voice.audio_preprocessor import AudioPreprocessor
+        self._preprocessor = AudioPreprocessor(self._config)
 
         self._loop: asyncio.AbstractEventLoop | None = None
         self._last_hearing_text: str = ""
@@ -113,15 +124,42 @@ class STTAsync:
     # ── Public API ─────────────────────────────────────────────────────
 
     async def preload(self) -> None:
-        """Detect best input mic, load Vosk model if configured."""
+        """Detect best input mic and load faster-whisper model.
+
+        Uses MicManager's device profiling (if available) for intelligent
+        device selection. Falls back to legacy BT/default detection otherwise.
+        """
         import pyaudio
 
         if self._audio is None:
             self._audio = pyaudio.PyAudio()
 
-        mic_cfg = self._config.get("mic", {})
-        device_name_cfg = mic_cfg.get("device_name")
+        if self._mic_manager is not None and self._mic_manager.is_profiled:
+            active = self._mic_manager.active_device
+            if active is not None:
+                self._mic_device_index = active.index
+                self.mic_name = active.name
+                self._is_bt_mic = (active.device_type == "bluetooth")
+                logger.info(
+                    "Using MicManager-profiled device: [%d] '%s' (%s, quality=%d)",
+                    active.index, active.name, active.device_type, active.quality_score,
+                )
+            else:
+                self._select_mic_legacy()
+        else:
+            self._select_mic_legacy()
 
+        self._load_whisper_model()
+
+        bilingual_str = "bilingual (en+hi)" if self._whisper_bilingual else "English-only"
+        logger.info(
+            "STT ready -- engine=faster-whisper, model=%s, mic='%s', lang=%s, preprocessor=%s",
+            self._whisper_model_size, self.mic_name, bilingual_str,
+            "enabled" if self._preprocessor._enabled else "disabled",
+        )
+
+    def _select_mic_legacy(self) -> None:
+        """Legacy mic selection (before MicManager profiling existed)."""
         if self.PREFER_BLUETOOTH:
             bt_idx, bt_name = self._find_bluetooth_input()
             if bt_idx is not None:
@@ -133,73 +171,51 @@ class STTAsync:
             else:
                 self._set_default_mic()
         else:
-            from voice.mic_selector import find_device
-            idx, _rate, _ch = find_device(
-                self._audio, device_name=device_name_cfg, exclude_bluetooth=True)
-            if idx is not None:
-                try:
-                    info = self._audio.get_device_info_by_index(idx)
-                    self._mic_device_index = idx
-                    self.mic_name = info.get("name", "Selected Mic")
-                    logger.info("Using non-Bluetooth mic: [%d] '%s'", idx, self.mic_name)
-                except Exception:
-                    self._set_default_mic()
-            else:
-                self._set_default_mic()
-
-        if self._stt_engine == "faster_whisper":
-            self._load_whisper_model()
-        elif self._stt_engine in ("vosk", "vosk_with_fallback"):
-            self._load_vosk_model()
-
-        engine_label = self._stt_engine
-        if self._stt_engine == "faster_whisper" and not self._whisper_available:
-            engine_label = "google (whisper unavailable)"
-        elif self._stt_engine in ("vosk", "vosk_with_fallback") and not self._vosk_available:
-            engine_label = "google (vosk unavailable)"
-        logger.info("STT ready -- engine=%s, mic=%s", engine_label, self.mic_name)
-
-    def _load_vosk_model(self) -> None:
-        """Load the Vosk model for offline speech recognition."""
-        try:
-            import vosk
-            vosk.SetLogLevel(-1)
-
-            atom_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-            model_path = os.path.join(atom_root, self._vosk_model_path)
-
-            if not os.path.isdir(model_path):
-                logger.warning("Vosk model not found at '%s' -- will use Google STT", model_path)
-                self._vosk_available = False
-                return
-
-            self._vosk_model = vosk.Model(model_path)
-            self._vosk_recognizer = vosk.KaldiRecognizer(self._vosk_model, 16000)
-            self._vosk_available = True
-            logger.info("Vosk model loaded from '%s'", model_path)
-        except ImportError:
-            logger.warning("vosk package not installed -- falling back to Google STT")
-            self._vosk_available = False
-        except Exception:
-            logger.exception("Failed to load Vosk model -- falling back to Google STT")
-            self._vosk_available = False
+            self._set_default_mic()
 
     def _load_whisper_model(self) -> None:
-        """Load faster-whisper model for offline STT (~140MB for base.en)."""
+        """Load faster-whisper model (multilingual for Hindi+English).
+
+        Recommended: 'small' (244M params, ~460MB, 3.4% WER English)
+        Uses GPU (cuda) if available, otherwise CPU with int8 quantization.
+        """
         try:
             from faster_whisper import WhisperModel
+
+            model_name = self._whisper_model_size
+            if self._whisper_bilingual and model_name.endswith(".en"):
+                model_name = model_name.replace(".en", "")
+                logger.info(
+                    "Bilingual mode: switching from '%s' to '%s' (multilingual)",
+                    self._whisper_model_size, model_name,
+                )
+
+            device = "cpu"
+            compute_type = "int8"
+            try:
+                import torch
+                if torch.cuda.is_available():
+                    device = "cuda"
+                    compute_type = "float16"
+                    logger.info("CUDA available -- whisper will use GPU acceleration")
+            except ImportError:
+                pass
+
             t0 = time.monotonic()
             self._whisper_model = WhisperModel(
-                self._whisper_model_size,
-                device="cpu",
-                compute_type="int8",
+                model_name,
+                device=device,
+                compute_type=compute_type,
             )
             self._whisper_available = True
             elapsed = (time.monotonic() - t0) * 1000
-            logger.info("faster-whisper loaded model=%s in %.0fms",
-                        self._whisper_model_size, elapsed)
+            lang_label = "bilingual (en+hi)" if self._whisper_bilingual else "English-only"
+            logger.info(
+                "faster-whisper loaded: model=%s, device=%s, %s, %.0fms",
+                model_name, device, lang_label, elapsed,
+            )
         except ImportError:
-            logger.warning("faster-whisper not installed -- falling back to Google STT")
+            logger.error("faster-whisper not installed -- STT will not work")
             self._whisper_available = False
         except Exception:
             logger.exception("Failed to load faster-whisper model")
@@ -231,7 +247,6 @@ class STTAsync:
 
             lower_name = new_name.lower()
             if any(blk in lower_name for blk in self._BT_DRIVER_BLACKLIST):
-                logger.debug("Default mic is driver path, using system default: '%s'", new_name)
                 new_idx = None
                 new_name = "System Default"
                 self._is_bt_mic = False
@@ -272,13 +287,7 @@ class STTAsync:
     )
 
     def _find_bluetooth_input(self) -> tuple[int | None, str]:
-        """Find the best Bluetooth input device for speech recognition.
-
-        Prefers 16000Hz endpoints (HFP speech profile) over 44100Hz
-        endpoints (A2DP media profile) because Google Web Speech API
-        expects 16kHz and the speech profile has lower noise.
-        Filters out driver path entries (e.g. @System32\\drivers\\bthhfenum.sys).
-        """
+        """Find the best Bluetooth input device for speech recognition."""
         if self._audio is None:
             return None, ""
         best_idx, best_name, best_score = None, "", -1
@@ -293,7 +302,6 @@ class STTAsync:
             if not any(kw in name for kw in self._BT_KEYWORDS):
                 continue
             if any(blk in name for blk in self._BT_DRIVER_BLACKLIST):
-                logger.debug("BT skip driver path [%d] '%s'", i, info.get("name", ""))
                 continue
             if i in self._rejected_bt_indices:
                 continue
@@ -311,8 +319,6 @@ class STTAsync:
                 best_idx = i
                 best_name = info.get("name", "Bluetooth")
                 best_score = score
-                logger.debug("BT candidate [%d] '%s' rate=%d score=%d",
-                             i, best_name, rate, score)
         if best_idx is not None:
             logger.info("BT mic selected: [%d] '%s' (score=%d)",
                         best_idx, best_name, best_score)
@@ -361,7 +367,7 @@ class STTAsync:
     # ── Recognizer management ──────────────────────────────────────────
 
     def _get_recognizer(self):
-        """Return the persistent recognizer, creating it only once.
+        """Return the persistent recognizer for mic capture.
 
         BT mics: dynamic threshold disabled (it drifts and captures noise).
         Wired mics: dynamic threshold enabled for auto-adjustment.
@@ -393,10 +399,18 @@ class STTAsync:
             self._recognizer.energy_threshold = effective
         return self._recognizer
 
-    # ── Core listen pipeline (decomposed) ──────────────────────────────
+    # ── Core listen pipeline ───────────────────────────────────────────
 
     def _open_mic(self):
-        """Open the microphone device. Returns (mic_obj, source) or (None, None)."""
+        """Open the microphone device persistently (Apple CoreAudio style).
+        
+        Instead of opening and closing the mic for every utterance (which adds
+        300-500ms latency and drops the first syllable), we keep the audio
+        stream hot in the background.
+        """
+        if self._persistent_mic is not None and self._persistent_source is not None:
+            return self._persistent_mic, self._persistent_source
+
         import speech_recognition as sr
 
         mic_kwargs = {}
@@ -444,13 +458,17 @@ class STTAsync:
             self._recognizer = None
             return None, None
 
+        self._persistent_mic = mic_obj
+        self._persistent_source = source
+        logger.info("Persistent mic stream opened (zero-latency wake enabled)")
         return mic_obj, source
 
     def _calibrate(self, recognizer, source) -> bool:
-        """Calibrate the recognizer against ambient noise.
+        """Calibrate recognizer AND AudioPreprocessor against ambient noise.
 
-        BT mics get a minimum threshold of 3500 to filter office noise.
-        Returns True if calibration succeeded, False to abort.
+        Dual calibration:
+            1. SpeechRecognition energy threshold (for listen() triggering)
+            2. AudioPreprocessor noise profile (for spectral noise gating)
         """
         from core.state_manager import AtomState
 
@@ -460,13 +478,26 @@ class STTAsync:
             logger.info("Waiting %.1fs before calibration...", self.CALIBRATION_DELAY_S)
             time.sleep(self.CALIBRATION_DELAY_S)
 
-        if not self._running or self._state.current is not AtomState.LISTENING:
+        if not self._running or self._state.current not in (AtomState.LISTENING, AtomState.SPEAKING):
             return False
 
         logger.info("Calibrating for ambient noise (1.5s)...")
         recognizer.adjust_for_ambient_noise(source, duration=1.5)
         threshold = recognizer.energy_threshold
         raw_threshold = threshold
+
+        try:
+            import speech_recognition as sr
+            ambient_audio = recognizer.listen(
+                source, timeout=1.5, phrase_time_limit=1.5,
+            )
+            ambient_wav = ambient_audio.get_wav_data(convert_rate=16000, convert_width=2)
+            ambient_pcm = ambient_wav[44:]
+            if len(ambient_pcm) > 3200:
+                self._preprocessor.learn_noise(ambient_pcm)
+                logger.info("AudioPreprocessor noise profile learned from ambient audio")
+        except Exception:
+            logger.debug("Ambient capture for preprocessor skipped (timeout or error)")
 
         if threshold < min_thr:
             threshold = min_thr
@@ -498,23 +529,22 @@ class STTAsync:
         self._base_threshold = threshold
         self._sr_calibrated = True
         self._last_successful_speech = time.monotonic()
-        logger.info("Calibrated: raw=%.0f, effective=%.0f (bt=%s)",
-                     raw_threshold, threshold, self._is_bt_mic)
+        logger.info("Calibrated: raw=%.0f, effective=%.0f (bt=%s, preprocessor=%s)",
+                     raw_threshold, threshold, self._is_bt_mic,
+                     "stable" if self._preprocessor._noise_profile.is_stable else "learning")
         return True
 
     def _needs_recalibration(self) -> bool:
-        """Force recalibration if no successful speech in _RECALIBRATE_AFTER_S."""
         if self._last_successful_speech <= 0:
             return False
-        elapsed = time.monotonic() - self._last_successful_speech
-        return elapsed > _RECALIBRATE_AFTER_S
+        return (time.monotonic() - self._last_successful_speech) > _RECALIBRATE_AFTER_S
 
     def _capture_audio(self, recognizer, source):
         """Capture audio from the mic. Returns audio data or None on timeout."""
         import speech_recognition as sr
         from core.state_manager import AtomState
 
-        if not self._running or self._state.current is not AtomState.LISTENING:
+        if not self._running or self._state.current not in (AtomState.LISTENING, AtomState.SPEAKING):
             return None
 
         self._listen_wait_count += 1
@@ -528,67 +558,92 @@ class STTAsync:
         except sr.WaitTimeoutError:
             return None
 
-    def _transcribe(self, recognizer, audio) -> str:
-        """Transcribe audio using the configured engine.
+    def _transcribe(self, audio) -> str:
+        """Transcribe audio using faster-whisper with preprocessing + bilingual.
 
-        Priority: faster-whisper > Vosk > Google Web Speech.
+        Pipeline:
+            1. Extract raw PCM from audio
+            2. Run AudioPreprocessor (noise gate, normalize, quality check)
+            3. Reject if quality too low
+            4. Transcribe with language=None for auto-detection (en/hi)
+            5. Track detected language for response routing
         """
-        if self._whisper_available and self._stt_engine == "faster_whisper":
-            text = self._transcribe_whisper(audio)
-            if text:
-                return text
-            self._handle_noise_flood(recognizer)
-            return ""
-
-        use_vosk = (
-            self._vosk_available
-            and self._stt_engine in ("vosk", "vosk_with_fallback")
-        )
-        if use_vosk:
-            text = self._transcribe_vosk(audio)
-            if text:
-                return text
-            if self._stt_engine == "vosk":
-                self._handle_noise_flood(recognizer)
-                return ""
-
-        return self._transcribe_google(recognizer, audio)
-
-    def _transcribe_whisper(self, audio) -> str:
-        """Transcribe audio using faster-whisper (offline, high accuracy)."""
-        if self._whisper_model is None:
+        if not self._whisper_available or self._whisper_model is None:
+            logger.warning("Whisper not available -- cannot transcribe")
             return ""
         try:
-            import io
             import numpy as np
 
             wav_data = audio.get_wav_data(convert_rate=16000, convert_width=2)
             raw_pcm = wav_data[44:]
-            samples = np.frombuffer(raw_pcm, dtype=np.int16).astype(np.float32) / 32768.0
+
+            clean_audio, quality = self._preprocessor.process(raw_pcm)
+
+            if quality.is_silence:
+                logger.debug("Preprocessor: silence detected, skipping STT")
+                return ""
+
+            if quality.score < _MIN_AUDIO_QUALITY_SCORE:
+                logger.info(
+                    "Preprocessor: low quality (%.2f) -- SNR=%.1fdB, energy=%.3f -- rejected",
+                    quality.score, quality.snr_db, quality.energy_rms,
+                )
+                return ""
+
+            if quality.is_clipped:
+                logger.warning("Audio clipping detected -- mic gain may be too high")
+
+            whisper_lang = None if self._whisper_bilingual else "en"
 
             segments, info = self._whisper_model.transcribe(
-                samples,
-                beam_size=1,
-                language="en",
+                clean_audio,
+                beam_size=3 if self._whisper_bilingual else 1,
+                language=whisper_lang,
                 vad_filter=True,
-                vad_parameters={"min_silence_duration_ms": 300},
+                vad_parameters={
+                    "min_silence_duration_ms": 250,
+                    "speech_pad_ms": 200,
+                    "threshold": 0.35,
+                },
+                condition_on_previous_text=False,
+                no_speech_threshold=0.5,
             )
+
             parts = []
             total_prob = 0.0
             count = 0
             for seg in segments:
-                parts.append(seg.text.strip())
-                total_prob += seg.avg_log_prob
-                count += 1
+                seg_text = seg.text.strip()
+                if seg_text:
+                    parts.append(seg_text)
+                    total_prob += seg.avg_log_prob
+                    count += 1
 
             text = " ".join(parts).strip()
             if not text:
                 return ""
 
+            detected_lang = getattr(info, "language", "en") or "en"
+            lang_prob = getattr(info, "language_probability", 0.0) or 0.0
+
+            if detected_lang in self._SUPPORTED_LANGUAGES:
+                self._detected_language = detected_lang
+                self._language_history.append(detected_lang)
+                if len(self._language_history) > 20:
+                    self._language_history = self._language_history[-20:]
+
             avg_prob = total_prob / count if count > 0 else -1.0
-            if avg_prob < -1.2:
-                logger.info("Whisper LOW CONFIDENCE: '%.60s' (avg_log_prob=%.2f) -- rejected",
-                            text, avg_prob)
+
+            confidence_threshold = -1.0 if detected_lang == "hi" else -1.2
+            if avg_prob < confidence_threshold:
+                logger.info(
+                    "Whisper LOW CONFIDENCE: '%.60s' (avg_log_prob=%.2f, lang=%s) -- rejected",
+                    text, avg_prob, detected_lang,
+                )
+                return ""
+
+            if self._is_whisper_hallucination(text):
+                logger.info("Whisper hallucination rejected: '%.60s'", text)
                 return ""
 
             self._last_confidence = min(1.0, max(0.0, 1.0 + avg_prob))
@@ -602,132 +657,51 @@ class STTAsync:
                     self._recognizer.energy_threshold = self._base_threshold
                 self._threshold_elevated = False
 
-            logger.info("Whisper STT: '%s' (avg_log_prob=%.2f)", text, avg_prob)
+            lang_label = "hi" if detected_lang == "hi" else "en"
+            logger.info(
+                "Whisper STT [%s]: '%s' (avg_log_prob=%.2f, lang_prob=%.2f, quality=%.2f)",
+                lang_label, text, avg_prob, lang_prob, quality.score,
+            )
             return text
         except Exception:
             logger.exception("faster-whisper transcription error")
             return ""
 
-    def _transcribe_vosk(self, audio) -> str:
-        """Transcribe captured audio using offline Vosk recognizer.
+    @staticmethod
+    def _is_whisper_hallucination(text: str) -> bool:
+        """Detect common whisper hallucinations on noise/silence."""
+        t = text.strip().lower()
 
-        Creates a fresh KaldiRecognizer per utterance to prevent context
-        leakage from previous audio producing garbage results.
-        """
-        if self._vosk_model is None:
-            return ""
+        hallucination_patterns = [
+            "thank you for watching",
+            "thanks for watching",
+            "please subscribe",
+            "like and subscribe",
+            "thank you for listening",
+            "thanks for listening",
+            "the end",
+            "subtitles by",
+            "copyright",
+            "music playing",
+            "[music]",
+            "(music)",
+            "you",
+        ]
+        for pattern in hallucination_patterns:
+            if t == pattern or t.startswith(pattern):
+                return True
 
-        try:
-            import vosk
-            rec = vosk.KaldiRecognizer(self._vosk_model, 16000)
-            rec.SetWords(True)
+        if len(t) > 0 and t == t[0] * len(t):
+            return True
 
-            wav_data = audio.get_wav_data(convert_rate=16000, convert_width=2)
-            raw_pcm = wav_data[44:]
+        words = t.split()
+        if len(words) >= 3 and len(set(words)) == 1:
+            return True
 
-            rec.AcceptWaveform(raw_pcm)
-            result = json.loads(rec.FinalResult())
-            text = result.get("text", "").strip()
-
-            words_info = result.get("result", [])
-            if words_info:
-                avg_conf = sum(w.get("conf", 0) for w in words_info) / len(words_info)
-                if avg_conf < 0.55:
-                    logger.info("Vosk LOW CONFIDENCE: '%.60s' (avg_conf=%.2f) -- rejected",
-                                text, avg_conf)
-                    return ""
-                self._last_confidence = avg_conf
-            else:
-                self._last_confidence = 0.70
-
-            if not text:
-                return ""
-
-            self._last_confidence = 0.85
-            self._listen_wait_count = 0
-            self._consecutive_noise = 0
-            self._last_successful_speech = time.monotonic()
-
-            if self._threshold_elevated:
-                self._calibrated_threshold = self._base_threshold
-                if self._recognizer:
-                    self._recognizer.energy_threshold = self._base_threshold
-                self._threshold_elevated = False
-                logger.info("Restored energy_threshold to base %.0f", self._base_threshold)
-
-            logger.info("Vosk STT: '%s'", text)
-            return text
-
-        except Exception:
-            logger.exception("Vosk transcription error")
-            return ""
-
-    def _transcribe_google(self, recognizer, audio) -> str:
-        """Send audio to Google Web Speech API and return transcribed text.
-
-        Returns empty string on failure, low confidence, or unknown audio.
-        Handles noise flood detection and threshold escalation.
-        """
-        import speech_recognition as sr
-
-        try:
-            raw_result = recognizer.recognize_google(audio, show_all=True)
-
-            text = ""
-            confidence = 0.0
-
-            if raw_result and isinstance(raw_result, dict):
-                alts = raw_result.get("alternative", [])
-                if alts:
-                    text = alts[0].get("transcript", "")
-                    confidence = float(alts[0].get("confidence", 0.85))
-            elif raw_result and isinstance(raw_result, list):
-                for entry in raw_result:
-                    alts = entry.get("alternative", []) if isinstance(entry, dict) else []
-                    if alts:
-                        text = alts[0].get("transcript", "")
-                        confidence = float(alts[0].get("confidence", 0.85))
-                        break
-
-            if not text:
-                raise sr.UnknownValueError()
-
-            self._last_confidence = confidence
-
-            if confidence < 0.5:
-                logger.info("LOW CONFIDENCE: '%.40s' (conf=%.2f) -- rejected", text, confidence)
-                self._emit_stt_event("stt_did_not_catch")
-                time.sleep(0.3)
-                return ""
-
-            self._listen_wait_count = 0
-            logger.info("Google STT: '%s' (conf=%.2f)", text, confidence)
-            self._consecutive_noise = 0
-            self._last_successful_speech = time.monotonic()
-
-            if self._threshold_elevated:
-                self._calibrated_threshold = self._base_threshold
-                recognizer.energy_threshold = self._base_threshold
-                self._threshold_elevated = False
-                logger.info("Restored energy_threshold to base %.0f", self._base_threshold)
-
-            return text
-
-        except sr.UnknownValueError:
-            self._handle_noise_flood(recognizer)
-            return ""
-        except sr.RequestError as e:
-            logger.warning("Google STT request failed: %s", e)
-            time.sleep(1.0)
-            return ""
+        return False
 
     def _handle_noise_flood(self, recognizer) -> None:
-        """Aggressively escalate threshold on consecutive noise.
-
-        Triggers after just 2 consecutive failures (not 3).
-        Raises threshold by 50% per step (not 40%).
-        Caps at _MAX_ENERGY_THRESHOLD.
-        """
+        """Escalate threshold on consecutive noise captures."""
         self._consecutive_noise += 1
 
         if self._consecutive_noise >= 2:
@@ -752,7 +726,6 @@ class STTAsync:
                 self._sr_calibrated = False
                 self._consecutive_noise = 0
         else:
-            logger.info("Google STT: could not understand audio")
             time.sleep(0.5)
 
     def _validate_text(self, text: str) -> str | None:
@@ -777,10 +750,7 @@ class STTAsync:
         return text
 
     def _listen_loop(self) -> str | None:
-        """Listen for speech using the decomposed pipeline.
-
-        Steps: acquire mic -> open device -> calibrate -> capture -> transcribe -> validate.
-        """
+        """Listen for speech: acquire mic -> capture -> transcribe -> validate."""
         if self._mic_manager is not None:
             t_acq = time.monotonic()
             if not self._mic_manager.acquire("stt"):
@@ -803,23 +773,17 @@ class STTAsync:
             if mic_obj is None:
                 return None
 
-            try:
-                if not self._sr_calibrated or self._needs_recalibration():
-                    if self._needs_recalibration():
-                        logger.info("Forcing recalibration (no speech in %.0fs)",
-                                     _RECALIBRATE_AFTER_S)
-                        self._sr_calibrated = False
-                    if not self._calibrate(recognizer, source):
-                        return None
-
-                audio = self._capture_audio(recognizer, source)
-                if audio is None:
+            if not self._sr_calibrated or self._needs_recalibration():
+                if self._needs_recalibration():
+                    logger.info("Forcing recalibration (no speech in %.0fs)",
+                                 _RECALIBRATE_AFTER_S)
+                    self._sr_calibrated = False
+                if not self._calibrate(recognizer, source):
                     return None
-            finally:
-                try:
-                    mic_obj.__exit__(None, None, None)
-                except Exception:
-                    pass
+
+            audio = self._capture_audio(recognizer, source)
+            if audio is None:
+                return None
 
             audio_duration_s = len(audio.get_raw_data()) / (
                 audio.sample_rate * audio.sample_width)
@@ -829,11 +793,12 @@ class STTAsync:
                              audio_duration_s, MIN_AUDIO_DURATION_S)
                 return None
 
-            logger.info("Captured %.1fs of audio, sending to Google...", audio_duration_s)
+            logger.info("Captured %.1fs of audio, transcribing...", audio_duration_s)
             self._emit_hearing("Processing...")
 
-            text = self._transcribe(recognizer, audio)
+            text = self._transcribe(audio)
             if not text:
+                self._handle_noise_flood(recognizer)
                 return None
 
             self._too_noisy_emitted = False
@@ -884,6 +849,14 @@ class STTAsync:
                 pass
 
     def _reset_audio(self) -> None:
+        if self._persistent_mic is not None:
+            try:
+                self._persistent_mic.__exit__(None, None, None)
+            except Exception:
+                pass
+            self._persistent_mic = None
+            self._persistent_source = None
+            
         if self._audio is not None:
             try:
                 self._audio.terminate()
@@ -891,6 +864,26 @@ class STTAsync:
                 pass
             self._audio = None
             logger.info("PyAudio reset -- will re-detect mic on next listen")
+
+    # ── Properties ─────────────────────────────────────────────────────
+
+    @property
+    def detected_language(self) -> str:
+        """Last detected language code ('en' or 'hi')."""
+        return self._detected_language
+
+    @property
+    def dominant_language(self) -> str:
+        """Most frequently detected language in recent history."""
+        if not self._language_history:
+            return "en"
+        from collections import Counter
+        counts = Counter(self._language_history[-10:])
+        return counts.most_common(1)[0][0]
+
+    @property
+    def preprocessor(self):
+        return self._preprocessor
 
     # ── Async wrappers ─────────────────────────────────────────────────
 
@@ -903,8 +896,9 @@ class STTAsync:
         if text:
             self._consecutive_errors = 0
             self._consecutive_noise = 0
-            logger.info("STT final: '%s'", text)
-            self._bus.emit("speech_final", text=text)
+            lang = self._detected_language
+            logger.info("STT final [%s]: '%s'", lang, text)
+            self._bus.emit("speech_final", text=text, language=lang)
         elif self._consecutive_errors > 0:
             backoff = min(2 ** self._consecutive_errors, self._MAX_BACKOFF_S)
             logger.warning("STT error backoff: %.1fs (attempt %d)",
@@ -922,8 +916,16 @@ class STTAsync:
     async def on_state_changed(self, old, new, **_kw) -> None:
         from core.state_manager import AtomState
 
-        if new is AtomState.LISTENING:
-            if old is AtomState.SPEAKING:
+        if new in (AtomState.LISTENING, AtomState.SPEAKING):
+            if new is AtomState.SPEAKING:
+                # Elevate threshold during speaking to prevent self-triggering
+                if self._recognizer is not None:
+                    self._calibrated_threshold = max(1500.0, self._base_threshold * 2.5)
+                    self._recognizer.energy_threshold = self._calibrated_threshold
+                    self._threshold_elevated = True
+                    logger.info("Speaking: elevated threshold to %.0f for barge-in", self._calibrated_threshold)
+            
+            if old is AtomState.SPEAKING and new is AtomState.LISTENING:
                 self._came_from_speaking = True
                 self._consecutive_noise = 0
                 self._too_noisy_emitted = False
@@ -933,8 +935,10 @@ class STTAsync:
                     self._recognizer.energy_threshold = restore
                     self._threshold_elevated = False
                     logger.info("Post-TTS: threshold restored to base %.0f", restore)
-            asyncio.create_task(self.start_listening())
-        elif old is AtomState.LISTENING:
+            
+            if not self._running:
+                asyncio.create_task(self.start_listening())
+        elif old in (AtomState.LISTENING, AtomState.SPEAKING) and new not in (AtomState.LISTENING, AtomState.SPEAKING):
             self.stop()
 
     def on_media_started(self) -> None:
@@ -951,6 +955,13 @@ class STTAsync:
         self._running = False
         if self._mic_manager is not None:
             self._mic_manager.release("stt")
+        if self._persistent_mic is not None:
+            try:
+                self._persistent_mic.__exit__(None, None, None)
+            except Exception:
+                pass
+            self._persistent_mic = None
+            self._persistent_source = None
         if self._audio:
             self._audio.terminate()
             self._audio = None

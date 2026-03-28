@@ -1,5 +1,5 @@
 """
-ATOM v14 -- Speech detection helpers.
+ATOM -- Speech detection helpers.
 
 Text corrections and noise word filtering for STT post-processing.
 """
@@ -108,13 +108,29 @@ NOISE_WORDS = frozenset({
     "just", "like", "well", "right", "here", "there",
     "one", "two", "three", "four", "five", "six", "seven",
     "hey", "hi", "hello", "bye", "thanks", "thank",
+    # Hindi filler/noise words
+    "haan", "nahi", "ji", "aur", "toh", "hai", "ka", "ki",
+    "ke", "ko", "se", "par", "mein", "yeh", "woh", "kya",
+    "accha", "theek", "bas", "hm",
 })
+
+# ── Hindi text corrections ──────────────────────────────────────────
+_HINDI_CORRECTIONS: list[tuple[str, str]] = [
+    ("atom ko bolo", "atom ko bolo"),
+    ("at um", "atom"),
+    ("at on", "atom"),
+    ("a tom", "atom"),
+    ("aye tom", "atom"),
+]
 
 
 def correct_text(text: str) -> str:
-    """Fix common misrecognitions and strip filler words."""
+    """Fix common misrecognitions and strip filler words (English + Hindi)."""
     t = text.lower().strip()
     for wrong, right in _TEXT_CORRECTIONS:
+        pattern = r'\b' + re.escape(wrong) + r'\b'
+        t = re.sub(pattern, right, t)
+    for wrong, right in _HINDI_CORRECTIONS:
         pattern = r'\b' + re.escape(wrong) + r'\b'
         t = re.sub(pattern, right, t)
     t = _FILLER_PATTERN.sub("", t)

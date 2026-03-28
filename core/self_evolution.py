@@ -1,5 +1,5 @@
 """
-ATOM v14 -- Self-Evolution Engine (AI OS Meta-Intelligence).
+ATOM -- Self-Evolution Engine (AI OS Meta-Intelligence).
 
 ATOM's self-awareness and continuous improvement system:
   - Analyzes own performance metrics in real-time

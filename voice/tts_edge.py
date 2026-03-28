@@ -1,5 +1,5 @@
 """
-ATOM v14 -- Edge Neural TTS with JARVIS-level speech quality.
+ATOM -- Edge Neural TTS with JARVIS-level speech quality.
 
 Features:
     - Microsoft Neural voices (en-GB-RyanNeural default -- warm British male)
@@ -209,8 +209,9 @@ class EdgeTTSAsync:
                      "airpods", "earbuds", "jbl", "bose", "sony", "mivi",
                      "oneplus", "realme", "yealink", "blaupunkt", "jabra")
 
-    # Larger buffer reduces dropouts/crackling on Bluetooth and some drivers
-    _MIXER_BUFFER = 4096
+    # Smaller buffer reduces latency (Apple CoreAudio style)
+    # 1024 frames at 24kHz is ~42ms of latency (very fast, no dropouts)
+    _MIXER_BUFFER = 1024
 
     async def init_voice(self) -> None:
         """Initialize pygame mixer, preferring Bluetooth output if available."""
@@ -637,6 +638,12 @@ class EdgeTTSAsync:
         self._tmp_files.clear()
 
     # ── Event handlers (same interface as TTSAsync) ──────────────
+
+    async def on_speech_partial(self, text: str, **_kw) -> None:
+        """Barge-in: stop speaking immediately when user starts talking."""
+        if self._playing and text in ("Listening...", "Processing..."):
+            logger.info("Barge-in detected, stopping TTS")
+            await self.stop()
 
     async def on_response(self, text: str, is_exit: bool = False,
                           is_sleep: bool = False, **_kw) -> None:

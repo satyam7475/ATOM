@@ -6,21 +6,18 @@ from __future__ import annotations
 
 import re
 
-from core import personality
+from core import adaptive_personality as personality
 from .base import IntentResult
 
 _EXIT = re.compile(
     r"^(shutdown|quit|exit|stop atom|shut\s*down|"
     r"close atom|turn off|power off|"
-    r"good\s*bye\s+shut\s*down|bye\s+shut\s*down|"
-    r"good\s*bye\s+exit|bye\s+exit|"
-    r"good\s*bye\s+quit|bye\s+quit|"
-    r"good\s*bye\s+atom\s+shut\s*down|"
+    r"good\s*bye|bye|"
+    r"shutdown\s+atom|shut\s*down\s+atom|"
     r"alvida|band\s+karo\s+atom)[\s!.]*$", re.I)
 
 _SILENT_MODE = re.compile(
-    r"^(bye|good\s*bye|goodbye|good\s*night|"
-    r"go\s+(to\s+)?sleep|sleep\s+mode|go\s+silent|silent\s+mode|"
+    r"^(go\s+(to\s+)?sleep|sleep\s+mode|go\s+silent|silent\s+mode|"
     r"be\s+quiet|shut\s+up|quiet|shh+|hush|rest\s+now|take\s+a\s+break|"
     r"chup\s+karo|chup\s+ho\s*ja|band\s+karo|band\s+ho\s*ja|"
     r"band\s+kar\s+do|ruk\s+ja|bas\s+kar|bas\s+karo|"

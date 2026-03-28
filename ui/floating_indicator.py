@@ -1,5 +1,5 @@
 """
-ATOM v14 -- Premium dark UI with animated reactor orb.
+ATOM -- Premium dark UI with animated reactor orb.
 
 880x800 frameless window with:
 - Frosted dark glass aesthetic
@@ -105,7 +105,7 @@ class FloatingIndicator:
     def _run_tk(self) -> None:
         root = tk.Tk()
         self._root = root
-        root.title("ATOM v14")
+        root.title("ATOM")
         root.overrideredirect(True)
         root.attributes("-topmost", True)
         root.configure(bg=BG)
@@ -340,7 +340,7 @@ class FloatingIndicator:
         self._mic_var = tk.StringVar(value=f"Mic: {self._mic_name}")
         tk.Label(info_row, textvariable=self._mic_var, font=info_font,
                  fg=TEXT_SUBTLE, bg=BG, anchor="w").pack(side="left")
-        tk.Label(info_row, text="ATOM v14  |  Ctrl+Alt+A", font=info_font,
+        tk.Label(info_row, text="ATOM  |  Ctrl+Alt+A", font=info_font,
                  fg=TEXT_SUBTLE, bg=BG, anchor="e").pack(side="right")
 
         root.withdraw()

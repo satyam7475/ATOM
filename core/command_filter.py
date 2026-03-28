@@ -1,20 +1,23 @@
 """
-ATOM v14 -- Command Probability Filter.
+ATOM -- Command Probability Filter (Bilingual: English + Hindi).
 
 Scores STT output to reject garbage speech before it reaches the Intent Engine.
-Combines Vosk confidence with command keyword detection and length heuristics.
+Combines STT confidence with command keyword detection and length heuristics.
+Supports both English and Hindi command keywords.
 
 Pipeline position:
-    Vosk -> Text Corrections -> **Command Filter** -> Intent Engine -> Router
+    AudioPreprocessor -> Whisper STT -> Text Corrections
+    -> **Command Filter** -> Intent Engine -> Router
 """
 
 from __future__ import annotations
 
 import logging
+import re
 
 logger = logging.getLogger("atom.cmd_filter")
 
-COMMAND_KEYWORDS = frozenset({
+COMMAND_KEYWORDS_EN = frozenset({
     # Action verbs
     "open", "close", "launch", "start", "run", "stop", "kill",
     "shutdown", "restart", "check", "show", "tell", "play",
@@ -50,13 +53,60 @@ COMMAND_KEYWORDS = frozenset({
     "folder", "file", "apps", "applications",
 })
 
+COMMAND_KEYWORDS_HI = frozenset({
+    # Action verbs (Hindi)
+    "kholo", "band", "karo", "chalu", "shuru", "bando", "dikhao",
+    "batao", "chalao", "bajao", "ruko", "dhoondo", "banao",
+    "hatao", "bhejo", "padho", "likho", "suno", "dekho",
+    "nikalo", "daalo", "badlo", "ghatao", "badhao",
+    # System (Hindi)
+    "system", "battery", "screen", "awaaz", "volume",
+    "time", "samay", "waqt", "tareekh", "din",
+    # Greetings (Hindi)
+    "namaste", "namaskar", "shukriya", "dhanyavaad", "alvida",
+    "suprabhat", "shubh", "ratri",
+    # ATOM-related
+    "atom", "boss",
+    # Confirm/deny (Hindi)
+    "haan", "nahi", "theek", "sahi", "galat", "ruko", "chalo",
+    # Queries (Hindi)
+    "kya", "kaise", "kab", "kahan", "kaun", "kitna", "kyun",
+    "mausam", "khabar", "news",
+})
+
+COMMAND_KEYWORDS = COMMAND_KEYWORDS_EN | COMMAND_KEYWORDS_HI
+
+_HINDI_SCRIPT_PATTERN = re.compile(r'[\u0900-\u097F]')
+
 MIN_SCORE = 0.35
+
+
+def contains_hindi(text: str) -> bool:
+    """Check if text contains Devanagari characters (native Hindi script)."""
+    return bool(_HINDI_SCRIPT_PATTERN.search(text))
+
+
+def detect_language_heuristic(text: str) -> str:
+    """Quick heuristic language detection from text content.
+
+    Returns 'hi' for Hindi, 'en' for English. Useful as a secondary
+    signal alongside whisper's language detection.
+    """
+    if contains_hindi(text):
+        return "hi"
+    words = text.lower().split()
+    hi_hits = sum(1 for w in words if w in COMMAND_KEYWORDS_HI)
+    en_hits = sum(1 for w in words if w in COMMAND_KEYWORDS_EN)
+    if hi_hits > en_hits and hi_hits >= 2:
+        return "hi"
+    return "en"
 
 
 def command_probability(text: str, confidence: float) -> float:
     """Score a phrase for command likelihood (0.0 to 1.0).
 
-    Higher scores mean more likely to be a real command.
+    Checks both English and Hindi keywords. Higher scores mean
+    more likely to be a real command.
     """
     words = text.lower().split()
     word_count = len(words)
@@ -68,11 +118,14 @@ def command_probability(text: str, confidence: float) -> float:
 
     if word_count == 1:
         score *= 0.6
-    elif word_count > 5:
+    elif word_count > 8:
         score *= 0.5
 
     keyword_hits = sum(1 for w in words if w in COMMAND_KEYWORDS)
     score += keyword_hits * 0.15
+
+    if contains_hindi(text):
+        score += 0.1
 
     return min(score, 1.0)
 

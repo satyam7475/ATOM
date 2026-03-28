@@ -1,5 +1,5 @@
 """
-ATOM v14 -- Desktop Control (AI OS Automation Layer).
+ATOM -- Desktop Control (AI OS Automation Layer).
 
 Voice-controlled desktop automation using pyautogui:
   - Scroll up/down

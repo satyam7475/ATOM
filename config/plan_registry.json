@@ -1,0 +1,24 @@
+{
+  "dev_setup": {
+    "match": ["dev setup", "development workspace", "initialize development", "backend"],
+    "steps": [
+      {"action": "open_vscode", "skill": "desktop_control", "expected_outcome": "VSCode is open", "dependencies": []},
+      {"action": "start_backend", "skill": "shell_execution", "expected_outcome": "Backend server running", "dependencies": ["open_vscode"]},
+      {"action": "open_docs", "skill": "web_navigation", "expected_outcome": "Documentation opened", "dependencies": []}
+    ],
+    "success_rate": 0.82,
+    "avg_time_s": 12,
+    "failure_patterns": ["start_backend"]
+  },
+  "research": {
+    "match": ["research", "search", "look up"],
+    "steps": [
+      {"action": "open_browser", "skill": "web_navigation", "expected_outcome": "Browser opened", "dependencies": []},
+      {"action": "search_query", "skill": "web_search", "expected_outcome": "Search results retrieved", "dependencies": ["open_browser"]},
+      {"action": "extract_info", "skill": "llm_summarize", "expected_outcome": "Information extracted", "dependencies": ["search_query"]}
+    ],
+    "success_rate": 0.75,
+    "avg_time_s": 20,
+    "failure_patterns": []
+  }
+}

@@ -1,5 +1,5 @@
 """
-ATOM v14 -- Task Scheduler (AI OS Kernel Service).
+ATOM -- Task Scheduler (AI OS Kernel Service).
 
 Persistent reminder and scheduled task engine:
   - One-time reminders ("remind me in 30 minutes to check email")

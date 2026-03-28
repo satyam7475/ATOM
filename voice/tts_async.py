@@ -1,5 +1,5 @@
 """
-ATOM v13 -- Persistent SAPI COM TTS via comtypes.
+ATOM -- Persistent SAPI COM TTS via comtypes.
 
 Single SpVoice COM object created at startup in a dedicated thread.
 Subsequent Speak() calls reuse it with zero init overhead (~5ms).

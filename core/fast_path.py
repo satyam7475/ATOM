@@ -1,5 +1,5 @@
 """
-ATOM v15 -- Fast-path pipeline optimizer.
+ATOM -- Fast-path pipeline optimizer.
 
 Eliminates unnecessary serial steps from the voice command pipeline:
   1. Quick-reply table checked *before* intent classification (saves ~2ms)

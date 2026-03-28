@@ -9,7 +9,7 @@ import re
 import socket
 import time
 
-from core import personality
+from core import adaptive_personality as personality
 from .base import IntentResult
 
 _TIME = re.compile(

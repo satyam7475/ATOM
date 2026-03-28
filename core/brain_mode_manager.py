@@ -1,5 +1,5 @@
 """
-ATOM v15 -- Brain / ATOM mode profiles (production-safe).
+ATOM -- Brain / ATOM mode profiles (production-safe).
 
 Controls how the local LLM runs: ATOM mode (fast, short), Balanced, Brain mode (deeper).
 All profile names are allowlisted. Changes can be audited and optionally persisted.
@@ -108,12 +108,15 @@ class BrainModeManager:
         return {
             "profile": prof_name,
             "model_path": str(model_path),
-            "n_ctx": int(_pick("n_ctx", 2048)),
+            "n_ctx": int(_pick("n_ctx", 8192)),
             "n_threads": int(_pick("n_threads", max(2, (os.cpu_count() or 4) // 2))),
-            "n_gpu_layers": int(_pick("n_gpu_layers", 0)),
-            "max_tokens": int(_pick("max_tokens", 150)),
-            "temperature": float(_pick("temperature", 0.4)),
-            "timeout_seconds": float(_pick("timeout_seconds", 60)),
+            "n_gpu_layers": int(_pick("n_gpu_layers", -1)),
+            "n_batch": int(_pick("n_batch", 512)),
+            "max_tokens": int(_pick("max_tokens", 512)),
+            "temperature": float(_pick("temperature", 0.7)),
+            "top_p": float(_pick("top_p", 0.9)),
+            "repeat_penalty": float(_pick("repeat_penalty", 1.1)),
+            "timeout_seconds": float(_pick("timeout_seconds", 30)),
             "extra_stop_sequences": [str(s) for s in extra_stops if s][:12],
         }
 

@@ -1,9 +1,3 @@
-# Secrets
-.env
-.env.local
-*.env
-!.env.example
-
 # Logs
 logs/
 *.log
@@ -21,6 +15,7 @@ __pycache__/
 # Models (too large for GitHub -- re-downloadable)
 models/*.gguf
 models/vosk-*/
+models/*.onnx
 
 # Temp / audio
 *.tmp

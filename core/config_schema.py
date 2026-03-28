@@ -1,5 +1,5 @@
 """
-ATOM v14 -- Configuration schema validation.
+ATOM -- Configuration schema validation.
 
 Validates config/settings.json at startup using jsonschema.
 Falls back gracefully if jsonschema is not installed.
@@ -41,12 +41,13 @@ CONFIG_SCHEMA: dict[str, Any] = {
             "properties": {
                 "engine": {
                     "type": "string",
-                    "enum": ["vosk", "google", "vosk_with_fallback"],
-                    "description": "STT engine: vosk (offline), google (cloud), vosk_with_fallback",
+                    "enum": ["faster_whisper"],
+                    "description": "STT engine: faster_whisper (offline, GPU-accelerated)",
                 },
-                "vosk_model_path": {
+                "whisper_model_size": {
                     "type": "string",
-                    "description": "Path to Vosk model directory (relative to ATOM root)",
+                    "enum": ["tiny", "base", "small", "medium", "large-v3"],
+                    "description": "Whisper model size (recommended: small for bilingual)",
                 },
                 "sample_rate": {
                     "type": "integer",
@@ -88,7 +89,11 @@ CONFIG_SCHEMA: dict[str, Any] = {
             "properties": {
                 "engine": {
                     "type": "string",
-                    "enum": ["sapi", "edge"],
+                    "enum": ["sapi", "edge", "kokoro"],
+                },
+                "kokoro_voice": {
+                    "type": "string",
+                    "description": "Voice profile for Kokoro TTS (e.g., af_heart, am_adam)",
                 },
                 "max_lines": {
                     "type": "integer",
@@ -147,6 +152,10 @@ CONFIG_SCHEMA: dict[str, Any] = {
         "memory": {
             "type": "object",
             "properties": {
+                "graph_db_path": {
+                    "type": "string",
+                    "description": "SQLite path for MemoryGraph (V7 timeline + RAG graph hints).",
+                },
                 "max_entries": {
                     "type": "integer",
                     "minimum": 10,
@@ -156,6 +165,22 @@ CONFIG_SCHEMA: dict[str, Any] = {
                     "type": "integer",
                     "minimum": 1,
                     "maximum": 50,
+                },
+                "semantic_weight": {
+                    "type": "number",
+                    "minimum": 0.0,
+                    "maximum": 1.0,
+                },
+                "v7_scoring": {
+                    "type": "object",
+                    "properties": {
+                        "enabled": {"type": "boolean"},
+                        "recency_weight": {"type": "number", "minimum": 0.0, "maximum": 1.0},
+                        "importance_weight": {"type": "number", "minimum": 0.0, "maximum": 1.0},
+                        "success_rate_weight": {"type": "number", "minimum": 0.0, "maximum": 1.0},
+                        "similarity_weight": {"type": "number", "minimum": 0.0, "maximum": 1.0},
+                    },
+                    "additionalProperties": False,
                 },
             },
             "additionalProperties": False,
@@ -223,6 +248,14 @@ CONFIG_SCHEMA: dict[str, Any] = {
                     "maximum": 65535,
                 },
                 "auto_open_browser": {"type": "boolean"},
+                "password_auth_enabled": {
+                    "type": "boolean",
+                    "description": "If false, dashboard token gate is disabled (no password-style token auth).",
+                },
+                "dashboard_access_token": {
+                    "type": "string",
+                    "description": "If set, WebSocket /ws requires ?token= or X-ATOM-Token header.",
+                },
             },
             "additionalProperties": False,
         },
@@ -246,11 +279,28 @@ CONFIG_SCHEMA: dict[str, Any] = {
             },
             "additionalProperties": True,
         },
+        "auth": {
+            "type": "object",
+            "properties": {
+                "sessions_enabled": {"type": "boolean"},
+                "session_ttl_s": {"type": "number", "minimum": 60},
+                "session_max_idle_s": {"type": "number", "minimum": 60},
+                "privilege_default": {"type": "string"},
+                "persist_sessions": {"type": "boolean"},
+                "session_db_path": {"type": "string"},
+                "revoke_on_ws_close": {"type": "boolean"},
+            },
+            "additionalProperties": False,
+        },
         "owner": {
             "type": "object",
             "properties": {
                 "name": {"type": "string"},
                 "title": {"type": "string"},
+                "registered_device_fingerprint": {
+                    "type": "string",
+                    "description": "SHA256 prefix from device_binding.get_device_id(); enforced in paranoid mode.",
+                },
             },
             "additionalProperties": True,
         },
@@ -279,8 +329,20 @@ CONFIG_SCHEMA: dict[str, Any] = {
                     "items": {"type": "string"},
                     "description": "Action names that always require voice confirmation.",
                 },
+                "rate_limit_window_s": {"type": "number"},
+                "rate_limit_max_actions": {"type": "integer"},
+                "action_signing_secret": {
+                    "type": "string",
+                    "description": "HMAC secret; override with ATOM_ACTION_SECRET env.",
+                },
+                "paranoid_require_session_even_when_local_trust": {"type": "boolean"},
+                "paranoid_signing_disabled": {
+                    "type": "boolean",
+                    "description": "If true, paranoid mode skips HMAC verification (not recommended).",
+                },
+                "behavior_monitor": {"type": "object", "additionalProperties": True},
             },
-            "additionalProperties": False,
+            "additionalProperties": True,
         },
         "features": {
             "type": "object",
@@ -309,8 +371,21 @@ CONFIG_SCHEMA: dict[str, Any] = {
             "properties": {
                 "lock_mode": {
                     "type": "string",
-                    "enum": ["off", "safe_only", "owner_only"],
-                    "description": "off = normal; safe_only = only safe intents; owner_only = placeholder for auth.",
+                    "enum": [
+                        "off",
+                        "safe_only",
+                        "owner_only",
+                        "open",
+                        "restricted",
+                        "secure",
+                        "paranoid",
+                    ],
+                    "description": "Canonical: open|restricted|secure|paranoid. Legacy: off→open, safe_only→restricted, owner_only→secure.",
+                },
+                "executor_mode": {
+                    "type": "string",
+                    "enum": ["in_process", "isolated"],
+                    "description": "in_process = ActionExecutor in main; isolated = subprocess IPC worker.",
                 },
                 "assistant_mode": {
                     "type": "string",
@@ -619,6 +694,264 @@ CONFIG_SCHEMA: dict[str, Any] = {
             },
             "additionalProperties": False,
         },
+        "v7_intelligence": {
+            "type": "object",
+            "description": "V7 intelligence layer: modes, timeline, prediction prefetch.",
+            "properties": {
+                "default_mode": {
+                    "type": "string",
+                    "enum": ["FAST", "SMART", "DEEP", "SECURE"],
+                },
+                "auto_mode": {"type": "boolean"},
+                "mode_stability_enabled": {"type": "boolean"},
+                "simple_query_max_chars": {"type": "integer", "minimum": 8, "maximum": 200},
+                "timeline_max_events": {"type": "integer", "minimum": 50, "maximum": 10000},
+                "max_timeline_size": {"type": "integer", "minimum": 50, "maximum": 10000},
+                "timeline_summarize_on_prune": {"type": "boolean"},
+                "prediction_prefetch_enabled": {"type": "boolean"},
+                "gpu_util_fast_threshold": {
+                    "type": "number",
+                    "minimum": 50,
+                    "maximum": 100,
+                },
+                "deep_query_min_chars": {"type": "integer", "minimum": 40, "maximum": 2000},
+                "prefer_secure_when_paranoid_ui": {"type": "boolean"},
+                "secure_rag_budget_factor": {
+                    "type": "number",
+                    "minimum": 0.2,
+                    "maximum": 1.0,
+                },
+                "cpu_force_fast_above": {
+                    "type": "number",
+                    "minimum": 50,
+                    "maximum": 100,
+                },
+                "cpu_idle_deep_below": {
+                    "type": "number",
+                    "minimum": 5,
+                    "maximum": 80,
+                },
+                "low_prediction_accuracy_deep_threshold": {
+                    "type": "number",
+                    "minimum": 0,
+                    "maximum": 1,
+                },
+                "mode_stability": {
+                    "type": "object",
+                    "properties": {
+                        "cooldown_turns": {"type": "integer", "minimum": 0, "maximum": 20},
+                        "significant_cpu_delta": {"type": "number"},
+                        "significant_gpu_delta": {"type": "number"},
+                    },
+                    "additionalProperties": False,
+                },
+                "observability": {
+                    "type": "object",
+                    "properties": {
+                        "debug_snapshot_interval_s": {"type": "number", "minimum": 0, "maximum": 3600},
+                        "debug_snapshot_cache_ttl_s": {"type": "number", "minimum": 0, "maximum": 60},
+                    },
+                    "additionalProperties": False,
+                },
+                "prefetch": {
+                    "type": "object",
+                    "properties": {
+                        "max_prefetch_candidates": {"type": "integer", "minimum": 1, "maximum": 64},
+                        "hard_abort_gpu_above": {"type": "number"},
+                        "soft_scale_gpu_above": {"type": "number"},
+                        "soft_scale_factor": {"type": "number"},
+                        "soft_delay_s": {"type": "number"},
+                        "gpu_soft_extra_delay_s": {"type": "number"},
+                        "min_prediction_confidence": {"type": "number"},
+                        "low_conf_extra_delay_s": {"type": "number"},
+                    },
+                    "additionalProperties": False,
+                },
+                "feedback": {
+                    "type": "object",
+                    "properties": {
+                        "max_records": {"type": "integer"},
+                        "learn_rate": {"type": "number"},
+                        "rolling_window_50": {"type": "integer"},
+                        "rolling_window_100": {"type": "integer"},
+                        "trend_flat_epsilon": {"type": "number"},
+                        "min_query_chars": {"type": "integer"},
+                        "learn_confidence_threshold": {"type": "number"},
+                    },
+                    "additionalProperties": True,
+                },
+                "health": {
+                    "type": "object",
+                    "properties": {
+                        "prediction_good_above": {"type": "number"},
+                        "prediction_poor_below": {"type": "number"},
+                        "prediction_unstable_low": {"type": "number"},
+                        "prediction_unstable_high": {"type": "number"},
+                        "prefetch_good_above": {"type": "number"},
+                        "prefetch_poor_below": {"type": "number"},
+                        "memory_relevance_good_above": {"type": "number"},
+                        "memory_relevance_poor_below": {"type": "number"},
+                        "system_load_cpu_low_below": {"type": "number"},
+                        "system_load_cpu_high_above": {"type": "number"},
+                        "system_load_ram_high_above": {"type": "number"},
+                    },
+                    "additionalProperties": False,
+                },
+                "warnings": {
+                    "type": "object",
+                    "properties": {
+                        "warn_on_degrading_prediction": {"type": "boolean"},
+                        "graph_miss_rate_above": {"type": "number"},
+                        "prefetch_waste_above": {"type": "number"},
+                    },
+                    "additionalProperties": False,
+                },
+                "preemption": {
+                    "type": "object",
+                    "properties": {
+                        "restart_cost": {"type": "number"},
+                        "relevance_scale": {"type": "number"},
+                        "context_scale": {"type": "number"},
+                        "min_improvement_score": {"type": "number"},
+                        "max_preemptions_per_query": {"type": "integer", "minimum": 0, "maximum": 10},
+                    },
+                    "additionalProperties": False,
+                },
+            },
+            "additionalProperties": False,
+        },
+        "v7_gpu": {
+            "type": "object",
+            "description": "ATOM V7 GPU resource manager, power modes, and degradation.",
+            "properties": {
+                "enabled": {"type": "boolean"},
+                "strict_control": {
+                    "type": "boolean",
+                    "description": "Require load grants before GPU model loads (single authority).",
+                },
+                "deployment_mode": {
+                    "type": "string",
+                    "enum": ["fused", "distributed"],
+                    "description": "fused = single-process voice+LLM; distributed = ZMQ workers.",
+                },
+                "simulation_mode": {
+                    "type": "string",
+                    "enum": ["heuristic", "hybrid", "memory_weighted"],
+                },
+                "vram_reserve_mb": {"type": "integer", "minimum": 0, "maximum": 8192},
+                "model_slots_mb": {
+                    "type": "object",
+                    "additionalProperties": {"type": "integer", "minimum": 0},
+                },
+                "eviction_order": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                },
+                "idle_unload_stt_s": {"type": "number", "minimum": 10, "maximum": 3600},
+                "idle_unload_llm_s": {"type": "number", "minimum": 30, "maximum": 7200},
+                "idle_sleep_s": {"type": "number", "minimum": 60, "maximum": 86400},
+                "fused_gpu_worker": {"type": "boolean"},
+                "gpu_stall_timeout_s": {"type": "number", "minimum": 10, "maximum": 600},
+                "allow_cuda_reset": {"type": "boolean"},
+                "degradation_default": {
+                    "type": "string",
+                    "enum": ["full", "limited", "safe"],
+                },
+                "event_replay_max": {"type": "integer", "minimum": 8, "maximum": 256},
+                "speculative_response": {"type": "boolean"},
+            },
+            "additionalProperties": False,
+        },
+        "gpu_execution": {
+            "type": "object",
+            "description": "Hardware-aware GPU coordinator (soft deferral, NVML).",
+            "properties": {
+                "vram_reserve_mb": {"type": "number", "minimum": 0},
+                "high_gpu_util_defer_background": {"type": "number", "minimum": 0, "maximum": 100},
+                "fragmentation_defer_threshold": {"type": "number", "minimum": 0, "maximum": 1},
+                "defer_backoff_s": {"type": "number", "minimum": 0.01},
+                "max_defer_cycles": {"type": "integer", "minimum": 1},
+                "embed_light_max_mb": {"type": "number", "minimum": 0},
+                "overlap_max_gpu_util": {"type": "number", "minimum": 0, "maximum": 100},
+                "gpu_state_ttl_s": {"type": "number", "minimum": 0.05},
+                "feedback_ewma_alpha": {"type": "number", "minimum": 0.01, "maximum": 1},
+                "exec_log_max": {"type": "integer", "minimum": 16},
+            },
+            "additionalProperties": False,
+        },
+        "cognitive_loop": {
+            "type": "object",
+            "description": "Jarvis-style observe/predict/decide/act interval.",
+            "properties": {
+                "interval_s": {"type": "number", "minimum": 5, "maximum": 3600},
+            },
+            "additionalProperties": False,
+        },
+        "rag": {
+            "type": "object",
+            "description": "GPU-aware RAG: hybrid retrieval, Qdrant optional, bounded wait before LLM.",
+            "properties": {
+                "enabled": {"type": "boolean"},
+                "backend": {"type": "string", "enum": ["chroma", "qdrant"]},
+                "first_token_budget_ms": {"type": "number", "minimum": 0, "maximum": 2000},
+                "collections": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                },
+                "top_k": {"type": "integer", "minimum": 1, "maximum": 32},
+                "vector_weight": {"type": "number", "minimum": 0, "maximum": 1},
+                "keyword_weight": {"type": "number", "minimum": 0, "maximum": 1},
+                "recency_weight": {"type": "number", "minimum": 0, "maximum": 1},
+                "skip_embed_gpu_util_above": {"type": "number", "minimum": 0, "maximum": 100},
+                "embed_vram_mb": {"type": "number", "minimum": 0},
+                "batch_embed_min": {"type": "integer", "minimum": 1},
+                "fast_mode": {
+                    "type": "boolean",
+                    "description": "Graph + memory cache only; skip vector embed for minimum latency.",
+                },
+                "persistent_embed_cache": {"type": "boolean"},
+                "embed_cache_path": {"type": "string"},
+                "prefetch_enabled": {"type": "boolean"},
+                "late_restart_confidence": {
+                    "type": "number",
+                    "minimum": 0,
+                    "maximum": 1,
+                    "description": "Late RAG preempt+restart when confidence exceeds this.",
+                },
+                "graph_first": {
+                    "type": "object",
+                    "description": "Prefer MemoryGraph when confidence is high; skip vector RAG.",
+                    "properties": {
+                        "enabled": {"type": "boolean"},
+                        "min_confidence": {"type": "number", "minimum": 0, "maximum": 1},
+                        "min_snippets": {"type": "integer", "minimum": 1, "maximum": 20},
+                        "project_boost": {"type": "number", "minimum": 0, "maximum": 0.5},
+                        "relevance_validation_min": {"type": "number", "minimum": 0, "maximum": 1},
+                    },
+                    "additionalProperties": False,
+                },
+                "adaptive": {
+                    "type": "object",
+                    "properties": {
+                        "budget_min_ms": {"type": "number"},
+                        "budget_max_ms": {"type": "number"},
+                    },
+                    "additionalProperties": False,
+                },
+                "qdrant_path": {"type": "string"},
+                "qdrant_collection": {"type": "string"},
+                "cache": {
+                    "type": "object",
+                    "properties": {
+                        "embed_ttl_s": {"type": "number"},
+                        "retrieval_ttl_s": {"type": "number"},
+                        "max_entries": {"type": "integer"},
+                    },
+                    "additionalProperties": False,
+                },
+            },
+            "additionalProperties": False,
+        },
     },
     "additionalProperties": True,
 }
@@ -665,8 +998,8 @@ def _basic_validation(config: dict) -> list[str]:
         errors.append("stt: must be an object")
     else:
         engine = stt.get("engine")
-        if engine is not None and engine not in ("vosk", "google", "vosk_with_fallback"):
-            errors.append(f"stt.engine: must be vosk|google|vosk_with_fallback, got {engine}")
+        if engine is not None and engine != "faster_whisper":
+            errors.append(f"stt.engine: must be faster_whisper, got {engine}")
 
         chunk = stt.get("chunk_size")
         if chunk is not None and (not isinstance(chunk, int)

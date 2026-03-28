@@ -1,5 +1,5 @@
 """
-ATOM v14 -- System Awareness Daemon (AI OS Kernel).
+ATOM -- System Awareness Daemon (AI OS Kernel).
 
 Lightweight background loop that monitors system-level changes
 and emits events for proactive ATOM responses:

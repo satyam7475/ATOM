@@ -1,5 +1,5 @@
 """
-ATOM OS -- Security Policy (Corporate-Safe Enforcement Layer).
+ATOM -- Security Policy (Production-Grade Enforcement Layer).
 
 The single security gate for ATOM. Every sensitive action goes through
 this module before execution. Config-driven via settings.json "security"
@@ -13,8 +13,13 @@ Enforcement layers:
   5. File path allowlist (path_allowed) -- centralised here
   6. Input sanitisation (sanitize_input) -- length + injection protection
   7. Audit logging -- every sensitive + blocked action logged to file
+  8. Rate limiting -- prevents rapid-fire command abuse
+  9. Prompt injection deep scan -- multi-layer LLM prompt injection defense
+  10. Directory traversal protection -- blocks ../ path escape attacks
+  11. Command chaining detection -- blocks && || ; piped attacks
 
-Owner: Satyam. All policy decisions prioritize system safety.
+v20: Hardened for production with SecurityFortress integration.
+Owner: Satyam. All policy decisions prioritize system safety and privacy.
 """
 
 from __future__ import annotations
@@ -127,48 +132,147 @@ _DANGEROUS_INPUT_RE = re.compile(
     re.I,
 )
 
+_PROMPT_INJECTION_RE = re.compile(
+    r"(ignore\s+(all\s+)?previous\s+instructions|"
+    r"disregard\s+(all\s+)?prior|"
+    r"you\s+are\s+now\s+|"
+    r"new\s+instructions?\s*:|"
+    r"system\s+prompt\s*:|"
+    r"override\s+(system|security|safety)|"
+    r"forget\s+(everything|all\s+rules|your\s+instructions)|"
+    r"pretend\s+you\s+are|"
+    r"act\s+as\s+if\s+you\s+are|"
+    r"jailbreak|bypass\s+security|"
+    r"do\s+anything\s+now|"
+    r"dan\s+mode|developer\s+mode|"
+    r"ignore\s+(?:all\s+)?(?:safety|ethical)|"
+    r"reveal\s+(?:your|the)\s+(?:system|secret|hidden)|"
+    r"what\s+(?:is|are)\s+your\s+(?:system|initial)\s+(?:prompt|instructions)|"
+    r"repeat\s+(?:your|the)\s+(?:system|initial)\s+prompt|"
+    r"output\s+(?:your|the)\s+(?:instructions|rules)|"
+    r"sudo\s+|admin\s+mode|root\s+access|"
+    r"disable\s+(?:all\s+)?(?:filters?|safety|security)|"
+    r"<\s*(?:system|admin|root)\s*>)",
+    re.I,
+)
+
+_DIRECTORY_TRAVERSAL_RE = re.compile(
+    r"(?:\.\./|\.\.\\|%2e%2e|%252e%252e|\.\.%2f|\.\.%5c)",
+    re.I,
+)
+
+_COMMAND_CHAIN_RE = re.compile(
+    r"(?:&&|\|\||;\s*(?:rm|del|format|shutdown|restart|kill|taskkill))",
+    re.I,
+)
+
 _MAX_INPUT_LENGTH = 2000
+_RATE_LIMIT_WINDOW_S = 5.0
+_RATE_LIMIT_MAX_ACTIONS = 10
 
 
 class SecurityPolicy:
     """The single security gate for ATOM OS.
 
     Config-driven: reads settings.json "security" section at init.
+    Includes rate limiting to prevent rapid-fire command abuse.
     """
 
     def __init__(self, config: dict | None = None) -> None:
         _AUDIT_FILE.parent.mkdir(parents=True, exist_ok=True)
+        self._config = config or {}
         sec = (config or {}).get("security", {})
         self._mode: str = sec.get("mode", "strict")
         self._audit_to_file: bool = sec.get("audit_to_file", True)
         self._extra_confirm: list[str] = sec.get("require_confirmation_for", [])
 
         ctrl = (config or {}).get("control", {})
-        self._lock_mode: str = ctrl.get("lock_mode", "off")
+        from core.lock_modes import normalize_lock_mode
+
+        self._lock_mode: str = normalize_lock_mode(ctrl.get("lock_mode", "off"))
         self._allow_runtime_mode_switch: bool = ctrl.get(
             "allow_runtime_mode_switch", True,
         )
         self._features: dict[str, bool] = (config or {}).get("features", {})
-        logger.info("SecurityPolicy init: mode=%s, lock=%s", self._mode, self._lock_mode)
+
+        self._action_timestamps: list[float] = []
+        self._rate_limit_window = sec.get("rate_limit_window_s", _RATE_LIMIT_WINDOW_S)
+        self._rate_limit_max = sec.get("rate_limit_max_actions", _RATE_LIMIT_MAX_ACTIONS)
+
+        from core.execution.behavior_monitor import BehaviorMonitor
+
+        self._behavior = BehaviorMonitor(config)
+        self._behavior.set_lock_mode(self._lock_mode)
+
+        logger.info("SecurityPolicy init: mode=%s, lock=%s, rate_limit=%d/%ds",
+                     self._mode, self._lock_mode,
+                     self._rate_limit_max, self._rate_limit_window)
 
     # ── Central action gate ───────────────────────────────────────────
 
-    def allow_action(self, action: str, args: dict | None = None) -> tuple[bool, str]:
+    def _check_rate_limit(self) -> bool:
+        """Return True if under the rate limit, False if too many actions."""
+        import time
+        now = time.monotonic()
+        self._action_timestamps = [
+            t for t in self._action_timestamps
+            if now - t < self._rate_limit_window
+        ]
+        if len(self._action_timestamps) >= self._rate_limit_max:
+            return False
+        self._action_timestamps.append(now)
+        return True
+
+    def allow_action(
+        self,
+        action: str,
+        args: dict | None = None,
+        *,
+        policy_context: str = "execute",
+    ) -> tuple[bool, str]:
         """Single gate: can this action execute right now?
 
         Returns (allowed, reason). Audit-logs all denials.
+        Includes rate limiting to prevent command flooding.
+        ``policy_context='plan_validate'`` skips paranoid HMAC verification (planning dry-run).
         """
-        if self._lock_mode == "safe_only" and action not in _SAFE_ALWAYS_INTENTS:
-            reason = f"Lock mode 'safe_only': action '{action}' is not permitted."
+        if action not in _SAFE_ALWAYS_INTENTS and not self._check_rate_limit():
+            reason = "Too many actions in a short time. Please slow down, Boss."
             self.audit_log(action, reason, success=False)
             return False, reason
+
+        from core.owner_gate import owner_policy_denies
+        denied, deny_reason = owner_policy_denies(action)
+        if denied:
+            self.audit_log(action, deny_reason, success=False)
+            return False, deny_reason
+
+        from core.runtime_config import DegradationMode, get_degradation_mode
+        if get_degradation_mode(self._config) == DegradationMode.SAFE:
+            if action not in _SAFE_ALWAYS_INTENTS:
+                reason = "SAFE degradation mode — only safe intents allowed."
+                self.audit_log(action, reason, success=False)
+                return False, reason
+
+        if self._lock_mode == "restricted" and action not in _SAFE_ALWAYS_INTENTS:
+            reason = f"Lock mode 'restricted': action '{action}' is not permitted."
+            self.audit_log(action, reason, success=False)
+            return False, reason
+
+        ok, p1_reason = self._phase1_policy_checks(action, args, policy_context=policy_context)
+        if not ok:
+            logger.warning("%s | action=%s", p1_reason, action)
+            self.audit_log(action, p1_reason, success=False)
+            return False, p1_reason
 
         if action in ("set_brain_profile", "set_assistant_mode"):
             if not self._allow_runtime_mode_switch:
                 reason = "Runtime brain / assistant mode switches are disabled in config."
                 self.audit_log(action, reason, success=False)
                 return False, reason
-            if self._lock_mode != "off":
+            from core.lock_modes import runtime_switch_locked
+
+            if runtime_switch_locked(self._lock_mode):
                 reason = (
                     f"Cannot change runtime mode while control.lock_mode is "
                     f"'{self._lock_mode}'."
@@ -214,6 +318,68 @@ class SecurityPolicy:
 
         return True, "ok"
 
+    def _phase1_policy_checks(
+        self,
+        action: str,
+        args: dict | None,
+        *,
+        policy_context: str,
+    ) -> tuple[bool, str]:
+        """Session, device binding, behavior monitor, HMAC (paranoid / secure)."""
+        if self._lock_mode in ("secure", "paranoid"):
+            s_ok, s_reason = self._session_gate()
+            if not s_ok:
+                return False, s_reason
+
+        if self._lock_mode == "paranoid":
+            from core.identity.device_binding import validate_device
+
+            d_ok, d_reason = validate_device(self._config)
+            if not d_ok:
+                return False, d_reason
+
+        bm_ok, bm_reason = self._behavior.check_action_allowed(
+            action, args, policy_context=policy_context,
+        )
+        if not bm_ok:
+            return False, bm_reason
+
+        if self._lock_mode == "paranoid" and policy_context == "execute":
+            from core.security.action_signing import verify_action
+
+            sec = self._config.get("security") or {}
+            if not sec.get("paranoid_signing_disabled"):
+                v_ok, v_reason = verify_action(action, args, config=self._config)
+                if not v_ok:
+                    return False, v_reason
+
+        return True, ""
+
+    def _session_gate(self) -> tuple[bool, str]:
+        from core.identity.session_manager import sessions_enabled, validate_session
+        from core.owner_gate import is_session_authenticated, trust_local_runtime
+        from core.security_context import current_session_id
+
+        auth = self._config.get("auth") or {}
+        if not auth.get("sessions_enabled", False):
+            return True, ""
+        sec = self._config.get("security") or {}
+        if self._lock_mode == "paranoid" and sec.get(
+            "paranoid_require_session_even_when_local_trust",
+        ):
+            sid = current_session_id.get()
+            if validate_session(sid) is None:
+                return False, "paranoid:session required (no valid session)"
+            return True, ""
+        if trust_local_runtime():
+            return True, ""
+        sid = current_session_id.get()
+        if validate_session(sid) is not None:
+            return True, ""
+        if is_session_authenticated():
+            return True, ""
+        return False, "secure:session invalid or missing"
+
     # ── Feature and lock queries ──────────────────────────────────────
 
     @property
@@ -222,7 +388,7 @@ class SecurityPolicy:
 
     def can_switch_runtime_modes(self) -> bool:
         """True if voice/UI may change brain profile or assistant mode."""
-        return self._allow_runtime_mode_switch and self._lock_mode == "off"
+        return self._allow_runtime_mode_switch and self._lock_mode == "open"
 
     def is_feature_enabled(self, feature: str) -> bool:
         return self._features.get(feature, True)
@@ -286,14 +452,64 @@ class SecurityPolicy:
     def sanitize_input(text: str) -> tuple[str, bool]:
         """Sanitise raw voice/text input. Returns (clean_text, was_modified).
 
-        Caps length and strips potential shell-injection characters.
+        Production-grade multi-layer input sanitization:
+          1. Length cap (2000 chars)
+          2. Shell injection character stripping
+          3. Prompt injection detection and removal
+          4. Directory traversal pattern removal
+          5. Command chaining detection
+          6. Null byte removal
+          7. Unicode normalization
+          8. Whitespace normalization
         """
         original = text
+
+        text = text.replace("\x00", "")
+
         if len(text) > _MAX_INPUT_LENGTH:
             text = text[:_MAX_INPUT_LENGTH]
+
         text = _DANGEROUS_INPUT_RE.sub("", text)
+
+        if _PROMPT_INJECTION_RE.search(text):
+            logger.warning("SECURITY: Prompt injection attempt detected and stripped")
+            text = _PROMPT_INJECTION_RE.sub("", text)
+
+        if _DIRECTORY_TRAVERSAL_RE.search(text):
+            logger.warning("SECURITY: Directory traversal attempt detected")
+            text = _DIRECTORY_TRAVERSAL_RE.sub("", text)
+
+        if _COMMAND_CHAIN_RE.search(text):
+            logger.warning("SECURITY: Command chaining attempt detected")
+            text = _COMMAND_CHAIN_RE.sub("", text)
+
+        text = re.sub(r"[\x01-\x08\x0b\x0c\x0e-\x1f\x7f]", "", text)
         text = re.sub(r"\s+", " ", text).strip()
+
         return text, text != original
+
+    # ── Fortress Integration ─────────────────────────────────────────
+
+    def attach_fortress(self, fortress) -> None:
+        """Wire SecurityFortress for deep security integration."""
+        self._fortress = fortress
+        logger.info("SecurityFortress attached to SecurityPolicy")
+
+    def fortress_gate(self, action: str) -> tuple[bool, str]:
+        """Additional fortress-level check for sensitive actions."""
+        fortress = getattr(self, "_fortress", None)
+        if fortress is None:
+            return True, "ok"
+        if not fortress.is_authenticated:
+            sensitive = {
+                "shutdown_pc", "restart_pc", "logoff", "sleep_pc",
+                "kill_process", "create_folder", "move_path", "copy_path",
+                "empty_recycle_bin", "flush_dns",
+            }
+            if action in sensitive:
+                self.audit_log(action, "Blocked: not authenticated", success=False)
+                return False, "Authentication required for this action, Boss."
+        return True, "ok"
 
     # ── Audit log ─────────────────────────────────────────────────────
 

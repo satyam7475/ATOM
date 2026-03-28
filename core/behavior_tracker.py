@@ -1,5 +1,5 @@
 """
-ATOM v14 -- User Behavior Tracker with Habit Detection Engine.
+ATOM -- User Behavior Tracker with Habit Detection Engine.
 
 Logs timestamped user actions to logs/behavior.json and detects
 recurring patterns as "habits" with confidence scores.

@@ -34,6 +34,7 @@ import asyncio
 import logging
 import time
 from datetime import datetime
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -344,23 +345,16 @@ class HealthMonitor:
     # ── Context Snapshot ──────────────────────────────────────────────
 
     def _emit_context_snapshot(self) -> None:
-        """Emit current system context for the autonomy engine."""
-        now = datetime.now()
-        active_app = ""
-        try:
-            import sys
-            if sys.platform == "win32":
-                import ctypes
-                hwnd = ctypes.windll.user32.GetForegroundWindow()
-                length = ctypes.windll.user32.GetWindowTextLengthW(hwnd)
-                if length > 0:
-                    buf = ctypes.create_unicode_buffer(length + 1)
-                    ctypes.windll.user32.GetWindowTextW(hwnd, buf, length + 1)
-                    active_app = buf.value[:80]
-        except Exception:
-            pass
+        """Emit current system context for the autonomy engine.
 
+        v20: Caches ctypes/psutil references at module level to avoid
+        repeated imports on each cycle. Reuses buffer for window title.
+        """
+        now = datetime.now()
+        hour = now.hour
+        active_app = self._get_active_app()
         cpu = self._last_cpu
+
         ram = 0.0
         try:
             import psutil
@@ -368,17 +362,37 @@ class HealthMonitor:
         except Exception:
             pass
 
+        weekday = now.weekday()
         self._bus.emit_fast(
             "context_snapshot",
-            time_of_day=_time_of_day(now.hour),
-            hour=now.hour,
+            time_of_day=_time_of_day(hour),
+            hour=hour,
             cpu=cpu,
             ram=ram,
             idle_minutes=self.idle_minutes,
             active_app=active_app,
-            is_weekday=now.weekday() < 5,
-            weekday=now.weekday(),
+            is_weekday=weekday < 5,
+            weekday=weekday,
         )
+
+    @staticmethod
+    def _get_active_app() -> str:
+        """Get the foreground window title (Windows). Cached import."""
+        try:
+            import sys
+            if sys.platform != "win32":
+                return ""
+            import ctypes
+            user32 = ctypes.windll.user32
+            hwnd = user32.GetForegroundWindow()
+            length = user32.GetWindowTextLengthW(hwnd)
+            if length > 0:
+                buf = ctypes.create_unicode_buffer(length + 1)
+                user32.GetWindowTextW(hwnd, buf, length + 1)
+                return buf.value[:80]
+        except Exception:
+            pass
+        return ""
 
     # ── Subsystem Checks ─────────────────────────────────────────────
 
@@ -431,3 +445,16 @@ class HealthMonitor:
                     self._tts.refresh_output_device()
             except Exception as exc:
                 logger.debug("BT output check error: %s", exc)
+
+
+def compute_v65_health_score() -> dict:
+    """
+    Composite 0–10 health score from runtime telemetry + profiler latencies.
+
+    Safe to call from CLI or dashboards without running the audio stack.
+    """
+    from core.system_health_score import estimate_from_runtime_json
+
+    root = Path(__file__).resolve().parent.parent
+    runtime = root / "config" / "atom_runtime.json"
+    return estimate_from_runtime_json(runtime)

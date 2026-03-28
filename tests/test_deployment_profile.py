@@ -32,7 +32,7 @@ def test_audit_clean_baseline() -> None:
         },
         "vision": {"enabled": False},
         "brain": {"n_gpu_layers": 0},
-        "stt": {"engine": "vosk"},
+        "stt": {"engine": "faster_whisper"},
         "tts": {"engine": "sapi"},
         "security": {"mode": "strict"},
         "control": {"assistant_mode": "hybrid"},

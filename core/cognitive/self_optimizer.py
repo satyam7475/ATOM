@@ -1,5 +1,5 @@
 """
-ATOM v15 -- Self-Optimization Engine.
+ATOM -- Self-Optimization Engine.
 
 ATOM improves its own resource usage and capabilities over time:
   - Tracks module/feature usage frequency

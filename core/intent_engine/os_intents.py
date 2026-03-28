@@ -116,6 +116,103 @@ _SET_PERF_MODE = re.compile(
     r"(?P<mode>full(?:\s+performance)?|lite|ultra\s*lite)"
     r"(?:\s+mode)?\b", re.I)
 
+# ── Self-Healing Intents ─────────────────────────────────────────────
+
+_DIAGNOSE_FAILURE = re.compile(
+    r"\b(?:diagnos(?:e|tic)\s+(?:the\s+)?(?:last\s+)?(?:failure|error|crash|problem|issue|bug)|"
+    r"what\s+(?:went\s+wrong|failed|crashed|broke|is\s+broken)|"
+    r"show\s+(?:me\s+)?(?:the\s+)?(?:last\s+)?(?:error|failure|crash)|"
+    r"(?:any|show)\s+(?:errors?|failures?|crashes?|problems?|issues?|bugs?)|"
+    r"failure\s+(?:report|log|status|analysis)|"
+    r"error\s+(?:report|log|status)|"
+    r"what\s+(?:errors?|problems?)\s+(?:do\s+you\s+have|are\s+there))\b", re.I)
+
+_FIX_IT = re.compile(
+    r"\b(?:fix\s+it|fix\s+(?:the\s+)?(?:error|failure|problem|issue|bug|crash)|"
+    r"repair\s+(?:yourself|it|this|that)|"
+    r"heal\s+(?:yourself|it)|auto\s*fix|self\s*fix|"
+    r"fix\s+(?:yourself|atom)|apply\s+(?:the\s+)?fix|"
+    r"fix\s+all(?:\s+errors|\s+issues|\s+failures)?)\b", re.I)
+
+_FIX_ALL = re.compile(
+    r"\b(?:fix\s+all|repair\s+all|heal\s+all|fix\s+everything|"
+    r"auto\s*fix\s+all|self\s*heal)\b", re.I)
+
+_MODULE_HEALTH = re.compile(
+    r"\b(?:module\s+health|check\s+(?:all\s+)?modules?|"
+    r"module\s+status|are\s+(?:all\s+)?modules?\s+(?:working|ok|healthy)|"
+    r"which\s+modules?\s+(?:are\s+)?(?:broken|failing|down)|"
+    r"health\s+check\s+modules?)\b", re.I)
+
+# ── Code Introspection Intents ───────────────────────────────────────
+
+_READ_OWN_CODE = re.compile(
+    r"\b(?:read\s+(?:your\s+)?(?:own\s+)?(?:code|source|programming)|"
+    r"explain\s+(?:your\s+)?(?:own\s+)?(?:code|source|design|architecture|system)|"
+    r"(?:show|tell)\s+(?:me\s+)?(?:your\s+)?(?:architecture|design|structure|code\s+structure)|"
+    r"how\s+(?:are\s+you|do\s+you)\s+(?:built|designed|structured|programmed|coded)|"
+    r"analyze\s+(?:your\s+)?(?:own\s+)?(?:code|source|codebase)|"
+    r"introspect(?:\s+(?:your|the)\s+code)?|"
+    r"code\s+(?:health|quality|analysis)|"
+    r"scan\s+(?:your\s+)?(?:own\s+)?(?:code|source|files))\b", re.I)
+
+_EXPLAIN_MODULE = re.compile(
+    r"\b(?:explain|describe|what\s+(?:is|does))\s+(?:the\s+)?(?:module\s+)?(?P<module>\S+\.py)\b", re.I)
+
+_SEARCH_CODE = re.compile(
+    r"\b(?:search|find|look\s+for|grep)\s+(?:in\s+)?(?:(?:your|the|my)\s+)?(?:code|source)\s+(?:for\s+)?(?P<query>.+)\b", re.I)
+
+# ── Security Intents ─────────────────────────────────────────────────
+
+_SECURITY_STATUS = re.compile(
+    r"\b(?:security\s+(?:status|report|check|scan)|"
+    r"(?:how\s+)?(?:is|am)\s+(?:I|my\s+system)\s+(?:secure|safe|protected)|"
+    r"(?:check|show|tell)\s+(?:me\s+)?(?:the\s+)?security|"
+    r"(?:are|is)\s+(?:we|atom|everything)\s+secure|"
+    r"threat\s+(?:level|status|report)|"
+    r"integrity\s+(?:check|verify|scan))\b", re.I)
+
+_SECURITY_LOCKDOWN = re.compile(
+    r"\b(?:lock\s*down|lockdown|enter\s+(?:secure|lockdown)\s+mode|"
+    r"maximum\s+security|full\s+security)\b", re.I)
+
+# ── Voice Authentication Intents ─────────────────────────────────────
+
+_VOICE_ENROLL = re.compile(
+    r"\b(?:enroll\s+(?:my\s+)?voice|register\s+(?:my\s+)?voice|"
+    r"voice\s+(?:enrollment|registration|enroll|register)|"
+    r"learn\s+my\s+voice|save\s+my\s+voice(?:\s*print)?|"
+    r"record\s+(?:my\s+)?voice(?:\s*print)?|"
+    r"create\s+(?:my\s+)?voice\s*(?:profile|print)|"
+    r"set\s*up\s+voice\s+(?:auth|authentication|id|identity))\b", re.I)
+
+_VOICE_VERIFY = re.compile(
+    r"\b(?:verify\s+(?:my\s+)?(?:voice|identity)|"
+    r"authenticate\s+(?:me|my\s+voice)|"
+    r"voice\s+(?:verify|verification|authenticate|check)|"
+    r"(?:am\s+)?I\s+(?:the\s+)?(?:owner|verified)|"
+    r"who\s+am\s+I|confirm\s+(?:my\s+)?identity|"
+    r"(?:check|prove)\s+(?:my\s+)?identity|"
+    r"identify\s+me|voice\s+id)\b", re.I)
+
+_VOICE_AUTH_STATUS = re.compile(
+    r"\b(?:voice\s+(?:auth|authentication)\s+(?:status|info|report)|"
+    r"(?:my\s+)?voice\s*(?:print)?\s+status|"
+    r"(?:show|check)\s+voice\s+(?:profile|enrollment)|"
+    r"voice\s+(?:enrollment|profile)\s+(?:status|info))\b", re.I)
+
+_VOICE_RESET = re.compile(
+    r"\b(?:reset\s+(?:my\s+)?voice\s*(?:print|enrollment|profile)?|"
+    r"clear\s+(?:my\s+)?voice\s*(?:print|enrollment|profile)?|"
+    r"delete\s+(?:my\s+)?voice\s*(?:print|enrollment|profile)?|"
+    r"remove\s+voice\s+(?:auth|authentication|enrollment))\b", re.I)
+
+_BEHAVIOR_AUTH_STATUS = re.compile(
+    r"\b(?:behavior(?:al)?\s+(?:auth|authentication|trust|status|report)|"
+    r"trust\s+(?:score|level|status)|"
+    r"(?:am\s+I|is\s+(?:my\s+)?behavior)\s+(?:normal|trusted)|"
+    r"anomaly\s+(?:score|report|status|check))\b", re.I)
+
 
 def _parse_duration(amount_str: str, unit_str: str) -> int:
     amount = int(amount_str)
@@ -137,6 +234,59 @@ def check_self_check(text: str) -> IntentResult | None:
 def check(text: str) -> IntentResult | None:
     if _SELF_CHECK.search(text):
         return IntentResult("self_check", action="self_check", action_args={})
+
+    # ── Self-healing intents (high priority) ──
+    if _FIX_ALL.search(text):
+        return IntentResult("fix_all", action="fix_all", action_args={})
+
+    if _FIX_IT.search(text):
+        return IntentResult("fix_it", action="fix_it", action_args={})
+
+    if _DIAGNOSE_FAILURE.search(text):
+        return IntentResult("diagnose_failure", action="diagnose_failure", action_args={})
+
+    if _MODULE_HEALTH.search(text):
+        return IntentResult("module_health", action="module_health", action_args={})
+
+    # ── Code introspection intents ──
+    m = _EXPLAIN_MODULE.search(text)
+    if m:
+        module = m.group("module").strip()
+        return IntentResult("explain_module", action="explain_module",
+                            action_args={"module": module})
+
+    m = _SEARCH_CODE.search(text)
+    if m:
+        query = m.group("query").strip()
+        return IntentResult("search_code", action="search_code",
+                            action_args={"query": query})
+
+    if _READ_OWN_CODE.search(text):
+        return IntentResult("read_own_code", action="read_own_code", action_args={})
+
+    # ── Security intents ──
+    if _SECURITY_LOCKDOWN.search(text):
+        return IntentResult("security_lockdown", action="security_lockdown", action_args={})
+
+    if _SECURITY_STATUS.search(text):
+        return IntentResult("security_status", action="security_status", action_args={})
+
+    # ── Voice authentication intents ──
+    if _VOICE_ENROLL.search(text):
+        return IntentResult("voice_enroll", action="voice_enroll", action_args={})
+
+    if _VOICE_VERIFY.search(text):
+        return IntentResult("voice_verify", action="voice_verify", action_args={})
+
+    if _VOICE_RESET.search(text):
+        return IntentResult("voice_reset", action="voice_reset", action_args={})
+
+    if _VOICE_AUTH_STATUS.search(text):
+        return IntentResult("voice_auth_status", action="voice_auth_status", action_args={})
+
+    if _BEHAVIOR_AUTH_STATUS.search(text):
+        return IntentResult("behavior_auth_status", action="behavior_auth_status",
+                            action_args={})
 
     m = _SET_PERF_MODE.search(text)
     if m:

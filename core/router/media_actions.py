@@ -1,5 +1,5 @@
 """
-ATOM v14 -- Media and volume action handlers.
+ATOM -- Media and volume action handlers.
 
 Handles: set_volume, mute/unmute, play/pause, play_youtube
 """

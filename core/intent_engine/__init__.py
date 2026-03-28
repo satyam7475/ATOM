@@ -17,9 +17,6 @@ import time
 from .base import (
     IntentResult,
     GRAMMAR_WORDS,
-    GREETING_REPLIES,
-    THANKS_REPLIES,
-    STATUS_REPLIES,
     get_grammar_json,
 )
 from .app_intents import APP_MAP, CLOSE_MAP
@@ -35,6 +32,7 @@ from . import (
     os_intents,
     cognitive_intents,
     runtime_mode_intents,
+    world_intents,
 )
 
 logger = logging.getLogger("atom.intent")
@@ -43,9 +41,6 @@ __all__ = [
     "IntentEngine",
     "IntentResult",
     "GRAMMAR_WORDS",
-    "GREETING_REPLIES",
-    "THANKS_REPLIES",
-    "STATUS_REPLIES",
     "get_grammar_json",
     "APP_MAP",
     "CLOSE_MAP",
@@ -84,6 +79,7 @@ class IntentEngine:
             or runtime_mode_intents.check(text)
             or os_intents.check_self_check(text)
             or info_intents.check(text)
+            or world_intents.check(text)
             or system_intents.check(text)
             or media_intents.check(text)
             or desktop_intents.check(text)

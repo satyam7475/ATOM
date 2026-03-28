@@ -1,5 +1,5 @@
 """
-ATOM v14 -- Lightweight structured metrics collector.
+ATOM -- Lightweight structured metrics collector.
 
 Tracks counters, latencies, and uptime for production observability.
 Periodic health log emits a one-line JSON summary every 60 seconds
@@ -58,12 +58,21 @@ class MetricsCollector:
         self._llm_latencies: deque[float] = deque(maxlen=MAX_LATENCY_SAMPLES)
         self._stt_confidences: deque[float] = deque(maxlen=MAX_LATENCY_SAMPLES)
         self._pipeline_latencies: dict[str, deque[float]] = {}
-        self._gauges: dict[str, int] = {"scheduler_queue_depth": 0}
+        self._gauges: dict[str, float] = {
+            "scheduler_queue_depth": 0,
+            "vram_used_mb": 0.0,
+            "gpu_util_pct": 0.0,
+            "gpu_sched_queue_depth": 0.0,
+        }
 
-    def set_gauge(self, name: str, value: int) -> None:
-        """Set an integer gauge (e.g. scheduler queue depth). Thread-safe."""
+    def set_gauge(self, name: str, value: int | float) -> None:
+        """Set a gauge (e.g. scheduler queue depth, VRAM MB). Thread-safe."""
         with self._lock:
-            self._gauges[name] = max(0, int(value))
+            v = float(value)
+            if name == "scheduler_queue_depth" or name.endswith("_depth"):
+                self._gauges[name] = max(0.0, v)
+            else:
+                self._gauges[name] = max(0.0, v)
 
     def inc(self, counter: str, amount: int = 1) -> None:
         """Increment a named counter. Thread-safe."""
@@ -97,6 +106,9 @@ class MetricsCollector:
             llm_lats = list(self._llm_latencies)
             stt_confs = list(self._stt_confidences)
             sched_depth = int(self._gauges.get("scheduler_queue_depth", 0))
+            vram_mb = float(self._gauges.get("vram_used_mb", 0.0))
+            gpu_u = float(self._gauges.get("gpu_util_pct", 0.0))
+            gpu_q = float(self._gauges.get("gpu_sched_queue_depth", 0.0))
             pipeline_snap = {
                 k: list(v) for k, v in self._pipeline_latencies.items()
             }
@@ -127,6 +139,9 @@ class MetricsCollector:
             "watchdog_recoveries": self.watchdog_recoveries,
             "scheduler_jobs_submitted": self.scheduler_jobs_submitted,
             "scheduler_queue_depth": sched_depth,
+            "vram_used_mb": round(vram_mb, 1),
+            "gpu_util_pct": round(gpu_u, 1),
+            "gpu_sched_queue_depth": int(gpu_q),
         }
 
         for name, samples in pipeline_snap.items():
@@ -164,3 +179,16 @@ def log_health(collector: MetricsCollector) -> None:
     """Write a single-line JSON health snapshot to the metrics log."""
     snap = collector.snapshot()
     _get_metrics_logger().info(json.dumps(snap, separators=(",", ":")))
+
+
+_metrics_instance: MetricsCollector | None = None
+_metrics_singleton_lock = Lock()
+
+
+def get_metrics() -> MetricsCollector:
+    """Process-wide metrics singleton (profiler, workers, orchestrator)."""
+    global _metrics_instance
+    with _metrics_singleton_lock:
+        if _metrics_instance is None:
+            _metrics_instance = MetricsCollector()
+        return _metrics_instance

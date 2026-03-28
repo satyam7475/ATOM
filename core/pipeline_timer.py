@@ -1,5 +1,5 @@
 """
-ATOM v14 -- End-to-end pipeline latency tracker.
+ATOM -- End-to-end pipeline latency tracker.
 
 Tracks timing across the full voice command pipeline:
     speech_final -> intent -> router -> action -> tts_start

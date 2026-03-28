@@ -48,10 +48,10 @@ def audit_corporate_alignment(config: dict[str, Any]) -> list[str]:
         )
 
     stt = config.get("stt", {}) or {}
-    eng = (stt.get("engine") or "vosk").lower()
-    if eng == "google":
+    eng = (stt.get("engine") or "faster_whisper").lower()
+    if eng != "faster_whisper":
         warnings.append(
-            "stt.engine is google — audio leaves the machine; use vosk for offline corporate use.",
+            f"stt.engine is {eng} — only faster_whisper is supported.",
         )
 
     tts = config.get("tts", {}) or {}

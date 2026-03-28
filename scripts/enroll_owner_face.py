@@ -1,5 +1,5 @@
 """
-ATOM v13 -- One-time enrollment: capture owner face and save encoding.
+ATOM -- One-time enrollment: capture owner face and save encoding.
 
 Run this script to create config/owner_face.npy so ATOM can recognize you (Satyam).
 Requires: pip install opencv-python face_recognition numpy

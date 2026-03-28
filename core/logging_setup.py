@@ -1,5 +1,5 @@
 """
-ATOM v14 -- Centralized logging configuration.
+ATOM -- Centralized logging configuration.
 
 Provides a single entry point for setting up structured logging
 across all ATOM modules.

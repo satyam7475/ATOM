@@ -7,7 +7,7 @@ from __future__ import annotations
 import re
 import urllib.parse
 
-from core import personality
+from core import adaptive_personality as personality
 from .base import IntentResult
 
 _OPEN_APP = re.compile(

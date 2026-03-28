@@ -16,7 +16,7 @@
 | `features.file_ops` | **`true`** | Create/move/copy paths allowed per policy + paths. |
 | `features.llm` | **`true`** | LLM routing enabled (cloud off — see below). |
 | `features.system_analyze` | **`true`** | System analysis intents enabled. |
-| `ai.enabled` | `false` | No Gemini traffic; keys not required on laptop. |
+| Cloud AI | Not used | ATOM is fully offline — no cloud API keys. |
 | `brain.enabled` | `true` | Local **Llama-3.2-3B-Instruct-Q4_K_M** GGUF, **CPU** (`n_gpu_layers: 0`). |
 | `control.assistant_mode` | `hybrid` | Commands + open queries can hit **local** brain. |
 | `control.lock_mode` | `off` | Runtime brain/assistant switches allowed (dashboard/voice). |
@@ -82,7 +82,7 @@ Use this table during testing; append notes and pass/fail.
 
 | Layer | Role |
 |--------|------|
-| `main.py` | Loads env from `%USERPROFILE%\.atom\env` / `ATOM_ENV_FILE` (no repo `.env` by default), validates config, wires bus, router, brain, UI, cognitive. |
+| `main.py` | Validates config, wires bus, router, brain, UI, cognitive. |
 | `core/security_policy.py` | Single gate: `allow_action`, path/shell/hotkey helpers, audit. |
 | `core/router/router.py` | Intent → action dispatch with security checks. |
 | `ui/web_dashboard.py` | Localhost-only bind, CSP headers, WS origin check. |

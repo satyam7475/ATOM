@@ -1,5 +1,5 @@
 """
-ATOM v14 -- Context Engine with privacy filtering.
+ATOM -- Context Engine with privacy filtering.
 
 Gathers environment context (active window, clipboard, CWD, timestamp)
 using Windows API via ctypes. Zero external dependencies.

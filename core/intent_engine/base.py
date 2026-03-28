@@ -29,31 +29,9 @@ def clean_slot(value: str | None) -> str:
     return v
 
 
-GREETING_REPLIES = [
-    "Hey boss! What can I do for you?",
-    "Hello! Ready when you are.",
-    "Hi! What are we working on?",
-    "Hey! I'm listening.",
-    "Hello boss! Fire away.",
-]
-
-THANKS_REPLIES = [
-    "Anytime, boss!",
-    "Happy to help!",
-    "You're welcome!",
-    "No problem!",
-    "Glad I could help!",
-]
-
-STATUS_REPLIES = [
-    "I'm here, boss! Ready to go.",
-    "Yes, I'm listening! What do you need?",
-    "Right here! How can I help?",
-    "Active and ready, boss!",
-]
 
 
-# ── Grammar vocabulary for Vosk constrained recognizer ───────────────
+# ── Command vocabulary for intent matching ────────────────────────────
 
 GRAMMAR_WORDS: list[str] = sorted(set([
     "atom", "hey", "boss", "buddy",
@@ -122,5 +100,5 @@ GRAMMAR_WORDS: list[str] = sorted(set([
 
 
 def get_grammar_json() -> str:
-    """Return JSON string of grammar words for Vosk KaldiRecognizer."""
+    """Return JSON string of recognized command vocabulary."""
     return json.dumps(GRAMMAR_WORDS)

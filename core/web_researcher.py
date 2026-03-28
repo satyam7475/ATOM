@@ -1,5 +1,5 @@
 """
-ATOM v14 -- Web Research Agent (AI OS Intelligence Service).
+ATOM -- Web Research Agent (AI OS Intelligence Service).
 
 Enables ATOM to search the public web for information:
   - DuckDuckGo Instant Answer API (no API key needed)

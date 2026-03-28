@@ -1,5 +1,5 @@
 """
-ATOM v14 -- Central command registry.
+ATOM -- Central command registry.
 
 Loads command definitions from config/commands.json and provides
 a runtime lookup API for the router.

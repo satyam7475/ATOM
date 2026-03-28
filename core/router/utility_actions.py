@@ -1,5 +1,5 @@
 """
-ATOM v14 -- Utility action handlers.
+ATOM -- Utility action handlers.
 
 Handles: minimize_window, maximize_window, switch_window,
          read_clipboard, timer

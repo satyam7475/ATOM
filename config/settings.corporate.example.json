@@ -27,8 +27,9 @@
         "prefer_bluetooth": true
     },
     "stt": {
-        "engine": "vosk",
-        "vosk_model_path": "models/vosk-model-small-en-us-0.15",
+        "engine": "faster_whisper",
+        "whisper_model_size": "small",
+        "bilingual": true,
         "sample_rate": 16000,
         "chunk_size": 2048,
         "post_tts_cooldown_ms": 800,
@@ -60,7 +61,7 @@
     },
     "brain": {
         "enabled": true,
-        "model_path": "models/Llama-3.2-3B-Instruct-Q4_K_M.gguf",
+        "model_path": "models/qwen3-8b-q4_k_m.gguf",
         "n_ctx": 2048,
         "n_threads": 8,
         "n_gpu_layers": 0,

@@ -1,5 +1,5 @@
 """
-ATOM v15 -- Named skills with optional multi-step chaining.
+ATOM -- Named skills with optional multi-step chaining.
 
 Loads `config/skills.json`. Case-insensitive trigger matching; first match
 wins. When a skill has a `chain` list, those extra utterances are returned

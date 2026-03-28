@@ -1,0 +1,107 @@
+# =============================================================================
+# ATOM — Personal desktop install (canonical dependency set)
+# =============================================================================
+#
+# Use this file on your own machine when you are ready to run ATOM fully
+# (voice, optional local LLM, dashboard, RAG). It mirrors requirements.txt;
+# keep both files aligned when you bump versions.
+#
+# Python: 3.11+ (64-bit recommended)
+#
+# Install (from the ATOM directory, in a virtual environment):
+#   python -m venv .venv
+#   .venv\Scripts\activate          # Windows
+#   # source .venv/bin/activate     # Linux/macOS
+#   python -m pip install --upgrade pip
+#   pip install -r requirements-desktop.txt
+#
+# Notes:
+# - llama-cpp-python may need a prebuilt wheel for your CUDA/CPU; see PyPI / docs.
+# - Some packages are Windows-oriented (winsdk, comtypes); adjust on Linux/macOS.
+# - Dev-only tools: see requirements-dev.txt (pytest, etc.).
+#
+# =============================================================================
+
+# ATOM v18+ -- Pinned dependencies (JARVIS-Level Upgrade)
+# Python 3.11+
+#
+# Regenerate after upgrading:
+#   pip freeze --local | findstr /i "speech numpy comtypes edge-tts pygame psutil keyboard jsonschema aiohttp truststore mss pillow llama-cpp cffi pyaudio sentence-transformers chromadb easyocr openwakeword pymupdf python-docx pynvml faster-whisper kokoro-tts sounddevice winsdk pyzmq"
+
+# ─── Core (required for default run) ─────────────────────────────────────
+# Voice: STT (faster-whisper offline -- primary, Vosk -- legacy, Google -- fallback)
+faster-whisper==1.2.1
+kokoro-tts==2.3.0
+sounddevice==0.5.1
+winsdk==1.0.0.post10
+pyzmq==26.0.3
+
+SpeechRecognition==3.14.6
+PyAudio==0.2.14
+cffi==2.0.0
+
+# Audio pipeline (Edge TTS postprocess, resampling, emotion analysis)
+numpy==2.4.3
+
+# TTS: SAPI fallback
+comtypes==1.4.15
+
+# TTS: Edge Neural (primary)
+edge-tts==7.2.7
+pygame==2.6.1
+
+# System monitoring
+psutil==7.2.2
+
+# Global hotkey Ctrl+Alt+A
+keyboard==0.13.5
+
+# Config validation (optional at runtime; basic validation used if missing)
+jsonschema==4.26.0
+
+# Web dashboard
+aiohttp==3.13.3
+
+# Corporate SSL (Windows certificate store)
+truststore==0.10.4
+
+# Desktop capture (screenshot intent, automation)
+mss==10.1.0
+Pillow==12.1.1
+
+# ─── Local LLM Brain (brain.enabled=true) ──────────────────────────────────
+# Requires a C++ compiler (Visual Studio Build Tools) or a pre-built wheel.
+# After install, place GGUF model in models/ and set brain.model_path in settings.json.
+llama-cpp-python==0.3.2
+
+# ─── v18: Semantic Memory (embedding + vector store) ───────────────────────
+# Embedding engine for semantic search (CPU, ~260MB model)
+sentence-transformers>=3.0.0
+
+# Persistent vector database (ChromaDB backend)
+# Falls back to in-memory JSON store if not installed
+chromadb>=0.5.0
+
+# ─── v18: Document Ingestion (RAG pipeline) ───────────────────────────────
+# PDF text extraction
+PyMuPDF>=1.24.0
+
+# DOCX text extraction
+python-docx>=1.1.0
+
+# ─── v18: Perception Upgrade ──────────────────────────────────────────────
+# Wake word detection ("Hey ATOM")
+# Optional: falls back to always-listen if not installed
+# openwakeword>=0.6.0
+
+# Screen OCR (local text extraction from screenshots)
+# Optional: falls back to clipboard + window title if not installed
+# easyocr>=1.7.0
+
+# ─── v18: GPU Monitoring ──────────────────────────────────────────────────
+# NVIDIA GPU telemetry (temperature, VRAM, utilization)
+# Optional: GPU governor degrades gracefully without it
+# pynvml>=12.0.0
+
+# ─── Optional: install only if you use the feature ─────────────────────────
+# soxr>=0.3.0         # Optional: better audio resample quality

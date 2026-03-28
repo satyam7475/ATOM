@@ -1,14 +1,18 @@
 """
-ATOM OS -- Instant Brain Router.
+ATOM -- Intelligent Router (Agentic 3-Layer Architecture).
 
-Architecture (3-layer intelligence):
-    Layer 1: Intent Engine (<5ms, regex, handles 80-90%)
-    Layer 2: Cache (instant, Jaccard similarity) + Memory (keyword overlap)
-    Layer 3: Local LLM (offline GGUF via llama.cpp)
+Refactoring:
+    - ConfirmationManager extracted to confirmation_manager.py
+    - DiagnosticsHandler extracted to diagnostics_handler.py
+    - Uses adaptive_personality instead of static personality
+    - Integrates ContextFusionEngine for action logging
 
-Security: Every sensitive action goes through SecurityPolicy.allow_action
-before dispatch.  Feature flags and lock-mode are also enforced here.
+Architecture:
+    Layer 1: Intent Engine (<5ms, regex fast-path for obvious commands)
+    Layer 2: Cache (LRU + Jaccard) + Memory (keyword overlap)
+    Layer 3: LLM Reasoning Agent (tool-use, ReAct loop, multi-step plans)
 
+Fully offline. Security-gated. Every action goes through SecurityPolicy.
 Action execution is delegated to focused sub-modules:
     system_actions, app_actions, media_actions, network_actions,
     utility_actions, file_actions
@@ -22,9 +26,11 @@ import re
 import time
 from typing import TYPE_CHECKING, Any
 
-from core import personality
+from core import adaptive_personality as personality
 from core.command_cache import get_command_cache
 from core.process_manager import ProcessManager
+from core.router.confirmation_manager import ConfirmationManager
+from core.router.diagnostics_handler import DiagnosticsHandler
 from core.security_policy import SecurityPolicy
 from . import (
     app_actions,
@@ -124,12 +130,14 @@ def compress_query(text: str) -> str:
 
 
 class Router:
-    """Instant Brain Router with 3-layer intelligence.
+    """Intelligent Router with agentic 3-layer architecture.
 
     Priority:
-        1. Intent Engine (instant, offline, handles 80-90%)
+        1. Intent Engine (<5ms, regex fast-path for obvious commands)
         2. Cache + Memory (instant, repeated/similar queries)
-        3. Local LLM (offline, private)
+        3. LLM Reasoning Agent (tool-use, ReAct loop, 1-4s)
+
+    The LLM is the true brain. IntentEngine is a speed optimization.
     """
 
     _INFO_INTENTS = frozenset({
@@ -157,6 +165,7 @@ class Router:
         assistant_mode_manager: Any | None = None,
         skills_registry: Any | None = None,
         conversation_memory: Any | None = None,
+        timeline_memory: Any | None = None,
     ) -> None:
         self._bus = bus
         self._state = state
@@ -170,19 +179,38 @@ class Router:
         self._brain_mode_mgr = brain_mode_manager
         self._assistant_mode_mgr = assistant_mode_manager
         self._processing_lock = asyncio.Lock()
-        self._pending_action: dict | None = None
         self._local_queries = 0
         self._llm_queries = 0
         self._last_entity: str = ""
         self._recent_queries: list[tuple[str, float]] = []
         self._conversation_window: list[tuple[str, str]] = []
-        self._conv_window_max = 5
+        self._conv_window_max = 20
         self._scheduler = scheduler
         self._process_mgr = process_mgr or ProcessManager()
         self._evolution = evolution
         self._behavior_tracker = behavior_tracker
         self._skills = skills_registry
         self._conv_memory = conversation_memory
+        self._timeline = timeline_memory
+
+        # Extracted modules
+        self._confirmation = ConfirmationManager(self._security)
+        self._diagnostics = DiagnosticsHandler(self._config)
+
+        from core.reasoning.action_executor import ActionExecutor
+        self._action_executor = ActionExecutor(
+            dispatch_fn=self._dispatch_action,
+            timeline=timeline_memory,
+            security=self._security,
+        )
+        self._code_sandbox = None
+        logger.info("ActionExecutor initialized with %d registered tools",
+                     self._action_executor.get_stats()["registered_tools"])
+
+    @property
+    def action_executor(self):
+        """Expose the ActionExecutor for wiring to LocalBrainController."""
+        return self._action_executor
 
     async def on_speech(self, text: str, **_kw) -> None:
         if self._processing_lock.locked():
@@ -211,6 +239,15 @@ class Router:
         clean_text = compress_query(text)
         if not clean_text:
             return
+
+        if self._timeline is not None:
+            try:
+                self._timeline.append_event(
+                    "user_query",
+                    {"text": clean_text[:2000], "source": "router"},
+                )
+            except Exception:
+                pass
 
         if self._conv_memory is not None:
             self._conv_memory.on_new_user_query(clean_text)
@@ -242,7 +279,7 @@ class Router:
                 bundle = self._context.get_bundle()
                 clip = (bundle or {}).get("clipboard", "")
                 if clip and len(clip) < 1000:
-                    clip = self._security.sanitize_input(clip)
+                    clip, _ = self._security.sanitize_input(clip)
                     text = f"{text}\n\nReferenced content: {clip}"
                     clipboard_injected = True
                     logger.info("Clipboard injected (%d chars)", len(clip))
@@ -312,25 +349,21 @@ class Router:
 
             if result.intent == "go_silent":
                 self._bus.emit_long("response_ready",
-                                    text=result.response or "Going quiet, Boss.",
+                                    text=result.response or personality.silent_response(),
                                     is_sleep=True)
                 return
 
             if result.intent == "exit":
                 self._bus.emit_long("response_ready",
-                                    text=result.response or "Goodbye!",
+                                    text=result.response or personality.exit_response(),
                                     is_exit=True)
                 return
 
             if result.action:
                 self._local_queries += 1
                 self._bus.emit_fast("metrics_event", counter="local_routed_queries")
-                if self._requires_confirmation(result):
-                    self._pending_action = {
-                        "result": result,
-                        "created_at": time.monotonic(),
-                    }
-                    prompt = self._build_confirmation_prompt(result)
+                if self._confirmation.requires_confirmation(result):
+                    prompt = self._confirmation.set_pending_action(result)
                     self._bus.emit_long("response_ready", text=prompt)
                     return
                 await self._execute_action(result)
@@ -362,69 +395,31 @@ class Router:
                                             clipboard_injected=clipboard_injected)
             return
 
-    # ── Confirmation flow ───────────────────────────────────────────────
+    # ── Confirmation flow (delegated to ConfirmationManager) ───────────
 
     async def _handle_confirmation(self, confirm_intent: str) -> None:
-        if self._pending_action is None:
-            if confirm_intent == "confirm":
-                self._bus.emit_long("response_ready",
-                               text="Nothing pending right now, boss.")
-            else:
-                self._bus.emit_long("response_ready", text="Okay boss.")
-            return
-        age = time.monotonic() - float(
-            self._pending_action.get("created_at", 0))
-        if age > 25:
-            self._pending_action = None
-            self._bus.emit_long("response_ready",
-                           text="Pending action timed out. "
-                                "Please say it again.")
-            return
-        if confirm_intent == "deny":
-            self._pending_action = None
-            self._bus.emit_long("response_ready",
-                           text="Okay boss, cancelled.")
-            return
-        result = self._pending_action.get("result")
-        self._pending_action = None
-        if result is not None:
-            await self._execute_action(result)
+        """Resolve pending confirmations via the extracted ConfirmationManager."""
+        outcome = self._confirmation.handle(confirm_intent)
 
-    def _requires_confirmation(self, result) -> bool:
-        if self._security.requires_extra_confirmation(result.action):
-            return True
-        from core.command_registry import get_registry
-        registry = get_registry()
-        if registry.count > 0:
-            return registry.requires_confirmation(result.action)
-        return result.action in {
-            "play_youtube", "create_folder", "move_path", "copy_path",
-            "close_app", "shutdown_pc", "restart_pc", "logoff",
-            "sleep_pc", "empty_recycle_bin", "kill_process",
-            "type_text",
-        }
+        if outcome.response:
+            self._bus.emit_long("response_ready", text=outcome.response)
 
-    @staticmethod
-    def _build_confirmation_prompt(result) -> str:
-        args = result.action_args or {}
-        action_details = {
-            "play_youtube": args.get("query", "music"),
-            "create_folder": args.get("name", "this folder"),
-            "close_app": args.get("name", "this app"),
-            "shutdown_pc": "shutdown",
-            "restart_pc": "restart",
-            "logoff": "log off",
-            "sleep_pc": "sleep",
-            "empty_recycle_bin": "empty recycle bin",
-            "kill_process": args.get("name", "process"),
-            "open_url": args.get("url", "link")[:120],
-            "lock_screen": "lock screen",
-            "screenshot": "screenshot",
-            "move_path": str(args.get("src", "item"))[:80],
-            "copy_path": str(args.get("src", "item"))[:80],
-        }
-        detail = action_details.get(result.action, "")
-        return personality.confirmation_prompt(result.action, detail)
+        if outcome.action_result is not None:
+            await self._execute_action(outcome.action_result)
+        elif outcome.tool_call is not None:
+            tool_call = outcome.tool_call
+            try:
+                result = self._dispatch_action(
+                    tool_call.name, dict(tool_call.arguments),
+                )
+                response = result or personality.action_done(tool_call.name)
+                self._bus.emit_long("response_ready", text=response)
+            except Exception as exc:
+                logger.error("Confirmed tool execution failed: %s", exc)
+                self._bus.emit_long(
+                    "response_ready",
+                    text=personality.error_response(tool_call.name),
+                )
 
     # ── Intent chaining (post-action follow-ups) ───────────────────────
     _CHAIN_MAP: dict[str, str | dict[str, str]] = {
@@ -462,7 +457,11 @@ class Router:
     # ── Action dispatcher ───────────────────────────────────────────────
 
     async def _execute_action(self, result) -> None:
+        from core.execution.behavior_monitor import strip_signing_keys
+        from core.security.action_signing import merge_signed_args
+
         args = result.action_args or {}
+        args = merge_signed_args(self._security, result.action, args)
 
         allowed, reason = self._security.allow_action(result.action, args)
         if not allowed:
@@ -471,28 +470,31 @@ class Router:
                                 text=f"Sorry Boss, that action is blocked. {reason}")
             return
 
-        self._security.audit_log(result.action,
-                                 f"args={args}" if args else "")
+        self._security.audit_log(
+            result.action,
+            f"args={strip_signing_keys(args)}" if args else "",
+        )
 
         response_text = result.response or personality.action_done(result.action)
+        dispatch_args = strip_signing_keys(args)
 
         if result.action in self._FIRE_AND_FORGET_ACTIONS:
             self._bus.emit_long("response_ready", text=response_text)
             try:
-                self._dispatch_action(result.action, args)
+                self._dispatch_action(result.action, dispatch_args)
             except Exception as exc:
                 logger.error("Background action failed: %s", exc)
-            self._emit_chain_suggestion(result.action, args)
+            self._emit_chain_suggestion(result.action, dispatch_args)
             return
 
         if result.action in self._SLOW_ACTIONS:
             self._bus.emit_long("thinking_ack", text="On it, Boss.")
 
         try:
-            response = self._dispatch_action(result.action, args)
+            response = self._dispatch_action(result.action, dispatch_args)
             if response is not None:
                 self._bus.emit_long("response_ready", text=response)
-                self._emit_chain_suggestion(result.action, args)
+                self._emit_chain_suggestion(result.action, dispatch_args)
                 return
         except Exception as exc:
             logger.error("Action failed: %s", exc)
@@ -501,22 +503,31 @@ class Router:
             return
 
         self._bus.emit_long("response_ready", text=response_text)
-        self._emit_chain_suggestion(result.action, args)
+        self._emit_chain_suggestion(result.action, dispatch_args)
 
     async def _run_skill_chain(self, chain: list[str]) -> None:
         """Execute remaining steps of a multi-step skill sequentially."""
         import asyncio
+        from core.execution.behavior_monitor import strip_signing_keys
+        from core.security.action_signing import merge_signed_args
+
         for step_text in chain:
             await asyncio.sleep(0.8)
             step_result = self._intent.classify(step_text)
             if step_result.action:
-                allowed, _ = self._security.allow_action(
-                    step_result.action, step_result.action_args or {},
+                sargs = merge_signed_args(
+                    self._security,
+                    step_result.action,
+                    step_result.action_args or {},
                 )
+                allowed, _ = self._security.allow_action(step_result.action, sargs)
                 if allowed:
                     logger.info("Skill chain step: '%s' -> %s", step_text[:60], step_result.intent)
                     try:
-                        self._dispatch_action(step_result.action, step_result.action_args or {})
+                        self._dispatch_action(
+                            step_result.action,
+                            strip_signing_keys(sargs),
+                        )
                     except Exception as exc:
                         logger.warning("Skill chain step failed: %s", exc)
 
@@ -737,20 +748,10 @@ class Router:
         return research_topic(topic)
 
     def _do_behavior_report(self, _action: str, _args: dict) -> str:
-        from core.behavior_tracker import BehaviorTracker
-        tracker = getattr(self, "_behavior_tracker", None)
-        if tracker is None:
-            return "Behavior tracker is not active, Boss."
-        suggestions = tracker.predict()
-        tracker.persist()
-        if not suggestions:
-            return "No clear usage patterns yet, Boss. Keep using me and I'll learn your habits."
-        return "Here are your patterns, Boss. " + " ".join(suggestions)
+        return self._diagnostics.behavior_report()
 
     def _do_self_diagnostic(self, _action: str, _args: dict) -> str:
-        if self._evolution is None:
-            return "Self-evolution engine is not active."
-        return self._evolution.format_diagnostic()
+        return self._diagnostics.self_diagnostic()
 
     # ── Desktop control actions ────────────────────────────────────
 
@@ -787,66 +788,21 @@ class Router:
     def _do_system_analyze(self, _action: str, _args: dict) -> str:
         return self._process_mgr.get_full_system_report()
 
-    # ── ATOM self-check diagnostics ────────────────────────────────
+    # ── ATOM self-check diagnostics (delegated) ─────────────────────
 
     def configure_diagnostics(self, *, stt=None, tts=None,
                                metrics=None,
                                local_brain=None,
                                health_monitor=None) -> None:
-        self._diag_stt = stt
-        self._diag_tts = tts
-        self._diag_metrics = metrics
-        self._diag_local_brain = local_brain
-        self._diag_health_monitor = health_monitor
+        self._diagnostics.configure(
+            stt=stt, tts=tts, metrics=metrics,
+            local_brain=local_brain, health_monitor=health_monitor,
+            evolution=self._evolution,
+            behavior_tracker=self._behavior_tracker,
+        )
 
     def _do_self_check(self, _action: str, _args: dict) -> str:
-        checks_ok = 0
-        checks_total = 0
-
-        checks_total += 1
-        stt = getattr(self, "_diag_stt", None)
-        mic_ok = bool(stt and getattr(stt, "mic_name", None))
-        if mic_ok:
-            checks_ok += 1
-
-        checks_total += 1
-        tts = getattr(self, "_diag_tts", None)
-        tts_ok = bool(tts)
-        if tts_ok:
-            checks_ok += 1
-
-        checks_total += 1
-        lb = getattr(self, "_diag_local_brain", None)
-        brain_ok = bool(lb and getattr(lb, "available", False))
-        if brain_ok:
-            checks_ok += 1
-
-        cpu_val, ram_val = 0.0, 0.0
-        checks_total += 1
-        try:
-            import psutil
-            cpu_val = psutil.cpu_percent(interval=0.1)
-            ram_val = psutil.virtual_memory().percent
-            checks_ok += 1
-        except Exception:
-            pass
-
-        perf_mode = self._config.get("performance", {}).get("mode", "full")
-
-        if checks_ok == checks_total:
-            return (f"All systems green, Boss. "
-                    f"CPU {cpu_val:.0f}%, RAM {ram_val:.0f}%. "
-                    f"Mic, TTS, and brain are online. Mode: {perf_mode}.")
-        issues = []
-        if not mic_ok:
-            issues.append("mic")
-        if not tts_ok:
-            issues.append("TTS")
-        if not brain_ok:
-            issues.append("brain")
-        return (f"{checks_ok} of {checks_total} systems ok. "
-                f"Issues: {', '.join(issues)}. "
-                f"CPU {cpu_val:.0f}%, RAM {ram_val:.0f}%. Mode: {perf_mode}.")
+        return self._diagnostics.self_check()
 
     def _do_set_performance_mode(self, _action: str, args: dict) -> str:
         mode = args.get("mode", "lite")
@@ -933,22 +889,135 @@ class Router:
         "set_performance_mode": _do_set_performance_mode,
         "set_brain_profile": _do_set_brain_profile,
         "set_assistant_mode": _do_set_assistant_mode,
+        "remember": _do_remember,
+        "recall": _do_recall,
+        "learn_document": _do_learn_document,
+        "run_code": _do_run_code,
+        "calculate": _do_calculate,
+        "record_workflow": _do_record_workflow,
+        "stop_recording": _do_stop_recording,
+        "run_workflow": _do_run_workflow,
+        "list_workflows": _do_list_workflows,
+        "screen_read": _do_screen_read,
+        "show_dream_summary": _do_show_dream_summary,
+        "set_goal": _do_set_goal,
+        "show_goals": _do_show_goals,
     }
 
-    # ── Screen analysis ──────────────────────────────────────────────
+    # ── Reasoning Engine actions ───────────────────────────────────────
+
+    def _do_remember(self, _action: str, args: dict) -> str:
+        fact = args.get("fact", "")
+        if not fact:
+            return "What should I remember, Boss?"
+        self._bus.emit_fast("brain_remember_request", fact=fact)
+        return f"Got it, Boss. I'll remember that: {fact[:100]}"
+
+    def _do_recall(self, _action: str, args: dict) -> str:
+        query = args.get("query", "")
+        if not query:
+            return "What should I recall, Boss?"
+        self._bus.emit_fast("brain_recall_request", query=query)
+        return ""
+
+    def _do_learn_document(self, _action: str, args: dict) -> str:
+        path = args.get("path", "")
+        if not path:
+            return "Which document should I learn from, Boss?"
+        self._bus.emit_fast("document_ingest_request", path=path)
+        return f"I'll start learning from that document, Boss."
+
+    def _get_sandbox(self):
+        if self._code_sandbox is None:
+            from core.reasoning.code_sandbox import CodeSandbox
+            self._code_sandbox = CodeSandbox(self._config)
+        return self._code_sandbox
+
+    def _do_run_code(self, _action: str, args: dict) -> str:
+        code = args.get("code", args.get("expression", ""))
+        if not code:
+            return "What should I calculate or run, Boss?"
+        try:
+            result = self._get_sandbox().execute(code)
+            if result["success"]:
+                return f"Result: {result['result']}"
+            return f"Couldn't compute that: {result['error']}"
+        except Exception as e:
+            return f"Calculation error: {str(e)[:100]}"
+
+    def _do_calculate(self, _action: str, args: dict) -> str:
+        expr = args.get("expression", "")
+        if not expr:
+            return "What should I calculate, Boss?"
+        try:
+            return self._get_sandbox().evaluate_math(expr)
+        except Exception as e:
+            return f"Calculation error: {str(e)[:100]}"
+
+    def _do_record_workflow(self, _action: str, args: dict) -> str:
+        name = args.get("name", "")
+        self._bus.emit_fast("workflow_start_recording", name=name)
+        return f"Recording workflow '{name or 'unnamed'}'. I'll capture your actions."
+
+    def _do_stop_recording(self, _action: str, _args: dict) -> str:
+        self._bus.emit_fast("workflow_stop_recording")
+        return "Workflow recording stopped."
+
+    def _do_run_workflow(self, _action: str, args: dict) -> str:
+        name = args.get("name", "")
+        if not name:
+            return "Which workflow should I run, Boss?"
+        self._bus.emit_fast("workflow_replay_request", name=name)
+        return f"Running workflow '{name}'."
+
+    def _do_list_workflows(self, _action: str, _args: dict) -> str:
+        self._bus.emit_fast("workflow_list_request")
+        return ""
+
+    def _do_screen_read(self, _action: str, _args: dict) -> str:
+        self._bus.emit_fast("screen_read_request")
+        return "Reading your screen, Boss."
+
+    def _do_show_dream_summary(self, _action: str, _args: dict) -> str:
+        self._bus.emit_fast("dream_summary_request")
+        return ""
+
+    def _do_set_goal(self, _action: str, args: dict) -> str:
+        title = args.get("title", "")
+        if not title:
+            return "What goal should I set, Boss?"
+        self._bus.emit_fast("intent_classified", intent="goal_create",
+                            action_args={"title": title})
+        return ""
+
+    def _do_show_goals(self, _action: str, _args: dict) -> str:
+        self._bus.emit_fast("intent_classified", intent="goal_show",
+                            action_args={})
+        return ""
+
+    # ── Screen analysis (with OCR) ─────────────────────────────────────
 
     async def _handle_screen_analyze(self, args: dict) -> None:
-        """Screen vision was cloud-based; offline ATOM uses screenshot + local Q&A instead."""
+        """Screen analysis via local OCR."""
         _q = args.get("question", "")
-        self._bus.emit_long(
-            "response_ready",
-            text=(
-                "Boss, live screen vision needs a cloud model — removed for offline ATOM. "
-                "Say **take a screenshot** to save the screen, then ask me about the file, "
-                "or paste text into the clipboard and ask."
-                + (f" (You asked: {_q[:80]})" if _q else "")
-            ),
-        )
+        try:
+            from context.screen_reader import ScreenReader
+            reader = ScreenReader(self._config)
+            summary = reader.get_screen_summary()
+            if _q:
+                full_text = f"You asked: {_q}. {summary}"
+            else:
+                full_text = summary
+            self._bus.emit_long("response_ready", text=full_text)
+        except Exception:
+            self._bus.emit_long(
+                "response_ready",
+                text=(
+                    "Screen reading isn't fully available yet, Boss. "
+                    "Say 'take a screenshot' or paste text to the clipboard."
+                    + (f" You asked: {_q[:80]}" if _q else "")
+                ),
+            )
 
     # ── LLM fallback ────────────────────────────────────────────────
 

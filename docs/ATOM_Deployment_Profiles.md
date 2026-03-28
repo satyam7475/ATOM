@@ -11,7 +11,7 @@ Use this doc to keep **ATOM aligned** with where you run it today (corporate tes
 ### Policy & hygiene (non-config)
 
 - Follow your org’s rules on **local AI**, **microphone/camera**, and **code on the laptop** (MDM, DLP, acceptable use).
-- Keep **secrets out of `config/settings.json`**. ATOM does **not** load a project `.env` by default (avoids accidental sync/commit). Use **Windows User env vars**, **`%USERPROFILE%\.atom\env`**, or **`ATOM_ENV_FILE`** — see **`.env.example`** in the repo. Prefer **no cloud keys** on the work machine.
+- Keep **secrets out of `config/settings.json`**. ATOM is fully offline and requires no cloud API keys.
 - Store the ATOM repo in an **approved location** (e.g. user profile, not synced public folders if policy forbids).
 - Treat the web dashboard as **localhost-only** (already bound to `127.0.0.1`) — still only as private as the Windows user session.
 
@@ -28,8 +28,7 @@ See **[ATOM_Corporate_Evolution.md](ATOM_Corporate_Evolution.md)** for the full 
 
 | Area | Suggestion | Why |
 |------|------------|-----|
-| `ai.enabled` | `false` | No corporate data to Gemini/other clouds unless explicitly approved. |
-| `groq.api_key` | Empty; use User env / `.atom\env` only if approved | Same as above. |
+| Cloud AI | Not used | ATOM is fully offline — no cloud API keys needed. |
 | `brain.enabled` | `true` with **small** GGUF (e.g. 3B Q4) | Local-only reasoning; fits CPU testing. |
 | `brain.n_gpu_layers` | `0` | No CUDA dependency on locked-down laptops. |
 | `brain.n_threads` | Match **physical** cores − 1 | Leaves headroom for OS + Teams/Edge. |
@@ -45,10 +44,10 @@ See **[ATOM_Corporate_Evolution.md](ATOM_Corporate_Evolution.md)** for the full 
 | Mode | What you get |
 |------|----------------|
 | **`command_only`** | Voice/UI still run **intents** (time, cpu, open app, etc.). **No** “open conversation” path to the LLM for vague questions — least risk of accidental dictation or sensitive context going to a model. |
-| **`hybrid`** | Commands stay fast; **unmatched / chatty** queries can go to the **local brain** (and cloud only if you enable it). **Use this to test ATOM properly** on a laptop when `ai.enabled` is `false` — you still exercise routing + local LLM. |
+| **`hybrid`** | Commands stay fast; **unmatched / chatty** queries go to the **local brain**. **Use this to test ATOM properly** on a laptop — you exercise routing + local LLM. |
 | **`conversational`** | More chat-oriented behavior (where implemented). |
 
-**For you (proper testing on company laptop):** keep **`hybrid`** with **`ai.enabled: false`** so you test full behavior using the **local** brain only.
+**For you (proper testing on company laptop):** keep **`hybrid`** to test full behavior using the **local** brain.
 
 ### §1b — `autonomy`: off vs high threshold (company laptop)
 
@@ -65,7 +64,7 @@ See **[ATOM_Corporate_Evolution.md](ATOM_Corporate_Evolution.md)** for the full 
 - **`control.assistant_mode`**: `hybrid`  
 - **`autonomy`**: `enabled: true`, `auto_execute_threshold: 0.95`, `suggest_threshold: 0.72`  
 - **`security.mode`**: `strict`  
-- **Secrets**: User env or `%USERPROFILE%\.atom\env` — no `.env` in the repo folder.
+- **Secrets**: ATOM is fully offline — no cloud API keys needed.
 
 ### Optional: two copies of config
 

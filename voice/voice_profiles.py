@@ -1,5 +1,5 @@
 """
-ATOM v14 -- Voice emotion profiles for Edge Neural TTS.
+ATOM -- Voice emotion profiles for Edge Neural TTS.
 
 Tuned for en-GB-RyanNeural (British male) to achieve a Vision/JARVIS hybrid:
   - Vision: calm, measured, empathetic warmth, deeper pitch

@@ -1,5 +1,5 @@
 """
-ATOM v15 -- Predictive Action Engine.
+ATOM -- Predictive Action Engine.
 
 Predicts the user's next action BEFORE they speak, using:
   1. Time-slot frequency (action counts per hour-of-day)

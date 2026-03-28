@@ -1,1 +1,1 @@
-from . import personality
+from . import adaptive_personality as personality

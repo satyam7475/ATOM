@@ -1,5 +1,5 @@
 """
-ATOM v14 -- Network and web action handlers.
+ATOM -- Network and web action handlers.
 
 Handles: open_url, weather, search
 """

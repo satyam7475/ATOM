@@ -1,18 +1,24 @@
-# ATOM v15 -- Pinned dependencies
+# ATOM v18 -- Pinned dependencies (JARVIS-Level Upgrade)
 # Python 3.11+
 #
+# Personal desktop: use requirements-desktop.txt (same pins + install header).
+#
 # Regenerate after upgrading:
-#   pip freeze --local | findstr /i "vosk speech numpy comtypes edge-tts pygame psutil keyboard jsonschema aiohttp truststore mss pillow llama-cpp cffi pyaudio"
+#   pip freeze --local | findstr /i "speech numpy comtypes edge-tts pygame psutil keyboard jsonschema aiohttp truststore mss pillow llama-cpp cffi pyaudio sentence-transformers chromadb easyocr openwakeword pymupdf python-docx pynvml faster-whisper kokoro-tts sounddevice winsdk pyzmq"
 
 # ─── Core (required for default run) ─────────────────────────────────────
 # Voice: STT (faster-whisper offline -- primary, Vosk -- legacy, Google -- fallback)
 faster-whisper==1.2.1
-vosk==0.3.45
+kokoro-tts==2.3.0
+sounddevice==0.5.1
+winsdk==1.0.0.post10
+pyzmq==26.0.3
+
 SpeechRecognition==3.14.6
 PyAudio==0.2.14
 cffi==2.0.0
 
-# Audio pipeline (Edge TTS postprocess, resampling)
+# Audio pipeline (Edge TTS postprocess, resampling, emotion analysis)
 numpy==2.4.3
 
 # TTS: SAPI fallback
@@ -45,6 +51,35 @@ Pillow==12.1.1
 # Requires a C++ compiler (Visual Studio Build Tools) or a pre-built wheel.
 # After install, place GGUF model in models/ and set brain.model_path in settings.json.
 llama-cpp-python==0.3.2
+
+# ─── v18: Semantic Memory (embedding + vector store) ───────────────────────
+# Embedding engine for semantic search (CPU, ~260MB model)
+sentence-transformers>=3.0.0
+
+# Persistent vector database (ChromaDB backend)
+# Falls back to in-memory JSON store if not installed
+chromadb>=0.5.0
+
+# ─── v18: Document Ingestion (RAG pipeline) ───────────────────────────────
+# PDF text extraction
+PyMuPDF>=1.24.0
+
+# DOCX text extraction
+python-docx>=1.1.0
+
+# ─── v18: Perception Upgrade ──────────────────────────────────────────────
+# Wake word detection ("Hey ATOM")
+# Optional: falls back to always-listen if not installed
+# openwakeword>=0.6.0
+
+# Screen OCR (local text extraction from screenshots)
+# Optional: falls back to clipboard + window title if not installed
+# easyocr>=1.7.0
+
+# ─── v18: GPU Monitoring ──────────────────────────────────────────────────
+# NVIDIA GPU telemetry (temperature, VRAM, utilization)
+# Optional: GPU governor degrades gracefully without it
+# pynvml>=12.0.0
 
 # ─── Optional: install only if you use the feature ─────────────────────────
 # soxr>=0.3.0         # Optional: better audio resample quality

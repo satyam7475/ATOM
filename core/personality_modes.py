@@ -1,5 +1,5 @@
 """
-ATOM v15 -- Multi-Mode Personality System.
+ATOM -- Multi-Mode Personality System.
 
 Four operational modes that change ATOM's entire behavior:
 
@@ -166,7 +166,13 @@ class PersonalityModes:
             self._queued_suggestions.clear()
 
         logger.info("Mode switched: %s -> %s", old, mode)
-        return f"Switched to {mode} mode, Boss."
+        _MODE_MESSAGES = {
+            "work": "Work mode, Boss. Let's get productive. I'll be sharp and efficient.",
+            "focus": "Focus mode activated, Boss. I'll keep quiet unless it's urgent. Deep work time.",
+            "chill": "Chill mode, Boss. We're taking it easy. I'm here for whatever, no pressure.",
+            "sleep": "Sleep mode, Boss. I'll be silent. Only emergencies will reach you. Rest well.",
+        }
+        return _MODE_MESSAGES.get(mode, f"Switched to {mode} mode, Boss.")
 
     async def _on_energy_state(self, energy: str = "", **_kw: Any) -> None:
         """Auto-suggest mode changes based on energy state."""

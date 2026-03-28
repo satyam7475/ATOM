@@ -1,5 +1,5 @@
 """
-ATOM v14 -- JARVIS-style Web Dashboard.
+ATOM -- JARVIS-style Web Dashboard.
 
 Replaces the Tkinter UI with a browser-based dashboard served over
 aiohttp (HTTP + WebSocket).  The dashboard features a Three.js animated
@@ -20,7 +20,7 @@ import sys
 import time
 import webbrowser
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Awaitable, Callable
+from typing import TYPE_CHECKING, Any, Awaitable, Callable, Optional
 
 from aiohttp import web
 
@@ -49,7 +49,9 @@ class WebDashboard:
         mic_name: str = "Detecting...",
         port: int = 8765,
         auto_open: bool = True,
+        config: dict | None = None,
     ) -> None:
+        self._config = dict(config or {})
         self._mic_name = mic_name
         self._port = port
         self._auto_open = auto_open
@@ -75,6 +77,7 @@ class WebDashboard:
         self._last_latency_ms: float | None = None
         self._activity_log: list[dict] = []
         self._conv_log: list[dict] = []
+        self._v7_health_provider: Optional[Callable[[], dict[str, Any]]] = None
 
     # ── Security ──────────────────────────────────────────────────────
 
@@ -100,7 +103,9 @@ class WebDashboard:
     async def start(self) -> None:
         self._app = web.Application(middlewares=[self._security_headers])
         self._app.router.add_get("/ws", self._ws_handler)
+        self._app.router.add_post("/api/auth/session", self._api_auth_session)
         self._app.router.add_get("/", self._serve_dashboard)
+        self._app.router.add_get("/v7/health", self._v7_health)
         self._app.router.add_static("/static", _DASHBOARD_DIR, show_index=False)
 
         self._runner = web.AppRunner(self._app, access_log=None)
@@ -143,9 +148,50 @@ class WebDashboard:
     async def _serve_dashboard(self, request: web.Request) -> web.FileResponse:
         return web.FileResponse(_DASHBOARD_DIR / "index.html")
 
+    async def _v7_health(self, request: web.Request) -> web.StreamResponse:
+        if self._v7_health_provider is None:
+            return web.json_response({"error": "v7_health_unavailable"}, status=503)
+        try:
+            payload = self._v7_health_provider()
+            return web.json_response(payload)
+        except Exception as e:
+            logger.warning("v7 health handler failed: %s", e)
+            return web.json_response({"error": "v7_health_failed"}, status=500)
+
+    def set_v7_health_provider(self, provider: Callable[[], dict[str, Any]]) -> None:
+        """Callable returns JSON-serializable dict (health + metrics + warnings + snapshot)."""
+        self._v7_health_provider = provider
+
+    async def _api_auth_session(self, request: web.Request) -> web.StreamResponse:
+        """Mint a session after dashboard token validation."""
+        try:
+            data = await request.json()
+        except Exception:
+            return web.json_response({"error": "invalid_json"}, status=400)
+        token = (data.get("token") or "").strip()
+        from core.owner_gate import dashboard_token_expected, validate_dashboard_token
+        from core.identity.session_manager import create_session, sessions_enabled
+
+        if not sessions_enabled():
+            return web.json_response({"error": "sessions_disabled"}, status=400)
+        if dashboard_token_expected() and not validate_dashboard_token(token):
+            return web.json_response({"error": "unauthorized"}, status=401)
+        sess = create_session()
+        if sess is None:
+            return web.json_response({"error": "session_unavailable"}, status=500)
+        resp = web.json_response({
+            "session_id": sess.id,
+            "expires_at": sess.expires_at,
+        })
+        resp.set_cookie(
+            "ATOM_SESSION", sess.id, httponly=True, samesite="Lax", path="/",
+        )
+        return resp
+
     # ── WebSocket ───────────────────────────────────────────────────
 
     async def _ws_handler(self, request: web.Request) -> web.WebSocketResponse:
+        bound_session_id: str | None = None
         origin = request.headers.get("Origin", "")
         if origin:
             from urllib.parse import urlparse
@@ -153,12 +199,67 @@ class WebDashboard:
             host = parsed.hostname or ""
             if host not in ("127.0.0.1", "localhost", "::1"):
                 raise web.HTTPForbidden(text="WebSocket connections from external origins are blocked")
+
+        try:
+            from core.owner_gate import (
+                dashboard_token_expected,
+                mark_session_authenticated,
+                validate_dashboard_token,
+            )
+            from core.identity.session_manager import (
+                create_session,
+                sessions_enabled,
+                validate_session,
+            )
+            from core.security_context import current_session_id
+
+            token = (
+                request.query.get("token")
+                or request.headers.get("X-ATOM-Token", "")
+                or ""
+            )
+            sid = (
+                request.query.get("session_id")
+                or request.headers.get("X-ATOM-Session", "")
+                or request.cookies.get("ATOM_SESSION", "")
+                or ""
+            ).strip()
+
+            if dashboard_token_expected():
+                if not validate_dashboard_token(token):
+                    logger.warning("Dashboard WebSocket rejected: invalid or missing token")
+                    raise web.HTTPForbidden(
+                        text="Dashboard access token required (query ?token= or X-ATOM-Token).",
+                    )
+
+            if sessions_enabled():
+                sess = validate_session(sid) if sid else None
+                if sess is None:
+                    sess = create_session()
+                if sess is None:
+                    logger.warning("Dashboard WebSocket: could not create session")
+                    raise web.HTTPForbidden(text="Session unavailable.")
+                current_session_id.set(sess.id)
+                bound_session_id = sess.id
+                mark_session_authenticated(True)
+            else:
+                mark_session_authenticated(True)
+        except web.HTTPException:
+            raise
+        except Exception:
+            logger.debug("owner_gate WebSocket check", exc_info=True)
+            try:
+                from core.owner_gate import mark_session_authenticated as _mark_ok
+                _mark_ok(True)
+            except Exception:
+                pass
+
         ws = web.WebSocketResponse(heartbeat=15.0)
         await ws.prepare(request)
         self._clients.add(ws)
         logger.info("Dashboard client connected (%d total)", len(self._clients))
 
-        await self._send_one(ws, {
+        init_payload: dict[str, Any] = {
             "type": "init",
             **self._init_info,
             "mic": self._mic_name,
@@ -169,7 +270,10 @@ class WebDashboard:
             "last_intent": self._last_intent,
             "last_latency_ms": self._last_latency_ms,
             **STATE_META.get(self._current_state, {}),
-        })
+        }
+        if bound_session_id:
+            init_payload["session_id"] = bound_session_id
+        await self._send_one(ws, init_payload)
 
         for entry in self._activity_log[-50:]:
             await self._send_one(ws, {**entry, "type": "activity"})
@@ -250,6 +354,18 @@ class WebDashboard:
         except Exception:
             pass
         finally:
+            auth_cfg = self._config.get("auth") or {}
+            if bound_session_id and auth_cfg.get("revoke_on_ws_close"):
+                try:
+                    from core.identity.session_manager import revoke_session
+                    revoke_session(bound_session_id)
+                except Exception:
+                    logger.debug("session revoke on ws close", exc_info=True)
+            try:
+                from core.security_context import current_session_id
+                current_session_id.set(None)
+            except Exception:
+                pass
             self._clients.discard(ws)
             logger.info("Dashboard client disconnected (%d remaining)",
                         len(self._clients))
@@ -307,6 +423,17 @@ class WebDashboard:
                 if battery:
                     payload["battery"] = round(battery.percent)
                     payload["charging"] = battery.power_plugged
+
+                try:
+                    from core.metrics import get_metrics
+                    snap = get_metrics().snapshot()
+                    payload["vram_used_mb"] = snap.get("vram_used_mb", 0)
+                    payload["gpu_util_pct"] = snap.get("gpu_util_pct", 0)
+                    payload["gpu_sched_queue_depth"] = snap.get(
+                        "gpu_sched_queue_depth", 0,
+                    )
+                except Exception:
+                    pass
 
                 await self._broadcast(payload)
             except Exception as exc:

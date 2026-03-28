@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-ATOM v15 -- End-to-end module timing benchmark (no full mic/TTS playback).
+ATOM -- End-to-end module timing benchmark (no full mic/TTS playback).
 
 Measures: config load, intent classification, memory recall, prompt build,
 local LLM inference for daily-work / buddy / learning style queries.
@@ -235,10 +235,10 @@ def main() -> int:
         results["edge_tts_first_chunk_ms"] = None
         results["edge_tts_note"] = str(e)[:120]
 
-    # 9) Documented STT reference (Vosk offline typical — from stt_async.py header)
     results["stt_reference"] = {
-        "engine_default": config.get("stt", {}).get("engine", "vosk"),
-        "typical_decode_ms_vosk_offline": "100-200 (codebase comment; varies with utterance length)",
+        "engine": "faster-whisper",
+        "model_size": config.get("stt", {}).get("whisper_model_size", "small"),
+        "typical_decode_ms": "300-500 (CPU int8), 100-200 (GPU float16)",
         "note": "Full mic→speech_final timing requires live run; see logs PIPELINE lines.",
     }
 

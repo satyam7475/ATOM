@@ -1,5 +1,5 @@
 """
-ATOM v14 -- Router package.
+ATOM -- Router package.
 
 Re-exports Router and compress_query for backward compatibility.
 """

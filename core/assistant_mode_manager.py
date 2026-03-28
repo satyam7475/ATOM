@@ -1,5 +1,5 @@
 """
-ATOM v15 -- Assistant mode (ATOM vs brain routing).
+ATOM -- Assistant mode (ATOM vs brain routing).
 
 Controls whether open-ended queries may invoke the LLM (hybrid / conversational)
 or are limited to commands + quick replies only (command_only).

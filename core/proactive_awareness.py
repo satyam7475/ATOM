@@ -1,5 +1,5 @@
 """
-ATOM v15 -- Proactive awareness engine.
+ATOM -- Proactive awareness engine.
 
 Generates *safe*, *dismissible* hints based on local-only signals:
   - Time-of-day greetings ("Good morning, Boss")

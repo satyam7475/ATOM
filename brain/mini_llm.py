@@ -1,13 +1,21 @@
 """
-ATOM v16 -- Offline LLM Brain (Local GGUF Inference).
+ATOM -- Offline LLM Brain (GPU-Accelerated Single-Model Inference).
 
-Wraps llama-cpp-python. Supports dual-model routing:
-  - 1B model (~750MB): fast casual queries, greetings, simple facts
-  - 3B model (~1.9GB): complex reasoning, explanations, technical queries
+Wraps llama-cpp-python with a single GGUF model fully offloaded to GPU.
 
-Loads lazily; supports BrainModeManager profiles (ATOM / balanced / brain)
-with hot-reload when model path or n_ctx changes.
+Recommended model: Qwen3-8B-Q4_K_M (~5GB, 32K context, native tool calling)
+
+Architecture:
+  - n_gpu_layers=-1 (full GPU offload) -- inference 1-4s
+  - n_batch=512 (GPU handles larger batches efficiently)
+  - n_ctx=8192 (or up to 32768 for Qwen3) -- deep conversation memory
+  - KV cache persistence for system prompt (saves ~200-400ms per query)
+  - True token streaming callback support for real-time sentence emission
+  - BrainModeManager profiles (ATOM / balanced / brain) with hot-reload
+
 Inference runs in a ThreadPoolExecutor; load/unload guarded by a lock.
+
+Owner: Satyam
 """
 
 from __future__ import annotations
@@ -19,7 +27,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Callable
 
 logger = logging.getLogger("atom.brain")
 
@@ -35,42 +43,38 @@ except ImportError:
 
 
 class MiniLLM:
-    """Lazy-loading offline LLM wrapper using llama.cpp."""
+    """Lazy-loading offline LLM wrapper using llama.cpp with full GPU offload."""
 
     def __init__(self, config: dict) -> None:
         self._config = config
         brain_cfg = config.get("brain", {})
         self._model_path = str(Path(brain_cfg.get(
             "model_path",
-            "models/Llama-3.2-3B-Instruct-Q4_K_M.gguf",
+            "models/qwen3-8b-q4_k_m.gguf",
         )))
-        self._model_path_1b = str(Path(brain_cfg.get(
-            "model_path_1b",
-            "models/Llama-3.2-1B-Instruct-Q4_K_M.gguf",
-        )))
-        self._dual_model = brain_cfg.get("dual_model", False)
-        self._n_ctx = brain_cfg.get("n_ctx", 2048)
+        self._n_ctx = brain_cfg.get("n_ctx", 8192)
         self._n_threads = brain_cfg.get(
             "n_threads", max(2, (os.cpu_count() or 4) // 2),
         )
-        self._n_gpu_layers = brain_cfg.get("n_gpu_layers", 0)
-        self._max_tokens = brain_cfg.get("max_tokens", 150)
-        self._temperature = brain_cfg.get("temperature", 0.4)
-        self._timeout = brain_cfg.get("timeout_seconds", 20)
+        self._n_gpu_layers = brain_cfg.get("n_gpu_layers", -1)
+        self._n_batch = brain_cfg.get("n_batch", 512)
+        self._max_tokens = brain_cfg.get("max_tokens", 512)
+        self._temperature = brain_cfg.get("temperature", 0.7)
+        self._top_p = brain_cfg.get("top_p", 0.9)
+        self._repeat_penalty = brain_cfg.get("repeat_penalty", 1.1)
+        self._timeout = brain_cfg.get("timeout_seconds", 30)
 
         self._llm: Llama | None = None
-        self._llm_1b: Llama | None = None
         self._load_failed = False
-        self._load_failed_1b = False
         self._loaded = False
-        self._loaded_1b = False
         self._fingerprint: tuple[str, int, int] | None = None
-        self._fingerprint_1b: tuple[str, int, int] | None = None
         self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="llm")
         self._load_lock = threading.RLock()
         self._brain_mode_mgr: BrainModeManager | None = None
         self._abort_generation: int = 0
-        self._active_model: str = "3b"
+
+        self._kv_cache_state: Any | None = None
+        self._kv_cache_prompt_hash: int | None = None
 
     def set_brain_mode_manager(self, mgr: "BrainModeManager | None") -> None:
         self._brain_mode_mgr = mgr
@@ -100,8 +104,11 @@ class MiniLLM:
             "n_ctx": self._n_ctx,
             "n_threads": self._n_threads,
             "n_gpu_layers": self._n_gpu_layers,
+            "n_batch": self._n_batch,
             "max_tokens": self._max_tokens,
             "temperature": self._temperature,
+            "top_p": self._top_p,
+            "repeat_penalty": self._repeat_penalty,
             "timeout_seconds": self._timeout,
             "extra_stop_sequences": [],
             "profile": "default",
@@ -114,6 +121,7 @@ class MiniLLM:
             self._llm = None
             self._loaded = False
             self._fingerprint = None
+            self._invalidate_kv_cache()
 
     def _ensure_loaded(self) -> bool:
         if not _HAS_LLAMA:
@@ -135,101 +143,119 @@ class MiniLLM:
             self._load_failed = False
             try:
                 t0 = time.monotonic()
+                gpu_layers = eff.get("n_gpu_layers", -1)
+                batch_size = eff.get("n_batch", 512)
                 logger.info(
-                    "Loading local LLM profile=%s path=%s ctx=%d threads=%d",
-                    eff.get("profile"), model_file.name, eff["n_ctx"], eff["n_threads"],
+                    "Loading LLM profile=%s path=%s ctx=%d threads=%d gpu_layers=%s batch=%d",
+                    eff.get("profile"), model_file.name, eff["n_ctx"],
+                    eff["n_threads"], gpu_layers, batch_size,
                 )
                 self._llm = Llama(
                     model_path=str(model_file),
                     n_ctx=eff["n_ctx"],
                     n_threads=eff["n_threads"],
-                    n_gpu_layers=eff["n_gpu_layers"],
-                    n_batch=256,
+                    n_gpu_layers=gpu_layers,
+                    n_batch=batch_size,
                     verbose=False,
                 )
                 self._fingerprint = fp
                 self._loaded = True
                 elapsed = (time.monotonic() - t0) * 1000
-                logger.info("Local LLM loaded in %.0fms", elapsed)
+                logger.info("LLM loaded in %.0fms (GPU layers=%s)", elapsed, gpu_layers)
                 return True
             except Exception:
-                logger.exception("Failed to load local LLM")
+                logger.exception("Failed to load LLM")
                 self._load_failed = True
                 return False
 
     def preload(self) -> bool:
-        ok = self._ensure_loaded()
-        if self._dual_model:
-            self._ensure_loaded_1b()
-        return ok
-
-    def _ensure_loaded_1b(self) -> bool:
-        """Load the 1B model for fast casual queries."""
-        if not _HAS_LLAMA:
-            return False
-        model_file = Path(self._model_path_1b)
-        if not model_file.is_file():
-            logger.info("1B model not found at '%s' -- using 3B only", self._model_path_1b)
-            self._load_failed_1b = True
-            return False
-
-        n_ctx_1b = 1024
-        n_threads_1b = max(2, self._n_threads // 2)
-        fp = (str(model_file), n_ctx_1b, n_threads_1b)
-
-        with self._load_lock:
-            if self._llm_1b is not None and self._fingerprint_1b == fp:
-                return True
-            if self._load_failed_1b:
-                return False
-            try:
-                t0 = time.monotonic()
-                logger.info("Loading 1B model path=%s ctx=%d threads=%d",
-                            model_file.name, n_ctx_1b, n_threads_1b)
-                self._llm_1b = Llama(
-                    model_path=str(model_file),
-                    n_ctx=n_ctx_1b,
-                    n_threads=n_threads_1b,
-                    n_gpu_layers=0,
-                    n_batch=256,
-                    verbose=False,
-                )
-                self._fingerprint_1b = fp
-                self._loaded_1b = True
-                elapsed = (time.monotonic() - t0) * 1000
-                logger.info("1B model loaded in %.0fms", elapsed)
-                return True
-            except Exception:
-                logger.exception("Failed to load 1B model")
-                self._load_failed_1b = True
-                return False
-
-    @property
-    def is_1b_available(self) -> bool:
-        return self._loaded_1b and self._llm_1b is not None
+        return self._ensure_loaded()
 
     def request_abort_preempt(self) -> None:
         """Invalidate the current streaming generation (user spoke again or barge-in)."""
         self._abort_generation += 1
 
-    def _generate_sync(self, prompt: str) -> tuple[str, bool]:
-        """Returns (text, preempted). Preempted generations discard partial output."""
+    # ── KV Cache Persistence ──────────────────────────────────────────
+
+    def save_kv_cache(self, system_prompt_hash: int) -> None:
+        """Save the KV cache state after processing the system prompt.
+
+        On subsequent queries, we can restore this state and skip
+        re-processing the system prompt tokens (~200-400ms savings).
+        """
+        if self._llm is None:
+            return
+        try:
+            self._kv_cache_state = self._llm.save_state()
+            self._kv_cache_prompt_hash = system_prompt_hash
+            logger.debug("KV cache saved (prompt_hash=%d)", system_prompt_hash)
+        except Exception:
+            logger.debug("KV cache save failed", exc_info=True)
+            self._kv_cache_state = None
+            self._kv_cache_prompt_hash = None
+
+    def restore_kv_cache(self, system_prompt_hash: int) -> bool:
+        """Restore cached KV state if the system prompt hash matches.
+
+        Returns True if cache was restored, False if a full re-process is needed.
+        """
+        if (
+            self._llm is None
+            or self._kv_cache_state is None
+            or self._kv_cache_prompt_hash != system_prompt_hash
+        ):
+            return False
+        try:
+            self._llm.load_state(self._kv_cache_state)
+            logger.debug("KV cache restored (prompt_hash=%d)", system_prompt_hash)
+            return True
+        except Exception:
+            logger.debug("KV cache restore failed", exc_info=True)
+            self._invalidate_kv_cache()
+            return False
+
+    def _invalidate_kv_cache(self) -> None:
+        """Discard cached KV state (model change, prompt change, etc.)."""
+        self._kv_cache_state = None
+        self._kv_cache_prompt_hash = None
+
+    # ── Streaming Inference ───────────────────────────────────────────
+
+    def _generate_sync_streaming(
+        self,
+        prompt: str,
+        on_token: Callable[[str, bool], None] | None = None,
+    ) -> tuple[str, bool]:
+        """Generate with true token-by-token streaming.
+
+        Args:
+            prompt: The full prompt string.
+            on_token: Callback fired for each token. Signature: (token_text, is_done).
+                      Called from the inference thread. The caller is responsible for
+                      thread-safe emission to the event bus.
+
+        Returns:
+            (full_text, preempted) — preempted is True if generation was aborted.
+        """
         eff = self._effective_inference()
         self._timeout = eff["timeout_seconds"]
         if not self._ensure_loaded() or self._llm is None:
             return "", False
-        self._active_model = "3b"
+
         my_gen = self._abort_generation
-        base_stops = ["</s>", "\n\n\n", "<|eot_id|>", "<|end|>"]
+        base_stops = ["</s>", "\n\n\n", "<|eot_id|>", "<|end|>",
+                       "<|im_end|>", "<|endoftext|>"]
         extra = eff.get("extra_stop_sequences") or []
         stop = base_stops + [s for s in extra if s and len(s) < 80][:16]
+
         t0 = time.perf_counter()
         try:
             stream = self._llm(
                 prompt,
                 max_tokens=eff["max_tokens"],
                 temperature=eff["temperature"],
-                top_p=0.9,
+                top_p=eff.get("top_p", 0.9),
+                repeat_penalty=eff.get("repeat_penalty", 1.1),
                 stop=stop,
                 echo=False,
                 stream=True,
@@ -238,102 +264,64 @@ class MiniLLM:
             for chunk in stream:
                 if self._abort_generation != my_gen:
                     elapsed_ms = (time.perf_counter() - t0) * 1000
-                    logger.info(
-                        "Local LLM [%s]: preempted after %.0fms",
-                        eff.get("profile"),
-                        elapsed_ms,
-                    )
+                    logger.info("LLM [%s]: preempted after %.0fms",
+                                eff.get("profile"), elapsed_ms)
+                    if on_token:
+                        on_token("", True)
                     return "", True
+
                 choices = chunk.get("choices") if isinstance(chunk, dict) else None
                 if not choices:
                     continue
                 delta = choices[0].get("text") or ""
                 if delta:
                     parts.append(delta)
+                    if on_token:
+                        on_token(delta, False)
+
+            if on_token:
+                on_token("", True)
+
             text = "".join(parts).strip()
             elapsed_ms = (time.perf_counter() - t0) * 1000
-            tokens_generated = max(0, len(text.split()))
+            tokens_generated = len(parts)
             tps = tokens_generated / (elapsed_ms / 1000) if elapsed_ms > 0 else 0
             logger.info(
-                "Local LLM [%s]: %.0fms, ~%d words, %.1f tok/s",
-                eff.get("profile"), elapsed_ms, tokens_generated, tps,
+                "LLM [%s]: %.0fms, ~%d tokens, ~%d words, %.1f tok/s",
+                eff.get("profile"), elapsed_ms, tokens_generated,
+                len(text.split()), tps,
             )
             return text, False
+
         except TypeError:
-            # Older llama-cpp without stream=True on __call__
             try:
                 output = self._llm(
                     prompt,
                     max_tokens=eff["max_tokens"],
                     temperature=eff["temperature"],
-                    top_p=0.9,
+                    top_p=eff.get("top_p", 0.9),
+                    repeat_penalty=eff.get("repeat_penalty", 1.1),
                     stop=stop,
                     echo=False,
                 )
                 text = (output.get("choices", [{}])[0]
                         .get("text", "").strip())
+                if on_token and text:
+                    on_token(text, True)
                 return text, False
             except Exception:
-                logger.exception("Local LLM inference error")
+                logger.exception("LLM inference error (non-streaming fallback)")
                 return "", False
         except Exception:
-            logger.exception("Local LLM inference error")
+            logger.exception("LLM inference error")
             return "", False
 
-    def _generate_sync_1b(self, prompt: str) -> tuple[str, bool]:
-        """Generate with the 1B model — faster for simple queries."""
-        if self._llm_1b is None:
-            return "", False
-        my_gen = self._abort_generation
-        self._active_model = "1b"
-        stop = ["</s>", "\n\n\n", "<|eot_id|>", "<|end|>"]
-        t0 = time.perf_counter()
-        try:
-            stream = self._llm_1b(
-                prompt,
-                max_tokens=60,
-                temperature=0.35,
-                top_p=0.9,
-                stop=stop,
-                echo=False,
-                stream=True,
-            )
-            parts: list[str] = []
-            for chunk in stream:
-                if self._abort_generation != my_gen:
-                    logger.info("1B model: preempted after %.0fms",
-                                (time.perf_counter() - t0) * 1000)
-                    return "", True
-                choices = chunk.get("choices") if isinstance(chunk, dict) else None
-                if not choices:
-                    continue
-                delta = choices[0].get("text") or ""
-                if delta:
-                    parts.append(delta)
-            text = "".join(parts).strip()
-            elapsed_ms = (time.perf_counter() - t0) * 1000
-            logger.info("1B model: %.0fms, ~%d words", elapsed_ms, len(text.split()))
-            return text, False
-        except Exception:
-            logger.exception("1B model inference error")
-            return "", False
-
-    async def generate_1b(self, prompt: str) -> tuple[str, bool]:
-        """Async wrapper for 1B model generation."""
-        loop = asyncio.get_running_loop()
-        try:
-            return await asyncio.wait_for(
-                loop.run_in_executor(self._executor, self._generate_sync_1b, prompt),
-                timeout=30.0,
-            )
-        except asyncio.TimeoutError:
-            logger.warning("1B model timed out")
-            return "", False
-        except Exception:
-            logger.exception("1B model generate error")
-            return "", False
+    def _generate_sync(self, prompt: str) -> tuple[str, bool]:
+        """Non-streaming generation (backward compat). Collects all tokens then returns."""
+        return self._generate_sync_streaming(prompt, on_token=None)
 
     async def generate(self, prompt: str) -> tuple[str, bool]:
+        """Async generation without streaming callback."""
         loop = asyncio.get_running_loop()
         try:
             return await asyncio.wait_for(
@@ -341,21 +329,43 @@ class MiniLLM:
                 timeout=float(self._effective_inference()["timeout_seconds"]),
             )
         except asyncio.TimeoutError:
-            logger.warning(
-                "Local LLM timed out after %ss",
-                self._effective_inference()["timeout_seconds"],
-            )
+            logger.warning("LLM timed out after %ss",
+                           self._effective_inference()["timeout_seconds"])
             return "", False
         except Exception:
-            logger.exception("Local LLM generate error")
+            logger.exception("LLM generate error")
+            return "", False
+
+    async def generate_streaming(
+        self,
+        prompt: str,
+        on_token: Callable[[str, bool], None] | None = None,
+    ) -> tuple[str, bool]:
+        """Async generation with true token streaming callback.
+
+        The on_token callback fires from the executor thread for each token.
+        Use a thread-safe mechanism (e.g., queue) to bridge to the async event bus.
+        """
+        loop = asyncio.get_running_loop()
+        try:
+            return await asyncio.wait_for(
+                loop.run_in_executor(
+                    self._executor,
+                    self._generate_sync_streaming,
+                    prompt,
+                    on_token,
+                ),
+                timeout=float(self._effective_inference()["timeout_seconds"]),
+            )
+        except asyncio.TimeoutError:
+            logger.warning("LLM streaming timed out after %ss",
+                           self._effective_inference()["timeout_seconds"])
+            return "", False
+        except Exception:
+            logger.exception("LLM streaming generate error")
             return "", False
 
     def shutdown(self) -> None:
         with self._load_lock:
             self._unload_unlocked()
-            if self._llm_1b is not None:
-                logger.info("Unloading 1B model")
-                del self._llm_1b
-                self._llm_1b = None
-                self._loaded_1b = False
         self._executor.shutdown(wait=False)

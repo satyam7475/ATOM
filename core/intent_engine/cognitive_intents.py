@@ -1,5 +1,5 @@
 """
-ATOM v15 -- Cognitive Intent Patterns.
+ATOM -- Cognitive Intent Patterns.
 
 Voice commands for the cognitive layer:
   - Goal management (create, show, progress, decompose)

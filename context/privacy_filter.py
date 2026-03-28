@@ -1,5 +1,5 @@
 """
-ATOM v14 -- Privacy filter for corporate data protection.
+ATOM -- Privacy filter for corporate data protection.
 
 Redacts sensitive patterns from text before sending to external LLM.
 All patterns are compiled at import time for near-zero runtime cost.
