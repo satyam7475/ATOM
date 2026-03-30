@@ -73,7 +73,7 @@ class DreamEngine:
         if not self._enabled:
             return
         self._running = True
-        self._task = asyncio.ensure_future(self._dream_monitor())
+        self._task = asyncio.create_task(self._dream_monitor())
         logger.info("Dream engine started (idle threshold: %d min)", self._min_idle)
 
     def stop(self) -> None:

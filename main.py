@@ -79,6 +79,8 @@ def _wire_events(
     process_mgr=None,
     evolution=None,
     priority_sched=None,
+    v3: bool = False,
+    v4: bool = False,
 ) -> dict:
     """Wire all event bus handlers. Extracted from main() for testability.
 
@@ -122,7 +124,7 @@ def _wire_events(
 
             priority_sched.submit(PRIORITY_VOICE, "speech_final", _factory)
 
-        if not args.v4:
+        if not v4:
             bus.on("speech_final", _speech_via_priority)
     else:
         async def _speech_final_direct(text: str, **kw) -> None:
@@ -132,7 +134,7 @@ def _wire_events(
                 local_brain.request_preempt()
             await router.on_speech(text, **kw)
 
-        if not args.v4:
+        if not v4:
             bus.on("speech_final", _speech_final_direct)
 
     # ── Local LLM only (offline) — serial queue + fast bus handler ─
@@ -251,7 +253,7 @@ def _wire_events(
         if state.current is AtomState.LISTENING:
             await asyncio.sleep(0.1)
             if state.current is AtomState.LISTENING:
-                if not (args.v3 or args.v4):
+                if not (v3 or v4):
                     asyncio.create_task(stt.start_listening())
     bus.on("restart_listening", on_restart_listening)
 
@@ -326,7 +328,7 @@ def _wire_events(
     def _start_thinking_progress() -> None:
         if _thinking_progress_task["task"] is not None:
             _thinking_progress_task["task"].cancel()
-        _thinking_progress_task["task"] = asyncio.ensure_future(_thinking_progress_loop())
+        _thinking_progress_task["task"] = asyncio.create_task(_thinking_progress_loop())
 
     def _stop_thinking_progress() -> None:
         t = _thinking_progress_task.get("task")
@@ -670,6 +672,8 @@ async def main() -> None:
     skills_reg = SkillsRegistry(config)
     conv_memory = ConversationMemory(config)
 
+    security = SecurityPolicy(config)
+
     router = Router(
         bus, state, cache, memory,
         intent_engine=intent_engine, context_engine=context_engine,
@@ -681,9 +685,10 @@ async def main() -> None:
         skills_registry=skills_reg,
         conversation_memory=conv_memory,
         timeline_memory=timeline_memory,
+        security_policy=security,
     )
-    brain_mode_mgr.attach_security(router._security)
-    assistant_mode_mgr.attach_security(router._security)
+    brain_mode_mgr.attach_security(security)
+    assistant_mode_mgr.attach_security(security)
 
     from core.fast_path import startup_warm_up
     startup_warm_up(intent_engine, cache, memory, config)
@@ -867,7 +872,6 @@ async def main() -> None:
                                    config=config)
 
     system_watcher = SystemWatcher(bus, poll_interval=watcher_interval)
-    security = SecurityPolicy(config)
 
     autonomy = AutonomyEngine(
         bus, behavior, security, health_monitor, config,
@@ -1159,7 +1163,7 @@ async def main() -> None:
     def _on_mode_change(new_mode: str) -> None:
         """Called from the dashboard when user switches performance mode."""
         running_loop.call_soon_threadsafe(
-            lambda: asyncio.ensure_future(_execute_mode_switch(new_mode))
+            lambda: asyncio.create_task(_execute_mode_switch(new_mode))
         )
 
     indicator.set_shutdown_callback(_ui_shutdown_callback)
@@ -1169,7 +1173,7 @@ async def main() -> None:
     if cognitive_enabled and personality_modes and hasattr(indicator, "set_personality_mode_callback"):
         def _on_personality_mode_from_ui(mode: str) -> None:
             running_loop.call_soon_threadsafe(
-                lambda: asyncio.ensure_future(
+                lambda: asyncio.create_task(
                     _switch_personality_mode_async(mode)
                 )
             )
@@ -1300,6 +1304,7 @@ async def main() -> None:
         behavior=behavior,
         scheduler=scheduler, process_mgr=process_mgr, evolution=evolution,
         priority_sched=priority_sched,
+        v3=args.v3, v4=args.v4,
     )
     _last_perceived_ms = _wiring_ctx["last_perceived_ms"]
 
@@ -1433,7 +1438,7 @@ async def main() -> None:
                     logger.info("Hotkey: SLEEP -> resume listening")
                 elif state.current is AtomState.LISTENING:
                     running_loop.call_soon_threadsafe(
-                        lambda: asyncio.ensure_future(state.transition(AtomState.IDLE))
+                        lambda: asyncio.create_task(state.transition(AtomState.IDLE))
                     )
                     logger.info("Hotkey: LISTENING -> IDLE")
                 else:
@@ -1486,696 +1491,64 @@ async def main() -> None:
         "JarvisCore + RealWorldIntel + ProactiveEngine"
     )
 
-    # ── Wire event handlers ────────────────────────────────────────
-    async def _on_document_ingest(path: str = "", **_kw) -> None:
-        if document_engine.is_ready:
-            result = await document_engine.ingest(path)
-            status = result.get("status", result.get("error", "unknown"))
-            if result.get("status") == "success":
-                msg = f"Learned from '{result['name']}': {result['chunks']} knowledge chunks stored."
-            elif result.get("status") == "already_ingested":
-                msg = f"I already know '{result['name']}', Boss."
-            else:
-                msg = f"Document ingestion issue: {status}"
-            bus.emit_long("response_ready", text=msg)
-        else:
-            bus.emit_long("response_ready", text="Document learning isn't available right now, Boss.")
-    bus.on("document_ingest_request", _on_document_ingest)
+    # ── Wire extracted event handlers ─────────────────────────────────
+    from core.wiring.feature_handlers import (
+        wire_documents_and_workflows,
+        wire_dream_curiosity,
+        wire_jarvis_and_system,
+        wire_autonomy_and_governor,
+    )
+    from core.wiring.intelligence_handlers import (
+        wire_self_healing,
+        wire_voice_auth,
+        wire_real_world,
+    )
 
-    async def _on_workflow_start(name: str = "", **_kw) -> None:
-        msg = workflow_engine.start_recording(name)
-        bus.emit_long("response_ready", text=msg)
-    bus.on("workflow_start_recording", _on_workflow_start)
+    wire_documents_and_workflows(
+        bus=bus, router=router, security=security,
+        document_engine=document_engine, workflow_engine=workflow_engine,
+        screen_reader=screen_reader,
+    )
+    wire_dream_curiosity(
+        bus=bus, dream_engine=dream_engine, curiosity_engine=curiosity_engine,
+        emotion_detector=emotion_detector, cognitive_enabled=cognitive_enabled,
+    )
+    wire_jarvis_and_system(
+        bus=bus, router=router, security=security, indicator=indicator,
+        system_scanner=system_scanner, system_control=system_control,
+        owner_understanding=owner_understanding,
+    )
+    wire_self_healing(
+        bus=bus, self_healing=self_healing, code_introspector=code_introspector,
+        security_fortress=security_fortress, context_engine=context_engine,
+    )
+    wire_voice_auth(
+        bus=bus, security_fortress=security_fortress,
+        context_engine=context_engine,
+    )
+    wire_real_world(
+        bus=bus, real_world_intel=real_world_intel,
+        context_fusion=context_fusion,
+    )
+    wire_autonomy_and_governor(
+        bus=bus, router=router, indicator=indicator, memory=memory,
+        autonomy=autonomy, state=state, tts=tts,
+        web_dashboard=web_dashboard, emotion_detector=emotion_detector,
+        wake_word_engine=wake_word_engine,
+    )
 
-    async def _on_workflow_stop(**_kw) -> None:
-        msg = workflow_engine.stop_recording()
-        bus.emit_long("response_ready", text=msg)
-    bus.on("workflow_stop_recording", _on_workflow_stop)
-
-    async def _on_workflow_list(**_kw) -> None:
-        msg = workflow_engine.list_workflows()
-        bus.emit_long("response_ready", text=msg)
-    bus.on("workflow_list_request", _on_workflow_list)
-
-    async def _on_workflow_replay(name: str = "", **_kw) -> None:
-        steps = workflow_engine.get_replay_steps(name)
-        if steps is None:
-            bus.emit_long("response_ready", text=f"No workflow named '{name}' found, Boss.")
-            return
-        bus.emit_long("response_ready", text=f"Running workflow '{name}' ({len(steps)} steps).")
-        for step in steps:
-            try:
-                router._dispatch_action(step.action, step.args)
-                await asyncio.sleep(max(0.3, step.delay_ms / 1000))
-            except Exception as e:
-                logger.warning("Workflow step failed: %s -> %s", step.action, e)
-    bus.on("workflow_replay_request", _on_workflow_replay)
-
-    async def _on_screen_read(**_kw) -> None:
-        if screen_reader is not None:
-            summary = screen_reader.get_screen_summary()
-            bus.emit_long("response_ready", text=summary)
-        else:
-            bus.emit_long("response_ready", text="Screen reading isn't available, Boss.")
-    bus.on("screen_read_request", _on_screen_read)
-
-    async def _on_dream_summary(**_kw) -> None:
-        if dream_engine is not None:
-            msg = dream_engine.get_dream_summary()
-            bus.emit_long("response_ready", text=msg)
-        else:
-            bus.emit_long("response_ready", text="Dream engine isn't active, Boss.")
-    bus.on("dream_summary_request", _on_dream_summary)
-
-    if cognitive_enabled and dream_engine is not None:
-        async def _on_cursor_response_for_dream(query: str = "", response: str = "", **_kw) -> None:
-            emotion_state = emotion_detector.current_emotion if emotion_detector else "neutral"
-            dream_engine.record_interaction(query, response, emotion=emotion_state)
-        bus.on("cursor_response", _on_cursor_response_for_dream)
-
-    if cognitive_enabled and curiosity_engine is not None:
-        async def _on_intent_for_curiosity(intent: str = "", text: str = "", **_kw) -> None:
-            if text:
-                for word in text.lower().split():
-                    if len(word) > 5:
-                        curiosity_engine.track_topic(word)
-        bus.on("intent_classified", _on_intent_for_curiosity)
-
-        async def _on_curiosity_question(text: str = "", **_kw) -> None:
-            bus.emit_long("response_ready", text=text)
-        bus.on("curiosity_question", _on_curiosity_question)
-
-    if workflow_engine is not None:
-        async def _on_action_for_workflow(intent: str = "", **kw) -> None:
-            if workflow_engine.is_recording and intent not in ("confirm", "deny", "fallback"):
-                workflow_engine.record_action(intent, kw.get("action_args", {}), intent)
-        bus.on("intent_classified", _on_action_for_workflow)
-
-    # ── JARVIS Core event handlers ──────────────────────────────
-    async def _on_jarvis_insight(message: str = "", category: str = "",
-                                  action: str = "", action_args: dict = None,
-                                  **_kw) -> None:
-        if message:
-            indicator.add_log("jarvis", f"[{category}] {message}")
-            bus.emit_long("response_ready", text=message)
-            if action and action_args:
-                try:
-                    router._dispatch_action(action, action_args or {})
-                except Exception:
-                    logger.debug("JARVIS insight action failed", exc_info=True)
-    bus.on("jarvis_insight", _on_jarvis_insight)
-
-    async def _on_system_scan_request(**_kw) -> None:
-        summary = system_scanner.get_scan_summary()
-        bus.emit_long("response_ready", text=summary)
-    bus.on("system_scan_request", _on_system_scan_request)
-
-    async def _on_system_control_request(action: str = "", **kw) -> None:
-        result = None
-        if action == "hardware_details":
-            result = system_control.get_hardware_details()
-        elif action == "uptime":
-            result = system_control.get_system_uptime()
-        elif action == "optimize":
-            result = system_control.optimize_for_atom()
-        elif action == "open_ports":
-            result = system_control.get_open_ports()
-        elif action == "wifi_scan":
-            result = system_control.get_wifi_networks()
-        elif action == "temp_files":
-            result = system_control.analyze_temp_files()
-        elif action == "startup_programs":
-            result = system_control.list_startup_programs()
-        elif action == "network_speed":
-            result = system_control.get_network_speed()
-        elif action == "full_status":
-            msg = system_control.get_full_status()
-            bus.emit_long("response_ready", text=msg)
-            return
-        elif action == "find_process":
-            name = kw.get("name", "")
-            result = system_control.find_process_by_name(name)
-        elif action == "process_details":
-            pid = kw.get("pid", 0)
-            result = system_control.get_process_details(pid)
-        elif action == "power_plan":
-            plan = kw.get("plan", "balanced")
-            result = system_control.set_power_plan(plan)
-
-        if result:
-            bus.emit_long("response_ready", text=result.message)
-        else:
-            bus.emit_long("response_ready",
-                          text=f"Unknown system control action: {action}")
-    bus.on("system_control_request", _on_system_control_request)
-
-    async def _on_owner_summary_request(**_kw) -> None:
-        summary = owner_understanding.get_owner_summary()
-        bus.emit_long("response_ready", text=summary)
-    bus.on("owner_summary_request", _on_owner_summary_request)
-
-    # ── Self-Healing + Code Introspection + Security Event Handlers ──
-
-    async def _on_diagnose_failure(intent: str = "", **kw) -> None:
-        if intent == "diagnose_failure":
-            msg = self_healing.diagnose_failure()
-            bus.emit_long("response_ready", text=msg)
-
-    async def _on_fix_it(intent: str = "", **kw) -> None:
-        if intent == "fix_it":
-            msg = self_healing.fix_last_failure()
-            bus.emit_long("response_ready", text=msg)
-
-    async def _on_fix_all(intent: str = "", **kw) -> None:
-        if intent == "fix_all":
-            msg = self_healing.fix_all()
-            bus.emit_long("response_ready", text=msg)
-
-    async def _on_module_health(intent: str = "", **kw) -> None:
-        if intent == "module_health":
-            msg = self_healing.get_health_summary()
-            bus.emit_long("response_ready", text=msg)
-
-    async def _on_read_own_code(intent: str = "", **kw) -> None:
-        if intent == "read_own_code":
-            if not code_introspector.is_scanned:
-                code_introspector.scan()
-            msg = code_introspector.explain_architecture()
-            health = code_introspector.format_code_health()
-            bus.emit_long("response_ready", text=f"{msg} {health}")
-
-    async def _on_explain_module(intent: str = "", **kw) -> None:
-        if intent == "explain_module":
-            args = kw.get("action_args", {}) or {}
-            module = args.get("module", "")
-            if module:
-                if not code_introspector.is_scanned:
-                    code_introspector.scan()
-                msg = code_introspector.explain_module(module)
-                bus.emit_long("response_ready", text=msg)
-
-    async def _on_search_code(intent: str = "", **kw) -> None:
-        if intent == "search_code":
-            args = kw.get("action_args", {}) or {}
-            query = args.get("query", "")
-            if query:
-                if not code_introspector.is_scanned:
-                    code_introspector.scan()
-                results = code_introspector.search_code(query)
-                if results:
-                    lines = [f"{r['file']}:{r['line']}: {r['content']}" for r in results[:5]]
-                    msg = f"Found {len(results)} matches. " + " | ".join(lines)
-                else:
-                    msg = f"No matches found for '{query}' in the codebase."
-                bus.emit_long("response_ready", text=msg)
-
-    async def _on_security_status(intent: str = "", **kw) -> None:
-        if intent == "security_status":
-            msg = security_fortress.get_security_status()
-            integrity_ok, integrity_msg = security_fortress.check_integrity()
-            bus.emit_long("response_ready", text=f"{msg} Integrity: {integrity_msg}")
-
-    async def _on_security_lockdown(intent: str = "", **kw) -> None:
-        if intent == "security_lockdown":
-            security_fortress.log_security_event("lockdown_activated", severity="HIGH")
-            bus.emit_long("response_ready",
-                          text="Security lockdown activated, Boss. All sensitive operations require authentication.")
-
-    async def _on_failure_report(intent: str = "", **kw) -> None:
-        if intent in ("self_diagnostic", "self_check"):
-            failure_report = self_healing.get_failure_report()
-            if "No failures" not in failure_report:
-                await asyncio.sleep(0.5)
-                bus.emit_long("response_ready", text=failure_report)
-
-    bus.on("intent_classified", _on_diagnose_failure)
-    bus.on("intent_classified", _on_fix_it)
-    bus.on("intent_classified", _on_fix_all)
-    bus.on("intent_classified", _on_module_health)
-    bus.on("intent_classified", _on_read_own_code)
-    bus.on("intent_classified", _on_explain_module)
-    bus.on("intent_classified", _on_search_code)
-    bus.on("intent_classified", _on_security_status)
-    bus.on("intent_classified", _on_security_lockdown)
-    bus.on("intent_classified", _on_failure_report)
-
-    # ── Voice Auth + Behavioral Auth Event Handlers ────────────────
-
-    async def _on_voice_enroll(intent: str = "", **kw) -> None:
-        if intent == "voice_enroll":
-            if not security_fortress.voice_auth.is_available:
-                bus.emit_long("response_ready",
-                              text="Voice authentication isn't available, Boss. "
-                                   "Install resemblyzer or numpy to enable it.")
-                return
-            bus.emit_long("response_ready",
-                          text="Starting voice enrollment. Say a few natural sentences "
-                               "and I'll learn your voice, Boss. I need at least 3 samples.")
-            security_fortress.log_security_event(
-                "voice_enroll_started", severity="INFO",
-            )
-
-    async def _on_voice_verify(intent: str = "", **kw) -> None:
-        if intent == "voice_verify":
-            if not security_fortress.voice_auth.is_enrolled:
-                bus.emit_long("response_ready",
-                              text="Voice not enrolled yet, Boss. "
-                                   "Say 'enroll my voice' to set up voice authentication.")
-                return
-            bus.emit_long("response_ready",
-                          text="Voice verification available. Your last speech will be "
-                               "compared against your voice print. "
-                               + security_fortress.voice_auth.get_status_message())
-
-    async def _on_voice_auth_status(intent: str = "", **kw) -> None:
-        if intent == "voice_auth_status":
-            msg = security_fortress.voice_auth.get_status_message()
-            bus.emit_long("response_ready", text=msg)
-
-    async def _on_voice_reset(intent: str = "", **kw) -> None:
-        if intent == "voice_reset":
-            msg = security_fortress.voice_reset()
-            bus.emit_long("response_ready", text=msg)
-
-    async def _on_behavior_auth_status(intent: str = "", **kw) -> None:
-        if intent == "behavior_auth_status":
-            msg = security_fortress.behavior_auth.get_anomaly_report()
-            bus.emit_long("response_ready", text=msg)
-
-    async def _on_intent_for_behavior_auth(intent: str = "", **kw) -> None:
-        """Feed every intent into behavioral auth for continuous verification."""
-        if intent and intent not in ("confirm", "deny", "empty"):
-            text = kw.get("text", "")
-            target = kw.get("target", "") or kw.get("name", "")
-            try:
-                active_app = ""
-                if hasattr(context_engine, "get_active_window"):
-                    active_app = context_engine.get_active_window() or ""
-            except Exception:
-                active_app = ""
-            security_fortress.observe_behavior(
-                action=intent,
-                detail=target,
-                query_text=text,
-                active_app=active_app,
-            )
-
-    bus.on("intent_classified", _on_voice_enroll)
-    bus.on("intent_classified", _on_voice_verify)
-    bus.on("intent_classified", _on_voice_auth_status)
-    bus.on("intent_classified", _on_voice_reset)
-    bus.on("intent_classified", _on_behavior_auth_status)
-    bus.on("intent_classified", _on_intent_for_behavior_auth)
-
-    async def _on_behavior_reauth_needed(**_kw) -> None:
-        bus.emit_long("response_ready",
-                      text="Boss, your usage patterns seem different from usual. "
-                           "For security, please verify your identity. "
-                           "Say 'verify my voice' or authenticate with your passphrase.")
-        security_fortress.log_security_event(
-            "behavioral_reauth_triggered",
-            f"trust={security_fortress.trust_score:.2f}",
-            severity="HIGH",
-        )
-    bus.on("reauth_required", _on_behavior_reauth_needed)
-
-    def _reauth_callback() -> None:
-        bus.emit_long("reauth_required")
-    security_fortress.behavior_auth.set_reauth_callback(_reauth_callback)
-
-    logger.info("Auth handlers wired: voice enrollment, verification, behavioral auth")
-    logger.info("Security event handlers wired: self-healing, code introspection, fortress")
-
-    # ── Real-World Intelligence Event Handlers ────────────────────
-    async def _on_weather_request(intent: str = "", **_kw) -> None:
-        if intent == "weather_report":
-            msg = real_world_intel.get_weather_summary()
-            bus.emit_long("response_ready", text=msg)
-
-    async def _on_news_request(intent: str = "", **_kw) -> None:
-        if intent == "news_headlines":
-            msg = real_world_intel.get_news_summary(count=5)
-            bus.emit_long("response_ready", text=msg)
-
-    async def _on_world_clock_request(intent: str = "", **_kw) -> None:
-        if intent == "world_clock":
-            msg = real_world_intel.get_world_clock_summary()
-            bus.emit_long("response_ready", text=msg)
-
-    async def _on_briefing_request(intent: str = "", **_kw) -> None:
-        if intent == "daily_briefing":
-            msg = real_world_intel.get_briefing()
-            bus.emit_long("response_ready", text=msg)
-
-    async def _on_temporal_request(intent: str = "", **_kw) -> None:
-        if intent == "temporal_info":
-            msg = real_world_intel.get_temporal_summary()
-            bus.emit_long("response_ready", text=msg)
-
-    async def _on_world_status_request(intent: str = "", **_kw) -> None:
-        if intent == "world_status":
-            ctx = real_world_intel.get_world_context()
-            parts = [real_world_intel.get_temporal_summary()]
-            if not ctx.weather.is_stale:
-                parts.append(real_world_intel.get_weather_summary())
-            if ctx.headlines:
-                parts.append(real_world_intel.get_news_summary(3))
-            parts.append(real_world_intel.get_world_clock_summary())
-            parts.append(f"World intelligence quality: {ctx.quality_score():.0%}")
-            bus.emit_long("response_ready", text=" ".join(parts))
-
-    async def _on_intent_for_context_fusion(intent: str = "", **kw) -> None:
-        """Feed every intent into ContextFusion for action logging."""
-        if intent and intent not in ("confirm", "deny", "empty"):
-            context_fusion.log_action(intent, kw.get("text", "")[:60])
-
-    bus.on("intent_classified", _on_weather_request)
-    bus.on("intent_classified", _on_news_request)
-    bus.on("intent_classified", _on_world_clock_request)
-    bus.on("intent_classified", _on_briefing_request)
-    bus.on("intent_classified", _on_temporal_request)
-    bus.on("intent_classified", _on_world_status_request)
-    bus.on("intent_classified", _on_intent_for_context_fusion)
-
-    logger.info("Real-world intelligence handlers wired: weather, news, briefing, world clock")
-
-    if emotion_detector is not None and emotion_detector.is_enabled:
-        async def _on_speech_for_emotion(text: str = "", **_kw) -> None:
-            result = emotion_detector.analyze_text_emotion(text)
-            if result.emotion != "neutral":
-                bus.emit_fast("user_emotion_detected",
-                              emotion=result.emotion, confidence=result.confidence)
-        bus.on("speech_final", _on_speech_for_emotion)
-
-    if wake_word_engine is not None:
-        async def _on_wake_word(**_kw) -> None:
-            from core.state_manager import AtomState
-            if state.current in (AtomState.IDLE, AtomState.SLEEP):
-                await state.transition(AtomState.LISTENING)
-                indicator.add_log("info", "Wake word detected! Listening, Boss.")
-        bus.on("wake_word_detected", _on_wake_word)
-
-    if web_dashboard is not None:
-        async def _on_governor_throttle_ui(**_kw):
-            web_dashboard.broadcast_governor(True)
-        async def _on_governor_normal_ui(**_kw):
-            web_dashboard.broadcast_governor(False)
-        bus.on("governor_throttle", _on_governor_throttle_ui)
-        bus.on("governor_normal", _on_governor_normal_ui)
-
-    async def _on_governor_throttle_tts(**_kw) -> None:
-        if hasattr(tts, "set_postprocess"):
-            tts.set_postprocess(False)
-            logger.info("Governor: TTS post-processing disabled (throttled)")
-    async def _on_governor_normal_tts(**_kw) -> None:
-        if hasattr(tts, "restore_postprocess"):
-            tts.restore_postprocess()
-            logger.info("Governor: TTS post-processing restored to config")
-    bus.on("governor_throttle", _on_governor_throttle_tts)
-    bus.on("governor_normal", _on_governor_normal_tts)
-
-    # ── Autonomy event handlers ───────────────────────────────────────
-    _pending_habit_id = {"id": ""}
-
-    async def _on_habit_suggestion(text: str = "", habit_id: str = "",
-                                   confidence: float = 0.0, **_kw) -> None:
-        _pending_habit_id["id"] = habit_id
-        indicator.add_log("info", f"[habit] {text}")
-        bus.emit_long("response_ready", text=text)
-
-    async def _on_intent_for_habit_feedback(intent: str = "", **_kw) -> None:
-        hid = _pending_habit_id.get("id", "")
-        if not hid:
-            return
-        if intent == "confirm":
-            bus.emit_fast("user_feedback", habit_id=hid, accepted=True)
-            _pending_habit_id["id"] = ""
-        elif intent == "deny":
-            bus.emit_fast("user_feedback", habit_id=hid, accepted=False)
-            _pending_habit_id["id"] = ""
-
-    bus.on("intent_classified", _on_intent_for_habit_feedback)
-
-    async def _on_autonomous_action(action: str = "", target: str = "",
-                                    habit_id: str = "",
-                                    confidence: float = 0.0, **_kw) -> None:
-        msg = f"Auto-executing {action.replace('_', ' ')}"
-        if target:
-            msg += f" for {target}"
-        indicator.add_log("action", f"[auto] {msg}")
-        try:
-            args = {"name": target, "exe": target, "process": target}
-            result = router._dispatch_action(action, args)
-            response = result or (msg + ", Boss.")
-            bus.emit_long("response_ready", text=response)
-        except Exception as exc:
-            logger.warning("Autonomous action failed: %s", exc)
-            bus.emit_long("response_ready",
-                          text=f"Tried to auto-execute {action}, but it failed, Boss.")
-
-    async def _on_autonomy_decision_log(decision: str = "", detail: str = "",
-                                        confidence: float = 0.0, **_kw) -> None:
-        if web_dashboard is not None:
-            web_dashboard.broadcast_autonomy_log(decision, detail, confidence)
-
-    async def _on_intent_for_memory(intent: str = "", **kw) -> None:
-        try:
-            import psutil
-            cpu = psutil.cpu_percent(interval=0)
-            ram = psutil.virtual_memory().percent
-        except Exception:
-            cpu, ram = 0, 0
-        memory.log_interaction(
-            command=kw.get("text", ""),
-            action=intent,
-            system_state={"cpu": cpu, "ram": ram},
-        )
-
-    bus.on("habit_suggestion", _on_habit_suggestion)
-    bus.on("autonomous_action", _on_autonomous_action)
-    bus.on("autonomy_decision_log", _on_autonomy_decision_log)
-    bus.on("intent_classified", _on_intent_for_memory)
-
-    # ── Cognitive Layer event handlers ─────────────────────────────
     if cognitive_enabled:
-        async def _on_cognitive_intent(intent: str = "", **kw) -> None:
-            """Dispatch cognitive-layer intents to the right module."""
-            args = kw.get("action_args", {}) or {}
-
-            if intent == "goal_create":
-                title = args.get("title", "")
-                if title:
-                    result = goal_engine.create_goal(title)
-                    if "error" in result:
-                        bus.emit_long("response_ready", text=result["error"])
-                    else:
-                        msg = f"Goal set: '{title}'. Say 'break down this goal' for a step plan."
-                        bus.emit_long("response_ready", text=msg)
-                return
-
-            if intent == "goal_show":
-                summary = goal_engine.format_goals_summary()
-                bus.emit_long("response_ready", text=summary)
-                return
-
-            if intent == "goal_progress":
-                target = args.get("target", "")
-                if target:
-                    goal = goal_engine.find_goal(target)
-                    if goal:
-                        ev = goal.get("evaluation", {})
-                        msg = (
-                            f"Goal '{goal['title']}': {goal['progress_pct']}% done. "
-                            f"Trajectory: {ev.get('trajectory', 'unknown')}. "
-                            f"Streak: {ev.get('streak_days', 0)} days."
-                        )
-                        bus.emit_long("response_ready", text=msg)
-                    else:
-                        bus.emit_long("response_ready", text="I couldn't find that goal, Boss.")
-                else:
-                    briefing = goal_engine.get_daily_briefing()
-                    bus.emit_long("response_ready", text=briefing or "No active goals to report on.")
-                return
-
-            if intent == "goal_decompose":
-                active = goal_engine.get_active_goals()
-                if active:
-                    bus.emit_long("response_ready", text="Breaking down your latest goal with AI...")
-                    result = await goal_engine.decompose_with_llm(active[-1]["id"])
-                    bus.emit_long("response_ready", text=result)
-                else:
-                    bus.emit_long("response_ready", text="No active goals to decompose, Boss.")
-                return
-
-            if intent == "goal_log_progress":
-                topic = args.get("topic", "")
-                minutes = args.get("minutes", 30)
-                active = goal_engine.get_active_goals()
-                if active:
-                    goal = active[0]
-                    steps = goal.get("steps", [])
-                    matched_step = None
-                    for s in steps:
-                        if topic.lower() in s["title"].lower():
-                            matched_step = s
-                            break
-                    if matched_step:
-                        result = goal_engine.log_progress(goal["id"], matched_step["id"], minutes)
-                        bus.emit_long("response_ready", text=result)
-                    elif steps:
-                        result = goal_engine.log_progress(goal["id"], steps[0]["id"], minutes)
-                        bus.emit_long("response_ready", text=result)
-                    else:
-                        bus.emit_long("response_ready",
-                                      text=f"Logged {minutes} minutes. Add steps to track properly.")
-                else:
-                    bus.emit_long("response_ready", text="No active goals to log progress on.")
-                return
-
-            if intent == "goal_complete_step":
-                step_name = args.get("step_name", "")
-                active = goal_engine.get_active_goals()
-                for goal in active:
-                    for step in goal.get("steps", []):
-                        if step_name.lower() in step["title"].lower():
-                            result = goal_engine.complete_step(goal["id"], step["id"])
-                            bus.emit_long("response_ready", text=result)
-                            return
-                bus.emit_long("response_ready", text="Couldn't find that step, Boss.")
-                return
-
-            if intent == "goal_pause":
-                target = args.get("target", "")
-                goal = goal_engine.find_goal(target) if target else None
-                if goal:
-                    result = goal_engine.pause_goal(goal["id"])
-                    bus.emit_long("response_ready", text=result)
-                else:
-                    bus.emit_long("response_ready", text="Goal not found, Boss.")
-                return
-
-            if intent == "goal_resume":
-                target = args.get("target", "")
-                goal = goal_engine.find_goal(target) if target else None
-                if goal:
-                    result = goal_engine.resume_goal(goal["id"])
-                    bus.emit_long("response_ready", text=result)
-                else:
-                    bus.emit_long("response_ready", text="Goal not found, Boss.")
-                return
-
-            if intent == "goal_abandon":
-                target = args.get("target", "")
-                goal = goal_engine.find_goal(target) if target else None
-                if goal:
-                    result = goal_engine.abandon_goal(goal["id"])
-                    bus.emit_long("response_ready", text=result)
-                else:
-                    bus.emit_long("response_ready", text="Goal not found, Boss.")
-                return
-
-            if intent == "prediction":
-                summary = prediction_engine.format_predictions()
-                bus.emit_long("response_ready", text=summary)
-                return
-
-            if intent == "mode_switch":
-                mode = args.get("mode", "work")
-                result = personality_modes.switch_mode(mode)
-                bus.emit_long("response_ready", text=result)
-                return
-
-            if intent == "cognitive_behavior_report":
-                report = behavior_model.get_profile_summary()
-                bus.emit_long("response_ready", text=report)
-                return
-
-            if intent == "scheduling_advice":
-                advice = behavior_model.get_scheduling_advice()
-                bus.emit_long("response_ready", text=advice)
-                return
-
-            if intent == "brain_remember":
-                fact = args.get("fact", "")
-                if fact:
-                    second_brain.learn_fact(fact, source="voice")
-                    bus.emit_long("response_ready",
-                                  text=f"Got it, Boss. I'll remember: {fact[:80]}")
-                return
-
-            if intent == "brain_recall":
-                query = args.get("query", "")
-                if query:
-                    results = second_brain.retrieve(query, k=3)
-                    if results:
-                        formatted = ". ".join(r for r in results)
-                        bus.emit_long("response_ready",
-                                      text=f"Here's what I know: {formatted}")
-                    else:
-                        bus.emit_long("response_ready",
-                                      text="I don't have anything stored on that yet, Boss.")
-                return
-
-            if intent == "brain_preferences":
-                prefs = second_brain.preferences
-                if prefs:
-                    items = [f"{k}: {v}" for k, v in list(prefs.items())[:8]]
-                    bus.emit_long("response_ready",
-                                  text=f"Your preferences: {', '.join(items)}")
-                else:
-                    bus.emit_long("response_ready",
-                                  text="No preferences stored yet. I'm still learning, Boss.")
-                return
-
-            if intent == "self_optimize":
-                report = self_optimizer.format_optimization_report()
-                bus.emit_long("response_ready", text=report)
-                return
-
-        bus.on("intent_classified", _on_cognitive_intent)
-
-        async def _on_habit_suggestion_mode_gate(text: str = "", **kw) -> None:
-            """Gate habit suggestions through personality mode."""
-            if personality_modes and not personality_modes.should_allow_suggestion():
-                personality_modes.queue_suggestion({"text": text, **kw})
-                return
-        bus.on("habit_suggestion", _on_habit_suggestion_mode_gate)
-
-        async def _on_cursor_response_for_brain(query: str = "", response: str = "", **_kw) -> None:
-            if "goal_decompose:" not in query and len(response) > 20:
-                second_brain.learn_fact(
-                    f"Q: {query[:100]} A: {response[:200]}",
-                    source="llm_conversation",
-                    tags=["conversation"],
-                )
-        bus.on("cursor_response", _on_cursor_response_for_brain)
-
-        async def _on_goal_briefing(text: str = "", **_kw) -> None:
-            if text:
-                indicator.add_log("info", f"[briefing] {text}")
-                bus.emit_long("response_ready", text=text)
-        bus.on("goal_briefing", _on_goal_briefing)
-
-        async def _on_mode_changed(mode: str = "", **_kw) -> None:
-            indicator.add_log("action", f"Mode: {mode.upper()}")
-            if hasattr(tts, "_rate_override"):
-                rate_adj = _kw.get("voice_rate_adj", 0)
-                tts._rate_override = f"{rate_adj:+d}%" if rate_adj else None
-            if web_dashboard is not None:
-                web_dashboard.broadcast_mode(personality_modes.get_mode_for_dashboard())
-        bus.on("mode_changed", _on_mode_changed)
-
-        async def _on_prediction_ready(predictions: list = None, **_kw) -> None:
-            if web_dashboard is not None and predictions:
-                web_dashboard.broadcast_predictions(predictions)
-        bus.on("prediction_ready", _on_prediction_ready)
-
-        async def _on_optimization_suggestions(suggestions: list = None, **_kw) -> None:
-            if suggestions:
-                logger.info("Self-optimizer: %d suggestions generated", len(suggestions))
-                for s in suggestions[:2]:
-                    indicator.add_log("info", f"[optimize] {s.get('message', '')}")
-        bus.on("optimization_suggestions", _on_optimization_suggestions)
+        from core.wiring.cognitive_handlers import wire as wire_cognitive
+        wire_cognitive(
+            bus=bus, goal_engine=goal_engine,
+            prediction_engine=prediction_engine,
+            behavior_model=behavior_model,
+            self_optimizer=self_optimizer,
+            second_brain=second_brain,
+            personality_modes=personality_modes,
+            indicator=indicator, tts=tts,
+            web_dashboard=web_dashboard,
+        )
 
     if web_dashboard is not None:
         async def _push_habits_periodically() -> None:

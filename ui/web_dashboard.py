@@ -461,7 +461,7 @@ class WebDashboard:
         if len(self._activity_log) > 200:
             self._activity_log = self._activity_log[-100:]
 
-        asyncio.ensure_future(self._broadcast({
+        asyncio.create_task(self._broadcast({
             "type": "state",
             **entry,
         }))
@@ -476,23 +476,23 @@ class WebDashboard:
         if len(self._conv_log) > 500:
             self._conv_log = self._conv_log[-300:]
 
-        asyncio.ensure_future(self._broadcast({
+        asyncio.create_task(self._broadcast({
             "type": "log",
             **entry,
         }))
 
     def show_hearing(self, text: str) -> None:
-        asyncio.ensure_future(self._broadcast({
+        asyncio.create_task(self._broadcast({
             "type": "hearing",
             "text": text[:80],
         }))
 
     def clear_hearing(self) -> None:
-        asyncio.ensure_future(self._broadcast({"type": "hearing", "text": ""}))
+        asyncio.create_task(self._broadcast({"type": "hearing", "text": ""}))
 
     def set_mic_name(self, name: str) -> None:
         self._mic_name = name
-        asyncio.ensure_future(self._broadcast({
+        asyncio.create_task(self._broadcast({
             "type": "mic",
             "name": name,
         }))
@@ -501,7 +501,7 @@ class WebDashboard:
         """Push owner (face) recognition status to dashboard clients."""
         self._owner_detected = detected
         self._owner_status = status
-        asyncio.ensure_future(self._broadcast({
+        asyncio.create_task(self._broadcast({
             "type": "owner_status",
             "detected": detected,
             "status": status,
@@ -509,7 +509,7 @@ class WebDashboard:
 
     def set_last_query(self, text: str) -> None:
         self._last_query = (text or "")[:80]
-        asyncio.ensure_future(self._broadcast({
+        asyncio.create_task(self._broadcast({
             "type": "last_query",
             "query": self._last_query,
             "intent": self._last_intent,
@@ -518,7 +518,7 @@ class WebDashboard:
 
     def set_last_intent(self, intent: str) -> None:
         self._last_intent = intent or ""
-        asyncio.ensure_future(self._broadcast({
+        asyncio.create_task(self._broadcast({
             "type": "last_query",
             "query": self._last_query,
             "intent": self._last_intent,
@@ -527,7 +527,7 @@ class WebDashboard:
 
     def set_last_latency_ms(self, ms: float) -> None:
         self._last_latency_ms = ms
-        asyncio.ensure_future(self._broadcast({
+        asyncio.create_task(self._broadcast({
             "type": "last_query",
             "query": self._last_query,
             "intent": self._last_intent,
@@ -535,7 +535,7 @@ class WebDashboard:
         }))
 
     def set_status(self, text: str) -> None:
-        asyncio.ensure_future(self._broadcast({
+        asyncio.create_task(self._broadcast({
             "type": "status_text",
             "text": text,
         }))
@@ -580,20 +580,20 @@ class WebDashboard:
         })
 
     def broadcast_governor(self, throttled: bool) -> None:
-        asyncio.ensure_future(self._broadcast({
+        asyncio.create_task(self._broadcast({
             "type": "governor",
             "throttled": throttled,
         }))
 
     def broadcast_perf_mode(self, mode: str) -> None:
-        asyncio.ensure_future(self._broadcast({
+        asyncio.create_task(self._broadcast({
             "type": "perf_mode",
             "mode": mode,
         }))
 
     def broadcast_thinking_progress(self, elapsed_s: float, estimate_s: float) -> None:
         remaining = max(0, estimate_s - elapsed_s)
-        asyncio.ensure_future(self._broadcast({
+        asyncio.create_task(self._broadcast({
             "type": "thinking_progress",
             "elapsed_s": round(elapsed_s, 1),
             "estimate_s": round(estimate_s, 1),
@@ -603,7 +603,7 @@ class WebDashboard:
     def broadcast_habits(self, habits: list[dict]) -> None:
         """Push active habits list to dashboard clients."""
         self._last_habits = habits
-        asyncio.ensure_future(self._broadcast({
+        asyncio.create_task(self._broadcast({
             "type": "habits_update",
             "habits": habits,
         }))
@@ -612,7 +612,7 @@ class WebDashboard:
         self, decision: str, detail: str = "", confidence: float = 0.0,
     ) -> None:
         """Push an autonomy decision log entry to dashboard clients."""
-        asyncio.ensure_future(self._broadcast({
+        asyncio.create_task(self._broadcast({
             "type": "autonomy_log",
             "decision": decision,
             "detail": detail,
@@ -622,28 +622,28 @@ class WebDashboard:
 
     def broadcast_goals(self, goals: list[dict]) -> None:
         """Push goals data to dashboard clients."""
-        asyncio.ensure_future(self._broadcast({
+        asyncio.create_task(self._broadcast({
             "type": "goals_update",
             "goals": goals,
         }))
 
     def broadcast_predictions(self, predictions: list[dict]) -> None:
         """Push predictions to dashboard clients."""
-        asyncio.ensure_future(self._broadcast({
+        asyncio.create_task(self._broadcast({
             "type": "predictions_update",
             "predictions": predictions,
         }))
 
     def broadcast_profile(self, profile: dict) -> None:
         """Push user profile/energy data to dashboard clients."""
-        asyncio.ensure_future(self._broadcast({
+        asyncio.create_task(self._broadcast({
             "type": "profile_update",
             **profile,
         }))
 
     def broadcast_mode(self, mode_data: dict) -> None:
         """Push personality mode state to dashboard clients."""
-        asyncio.ensure_future(self._broadcast({
+        asyncio.create_task(self._broadcast({
             "type": "mode_update",
             **mode_data,
         }))

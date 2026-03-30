@@ -176,7 +176,7 @@ class GPUGovernor:
         if not self._nvml_available or not self._enabled:
             return
         self._running = True
-        self._task = asyncio.ensure_future(self._monitor_loop())
+        self._task = asyncio.create_task(self._monitor_loop())
         logger.info("GPU Governor monitoring started (interval=%ds)", self._poll_interval)
 
     def stop(self) -> None:

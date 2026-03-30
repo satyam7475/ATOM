@@ -870,7 +870,7 @@ class JarvisCore:
         self._bus.on("query_failed", self._on_query_failed)
         self._bus.on("query_succeeded", self._on_query_succeeded)
 
-        self._task = asyncio.ensure_future(self._proactive_loop())
+        self._task = asyncio.create_task(self._proactive_loop())
         logger.info(
             "JARVIS Core v21 started (proactive_interval=%.0fs, "
             "fusion=%s, behavior=%s, prediction=%s)",

@@ -166,6 +166,7 @@ class Router:
         skills_registry: Any | None = None,
         conversation_memory: Any | None = None,
         timeline_memory: Any | None = None,
+        security_policy: SecurityPolicy | None = None,
     ) -> None:
         self._bus = bus
         self._state = state
@@ -174,7 +175,7 @@ class Router:
         self._intent = intent_engine
         self._context = context_engine
         self._config = config or {}
-        self._security = SecurityPolicy(self._config)
+        self._security = security_policy or SecurityPolicy(self._config)
         self._brain_enabled = bool(self._config.get("brain", {}).get("enabled", False))
         self._brain_mode_mgr = brain_mode_manager
         self._assistant_mode_mgr = assistant_mode_manager
@@ -408,6 +409,17 @@ class Router:
             await self._execute_action(outcome.action_result)
         elif outcome.tool_call is not None:
             tool_call = outcome.tool_call
+            allowed, reason = self._security.allow_action(
+                tool_call.name, dict(tool_call.arguments),
+            )
+            if not allowed:
+                logger.warning("Security BLOCKED confirmed tool '%s': %s",
+                               tool_call.name, reason)
+                self._bus.emit_long(
+                    "response_ready",
+                    text=f"Sorry Boss, that action is blocked. {reason}",
+                )
+                return
             try:
                 result = self._dispatch_action(
                     tool_call.name, dict(tool_call.arguments),
@@ -667,7 +679,7 @@ class Router:
     def _do_timer(self, _action: str, args: dict) -> str:
         seconds = int(args.get("seconds", 30))
         label = args.get("label", f"{seconds}s")
-        asyncio.ensure_future(utility_actions.run_timer(seconds, label, self._bus))
+        asyncio.create_task(utility_actions.run_timer(seconds, label, self._bus))
         return personality.action_done("timer", label)
 
     def _do_read_clipboard(self, _action: str, _args: dict) -> str:
@@ -1085,11 +1097,11 @@ class Router:
         if is_repeat:
             logger.info("Repeat query detected -- bypassing cache")
 
-        cache_task = asyncio.ensure_future(
+        cache_task = asyncio.create_task(
             asyncio.get_running_loop().run_in_executor(
                 None, self._cache.get, cache_key)
         )
-        memory_task = asyncio.ensure_future(
+        memory_task = asyncio.create_task(
             self._memory.retrieve(clean_text, k=2))
         cached, memory_ctx = await asyncio.gather(cache_task, memory_task)
 
@@ -1194,15 +1206,19 @@ class Router:
     # ── Conversation window ─────────────────────────────────────────
 
     def record_turn(self, query: str, response: str) -> None:
-        """Append a Q&A turn to the rolling conversation window + ConversationMemory."""
-        snippet = " ".join(response.split()[:60])
-        self._conversation_window.append((query[:100], snippet))
-        if len(self._conversation_window) > self._conv_window_max:
-            self._conversation_window = self._conversation_window[-self._conv_window_max:]
+        """Append a Q&A turn. ConversationMemory is the single source of truth
+        when available; the legacy window is only kept as fallback."""
         if self._conv_memory is not None:
             self._conv_memory.record(query, "llm_response", response)
+        else:
+            snippet = " ".join(response.split()[:60])
+            self._conversation_window.append((query[:100], snippet))
+            if len(self._conversation_window) > self._conv_window_max:
+                self._conversation_window = self._conversation_window[-self._conv_window_max:]
 
     def get_conversation_history(self) -> list[tuple[str, str]]:
+        if self._conv_memory is not None and self._conv_memory.turn_count > 0:
+            return self._conv_memory.get_pairs()
         return list(self._conversation_window)
 
     # ── Helpers ─────────────────────────────────────────────────────

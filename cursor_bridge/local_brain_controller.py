@@ -682,7 +682,7 @@ class LocalBrainController:
             # Thread-safe push to asyncio queue (eliminates polling latency)
             loop.call_soon_threadsafe(token_queue.put_nowait, (token_text, is_done))
 
-        generate_task = asyncio.ensure_future(
+        generate_task = asyncio.create_task(
             self._llm.generate_streaming(prompt, on_token=_on_token)
         )
 
@@ -692,7 +692,7 @@ class LocalBrainController:
 
         while True:
             # Wait for the next token without polling
-            get_task = asyncio.ensure_future(token_queue.get())
+            get_task = asyncio.create_task(token_queue.get())
             done, pending = await asyncio.wait(
                 [get_task, generate_task],
                 return_when=asyncio.FIRST_COMPLETED

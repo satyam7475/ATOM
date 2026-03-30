@@ -82,7 +82,7 @@ class CuriosityEngine:
         if not self._enabled:
             return
         self._running = True
-        self._task = asyncio.ensure_future(self._curiosity_loop())
+        self._task = asyncio.create_task(self._curiosity_loop())
         logger.info("Curiosity engine started (max %d questions/hour)", self._max_per_hour)
 
     def stop(self) -> None:

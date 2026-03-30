@@ -692,7 +692,7 @@ class OwnerUnderstanding:
             self._bus.on("user_emotion_detected", self._on_emotion)
             self._bus.on("intent_classified", self._on_intent)
 
-        self._task = asyncio.ensure_future(self._background_loop())
+        self._task = asyncio.create_task(self._background_loop())
         logger.info("Owner understanding engine started (%d prior interactions)",
                      self._total_interactions)
 

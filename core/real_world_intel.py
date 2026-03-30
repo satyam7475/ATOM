@@ -171,7 +171,7 @@ class RealWorldIntelligence:
     # ── Lifecycle ────────────────────────────────────────────────────
 
     def start(self) -> None:
-        self._task = asyncio.ensure_future(self._refresh_loop())
+        self._task = asyncio.create_task(self._refresh_loop())
         logger.info(
             "Real-world intelligence started (refresh every %ds)",
             self._refresh_interval,

@@ -93,7 +93,7 @@ class SystemWatcher:
     def start(self) -> None:
         if self._task is None or self._task.done():
             self._stop = False
-            self._task = asyncio.ensure_future(self._run())
+            self._task = asyncio.create_task(self._run())
             logger.info("SystemWatcher started (poll=%.0fs)", self._interval)
 
         self._bus.on("governor_throttle", self._on_governor_throttle)

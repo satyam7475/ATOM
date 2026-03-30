@@ -35,7 +35,7 @@
 | Monitoring | psutil, custom MetricsCollector, HealthMonitor |
 | Persistence | JSON files (logs/, config/) — no database dependency |
 
-## The 7 Rings (Architecture Layers)
+## The 8 Rings (Architecture Layers)
 
 ```
 Ring 1: PERCEPTION    — STT, Mic, SystemWatcher, ContextEngine

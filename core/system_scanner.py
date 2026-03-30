@@ -623,7 +623,7 @@ class SystemScanner:
     # ── Background Scanner ────────────────────────────────────────
 
     def start(self) -> None:
-        self._task = asyncio.ensure_future(self._run())
+        self._task = asyncio.create_task(self._run())
         logger.info("System scanner started (interval=%.0fs)", self._scan_interval)
 
     def stop(self) -> None:

@@ -9,7 +9,7 @@
 ## Table of Contents
 
 1. [System Identity](#1-system-identity)
-2. [Architecture Layers (The 7 Rings)](#2-architecture-layers-the-7-rings)
+2. [Architecture Layers (The 8 Rings)](#2-architecture-layers-the-8-rings)
 3. [Module Registry — Every Organ Mapped](#3-module-registry--every-organ-mapped)
 4. [The Nervous System — Event Bus Contract](#4-the-nervous-system--event-bus-contract)
 5. [The Brain Pipeline — How ATOM Thinks](#5-the-brain-pipeline--how-atom-thinks)
@@ -63,7 +63,7 @@
 
 ---
 
-## 2. Architecture Layers (The 7 Rings)
+## 2. Architecture Layers (The 8 Rings)
 
 ATOM is structured in **8 concentric rings**, from outermost (user-facing) to innermost (JARVIS mind):
 

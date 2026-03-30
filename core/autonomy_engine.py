@@ -75,7 +75,7 @@ class AutonomyEngine:
 
         auto_cfg = (config or {}).get("autonomy", {})
         self._enabled: bool = auto_cfg.get("enabled", True)
-        self._auto_threshold: float = auto_cfg.get("auto_execute_threshold", 0.8)
+        self._auto_threshold: float = auto_cfg.get("auto_execute_threshold", 0.95)
         self._suggest_threshold: float = auto_cfg.get("suggest_threshold", 0.5)
         self._check_interval: float = auto_cfg.get("check_interval_s", 90.0)
         self._idle_timeout_min: float = auto_cfg.get("idle_timeout_minutes", 10.0)

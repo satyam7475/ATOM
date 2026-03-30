@@ -60,8 +60,11 @@ class PriorityEventBus:
         self._worker_task: asyncio.Task | None = None
 
 class AsyncEventBus(PriorityEventBus):
-    """Alias for backwards compatibility."""
-    pass
+    """Full event bus implementation with priority dispatch and error isolation.
+
+    PriorityEventBus provides slots + __init__; this class adds all
+    the operational methods (emit, subscribe, dispatch, lifecycle).
+    """
 
     def _get_loop(self) -> asyncio.AbstractEventLoop:
         loop = self._loop
@@ -137,16 +140,67 @@ class AsyncEventBus(PriorityEventBus):
                 logger.error("Priority worker error: %s", e)
                 await asyncio.sleep(0.1)
 
+    def _dispatch(self, event: str, data: dict[str, Any], emit_type: str) -> None:
+        """Route queued event to handlers using the appropriate call wrapper.
+
+        emit_type determines timeout behaviour:
+          - "fast"   → _fast_call  (no timeout, fire-and-forget)
+          - "long"   → _long_call  (60 s timeout, for TTS / LLM)
+          - "normal" → _safe_call  (10 s timeout + slow-handler warning)
+        """
+        handlers = self._get_handlers(event)
+        if not handlers:
+            return
+
+        self._emit_counts[event] += 1
+        loop = self._get_loop()
+
+        if emit_type == "fast":
+            if len(handlers) == 1:
+                task = loop.create_task(
+                    self._fast_call_single(handlers[0], event, data))
+                task.add_done_callback(self._task_done)
+                self._active_tasks.add(task)
+                return
+            call_fn = self._fast_call
+        elif emit_type == "long":
+            call_fn = self._long_call
+        else:
+            call_fn = self._safe_call
+
+        for handler in handlers:
+            task = loop.create_task(call_fn(handler, event, data))
+            task.add_done_callback(self._task_done)
+            self._active_tasks.add(task)
+
+    _HIGH_EVENTS: frozenset[str] = frozenset({
+        "speech_final", "speech_partial", "interrupt",
+        "wake_word", "silence_timeout",
+    })
+    _LOW_EVENTS: frozenset[str] = frozenset({
+        "system_scan", "media_update", "log", "metrics",
+    })
+    _PRIORITY_CACHE: dict[str, int] = {}
+
     def _get_priority(self, event: str) -> int:
-        """Determine priority level (0=High, 1=Medium, 2=Low)."""
-        high_events = {"speech_final", "speech_partial", "interrupt", "wake_word", "silence_timeout"}
-        low_events = {"system_scan", "media_update", "log", "metrics"}
-        
-        if any(event.startswith(h) or event == h for h in high_events):
-            return 0
-        if any(event.startswith(l) or event == l for l in low_events):
-            return 2
-        return 1
+        """O(1) priority lookup with caching for prefix matches."""
+        cached = self._PRIORITY_CACHE.get(event)
+        if cached is not None:
+            return cached
+
+        if event in self._HIGH_EVENTS:
+            p = 0
+        elif event in self._LOW_EVENTS:
+            p = 2
+        elif any(event.startswith(h) for h in self._HIGH_EVENTS):
+            p = 0
+        elif any(event.startswith(lo) for lo in self._LOW_EVENTS):
+            p = 2
+        else:
+            p = 1
+
+        self._PRIORITY_CACHE[event] = p
+        return p
 
     def emit(self, event: str, **data: Any) -> None:
         """Queue event for normal processing."""
