@@ -43,17 +43,21 @@ class ConfirmationManager:
     """Manages pending action and tool confirmations with timeouts."""
 
     __slots__ = (
-        "_pending_action", "_pending_tool", "_security",
+        "_pending_action", "_pending_tool", "_security", "_registry",
         "_action_timeout_s", "_tool_timeout_s",
     )
 
     def __init__(
         self,
         security: Any,
+        registry: Any | None = None,
         action_timeout_s: float = 25.0,
         tool_timeout_s: float = 30.0,
     ) -> None:
+        from core.reasoning.tool_registry import get_tool_registry
+
         self._security = security
+        self._registry = registry or get_tool_registry()
         self._pending_action: dict | None = None
         self._pending_tool: dict | None = None
         self._action_timeout_s = action_timeout_s
@@ -67,31 +71,8 @@ class ConfirmationManager:
 
     def requires_confirmation(self, result: Any) -> bool:
         """Check if an action result needs confirmation before execution."""
-        try:
-            from core.action_safety import default_risk_for_action, risk_requires_confirmation
-
-            action_name = getattr(result, "action", None) or ""
-            if risk_requires_confirmation(default_risk_for_action(str(action_name))):
-                return True
-        except Exception:
-            pass
-
-        action = result.action
-        if self._security.requires_extra_confirmation(action):
-            return True
-        try:
-            from core.command_registry import get_registry
-            registry = get_registry()
-            if registry.count > 0:
-                return registry.requires_confirmation(action)
-        except Exception:
-            pass
-        return action in {
-            "play_youtube", "create_folder", "move_path", "copy_path",
-            "close_app", "shutdown_pc", "restart_pc", "logoff",
-            "sleep_pc", "empty_recycle_bin", "kill_process",
-            "type_text",
-        }
+        action = str(getattr(result, "action", "") or "")
+        return self._registry.requires_confirmation(action)
 
     def set_pending_action(self, result: Any) -> str:
         """Stage an action for confirmation. Returns the prompt to speak."""

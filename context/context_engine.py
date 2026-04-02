@@ -20,12 +20,12 @@ import time
 from typing import Any
 
 from context.privacy_filter import redact as _redact_sensitive
+import ctypes
 
 
 def _get_foreground_window_title() -> str:
     """Active window title via user32.GetWindowTextW. Returns '' on failure."""
     try:
-        import ctypes
         user32 = ctypes.windll.user32  # type: ignore[attr-defined]
         hwnd = user32.GetForegroundWindow()
         length = user32.GetWindowTextLengthW(hwnd)
@@ -44,7 +44,6 @@ def _get_clipboard_text(max_chars: int = 500) -> str:
     Truncated to max_chars. Returns '' on failure or non-text clipboard.
     """
     try:
-        import ctypes
         user32 = ctypes.windll.user32  # type: ignore[attr-defined]
         kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
 

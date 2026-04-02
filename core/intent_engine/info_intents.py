@@ -11,6 +11,7 @@ import time
 
 from core import adaptive_personality as personality
 from .base import IntentResult
+import psutil
 
 _TIME = re.compile(
     r"\b(what('?s|\s+is)?\s+the\s+time|current\s+time|time\s+(now|please)|"
@@ -69,7 +70,6 @@ def check(text: str) -> IntentResult | None:
     if _CPU.search(text):
         pfx = personality.info_prefix()
         try:
-            import psutil
             cpu = psutil.cpu_percent(interval=0.1)
             return IntentResult("cpu", response=f"{pfx} CPU usage is {cpu:.0f} percent.".strip())
         except Exception:
@@ -77,7 +77,6 @@ def check(text: str) -> IntentResult | None:
     if _RAM.search(text):
         pfx = personality.info_prefix()
         try:
-            import psutil
             mem = psutil.virtual_memory()
             used_gb = mem.used / (1024 ** 3)
             total_gb = mem.total / (1024 ** 3)
@@ -89,7 +88,6 @@ def check(text: str) -> IntentResult | None:
     if _BATTERY.search(text):
         pfx = personality.info_prefix()
         try:
-            import psutil
             bat = psutil.sensors_battery()
             if bat:
                 plug = "and charging" if bat.power_plugged else "on battery"
@@ -101,7 +99,6 @@ def check(text: str) -> IntentResult | None:
     if _DISK.search(text):
         pfx = personality.info_prefix()
         try:
-            import psutil
             d = psutil.disk_usage("C:\\")
             free_gb = d.free / (1024 ** 3)
             total_gb = d.total / (1024 ** 3)
@@ -113,7 +110,6 @@ def check(text: str) -> IntentResult | None:
     if _SYSTEM_INFO.search(text):
         pfx = personality.info_prefix()
         try:
-            import psutil
             cpu = psutil.cpu_percent(interval=0.1)
             mem = psutil.virtual_memory()
             bat = psutil.sensors_battery()
@@ -142,7 +138,6 @@ def check(text: str) -> IntentResult | None:
         return IntentResult("wifi", action="wifi_status", action_args={})
     if _UPTIME.search(text):
         try:
-            import psutil
             boot = psutil.boot_time()
             uptime_secs = time.time() - boot
             hours = int(uptime_secs // 3600)
@@ -156,7 +151,6 @@ def check(text: str) -> IntentResult | None:
             return IntentResult("uptime", response="Couldn't get uptime.")
     if _TOP_PROCESSES.search(text):
         try:
-            import psutil
             procs = []
             for p in psutil.process_iter(["pid", "name", "cpu_percent", "memory_percent"]):
                 try:

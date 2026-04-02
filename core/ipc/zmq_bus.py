@@ -2,7 +2,7 @@
 ATOM V4 -- ZeroMQ Distributed Event Bus.
 
 A hardened distributed event bus supporting a strict message contract,
-ACKs, retries, and timeout handling.
+ACKs, retries with exponential backoff, and timeout handling.
 
 Owner: Satyam
 """
@@ -10,6 +10,7 @@ Owner: Satyam
 import asyncio
 import json
 import logging
+import random
 import time
 import uuid
 from collections import defaultdict
@@ -35,6 +36,7 @@ class ZmqEventBus:
         sub_url: str = "tcp://127.0.0.1:5556",
         req_url: str = "tcp://127.0.0.1:5557",
         rep_url: str = "tcp://127.0.0.1:5558",
+        dealer_url: str = "tcp://127.0.0.1:5559",
         worker_name: str = "unknown"
     ) -> None:
         self._pub_url = pub_url
@@ -56,10 +58,10 @@ class ZmqEventBus:
         self.req_socket = self.ctx.socket(zmq.REQ)
         self.req_socket.connect(self._req_url)
         
-        # DEALER for async tasks
+        # DEALER for async tasks (port now configurable)
         self.dealer_socket = self.ctx.socket(zmq.DEALER)
         self.dealer_socket.setsockopt_string(zmq.IDENTITY, self.worker_name)
-        self.dealer_socket.connect("tcp://127.0.0.1:5559")
+        self.dealer_socket.connect(dealer_url)
         
         # Local handlers: event_name -> list of async callables
         self._handlers: dict[str, list[Callable[..., Coroutine[Any, Any, None]]]] = defaultdict(list)
@@ -124,7 +126,8 @@ class ZmqEventBus:
             return reply.get("result")
         except asyncio.TimeoutError:
             logger.error(f"REQ timeout for command: {command}")
-            # Need to reset socket state on timeout in REQ/REP pattern
+            # Fix: set LINGER=0 before close to prevent socket leak
+            self.req_socket.setsockopt(zmq.LINGER, 0)
             self.req_socket.close()
             self.req_socket = self.ctx.socket(zmq.REQ)
             self.req_socket.connect(self._req_url)
@@ -186,9 +189,14 @@ class ZmqEventBus:
             logger.error(f"Failed to emit ZMQ event {event}: {e}")
 
     async def emit_with_ack(self, event: str, target: str, timeout: float = 2.0, retries: int = 3, **data: Any) -> bool:
-        """Emit an event and wait for an ACK from the target worker."""
+        """Emit an event and wait for an ACK from the target worker.
+
+        Uses exponential backoff with jitter to prevent thundering herd
+        when multiple workers time out simultaneously.
+        """
         msg = self._build_message(event, target=target, priority="high", payload=data)
         msg_id = msg["id"]
+        base_timeout = timeout
         
         for attempt in range(retries):
             try:
@@ -202,11 +210,16 @@ class ZmqEventBus:
                 self.pub_socket.send_multipart([event.encode("utf-8"), payload_str])
                 logger.debug(f"ZMQ Emit with ACK: {event} (id: {msg_id}, attempt: {attempt+1})")
                 
-                await asyncio.wait_for(fut, timeout=timeout)
+                # Exponential backoff: timeout doubles each retry + random jitter
+                current_timeout = base_timeout * (2 ** attempt) + random.uniform(0, 0.5)
+                await asyncio.wait_for(fut, timeout=current_timeout)
                 return True
                 
             except asyncio.TimeoutError:
-                logger.warning(f"ACK timeout for {event} (id: {msg_id}). Retrying...")
+                logger.warning(
+                    f"ACK timeout for {event} (id: {msg_id}, attempt {attempt+1}/{retries}, "
+                    f"waited {current_timeout:.1f}s). Retrying..."
+                )
             except Exception as e:
                 logger.error(f"Failed to emit ZMQ event {event}: {e}")
             finally:

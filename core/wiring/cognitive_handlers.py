@@ -235,6 +235,23 @@ def wire(
             bus.emit_long("response_ready", text=text)
     bus.on("goal_briefing", _on_goal_briefing)
 
+    async def _on_goal_update(
+        goal_id: str = "",
+        action: str = "",
+        title: str = "",
+        **_kw,
+    ) -> None:
+        """Reflect GoalEngine changes in indicator + dashboard (Ring 6 → 5)."""
+        label = title or goal_id or "goal"
+        indicator.add_log("info", f"[goal {action}] {label}")
+        if web_dashboard is not None:
+            try:
+                web_dashboard.broadcast_goals(goal_engine.get_goals_for_dashboard())
+            except Exception:
+                logger.debug("Dashboard goals broadcast failed", exc_info=True)
+
+    bus.on("goal_update", _on_goal_update)
+
     async def _on_mode_changed(mode: str = "", **_kw) -> None:
         indicator.add_log("action", f"Mode: {mode.upper()}")
         if hasattr(tts, "_rate_override"):

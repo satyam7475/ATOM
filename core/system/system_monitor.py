@@ -10,6 +10,8 @@ from __future__ import annotations
 import logging
 import sys
 from typing import Any
+import psutil
+import ctypes
 
 logger = logging.getLogger("atom.system_monitor")
 
@@ -18,7 +20,6 @@ def _foreground_title() -> str:
     if sys.platform != "win32":
         return ""
     try:
-        import ctypes
         user32 = ctypes.windll.user32
         hwnd = user32.GetForegroundWindow()
         if not hwnd:
@@ -39,7 +40,6 @@ def get_system_state() -> dict[str, Any]:
     ram_pct = 0.0
     top_apps: list[dict[str, Any]] = []
     try:
-        import psutil
         cpu_pct = float(psutil.cpu_percent(interval=0))
         ram_pct = float(psutil.virtual_memory().percent)
         by_cpu: list[tuple[float, str]] = []

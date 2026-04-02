@@ -68,7 +68,7 @@ The `AsyncEventBus` is ATOM's backbone. EVERY module communicates through it. Ze
 | `habit_suggestion` | `{text, habit_id, confidence}` | Autonomy → TTS |
 | `autonomous_action` | `{action, target, habit_id, confidence}` | Autonomy → Router |
 | `user_feedback` | `{habit_id, accepted}` | main.py → Autonomy |
-| `goal_update` | `{goal_id, action, title}` | GoalEngine → — |
+| `goal_update` | `{goal_id, action, title}` | GoalEngine → cognitive_handlers (indicator, dashboard) |
 | `goal_briefing` | `{text}` | GoalEngine → TTS |
 | `prediction_ready` | `{predictions: []}` | Prediction → Dashboard |
 | `user_energy_state` | `{energy, idle_minutes, active_app}` | BehaviorModel → PersonalityModes |

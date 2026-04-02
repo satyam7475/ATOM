@@ -39,6 +39,8 @@ from dataclasses import dataclass, field
 from enum import Enum, auto
 from pathlib import Path
 from typing import Any
+import psutil
+import ctypes
 
 logger = logging.getLogger("atom.platform")
 
@@ -174,7 +176,6 @@ class PlatformAdapter:
         p.shell = os.environ.get("SHELL") or os.environ.get("COMSPEC", "")
 
         try:
-            import psutil
             p.cpu_cores_physical = psutil.cpu_count(logical=False) or 0
             p.cpu_cores_logical = psutil.cpu_count(logical=True) or 0
             mem = psutil.virtual_memory()
@@ -264,7 +265,6 @@ class PlatformAdapter:
         """Get display count and primary resolution."""
         if self.os_type == OSType.WINDOWS:
             try:
-                import ctypes
                 user32 = ctypes.windll.user32
                 w = user32.GetSystemMetrics(0)
                 h = user32.GetSystemMetrics(1)
@@ -301,7 +301,6 @@ class PlatformAdapter:
 
     def _fg_window_windows(self) -> dict[str, str]:
         try:
-            import ctypes
             from ctypes import wintypes
 
             user32 = ctypes.windll.user32
@@ -318,7 +317,6 @@ class PlatformAdapter:
 
             process_name = ""
             try:
-                import psutil
                 proc = psutil.Process(pid.value)
                 process_name = proc.name()
             except Exception:
@@ -388,7 +386,6 @@ class PlatformAdapter:
 
     def _clipboard_windows(self, max_chars: int) -> str:
         try:
-            import ctypes
             user32 = ctypes.windll.user32
             kernel32 = ctypes.windll.kernel32
             if not user32.OpenClipboard(0):
@@ -418,7 +415,6 @@ class PlatformAdapter:
         """List running processes sorted by CPU or memory usage."""
         procs: list[ProcessInfo] = []
         try:
-            import psutil
             for proc in psutil.process_iter(
                 ["pid", "name", "cpu_percent", "memory_info",
                  "status", "username", "create_time", "cmdline"],
@@ -448,7 +444,6 @@ class PlatformAdapter:
 
     def kill_process(self, pid: int) -> bool:
         try:
-            import psutil
             proc = psutil.Process(pid)
             proc.terminate()
             proc.wait(timeout=5)
@@ -462,7 +457,6 @@ class PlatformAdapter:
         """List all network interfaces with IP and status."""
         interfaces: list[NetworkInterface] = []
         try:
-            import psutil
             addrs = psutil.net_if_addrs()
             stats = psutil.net_if_stats()
             for name, addr_list in addrs.items():
@@ -490,7 +484,6 @@ class PlatformAdapter:
         """List all disk partitions with usage."""
         disks: list[DiskInfo] = []
         try:
-            import psutil
             for part in psutil.disk_partitions(all=False):
                 try:
                     usage = psutil.disk_usage(part.mountpoint)
@@ -614,7 +607,6 @@ class PlatformAdapter:
     def lock_screen(self) -> bool:
         try:
             if self.os_type == OSType.WINDOWS:
-                import ctypes
                 ctypes.windll.user32.LockWorkStation()
             elif self.os_type == OSType.LINUX:
                 subprocess.Popen(["xdg-screensaver", "lock"])
@@ -746,7 +738,6 @@ class PlatformAdapter:
         services: list[dict[str, str]] = []
         try:
             if self.os_type == OSType.WINDOWS:
-                import psutil
                 for svc in psutil.win_service_iter():
                     try:
                         info = svc.as_dict()

@@ -35,6 +35,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+import psutil
 
 logger = logging.getLogger("atom.sysctl")
 
@@ -66,7 +67,6 @@ class SystemControl:
     def set_process_priority(self, pid: int, priority: str = "normal") -> SystemControlResult:
         """Set process priority: low, below_normal, normal, above_normal, high, realtime."""
         try:
-            import psutil
             proc = psutil.Process(pid)
             priority_map = {
                 "low": psutil.IDLE_PRIORITY_CLASS if self._is_windows else 19,
@@ -92,7 +92,6 @@ class SystemControl:
     def suspend_process(self, pid: int) -> SystemControlResult:
         """Suspend (pause) a process."""
         try:
-            import psutil
             proc = psutil.Process(pid)
             proc.suspend()
             return SystemControlResult(True, f"Process {proc.name()} (PID {pid}) suspended")
@@ -102,7 +101,6 @@ class SystemControl:
     def resume_process(self, pid: int) -> SystemControlResult:
         """Resume a suspended process."""
         try:
-            import psutil
             proc = psutil.Process(pid)
             proc.resume()
             return SystemControlResult(True, f"Process {proc.name()} (PID {pid}) resumed")
@@ -112,7 +110,6 @@ class SystemControl:
     def get_process_details(self, pid: int) -> SystemControlResult:
         """Get detailed info about a specific process."""
         try:
-            import psutil
             proc = psutil.Process(pid)
             info = proc.as_dict(attrs=[
                 "pid", "name", "exe", "cmdline", "status", "username",
@@ -140,7 +137,6 @@ class SystemControl:
     def find_process_by_name(self, name: str) -> SystemControlResult:
         """Find processes matching a name pattern."""
         try:
-            import psutil
             matches = []
             name_lower = name.lower()
             for proc in psutil.process_iter(["pid", "name", "cpu_percent", "memory_info"]):
@@ -192,7 +188,6 @@ class SystemControl:
     def get_network_speed(self) -> SystemControlResult:
         """Measure current network throughput."""
         try:
-            import psutil
             net1 = psutil.net_io_counters()
             time.sleep(1)
             net2 = psutil.net_io_counters()
@@ -210,7 +205,6 @@ class SystemControl:
     def get_open_ports(self) -> SystemControlResult:
         """List open listening ports."""
         try:
-            import psutil
             ports = []
             for conn in psutil.net_connections(kind="inet"):
                 if conn.status == "LISTEN" and conn.laddr:
@@ -422,7 +416,6 @@ class SystemControl:
         optimizations = []
 
         try:
-            import psutil
 
             for proc in psutil.process_iter(["pid", "name", "cpu_percent", "memory_info"]):
                 try:
@@ -463,7 +456,6 @@ class SystemControl:
     def get_system_uptime(self) -> SystemControlResult:
         """Get detailed system uptime info."""
         try:
-            import psutil
             boot = psutil.boot_time()
             uptime_s = time.time() - boot
             hours = int(uptime_s // 3600)

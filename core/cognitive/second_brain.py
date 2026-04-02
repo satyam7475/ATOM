@@ -25,6 +25,8 @@ import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from core.persistence_manager import persistence_manager
+
 if TYPE_CHECKING:
     from core.behavior_tracker import BehaviorTracker
     from core.memory_engine import MemoryEngine
@@ -103,16 +105,14 @@ class SecondBrain:
         if not self._dirty:
             return
         try:
-            _BRAIN_FILE.parent.mkdir(parents=True, exist_ok=True)
             data = {
                 "facts": self._facts[-_MAX_FACTS:],
                 "user_preferences": self._preferences,
                 "learned_corrections": self._corrections[-_MAX_CORRECTIONS:],
                 "episodic_buffer": self._episodic_buffer[-50:],
             }
-            _BRAIN_FILE.write_text(
-                json.dumps(data, indent=2, default=str), encoding="utf-8",
-            )
+            persistence_manager.register("second_brain", _BRAIN_FILE)
+            persistence_manager.save_now("second_brain", data)
             self._dirty = False
             if self._vector_store is not None:
                 self._vector_store.persist()

@@ -215,8 +215,8 @@ class SelfEvolutionEngine:
 
         cache_pct = snap.get("cache_hit_rate_pct", 0)
         if cache_pct < 10 and total > 20:
-            return ("Boss, I notice most queries go to cloud AI. "
-                    "I could handle more locally if you teach me "
+            return ("Boss, I notice most queries go to the full LLM pipeline. "
+                    "I could handle more via fast-path if you teach me "
                     "new patterns. Just say what you ask most often.")
 
         perceived = snap.get("perceived_avg_ms", 0)

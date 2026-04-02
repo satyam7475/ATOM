@@ -58,6 +58,7 @@ class PriorityEventBus:
         
         self._queue: asyncio.PriorityQueue | None = None
         self._worker_task: asyncio.Task | None = None
+        self._priority_cache: dict[str, int] = {}
 
 class AsyncEventBus(PriorityEventBus):
     """Full event bus implementation with priority dispatch and error isolation.
@@ -180,11 +181,10 @@ class AsyncEventBus(PriorityEventBus):
     _LOW_EVENTS: frozenset[str] = frozenset({
         "system_scan", "media_update", "log", "metrics",
     })
-    _PRIORITY_CACHE: dict[str, int] = {}
 
     def _get_priority(self, event: str) -> int:
         """O(1) priority lookup with caching for prefix matches."""
-        cached = self._PRIORITY_CACHE.get(event)
+        cached = self._priority_cache.get(event)
         if cached is not None:
             return cached
 
@@ -199,7 +199,7 @@ class AsyncEventBus(PriorityEventBus):
         else:
             p = 1
 
-        self._PRIORITY_CACHE[event] = p
+        self._priority_cache[event] = p
         return p
 
     def emit(self, event: str, **data: Any) -> None:

@@ -63,6 +63,7 @@ VALID_TRANSITIONS: dict[AtomState, frozenset[AtomState]] = {
     AtomState.THINKING: frozenset({
         AtomState.SPEAKING,
         AtomState.LISTENING,
+        AtomState.IDLE,
         AtomState.ERROR_RECOVERY,
         AtomState.SLEEP,
     }),
@@ -95,14 +96,22 @@ class StateManager:
         "_state", "_lock", "_bus", "_always_listen",
         "_state_enter_time", "_transition_counts",
         "_state_durations", "_last_transition_time",
-        "_total_transitions",
+        "_total_transitions", "_error_recovery_hold_s",
     )
 
-    def __init__(self, bus: AsyncEventBus, initial: AtomState = AtomState.IDLE) -> None:
+    def __init__(
+        self,
+        bus: AsyncEventBus,
+        initial: AtomState = AtomState.IDLE,
+        *,
+        error_recovery_hold_s: float = 0.35,
+    ) -> None:
         self._state = initial
         self._lock = asyncio.Lock()
         self._bus = bus
         self._always_listen = False
+        # Keep ERROR_RECOVERY visible long enough for observers to react.
+        self._error_recovery_hold_s = max(0.0, float(error_recovery_hold_s))
         now = time.monotonic()
         self._state_enter_time: float = now
         self._last_transition_time: float = now
@@ -208,5 +217,7 @@ class StateManager:
         if self._state in (AtomState.LISTENING, AtomState.THINKING, AtomState.SPEAKING):
             logger.error("Error from %s in state %s -- entering recovery", source, self._state.value)
             await self.transition(AtomState.ERROR_RECOVERY)
+            if self._error_recovery_hold_s > 0:
+                await asyncio.sleep(self._error_recovery_hold_s)
             await self.transition(AtomState.IDLE)
 

@@ -21,6 +21,7 @@ import logging
 import time
 from pathlib import Path
 from typing import Any
+import ctypes
 
 logger = logging.getLogger("atom.screen")
 
@@ -81,7 +82,6 @@ class ScreenReader:
     def _take_screenshot(self) -> str | None:
         """Capture the current screen to a temporary file."""
         try:
-            import ctypes
             from PIL import ImageGrab
             img = ImageGrab.grab()
             tmp_path = Path("logs/screen_capture.png")

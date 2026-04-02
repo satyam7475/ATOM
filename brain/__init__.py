@@ -4,7 +4,6 @@ from .memory_graph import MemoryGraph, MemoryNode
 from .behavior_model import BehaviorModel, UserState
 from .proactive_engine import ProactiveEngine
 from .skill_engine import SkillEngine, Skill
-from .cognition_loop import CognitionLoop
 
 __all__ = [
     'IntentEngine', 'Intent',
@@ -13,5 +12,4 @@ __all__ = [
     'BehaviorModel', 'UserState',
     'ProactiveEngine',
     'SkillEngine', 'Skill',
-    'CognitionLoop',
 ]

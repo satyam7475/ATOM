@@ -109,16 +109,39 @@ class FusedContext:
     context_richness: float = 0.5   # 0=no context, 1=fully enriched
 
     def quality_score(self) -> float:
-        """How complete is this fused context? 0.0 to 1.0."""
-        scores = [
-            1.0 if self.time_of_day else 0.0,
-            1.0 if self.emotion != "neutral" else 0.3,
-            1.0 if self.system_health < 100 else 0.5,
-            min(1.0, len(self.conversation.topic_thread) / 3),
-            min(1.0, len(self.relevant_memories) / 2),
-            1.0 if self.active_project else 0.0,
+        """How complete is this fused context? 0.0 to 1.0.
+
+        Weighted multi-signal scoring across all intelligence layers.
+        Higher weight = more critical for response quality.
+        """
+        # (signal_score, weight) pairs
+        signals: list[tuple[float, float]] = [
+            # Situation layer (always available, baseline context)
+            (1.0 if self.time_of_day else 0.0, 0.5),
+            # Emotion awareness (knowing emotion dramatically improves response)
+            (0.9 if self.emotion not in ("neutral", "") else 0.3, 1.5),
+            # Emotion trajectory (trending adds prediction power)
+            (0.8 if self.emotion_trajectory != "stable" else 0.4, 0.8),
+            # System health (only high-value when degraded)
+            (1.0 if self.system_health < 80 else 0.5, 0.6),
+            # Conversation depth (deeper = richer context)
+            (min(1.0, self.conversation.turn_count / 5), 1.2),
+            # Topic tracking (knowing what we're talking about)
+            (min(1.0, len(self.conversation.topic_thread) / 3), 1.0),
+            # Memory retrieval (relevant memories = grounded response)
+            (min(1.0, len(self.relevant_memories) / 2), 1.5),
+            # Facts available
+            (min(1.0, len(self.relevant_facts) / 2), 1.0),
+            # Active project awareness
+            (0.9 if self.active_project else 0.0, 0.8),
+            # Recent actions (know what we just did)
+            (min(1.0, len(self.recent_actions) / 2), 0.6),
+            # Energy/expertise hint (personalization depth)
+            (0.8 if self.expertise_hint else 0.2, 0.5),
         ]
-        return sum(scores) / len(scores)
+        total_weight = sum(w for _, w in signals)
+        weighted_sum = sum(score * weight for score, weight in signals)
+        return weighted_sum / total_weight if total_weight > 0 else 0.0
 
 
 class ContextFusionEngine:

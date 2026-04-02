@@ -136,6 +136,7 @@ async def test_illegal_transitions_blocked() -> None:
     Must stay aligned with ``core.state_manager.VALID_TRANSITIONS`` (v14+):
     - LISTENING -> SPEAKING is **legal** (fast-path local reply, skips THINKING).
     - SLEEP -> LISTENING is **legal** (resume from sleep / silent mode).
+    - THINKING -> IDLE is **legal** (cache/cognitive paths with no TTS).
     """
     bus = FakeEventBus()
 
@@ -143,7 +144,6 @@ async def test_illegal_transitions_blocked() -> None:
         (AtomState.IDLE, AtomState.THINKING),       # can't skip LISTENING
         (AtomState.IDLE, AtomState.SPEAKING),       # can't skip LISTENING (+ usually THINKING)
         (AtomState.IDLE, AtomState.ERROR_RECOVERY), # no direct path from idle
-        (AtomState.THINKING, AtomState.IDLE),       # must go through SPEAKING or LISTENING
         (AtomState.SPEAKING, AtomState.THINKING),   # can't go backwards
         (AtomState.SLEEP, AtomState.THINKING),      # can't skip to THINKING
         (AtomState.SLEEP, AtomState.SPEAKING),      # can't skip everything

@@ -293,7 +293,11 @@ class MiniLLM:
             )
             return text, False
 
-        except TypeError:
+        except TypeError as te:
+            logger.warning(
+                "Streaming API raised TypeError (%s), falling back to non-streaming",
+                te,
+            )
             try:
                 output = self._llm(
                     prompt,

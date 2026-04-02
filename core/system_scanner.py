@@ -33,6 +33,7 @@ import time
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from typing import Any, TYPE_CHECKING
+import psutil
 
 if TYPE_CHECKING:
     from core.async_event_bus import AsyncEventBus
@@ -269,7 +270,6 @@ class SystemScanner:
         report: dict[str, Any] = {"scan_time": time.time(), "type": "light"}
 
         try:
-            import psutil
             report["cpu_percent"] = psutil.cpu_percent(interval=0.5)
             report["cpu_per_core"] = psutil.cpu_percent(interval=0, percpu=True)
             mem = psutil.virtual_memory()
@@ -329,7 +329,6 @@ class SystemScanner:
         """Scan active network connections."""
         conn_info: dict[str, Any] = {"established": 0, "listening": 0, "total": 0}
         try:
-            import psutil
             conns = psutil.net_connections(kind="inet")
             conn_info["total"] = len(conns)
             listening_ports = []
@@ -421,7 +420,6 @@ class SystemScanner:
             h.details.append(f"RAM moderately used: {ram_pct_used:.0f}%")
 
         try:
-            import psutil
             cpu = psutil.cpu_percent(interval=0)
             h.cpu_score = max(0, min(100, int(100 - cpu)))
             if cpu > 90:
@@ -897,7 +895,6 @@ class SystemScanner:
         """Check available system memory."""
         result: dict[str, Any] = {"status": "pass", "detail": ""}
         try:
-            import psutil
             mem = psutil.virtual_memory()
             total_gb = mem.total / (1024 ** 3)
             avail_gb = mem.available / (1024 ** 3)

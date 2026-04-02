@@ -90,6 +90,7 @@ class ToolRegistry:
     def __init__(self) -> None:
         self._tools: dict[str, Tool] = {}
         self._categories: dict[str, list[str]] = {}
+        self._extra_confirmation_required: set[str] = set()
         self._register_builtin_tools()
 
     def register(self, tool: Tool) -> None:
@@ -111,6 +112,66 @@ class ToolRegistry:
     @property
     def count(self) -> int:
         return len(self._tools)
+
+    def apply_confirmation_policy(
+        self,
+        *,
+        config: dict | None = None,
+        command_registry: Any | None = None,
+    ) -> None:
+        """Merge config- and command-driven confirmation requirements.
+
+        Tool metadata remains the base policy. This method adds any extra
+        confirmations requested by `commands.json` and `settings.json`
+        without weakening built-in safety defaults.
+        """
+        merged: set[str] = set()
+
+        if command_registry is not None:
+            try:
+                for cmd in command_registry.all_commands():
+                    action = str(getattr(cmd, "action", "") or "")
+                    if action and bool(getattr(cmd, "confirm", False)):
+                        merged.add(action)
+            except Exception:
+                logger.debug("Command registry confirmation merge failed", exc_info=True)
+
+        sec = (config or {}).get("security", {}) if isinstance(config, dict) else {}
+        extra = sec.get("require_confirmation_for", []) or []
+        for action in extra:
+            if isinstance(action, str) and action:
+                merged.add(action)
+
+        self._extra_confirmation_required = merged
+        logger.info(
+            "Tool registry confirmation policy merged: %d extra actions",
+            len(self._extra_confirmation_required),
+        )
+
+    def requires_confirmation(self, action: str) -> bool:
+        """Return True when an action must be confirmed before execution."""
+        if not action:
+            return False
+
+        if action in self._extra_confirmation_required:
+            return True
+
+        tool = self._tools.get(action)
+        if tool is not None and (
+            tool.requires_confirmation or tool.safety_level == "dangerous"
+        ):
+            return True
+
+        # Conservative fallback for actions not yet fully modeled as tools.
+        try:
+            from core.action_safety import (
+                default_risk_for_action,
+                risk_requires_confirmation,
+            )
+
+            return risk_requires_confirmation(default_risk_for_action(action))
+        except Exception:
+            return False
 
     def generate_prompt_tools_section(self) -> str:
         """Generate the tools section for the LLM prompt."""
@@ -189,8 +250,9 @@ class ToolRegistry:
                  [ToolParameter("clicks", "integer", "Scroll amount", False, 5)]),
             Tool("press_key", "Press a keyboard key", "desktop", "moderate",
                  [ToolParameter("key", "string", "Key name", True)]),
-            Tool("type_text", "Type text into active window", "desktop", "moderate",
-                 [ToolParameter("text", "string", "Text to type", True)]),
+            Tool("type_text", "Type text into active window", "desktop", "dangerous",
+                 [ToolParameter("text", "string", "Text to type", True)],
+                 requires_confirmation=True),
             Tool("click_screen", "Click at mouse position", "desktop", "moderate"),
             Tool("hotkey_combo", "Press a hotkey combination", "desktop", "moderate",
                  [ToolParameter("combo", "string", "Hotkey combo like ctrl+c", True)]),

@@ -78,6 +78,8 @@ async def section_state_machine() -> None:
     valid_paths = [
         (AtomState.IDLE, AtomState.LISTENING),
         (AtomState.LISTENING, AtomState.THINKING),
+        (AtomState.THINKING, AtomState.IDLE),
+        (AtomState.LISTENING, AtomState.THINKING),
         (AtomState.THINKING, AtomState.SPEAKING),
         (AtomState.SPEAKING, AtomState.IDLE),
         (AtomState.IDLE, AtomState.SLEEP),
@@ -96,7 +98,6 @@ async def section_state_machine() -> None:
         (AtomState.IDLE, AtomState.THINKING),
         (AtomState.IDLE, AtomState.SPEAKING),
         (AtomState.IDLE, AtomState.ERROR_RECOVERY),
-        (AtomState.THINKING, AtomState.IDLE),
         (AtomState.SPEAKING, AtomState.THINKING),
         (AtomState.SLEEP, AtomState.THINKING),
         (AtomState.SLEEP, AtomState.SPEAKING),

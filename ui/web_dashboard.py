@@ -15,6 +15,7 @@ import asyncio
 import json
 import logging
 import os
+import secrets
 import subprocess
 import sys
 import time
@@ -23,6 +24,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Awaitable, Callable, Optional
 
 from aiohttp import web
+import psutil
 
 if TYPE_CHECKING:
     from core.state_manager import AtomState
@@ -62,6 +64,7 @@ class WebDashboard:
         self._site: web.TCPSite | None = None
         self._system_task: asyncio.Task | None = None
         self._shutdown_callback: Any = None
+        self._ws_token = secrets.token_urlsafe(32)
         self._unstick_callback: Callable[[], Awaitable[None]] | None = None
         self._mode_change_callback: Callable[[str], None] | None = None
         self._personality_mode_callback: Callable[[str], None] | None = None
@@ -145,8 +148,10 @@ class WebDashboard:
 
         self._system_task = asyncio.create_task(self._push_system_info_loop())
 
-    async def _serve_dashboard(self, request: web.Request) -> web.FileResponse:
-        return web.FileResponse(_DASHBOARD_DIR / "index.html")
+    async def _serve_dashboard(self, request: web.Request) -> web.Response:
+        content = (_DASHBOARD_DIR / "index.html").read_text(encoding="utf-8")
+        content = content.replace("const WS='ws://'+location.host+'/ws';", f"const WS='ws://'+location.host+'/ws?token={self._ws_token}';")
+        return web.Response(text=content, content_type="text/html")
 
     async def _v7_health(self, request: web.Request) -> web.StreamResponse:
         if self._v7_health_provider is None:
@@ -231,6 +236,10 @@ class WebDashboard:
                     raise web.HTTPForbidden(
                         text="Dashboard access token required (query ?token= or X-ATOM-Token).",
                     )
+            else:
+                if not secrets.compare_digest(token, getattr(self, "_ws_token", "")):
+                    logger.warning("Dashboard WebSocket rejected: missing or invalid dynamic token (CSWSH defense)")
+                    raise web.HTTPForbidden(text="Invalid dynamic WebSocket token.")
 
             if sessions_enabled():
                 sess = validate_session(sid) if sid else None
@@ -400,7 +409,7 @@ class WebDashboard:
 
     async def _push_system_info_loop(self) -> None:
         try:
-            import psutil
+            pass
         except ImportError:
             return
 

@@ -17,6 +17,8 @@ import logging
 import time
 from collections import deque
 from datetime import datetime
+import psutil
+import ctypes
 
 logger = logging.getLogger("atom.process_mgr")
 
@@ -31,7 +33,6 @@ class ProcessManager:
     def get_top_processes(self, n: int = 8, sort_by: str = "cpu") -> list[dict]:
         """Return top N processes sorted by CPU or memory usage."""
         try:
-            import psutil
             procs = []
             for p in psutil.process_iter(
                 ["pid", "name", "cpu_percent", "memory_percent", "status"]
@@ -54,7 +55,6 @@ class ProcessManager:
     def kill_process(self, name: str) -> tuple[bool, str]:
         """Kill all processes matching name. Returns (success, message)."""
         try:
-            import psutil
             killed = 0
             name_lower = name.lower().replace(".exe", "").strip()
             for p in psutil.process_iter(["pid", "name"]):
@@ -79,7 +79,6 @@ class ProcessManager:
     def get_resource_summary(self) -> dict:
         """Comprehensive system resource snapshot."""
         try:
-            import psutil
             cpu = psutil.cpu_percent(interval=0.3)
             cpu_count = psutil.cpu_count()
             mem = psutil.virtual_memory()
@@ -188,7 +187,6 @@ class ProcessManager:
     def get_open_windows(self) -> list[str]:
         """List all visible windows using Win32 EnumWindows."""
         try:
-            import ctypes
             from ctypes import wintypes
 
             user32 = ctypes.windll.user32

@@ -132,8 +132,8 @@
 
     IPC helpers: core/ipc/zmq_bus.py, interrupt_manager.py, proxies.py
 
-    Note: services/brain_worker.py exists as a module; the orchestrator in
-    run_v4 is brain_orchestrator.py — verify entrypoints when changing V4.
+    The dedicated cognitive hub for the V4 track is
+    services/brain_orchestrator.py — verify that entrypoint when changing V4.
 
 
   4.3 Main interaction pipeline (happy path)
@@ -228,7 +228,7 @@
   ui/              Web dashboard, floating indicator
   cursor_bridge/   Local brain controller, structured prompts (LLM integration)
   services/        V4 worker processes (stt, tts, llm, intent, context, decision,
-                   memory, brain_orchestrator; brain_worker optional/legacy path)
+                   memory, brain_orchestrator)
   config/          Settings JSON/schema (see config_schema / settings patterns)
 
 

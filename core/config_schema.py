@@ -494,6 +494,12 @@ CONFIG_SCHEMA: dict[str, Any] = {
                     "maximum": 30,
                     "description": "Seconds between stuck-state polls.",
                 },
+                "error_recovery_hold_s": {
+                    "type": "number",
+                    "minimum": 0,
+                    "maximum": 10,
+                    "description": "Seconds to remain in ERROR_RECOVERY before returning to IDLE.",
+                },
                 "use_priority_scheduler": {
                     "type": "boolean",
                     "description": "Route speech_final and cursor_query through PriorityScheduler (voice > LLM > background).",

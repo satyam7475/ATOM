@@ -24,14 +24,43 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from core.persistence_manager import persistence_manager
+
 logger = logging.getLogger("atom.dream")
+
+def _cosine_similarity(v1: list[float], v2: list[float]) -> float:
+    """Compute cosine similarity between two dense vectors."""
+    if not v1 or not v2 or len(v1) != len(v2):
+        return 0.0
+    dot = sum(a * b for a, b in zip(v1, v2))
+    norm_a = math.sqrt(sum(a * a for a in v1))
+    norm_b = math.sqrt(sum(b * b for b in v2))
+    if norm_a == 0 or norm_b == 0:
+        return 0.0
+    return dot / (norm_a * norm_b)
+
+# Common words to ignore in semantic connection analysis
+_STOPWORDS = frozenset({
+    "about", "after", "again", "being", "could", "doing",
+    "every", "first", "found", "going", "great", "https",
+    "known", "large", "leave", "might", "never", "other",
+    "place", "point", "quite", "right", "shall", "since",
+    "small", "start", "still", "taken", "their", "there",
+    "these", "thing", "think", "those", "three", "under",
+    "using", "value", "watch", "where", "which", "while",
+    "whole", "world", "would", "write", "years", "please",
+    "should", "would", "could", "really", "system", "check",
+    "what's", "don't", "can't", "that's",
+})
 
 if TYPE_CHECKING:
     from core.async_event_bus import AsyncEventBus
+    from core.cognitive.second_brain import SecondBrain
 
 _DREAM_LOG = Path("logs/dream_log.json")
 _MIN_IDLE_MINUTES = 30
@@ -57,7 +86,12 @@ class DreamEngine:
         self._running = False
         self._task: asyncio.Task | None = None
         self._session_interactions: list[dict] = []
+        self._second_brain: SecondBrain | None = None
         self._load_log()
+
+    def wire(self, second_brain: "SecondBrain | None" = None) -> None:
+        """Wire cognitive dependencies after initialization."""
+        self._second_brain = second_brain
 
     def _load_log(self) -> None:
         if _DREAM_LOG.exists():
@@ -145,7 +179,7 @@ class DreamEngine:
         connections = self._find_connections()
         dream_result["connections"] = connections
 
-        await self._strengthen_memories(facts)
+        await self._strengthen_memories(facts, patterns)
 
         pruned = self._prune_noise()
         dream_result["pruned"] = pruned
@@ -208,38 +242,138 @@ class DreamEngine:
         return facts[:20]
 
     def _find_connections(self) -> list[dict]:
-        """Find semantic connections between different interactions."""
+        """Find semantic connections using Mathematical Vector Clustering.
+
+        Maps all queries to dense vectors and clusters them by cosine distance.
+        This provides JARVIS-level semantic correlation without LLM overhead.
+        """
         connections = []
-        topics: dict[str, list[int]] = {}
+        try:
+            from core.embedding_engine import get_embedding_engine
+            embed = get_embedding_engine()
+        except ImportError:
+            return []
 
+        # 1. Embed valid queries
+        embedded_ixs = []
         for i, ix in enumerate(self._session_interactions):
-            words = set(ix.get("query", "").lower().split())
-            for word in words:
-                if len(word) > 4:
-                    topics.setdefault(word, []).append(i)
+            query = ix.get("query", "").strip()
+            if len(query) < 10:
+                continue
+            try:
+                vec = embed.embed_sync(query)
+                embedded_ixs.append((i, query, vec))
+            except Exception:
+                pass
 
-        for word, indices in topics.items():
-            if len(indices) >= 2 and len(indices) <= 5:
-                connections.append({
-                    "topic": word,
-                    "occurrences": len(indices),
-                    "type": "recurring_topic",
-                })
+        if not embedded_ixs:
+            return []
 
+        # 2. O(N^2) Math clustering threshold (safe since N < 200)
+        _SIMILARITY_THRESHOLD = 0.82
+        clusters: list[list[int]] = []
+        assigned = set()
+
+        for i in range(len(embedded_ixs)):
+            idx1, q1, v1 = embedded_ixs[i]
+            if idx1 in assigned:
+                continue
+                
+            current_cluster = [idx1]
+            assigned.add(idx1)
+            
+            for j in range(i + 1, len(embedded_ixs)):
+                idx2, q2, v2 = embedded_ixs[j]
+                if idx2 in assigned:
+                    continue
+                
+                sim = _cosine_similarity(v1, v2)
+                if sim >= _SIMILARITY_THRESHOLD:
+                    current_cluster.append(idx2)
+                    assigned.add(idx2)
+            
+            if len(current_cluster) >= 2:
+                clusters.append(current_cluster)
+
+        # 3. Format insights
+        for c in clusters:
+            samples = []
+            for idx in c[:3]:
+                q = self._session_interactions[idx].get("query", "")[:60]
+                if q:
+                    samples.append(q)
+                    
+            # Derive an arbitrary top word as topic
+            words = set(samples[0].lower().split()) - _STOPWORDS if samples else set()
+            topic = max(words, key=len).title() if words else "Recurring Concept"
+            
+            connections.append({
+                "topic": topic,
+                "occurrences": len(c),
+                "type": "semantic_cluster",
+                "sample_queries": samples,
+            })
+
+        connections.sort(key=lambda x: x["occurrences"], reverse=True)
         return connections[:10]
 
-    async def _strengthen_memories(self, facts: list[str]) -> None:
-        """Store extracted facts in SecondBrain."""
-        try:
-            from core.cognitive.second_brain import SecondBrain
-        except ImportError:
-            return
+    async def _strengthen_memories(
+        self, facts: list[str], patterns: list[dict] | None = None,
+    ) -> None:
+        """Store extracted facts and patterns in SecondBrain.
+
+        Previously this method only emitted events that nothing handled.
+        Now it actually persists knowledge into the SecondBrain store.
+        """
+        stored_count = 0
 
         for fact in facts:
+            # 1. Always emit the event (other modules may listen)
             try:
                 self._bus.emit_fast("dream_fact_learned", fact=fact)
             except Exception:
                 pass
+
+            # 2. Actually store in SecondBrain (the critical fix)
+            if self._second_brain is not None:
+                try:
+                    self._second_brain.learn_fact(
+                        text=fact,
+                        source="dream_consolidation",
+                        tags=["dream", "auto_extracted"],
+                        importance=0.6,
+                    )
+                    stored_count += 1
+                except Exception:
+                    logger.debug("Failed to store dream fact: %s", fact[:40], exc_info=True)
+
+        # Also store notable patterns as learned knowledge
+        for pattern in (patterns or []):
+            if pattern.get("count", 0) >= 5 and self._second_brain is not None:
+                try:
+                    insight = pattern.get("insight", "")
+                    if insight:
+                        self._second_brain.learn_fact(
+                            text=insight,
+                            source="dream_pattern",
+                            tags=["dream", "pattern", pattern.get("action", "")],
+                            importance=0.7,
+                        )
+                        stored_count += 1
+                except Exception:
+                    pass
+
+        # Persist SecondBrain if we stored anything
+        if stored_count > 0 and self._second_brain is not None:
+            try:
+                self._second_brain.persist()
+            except Exception:
+                pass
+
+        logger.info(
+            "Dream memory strengthening: %d facts + patterns stored in SecondBrain",
+            stored_count,
+        )
 
     def _prune_noise(self) -> int:
         """Remove low-value interactions (noise words, failed intents)."""
@@ -254,13 +388,13 @@ class DreamEngine:
 
     def persist(self) -> None:
         try:
-            _DREAM_LOG.parent.mkdir(parents=True, exist_ok=True)
             data = {
                 "dreams": self._dream_log[-50:],
                 "last_dream": self._last_dream_time,
                 "total_dreams": self._dream_count,
             }
-            _DREAM_LOG.write_text(json.dumps(data, indent=2), encoding="utf-8")
+            persistence_manager.register("dream_log", _DREAM_LOG)
+            persistence_manager.save_now("dream_log", data)
         except Exception:
             logger.debug("Dream log persist failed", exc_info=True)
 

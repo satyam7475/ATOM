@@ -35,8 +35,8 @@ async def test_latency():
     # We will simulate a round trip by sending a ping and waiting for an ACK
     for i in range(10):
         start = time.time()
-        # Using emit_with_ack to test round-trip to Brain Worker
-        success = await bus.emit_with_ack("ping", target="brain_worker", timeout=1.0)
+        # Using emit_with_ack to test round-trip to the V4 cognitive hub
+        success = await bus.emit_with_ack("ping", target="brain_orchestrator", timeout=1.0)
         end = time.time()
         
         if success:

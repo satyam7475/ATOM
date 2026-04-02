@@ -59,7 +59,18 @@ class SystemIndexer:
         if self._running:
             return
         self._running = True
-        self._task = asyncio.create_task(self._index_loop())
+        
+        async def _supervisor() -> None:
+            while self._running:
+                try:
+                    await self._index_loop()
+                except asyncio.CancelledError:
+                    break
+                except Exception as e:
+                    logger.error("SUPERVISOR: SystemIndexer crashed! (%s). Restarting in 60s...", e)
+                    await asyncio.sleep(60.0)
+                    
+        self._task = asyncio.create_task(_supervisor())
         logger.info("System Indexer started")
 
     def stop(self) -> None:

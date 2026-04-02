@@ -113,7 +113,19 @@ class ProactiveIntelligenceEngine:
 
     def start(self) -> None:
         self._bus.on("action_executed", self._on_action)
-        self._task = asyncio.create_task(self._run())
+        self._bus.on("system_light_scan", self._on_system_light_scan)
+        
+        async def _supervisor() -> None:
+            while not self._shutdown.is_set():
+                try:
+                    await self._run()
+                except asyncio.CancelledError:
+                    break
+                except Exception as e:
+                    logger.error("SUPERVISOR: ProactiveEngine crashed! (%s). Restarting in 10s...", e)
+                    await asyncio.sleep(10.0)
+                    
+        self._task = asyncio.create_task(_supervisor())
         logger.info(
             "Proactive Intelligence Engine started (interval=%.0fs)",
             self._check_interval,
@@ -150,6 +162,42 @@ class ProactiveIntelligenceEngine:
         self._action_sequence.append((action, now))
         if len(self._action_sequence) > 200:
             self._action_sequence = self._action_sequence[-200:]
+
+    async def _on_system_light_scan(self, scan: dict[str, Any] = None, **_kw: Any) -> None:
+        """Zero-latency delta monitor for the 5-minute system scan."""
+        if not scan:
+            return
+            
+        if not hasattr(self, "_last_scan"):
+            self._last_scan = scan
+            return
+            
+        old_scan = self._last_scan
+        self._last_scan = scan
+        
+        latest_ram = scan.get("ram_percent", 0)
+        old_ram = old_scan.get("ram_percent", 0)
+        
+        # 0ms latency mathematical delta check, keeps LLM asleep
+        if latest_ram - old_ram > 20.0 and latest_ram > 75.0:
+            self._bus.emit_long(
+                "jarvis_insight",
+                message=f"Boss, your RAM usage just jumped by {latest_ram - old_ram:.0f} percent. We're at {latest_ram:.0f} percent total capacity.",
+                category="system",
+                priority=8,
+                source="proactive_scanner"
+            )
+            
+        latest_cpu = scan.get("cpu_percent", 0)
+        old_cpu = old_scan.get("cpu_percent", 0)
+        if latest_cpu - old_cpu > 40.0 and latest_cpu > 80.0:
+            self._bus.emit_long(
+                "jarvis_insight",
+                message=f"Boss, massive CPU spike detected. We just hit {latest_cpu:.0f} percent. Something heavy just started.",
+                category="system",
+                priority=8,
+                source="proactive_scanner"
+            )
 
     # ── Scan All Triggers ─────────────────────────────────────────────
 

@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import logging
 from typing import Any
+import psutil
 
 logger = logging.getLogger("atom.diagnostics")
 
@@ -97,7 +98,6 @@ class DiagnosticsHandler:
         cpu_val, ram_val = 0.0, 0.0
         checks_total += 1
         try:
-            import psutil
             cpu_val = psutil.cpu_percent(interval=0.1)
             ram_val = psutil.virtual_memory().percent
             checks_ok += 1

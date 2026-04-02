@@ -15,10 +15,13 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Optional
+
+from core.persistence_manager import persistence_manager
 
 if TYPE_CHECKING:
     from core.async_event_bus import AsyncEventBus
@@ -77,16 +80,13 @@ class GoalEngine:
 
     def persist(self) -> None:
         try:
-            _GOALS_FILE.parent.mkdir(parents=True, exist_ok=True)
             payload = {
                 "goals": self._goals,
                 "last_briefing_date": self._last_briefing_date,
                 "saved_at": datetime.now().isoformat(),
             }
-            _GOALS_FILE.write_text(
-                json.dumps(payload, indent=2, default=str),
-                encoding="utf-8",
-            )
+            persistence_manager.register("goals", _GOALS_FILE)
+            persistence_manager.save_now("goals", payload)
             self._dirty = False
         except Exception:
             logger.exception("Failed to persist goals")
@@ -260,22 +260,59 @@ class GoalEngine:
     # ── LLM Decomposition ─────────────────────────────────────────────
 
     async def decompose_with_llm(self, goal_id: str) -> str:
+        """Decompose a goal into steps using the LLM.
+
+        Sends a query to the LLM brain and waits for a real response.
+        Falls back to template-based decomposition if the LLM doesn't
+        respond within the timeout period.
+        """
         goal = self._find_by_id(goal_id)
         if not goal:
             return "Goal not found, Boss."
         if len(goal.get("steps", [])) >= _MAX_STEPS:
             return f"Goal already has {_MAX_STEPS} steps -- that's the max."
 
-        query = f"goal_decompose:{goal['title']}"
+        query = (
+            f"Break down this goal into 4-8 concrete, actionable steps. "
+            f"Goal: {goal['title']}. "
+            f"Return each step as a numbered list (1. Step description)."
+        )
+
+        # Set up a future to capture the LLM response
+        loop = asyncio.get_running_loop()
+        llm_response_future: asyncio.Future[str] = loop.create_future()
+
+        async def _capture_response(event: str = "", text: str = "", **kw) -> None:
+            """Bus callback to capture the LLM's response."""
+            if not llm_response_future.done() and text:
+                llm_response_future.set_result(text)
+
         try:
+            # Register a one-shot listener for the LLM response
+            self._bus.on("llm_response_complete", _capture_response)
+
+            # Send query to the LLM brain
             self._bus.emit_long(
                 "cursor_query",
                 text=query,
                 memory_context="",
-                context={},
+                context={"source": "goal_decomposition", "goal_id": goal_id},
                 history=[],
             )
-            steps = self._generate_default_steps(goal["title"])
+
+            # Wait for LLM response with timeout
+            try:
+                llm_text = await asyncio.wait_for(llm_response_future, timeout=15.0)
+                steps = self._parse_llm_steps(llm_text, goal["title"])
+                if steps:
+                    logger.info("LLM decomposed goal '%s' into %d steps", goal["title"], len(steps))
+                else:
+                    logger.info("LLM response didn't contain parseable steps, using defaults")
+                    steps = self._generate_default_steps(goal["title"])
+            except asyncio.TimeoutError:
+                logger.info("LLM decomposition timed out, using default steps")
+                steps = self._generate_default_steps(goal["title"])
+
             for s in steps:
                 if len(goal.get("steps", [])) >= _MAX_STEPS:
                     break
@@ -288,6 +325,37 @@ class GoalEngine:
         except Exception:
             logger.exception("Goal decomposition failed")
             return "Failed to decompose the goal, Boss. I'll try again later."
+
+    @staticmethod
+    def _parse_llm_steps(llm_text: str, goal_title: str) -> list[dict]:
+        """Parse numbered steps from LLM response text.
+
+        Handles formats like:
+            1. Step description
+            1) Step description
+            - Step description
+        """
+        lines = llm_text.strip().split("\n")
+        step_pattern = re.compile(r'^\s*(?:\d+[.)\-]|[-*•])\s*(.+)$')
+        steps = []
+        now = datetime.now().isoformat()
+
+        for line in lines:
+            match = step_pattern.match(line.strip())
+            if match:
+                title = match.group(1).strip()
+                if len(title) > 5:  # Filter noise
+                    steps.append({
+                        "id": str(uuid.uuid4())[:8],
+                        "title": title[:200],
+                        "status": "pending",
+                        "minutes_logged": 0,
+                        "created_at": now,
+                        "updated_at": now,
+                        "source": "llm",
+                    })
+
+        return steps[:_MAX_STEPS]
 
     @staticmethod
     def _generate_default_steps(title: str) -> list[dict]:

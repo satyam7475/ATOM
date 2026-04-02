@@ -18,6 +18,8 @@ import asyncio
 import logging
 import socket
 from typing import TYPE_CHECKING
+import psutil
+import ctypes
 
 logger = logging.getLogger("atom.watcher")
 
@@ -32,7 +34,6 @@ _NETWORK_CHECK_HOSTS = [
 
 def _get_foreground_app() -> str:
     try:
-        import ctypes
         user32 = ctypes.windll.user32  # type: ignore[attr-defined]
         hwnd = user32.GetForegroundWindow()
         length = user32.GetWindowTextLengthW(hwnd)
@@ -72,8 +73,8 @@ class SystemWatcher:
 
     def __init__(self, bus: AsyncEventBus, poll_interval: float = 10.0) -> None:
         self._bus = bus
-        self._base_interval = poll_interval
         self._interval = poll_interval
+        self._base_interval = poll_interval
         self._stop = False
         self._task: asyncio.Task | None = None
 
@@ -90,22 +91,45 @@ class SystemWatcher:
 
         self._pa = None
 
+        self._bus.on("governor_throttle", self._on_governor_throttle)
+        self._bus.on("governor_normal", self._on_governor_normal)
+        self._bus.on("power_state_changed", self._on_power_state_changed)
+
     def start(self) -> None:
         if self._task is None or self._task.done():
             self._stop = False
-            self._task = asyncio.create_task(self._run())
-            logger.info("SystemWatcher started (poll=%.0fs)", self._interval)
-
-        self._bus.on("governor_throttle", self._on_governor_throttle)
-        self._bus.on("governor_normal", self._on_governor_normal)
+            
+            async def _supervisor() -> None:
+                while not self._stop:
+                    try:
+                        await self._run()
+                    except asyncio.CancelledError:
+                        break
+                    except Exception as e:
+                        logger.error("SUPERVISOR: SystemWatcher crashed! (%s). Restarting in 5s...", e)
+                        await asyncio.sleep(5.0)
+            
+            self._task = asyncio.create_task(_supervisor())
+            logger.info("SystemWatcher started (interval=%.0fs)", self._interval)
 
     async def _on_governor_throttle(self, **_kw) -> None:
-        self._interval = self._base_interval * 3.0
+        """Slow down polling when CPU is hot."""
+        self._interval = max(self._interval, self._base_interval * 3)
         logger.info("SystemWatcher: governor throttle -> interval %.0fs", self._interval)
 
     async def _on_governor_normal(self, **_kw) -> None:
+        """Resume normal polling."""
         self._interval = self._base_interval
         logger.info("SystemWatcher: governor normal -> interval %.0fs", self._interval)
+
+    async def _on_power_state_changed(self, state: str = "plugged_in", **_kw) -> None:
+        """Throttle polling significantly when running on battery to optimize power."""
+        if state == "battery":
+            self._interval = max(self._interval, self._base_interval * 4)
+            logger.debug("SystemWatcher throttled for battery mode")
+        else:
+            self._interval = self._base_interval
+            logger.debug("SystemWatcher resumed normal power polling")
 
     def stop(self) -> None:
         self._stop = True
@@ -211,7 +235,6 @@ class SystemWatcher:
 
     def _check_battery(self) -> None:
         try:
-            import psutil
             bat = psutil.sensors_battery()
             if bat is None:
                 return
@@ -275,7 +298,6 @@ class SystemWatcher:
         """
         import time
         try:
-            import psutil
             cpu = psutil.cpu_percent(interval=0.5)
             mem = psutil.virtual_memory()
             now = time.time()
@@ -283,15 +305,20 @@ class SystemWatcher:
             if cpu > 85 and (now - self._last_cpu_alert) > 300:
                 self._last_cpu_alert = now
                 top = []
+                top_proc_name = ""
                 for p in psutil.process_iter(["name", "cpu_percent"]):
                     try:
                         c = p.info.get("cpu_percent", 0) or 0
                         if c > 10:
                             top.append(f"{p.info['name']} at {c:.0f}%")
+                            if not top_proc_name:
+                                top_proc_name = p.info['name']
                     except Exception:
                         pass
                 detail = ", ".join(top[:3]) if top else "multiple processes"
                 msg = f"Boss, CPU is at {cpu:.0f}% -- {detail}."
+                if top_proc_name:
+                    msg += f" Should I suspend {top_proc_name} or lower its priority?"
                 self._bus.emit_fast("system_event",
                                     kind="resource_alert", metric="cpu",
                                     value=cpu, message=msg)
@@ -302,7 +329,7 @@ class SystemWatcher:
                 used_gb = round(mem.used / (1024 ** 3), 1)
                 total_gb = round(mem.total / (1024 ** 3), 1)
                 msg = (f"Boss, RAM is at {mem.percent:.0f}% -- "
-                       f"{used_gb}GB of {total_gb}GB used.")
+                       f"{used_gb}GB of {total_gb}GB used. Want me to clear up some memory?")
                 self._bus.emit_fast("system_event",
                                     kind="resource_alert", metric="ram",
                                     value=mem.percent, message=msg)

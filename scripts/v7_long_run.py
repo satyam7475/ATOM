@@ -15,6 +15,7 @@ import json
 import sys
 import time
 from pathlib import Path
+import psutil
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
@@ -37,7 +38,6 @@ def main() -> None:
         except Exception as e:
             row["vram_error"] = str(e)
         try:
-            import psutil
             row["cpu_pct"] = psutil.cpu_percent(interval=0.5)
             row["ram_pct"] = psutil.virtual_memory().percent
         except Exception as e:

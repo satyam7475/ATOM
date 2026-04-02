@@ -53,80 +53,14 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger("atom.router")
 
-_FILLER = re.compile(
-    r"\b(um+|uh+|hmm+|ah+|oh+|like|actually|basically|"
-    r"you know|i mean|so+|well|okay so|right so|"
-    r"please|kindly)\b",
-    re.I,
-)
-_MULTI_SPACE = re.compile(r"\s+")
+from core.router.conversation_manager import ConversationManager, compress_query
 
-# ── Conversational continuity ────────────────────────────────────────
-_DANGLING_PRONOUN = re.compile(
-    r"\b(it|that|this|there|those|these|them)\b", re.I)
-_STOP_VERBS = frozenset({
-    "is", "are", "was", "were", "do", "does", "did", "can", "could",
-    "will", "would", "should", "has", "have", "had", "be", "been",
-    "tell", "show", "give", "get", "make", "let", "know", "say",
-    "explain", "search", "find", "open", "close", "check", "set",
-})
-_STOP_PREPS = frozenset({
-    "the", "a", "an", "in", "on", "at", "to", "for", "of", "with",
-    "about", "from", "by", "as", "into", "through", "my", "your",
-    "me", "i", "and", "or", "but", "so", "if", "what", "why", "how",
-    "when", "where", "who", "which", "please",
-})
 _CLIPBOARD_REF = re.compile(
     r"\b(that\s+error|this\s+error|that\s+code|this\s+code|"
     r"that\s+message|this\s+message|what\s+i\s+copied|"
     r"the\s+clipboard|from\s+clipboard|clipboard\s+content|"
     r"that\s+exception|this\s+exception|that\s+bug|this\s+bug|"
     r"that\s+text|this\s+text)\b", re.I)
-
-
-def _extract_entity(text: str) -> str:
-    """Extract the likely topic/entity from a query -- zero-cost heuristic.
-
-    Strips verbs, prepositions, and stop words from the end, then takes
-    the remaining significant tail as the entity.
-    """
-    words = text.lower().split()
-    significant = [
-        w for w in words
-        if w not in _STOP_VERBS and w not in _STOP_PREPS
-        and len(w) > 2 and not w.isdigit()
-    ]
-    if not significant:
-        return ""
-    return " ".join(significant[-3:])
-
-
-def _resolve_pronouns(query: str, last_entity: str) -> str:
-    """Replace dangling pronouns with the last known entity."""
-    if not last_entity:
-        return query
-    words = query.split()
-    if len(words) > 8:
-        return query
-    if not _DANGLING_PRONOUN.search(query):
-        return query
-    has_noun = any(
-        w.lower() not in _STOP_VERBS and w.lower() not in _STOP_PREPS
-        and len(w) > 2 and not w.isdigit()
-        and w.lower() not in ("it", "that", "this", "there", "those",
-                              "these", "them", "he", "she", "they")
-        for w in words
-    )
-    if has_noun:
-        return query
-    resolved = _DANGLING_PRONOUN.sub(last_entity, query, count=1)
-    return resolved
-
-
-def compress_query(text: str) -> str:
-    cleaned = _FILLER.sub("", text)
-    cleaned = _MULTI_SPACE.sub(" ", cleaned).strip()
-    return cleaned[:1500]
 
 
 class Router:
@@ -179,13 +113,9 @@ class Router:
         self._brain_enabled = bool(self._config.get("brain", {}).get("enabled", False))
         self._brain_mode_mgr = brain_mode_manager
         self._assistant_mode_mgr = assistant_mode_manager
-        self._processing_lock = asyncio.Lock()
+        self._processing_semaphore = asyncio.Semaphore(2)  # Allow 2 concurrent queries (fast-path + LLM)
         self._local_queries = 0
         self._llm_queries = 0
-        self._last_entity: str = ""
-        self._recent_queries: list[tuple[str, float]] = []
-        self._conversation_window: list[tuple[str, str]] = []
-        self._conv_window_max = 20
         self._scheduler = scheduler
         self._process_mgr = process_mgr or ProcessManager()
         self._evolution = evolution
@@ -195,6 +125,7 @@ class Router:
         self._timeline = timeline_memory
 
         # Extracted modules
+        self._conv_mgr = ConversationManager(self._conv_memory)
         self._confirmation = ConfirmationManager(self._security)
         self._diagnostics = DiagnosticsHandler(self._config)
 
@@ -213,12 +144,20 @@ class Router:
         """Expose the ActionExecutor for wiring to LocalBrainController."""
         return self._action_executor
 
+    def _emit_response(self, text: str, **kw) -> None:
+        """Emit response through adaptive output polishing."""
+        polished = personality.polish_response(text or "", source="router")
+        self._bus.emit_long("response_ready", text=polished, **kw)
+
+    def _emit_thinking_ack(self, text: str) -> None:
+        polished = personality.polish_response(text or "", source="thinking_ack")
+        self._bus.emit_long("thinking_ack", text=polished)
+
     async def on_speech(self, text: str, **_kw) -> None:
-        if self._processing_lock.locked():
-            logger.warning("Dropped speech '%s' -- already processing",
+        if self._processing_semaphore._value == 0:
+            logger.warning("Queuing speech '%s' -- at concurrency limit",
                            text[:40])
-            return
-        async with self._processing_lock:
+        async with self._processing_semaphore:
             await self._route(text)
 
     async def _route(self, text: str) -> None:
@@ -267,7 +206,7 @@ class Router:
                 _skill_chain = list(match.chain)
 
         # ── 1. Pronoun resolution (conversational continuity) ────────
-        resolved = _resolve_pronouns(clean_text, self._last_entity)
+        resolved = self._conv_mgr.resolve_pronouns(clean_text)
         if resolved != clean_text:
             logger.info("Pronoun resolved: '%s' -> '%s'", clean_text, resolved)
             clean_text = resolved
@@ -337,9 +276,7 @@ class Router:
             return
 
         # ── Entity tracking (conversational continuity) ──────────────
-        entity = _extract_entity(clean_text)
-        if entity:
-            self._last_entity = entity
+        self._conv_mgr.track_entity(clean_text)
 
         is_local = result.intent not in ("fallback", "screen_analyze")
 
@@ -349,15 +286,17 @@ class Router:
                 return
 
             if result.intent == "go_silent":
-                self._bus.emit_long("response_ready",
-                                    text=result.response or personality.silent_response(),
-                                    is_sleep=True)
+                self._emit_response(
+                    result.response or personality.silent_response(),
+                    is_sleep=True,
+                )
                 return
 
             if result.intent == "exit":
-                self._bus.emit_long("response_ready",
-                                    text=result.response or personality.exit_response(),
-                                    is_exit=True)
+                self._emit_response(
+                    result.response or personality.exit_response(),
+                    is_exit=True,
+                )
                 return
 
             if result.action:
@@ -365,7 +304,7 @@ class Router:
                 self._bus.emit_fast("metrics_event", counter="local_routed_queries")
                 if self._confirmation.requires_confirmation(result):
                     prompt = self._confirmation.set_pending_action(result)
-                    self._bus.emit_long("response_ready", text=prompt)
+                    self._emit_response(prompt)
                     return
                 await self._execute_action(result)
                 if _skill_chain:
@@ -376,10 +315,9 @@ class Router:
                 self._local_queries += 1
                 self._bus.emit_fast("metrics_event", counter="local_routed_queries")
                 if result.intent == "status":
-                    self._bus.emit_long("response_ready",
-                                   text=self._status_with_usage(result.response))
+                    self._emit_response(self._status_with_usage(result.response))
                     return
-                self._bus.emit_long("response_ready", text=result.response)
+                self._emit_response(result.response)
                 return
         else:
             await self._state.transition(AtomState.THINKING)
@@ -403,7 +341,7 @@ class Router:
         outcome = self._confirmation.handle(confirm_intent)
 
         if outcome.response:
-            self._bus.emit_long("response_ready", text=outcome.response)
+            self._emit_response(outcome.response)
 
         if outcome.action_result is not None:
             await self._execute_action(outcome.action_result)
@@ -417,7 +355,10 @@ class Router:
                                tool_call.name, reason)
                 self._bus.emit_long(
                     "response_ready",
-                    text=f"Sorry Boss, that action is blocked. {reason}",
+                    text=personality.polish_response(
+                        f"Sorry Boss, that action is blocked. {reason}",
+                        source="security_block",
+                    ),
                 )
                 return
             try:
@@ -425,46 +366,12 @@ class Router:
                     tool_call.name, dict(tool_call.arguments),
                 )
                 response = result or personality.action_done(tool_call.name)
-                self._bus.emit_long("response_ready", text=response)
+                self._emit_response(response)
             except Exception as exc:
                 logger.error("Confirmed tool execution failed: %s", exc)
-                self._bus.emit_long(
-                    "response_ready",
-                    text=personality.error_response(tool_call.name),
-                )
+                self._emit_response(personality.error_response(tool_call.name))
 
-    # ── Intent chaining (post-action follow-ups) ───────────────────────
-    _CHAIN_MAP: dict[str, str | dict[str, str]] = {
-        "open_app": {
-            "code": "Want me to check your git status?",
-            "vscode": "Want me to check your git status?",
-            "teams": "Should I check your calendar?",
-            "outlook": "Want me to read your latest emails?",
-            "chrome": "Need me to search for something?",
-            "firefox": "Need me to search for something?",
-        },
-        "search": "Want me to analyze the results on your screen?",
-        "screenshot": "Want me to analyze what's on screen?",
-        "set_volume": "Should I also pause media?",
-        "weather": "Want me to check traffic for your commute?",
-        "lock_screen": "I'll keep watch. Say 'Atom' when you're back.",
-    }
 
-    def _get_chain_suggestion(self, action: str, args: dict) -> str | None:
-        chain = self._CHAIN_MAP.get(action)
-        if chain is None:
-            return None
-        if isinstance(chain, dict):
-            target = (args.get("name", "") or args.get("exe", "")).lower()
-            for key, suggestion in chain.items():
-                if key in target:
-                    return suggestion
-            return None
-        if action == "set_volume":
-            pct = int(args.get("percent", 50))
-            if pct > 20:
-                return None
-        return chain
 
     # ── Action dispatcher ───────────────────────────────────────────────
 
@@ -478,8 +385,7 @@ class Router:
         allowed, reason = self._security.allow_action(result.action, args)
         if not allowed:
             logger.warning("Security BLOCKED action '%s': %s", result.action, reason)
-            self._bus.emit_long("response_ready",
-                                text=f"Sorry Boss, that action is blocked. {reason}")
+            self._emit_response(f"Sorry Boss, that action is blocked. {reason}")
             return
 
         self._security.audit_log(
@@ -491,7 +397,7 @@ class Router:
         dispatch_args = strip_signing_keys(args)
 
         if result.action in self._FIRE_AND_FORGET_ACTIONS:
-            self._bus.emit_long("response_ready", text=response_text)
+            self._emit_response(response_text)
             try:
                 self._dispatch_action(result.action, dispatch_args)
             except Exception as exc:
@@ -500,21 +406,20 @@ class Router:
             return
 
         if result.action in self._SLOW_ACTIONS:
-            self._bus.emit_long("thinking_ack", text="On it, Boss.")
+            self._emit_thinking_ack("On it, Boss.")
 
         try:
             response = self._dispatch_action(result.action, dispatch_args)
             if response is not None:
-                self._bus.emit_long("response_ready", text=response)
+                self._emit_response(response)
                 self._emit_chain_suggestion(result.action, dispatch_args)
                 return
         except Exception as exc:
             logger.error("Action failed: %s", exc)
-            self._bus.emit_long("response_ready",
-                           text=personality.error_response(result.action))
+            self._emit_response(personality.error_response(result.action))
             return
 
-        self._bus.emit_long("response_ready", text=response_text)
+        self._emit_response(response_text)
         self._emit_chain_suggestion(result.action, dispatch_args)
 
     async def _run_skill_chain(self, chain: list[str]) -> None:
@@ -544,7 +449,7 @@ class Router:
                         logger.warning("Skill chain step failed: %s", exc)
 
     def _emit_chain_suggestion(self, action: str, args: dict) -> None:
-        suggestion = self._get_chain_suggestion(action, args)
+        suggestion = self._conv_mgr.get_chain_suggestion(action, args)
         if suggestion:
             self._bus.emit_fast("intent_chain_suggestion",
                                 suggestion=suggestion, action=action)
@@ -571,6 +476,19 @@ class Router:
         if handler is None:
             return None
         return handler(self, action, args)
+
+    async def _dispatch_action_async(self, action: str, args: dict) -> str | None:
+        """Async wrapper that offloads slow/blocking actions to a thread.
+
+        Fast actions run directly in the event loop.
+        Slow actions (file listing, system analysis, etc.) run in executor.
+        """
+        if action in self._SLOW_ACTIONS:
+            loop = asyncio.get_running_loop()
+            return await loop.run_in_executor(
+                None, self._dispatch_action, action, args
+            )
+        return self._dispatch_action(action, args)
 
     # ── Action handlers (called from dispatch table) ─────────────────
 
@@ -1020,80 +938,28 @@ class Router:
                 full_text = f"You asked: {_q}. {summary}"
             else:
                 full_text = summary
-            self._bus.emit_long("response_ready", text=full_text)
+            self._emit_response(full_text)
         except Exception:
-            self._bus.emit_long(
-                "response_ready",
-                text=(
-                    "Screen reading isn't fully available yet, Boss. "
-                    "Say 'take a screenshot' or paste text to the clipboard."
-                    + (f" You asked: {_q[:80]}" if _q else "")
-                ),
+            self._emit_response(
+                "Screen reading isn't fully available yet, Boss. "
+                "Say 'take a screenshot' or paste text to the clipboard."
+                + (f" You asked: {_q[:80]}" if _q else "")
             )
 
     # ── LLM fallback ────────────────────────────────────────────────
 
-    # ── Smart acknowledgments ───────────────────────────────────────
-    _ACK_MAP: list[tuple[list[str], str]] = [
-        (["error", "bug", "crash", "exception", "fail", "broken", "not working"],
-         "Let me look into that issue."),
-        (["weather", "temperature", "forecast", "rain", "humid"],
-         "Checking the forecast."),
-        (["code", "function", "class", "method", "variable", "syntax"],
-         "Looking at the code."),
-        (["explain", "what is", "what are", "meaning", "define", "difference"],
-         "Let me think about that."),
-        (["search", "find", "look up", "google"],
-         "Let me find that for you."),
-        (["how to", "how do", "steps", "guide", "tutorial"],
-         "Let me work through that."),
-        (["compare", "versus", "vs", "better", "which one"],
-         "Weighing the options."),
-        (["history", "when did", "who was", "origin"],
-         "Let me recall that."),
-    ]
-    _GENERIC_ACKS = [
-        "On it.",
-        "Working on it.",
-        "One moment, Boss.",
-        "Let me think...",
-        "Give me a sec.",
-    ]
-
-    def _smart_ack(self, query: str) -> str:
-        q = query.lower()
-        for keywords, ack in self._ACK_MAP:
-            if any(kw in q for kw in keywords):
-                return ack
-        idx = hash(query) % len(self._GENERIC_ACKS)
-        return self._GENERIC_ACKS[idx]
-
-    # ── Repeat query detection ───────────────────────────────────────
-    def _check_repeat(self, cache_key: str) -> bool:
-        now = time.monotonic()
-        self._recent_queries = [
-            (q, t) for q, t in self._recent_queries if now - t < 60
-        ]
-        for prev_q, _ in self._recent_queries:
-            if prev_q == cache_key:
-                return True
-        self._recent_queries.append((cache_key, now))
-        if len(self._recent_queries) > 5:
-            self._recent_queries = self._recent_queries[-5:]
-        return False
-
     async def _handle_llm_fallback(self, original_text: str,
                                    clean_text: str,
                                    clipboard_injected: bool = False) -> None:
-        ack = self._smart_ack(clean_text)
+        ack = self._conv_mgr.smart_ack(clean_text)
         if clipboard_injected:
             ack = "I see what's on your clipboard. " + ack
-        self._bus.emit_long("thinking_ack", text=ack)
+        self._emit_thinking_ack(ack)
 
         cache_key = clean_text.lower()
         t_lookup = time.perf_counter()
 
-        is_repeat = self._check_repeat(cache_key)
+        is_repeat = self._conv_mgr.check_repeat(cache_key)
         if is_repeat:
             logger.info("Repeat query detected -- bypassing cache")
 
@@ -1108,7 +974,7 @@ class Router:
         if cached and not is_repeat:
             logger.info("Serving from cache (%.1fms)",
                         (time.perf_counter() - t_lookup) * 1000)
-            self._bus.emit_long("response_ready", text=cached)
+            self._emit_response(cached)
             return
 
         if is_repeat:
@@ -1124,16 +990,13 @@ class Router:
         qr = try_quick_reply(clean_text, self._config)
         if qr:
             logger.info("Quick reply served (no LLM)")
-            self._bus.emit_long("response_ready", text=qr)
+            self._emit_response(qr)
             return
 
         if self._assistant_mode_mgr is not None:
             if not self._assistant_mode_mgr.allows_llm_fallback():
                 logger.info("Assistant mode command_only — skipping LLM")
-                self._bus.emit_long(
-                    "response_ready",
-                    text=self._assistant_mode_mgr.command_only_message(),
-                )
+                self._emit_response(self._assistant_mode_mgr.command_only_message())
                 return
 
         context_bundle = None
@@ -1156,14 +1019,12 @@ class Router:
 
         if not self._security.is_feature_enabled("llm"):
             logger.info("LLM feature disabled by policy")
-            self._bus.emit_long("response_ready",
-                           text=personality.offline_fallback())
+            self._emit_response(personality.offline_fallback())
             return
 
         if not self._brain_enabled:
             logger.info("No local brain (brain.enabled is false)")
-            self._bus.emit_long("response_ready",
-                           text=personality.offline_fallback())
+            self._emit_response(personality.offline_fallback())
             return
 
         history = (
@@ -1182,44 +1043,16 @@ class Router:
 
     # ── Contextual follow-up ────────────────────────────────────────
 
-    _FOLLOW_UP_HINTS: list[tuple[list[str], str]] = [
-        (["error", "exception", "traceback", "stack trace", "bug"],
-         "Want me to read the clipboard or run a screenshot?"),
-        (["install", "download", "pip install", "npm install", "setup"],
-         "Should I open the terminal for you?"),
-        (["documentation", "docs", "reference", "guide", "manual"],
-         "Want me to search for the docs?"),
-        (["reminder", "later", "tomorrow", "don't forget"],
-         "Want me to set a timer for that?"),
-    ]
-
     def _suggest_follow_up(self, query: str, response: str) -> str | None:
-        """Return a short follow-up suggestion if the response context warrants one."""
-        lower_resp = response.lower()
-        lower_query = query.lower()
-        combined = lower_query + " " + lower_resp
-        for keywords, suggestion in self._FOLLOW_UP_HINTS:
-            if any(kw in combined for kw in keywords):
-                return suggestion
-        return None
+        return self._conv_mgr.suggest_follow_up(query, response)
 
     # ── Conversation window ─────────────────────────────────────────
 
     def record_turn(self, query: str, response: str) -> None:
-        """Append a Q&A turn. ConversationMemory is the single source of truth
-        when available; the legacy window is only kept as fallback."""
-        if self._conv_memory is not None:
-            self._conv_memory.record(query, "llm_response", response)
-        else:
-            snippet = " ".join(response.split()[:60])
-            self._conversation_window.append((query[:100], snippet))
-            if len(self._conversation_window) > self._conv_window_max:
-                self._conversation_window = self._conversation_window[-self._conv_window_max:]
+        return self._conv_mgr.record_turn(query, response)
 
     def get_conversation_history(self) -> list[tuple[str, str]]:
-        if self._conv_memory is not None and self._conv_memory.turn_count > 0:
-            return self._conv_memory.get_pairs()
-        return list(self._conversation_window)
+        return self._conv_mgr.get_conversation_history()
 
     # ── Helpers ─────────────────────────────────────────────────────
 

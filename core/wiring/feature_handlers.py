@@ -13,6 +13,7 @@ import asyncio
 import logging
 import time
 from typing import TYPE_CHECKING, Any
+import psutil
 
 if TYPE_CHECKING:
     from core.async_event_bus import AsyncEventBus
@@ -290,7 +291,6 @@ def wire_autonomy_and_governor(
 
     async def _on_intent_for_memory(intent: str = "", **kw) -> None:
         try:
-            import psutil
             cpu = psutil.cpu_percent(interval=0)
             ram = psutil.virtual_memory().percent
         except Exception:

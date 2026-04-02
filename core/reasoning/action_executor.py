@@ -144,7 +144,7 @@ class ActionExecutor:
                 elapsed_ms=(time.perf_counter() - t0) * 1000,
             )
 
-        if tool_def.requires_confirmation or tool_def.safety_level == "dangerous":
+        if self._registry.requires_confirmation(name):
             from core import adaptive_personality as personality
             detail = self._confirmation_detail(name, args)
             prompt = personality.confirmation_prompt(name, detail)
@@ -212,10 +212,16 @@ class ActionExecutor:
 
     @staticmethod
     def _validate_params(tool_def, args: dict) -> list[str]:
-        """Return list of missing required parameters."""
+        """Return list of missing required parameters.
+
+        Note: normalizes parameter aliases (e.g. 'exe' -> 'name') by
+        working on a copy of args to avoid mutating the caller's dict.
+        The normalized args are written back after validation.
+        """
         missing = []
+        normalized = dict(args)  # Shallow copy to avoid side-effects
         for param in tool_def.parameters:
-            if param.required and param.name not in args:
+            if param.required and param.name not in normalized:
                 alt_keys = {"name": ["exe", "app"], "query": ["q", "search"],
                             "percent": ["level", "value", "pct"],
                             "path": ["file", "dir", "folder"],
@@ -223,12 +229,15 @@ class ActionExecutor:
                 alts = alt_keys.get(param.name, [])
                 found_alt = False
                 for alt in alts:
-                    if alt in args:
-                        args[param.name] = args.pop(alt)
+                    if alt in normalized:
+                        normalized[param.name] = normalized.pop(alt)
                         found_alt = True
                         break
                 if not found_alt:
                     missing.append(param.name)
+        # Update the original dict with normalized keys (deliberate, after validation)
+        args.clear()
+        args.update(normalized)
         return missing
 
     @staticmethod

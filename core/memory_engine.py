@@ -21,6 +21,7 @@ Scores are blended: 0.7 * semantic + 0.3 * keyword overlap.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import math
@@ -31,6 +32,8 @@ from collections import Counter, defaultdict
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+
+from core.persistence_manager import persistence_manager
 
 logger = logging.getLogger("atom.memory")
 
@@ -123,6 +126,7 @@ class MemoryEngine:
         self._vectors_ready: bool = False
         self._migration_done: bool = False
         self._config = config or {}
+        self._lock = asyncio.Lock()
         v7 = mem_cfg.get("v7_scoring") or {}
         self._v7_scoring_enabled: bool = bool(v7.get("enabled", False))
         self._v7_w = {
@@ -271,8 +275,9 @@ class MemoryEngine:
         self._index_entry(idx, keywords)
 
         if len(self._entries) > self._max_entries:
-            self._entries = self._entries[-self._max_entries:]
-            self._rebuild_inverted_index()
+            async with self._lock:
+                self._entries = self._entries[-self._max_entries:]
+                self._rebuild_inverted_index()
 
     async def _retrieve_keyword(self, query: str, k: int) -> list[tuple[float, str]]:
         """O(1) keyword lookup using inverted index instead of scanning all entries."""
@@ -280,26 +285,27 @@ class MemoryEngine:
         if not query_tokens:
             return []
 
-        candidate_indices: Counter[int] = Counter()
-        for token in query_tokens:
-            for idx in self._inverted_index.get(token, ()):
-                candidate_indices[idx] += 1
+        async with self._lock:
+            candidate_indices: Counter[int] = Counter()
+            for token in query_tokens:
+                for idx in self._inverted_index.get(token, ()):
+                    candidate_indices[idx] += 1
 
-        if not candidate_indices:
-            return []
+            if not candidate_indices:
+                return []
 
-        results: list[tuple[float, str]] = []
-        n_query = len(query_tokens)
+            results: list[tuple[float, str]] = []
+            n_query = len(query_tokens)
 
-        for idx, overlap_count in candidate_indices.most_common(k * 3):
-            if idx >= len(self._entries):
-                continue
-            entry = self._entries[idx]
-            entry_tokens = set(entry.get("keywords", []))
-            union = len(query_tokens | entry_tokens) or 1
-            jaccard = overlap_count / union
-            score = jaccard * self._keyword_weight
-            results.append((score, entry["summary"]))
+            for idx, overlap_count in candidate_indices.most_common(k * 3):
+                if idx >= len(self._entries):
+                    continue
+                entry = self._entries[idx]
+                entry_tokens = set(entry.get("keywords", []))
+                union = len(query_tokens | entry_tokens) or 1
+                jaccard = overlap_count / union
+                score = jaccard * self._keyword_weight
+                results.append((score, entry["summary"]))
 
         results.sort(key=lambda x: x[0], reverse=True)
         return results[:k * 2]
@@ -390,12 +396,8 @@ class MemoryEngine:
                 {k: v for k, v in e.items() if k != "embedding_vec"}
                 for e in self._entries
             ]
-            with open(_PERSIST_FILE, "w", encoding="utf-8") as f:
-                json.dump(save_entries, f)
-            try:
-                os.chmod(_PERSIST_FILE, 0o600)
-            except OSError:
-                pass
+            persistence_manager.register("memory", _PERSIST_FILE)
+            persistence_manager.save_now("memory", save_entries)
             logger.info("Memory persisted: %d entries", len(self._entries))
         except Exception:
             logger.exception("Failed to persist memory")
@@ -464,13 +466,8 @@ class MemoryEngine:
         if not self._interactions_dirty:
             return
         try:
-            _INTERACTIONS_FILE.parent.mkdir(parents=True, exist_ok=True)
-            with open(_INTERACTIONS_FILE, "w", encoding="utf-8") as f:
-                json.dump(self._interactions, f, separators=(",", ":"))
-            try:
-                os.chmod(_INTERACTIONS_FILE, 0o600)
-            except OSError:
-                pass
+            persistence_manager.register("interactions", _INTERACTIONS_FILE)
+            persistence_manager.save_now("interactions", self._interactions)
             self._interactions_dirty = False
         except Exception:
             logger.debug("Failed to persist interactions", exc_info=True)

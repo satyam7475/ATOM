@@ -70,23 +70,23 @@ The cognitive capabilities have been strictly modularized into the `ATOM/brain/`
 
 ## 3. System Orchestration & ZMQ Data Flow
 
-The V4 architecture maintains the robust ZeroMQ (ZMQ) multi-process foundation but fundamentally alters the data flow by introducing the **Brain Worker** (`brain_worker.py`) as the central cognitive hub.
+The V4 architecture maintains the robust ZeroMQ (ZMQ) multi-process foundation but fundamentally alters the data flow by introducing the **Brain Orchestrator** (`brain_orchestrator.py`) as the central cognitive hub.
 
 ### The New V4 Pipeline
 1.  **Input:** Speech is captured and transcribed by the isolated `STT Worker`.
 2.  **Event Emission:** The STT Worker emits a `speech_final` event over the ZMQ PUB/SUB bus.
-3.  **Interception:** The new `BrainWorker` intercepts `speech_final`.
+3.  **Interception:** The `BrainOrchestrator` intercepts `speech_final`.
 4.  **Cognitive Processing:** 
     *   The text is passed to the **Intent Engine**.
     *   The **Context Router** builds the minimal required context payload.
 5.  **The Decision Gate:**
-    *   *Fast Path (Direct Action):* If the intent is `system` or `task` and matches a known Skill, the **Skill Engine** executes it immediately. The Brain Worker emits a `response_ready` event directly to the TTS worker. **(Latency: <50ms)**
-    *   *Deep Path (LLM Required):* If the intent is `chat` or complex, the Brain Worker emits an `llm_query_request` to the isolated **LLM Worker**, passing the highly optimized context. **(Latency: LLM dependent, but optimized due to smaller context)**
+    *   *Fast Path (Direct Action):* If the intent is `system` or `task` and matches a known Skill, the **Skill Engine** executes it immediately. The Brain Orchestrator emits a `response_ready` event directly to the TTS worker. **(Latency: <50ms)**
+    *   *Deep Path (LLM Required):* If the intent is `chat` or complex, the Brain Orchestrator emits an `llm_query_request` to the isolated **LLM Worker**, passing the highly optimized context. **(Latency: LLM dependent, but optimized due to smaller context)**
 6.  **Output:** The `TTS Worker` synthesizes the final response.
 
 ### Integration Details (`main.py` & `run_v4.py`)
-*   Created `run_v4.py` to orchestrate the spawning of the ZMQ Broker, STT Worker, TTS Worker, LLM Worker, and the new **Brain Worker**.
-*   Updated `main.py` with a `--v4` flag. When active, `main.py` gracefully disables its local handling of `speech_final` and LLM processing, fully delegating cognitive control to the distributed Brain Worker.
+*   Created `run_v4.py` to orchestrate the spawning of the ZMQ Broker, STT Worker, TTS Worker, LLM Worker, and the **Brain Orchestrator** cognitive hub.
+*   Updated `main.py` with a `--v4` flag. When active, `main.py` gracefully disables its local handling of `speech_final` and LLM processing, fully delegating cognitive control to the distributed Brain Orchestrator.
 
 ---
 
@@ -101,7 +101,7 @@ Based on the current implementation, here is an objective, highly critical asses
 | **Context Efficiency** | **8.5/10** | The Context Router effectively prevents token bloat. *Critique: It currently relies on hardcoded limits (e.g., max 5 chat messages). It needs dynamic summarization of older context.* |
 | **Memory Architecture** | **8.0/10** | The SQLite + JSON graph is highly functional, ACID compliant, and offline-friendly. *Critique: It lacks semantic similarity search. Needs local vector embeddings (e.g., FAISS or ChromaDB) for fuzzy matching.* |
 | **Proactive Intelligence** | **7.0/10** | The background daemon loop works flawlessly and is thread-safe. *Critique: The prediction logic is currently rule-based (if X then Y). It requires a transition to probabilistic ML models (e.g., Markov chains or small local transformers) for true predictive intelligence.* |
-| **Overall Production Readiness** | **8.5/10** | The multi-process ZMQ architecture is rock solid. The cognitive layers are safely isolated, meaning a crash in the Brain Worker won't take down the STT or TTS pipelines. |
+| **Overall Production Readiness** | **8.5/10** | The multi-process ZMQ architecture is rock solid. The cognitive layers are safely isolated, meaning a crash in the Brain Orchestrator won't take down the STT or TTS pipelines. |
 
 ---
 
@@ -117,7 +117,7 @@ The system currently includes:
 * ZMQ-based distributed event bus (PUB/SUB proxy)
 * Proxy-based orchestration (`main.py` delegates to workers)
 * Tool registry with secure execution
-* **NEW:** A 6-layer Cognitive Brain running in its own dedicated ZMQ Worker (`BrainWorker`). The layers include: Intent Engine (regex/keyword), Context Router (dynamic payload filtering), SQLite Memory Graph (nodes/edges), Behavior Model (state tracking), Proactive Engine (10s daemon loop), and Skill Engine (macro execution).
+* **NEW:** A 6-layer Cognitive Brain running in its own dedicated ZMQ cognitive hub (`services/brain_orchestrator.py`). The layers include: Intent Engine (regex/keyword), Context Router (dynamic payload filtering), SQLite Memory Graph (nodes/edges), Behavior Model (state tracking), Proactive Engine (10s daemon loop), and Skill Engine (macro execution).
 
 I want you to act as a Principal AI Systems Architect and evolve this system further.
 
@@ -140,7 +140,7 @@ Focus on:
 
 5. **Performance Optimization:**
 * Reduce end-to-end latency below 500ms for LLM-required paths.
-* Optimize GPU/CPU usage across processes (e.g., ensuring the Brain Worker doesn't block the STT Worker).
+* Optimize GPU/CPU usage across processes (e.g., ensuring the Brain Orchestrator doesn't block the STT Worker).
 
 6. **Modularity & Future Scaling:**
 * Suggest how to scale this ZMQ architecture across multiple physical machines in the future.

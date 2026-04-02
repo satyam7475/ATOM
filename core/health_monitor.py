@@ -36,6 +36,8 @@ import time
 from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
+import psutil
+import ctypes
 
 if TYPE_CHECKING:
     from core.async_event_bus import AsyncEventBus
@@ -270,7 +272,6 @@ class HealthMonitor:
     def _check_system_resources(self) -> list[str]:
         issues: list[str] = []
         try:
-            import psutil
             mem = psutil.virtual_memory()
             if mem.percent > 90:
                 issues.append(
@@ -357,7 +358,6 @@ class HealthMonitor:
 
         ram = 0.0
         try:
-            import psutil
             ram = psutil.virtual_memory().percent
         except Exception:
             pass
@@ -377,18 +377,17 @@ class HealthMonitor:
 
     @staticmethod
     def _get_active_app() -> str:
-        """Get the foreground window title (Windows). Cached import."""
+        """Get the foreground window title (Windows). Uses cached ctypes ref."""
         try:
             import sys
             if sys.platform != "win32":
                 return ""
-            import ctypes
-            user32 = ctypes.windll.user32
-            hwnd = user32.GetForegroundWindow()
-            length = user32.GetWindowTextLengthW(hwnd)
+            _user32 = ctypes.windll.user32
+            hwnd = _user32.GetForegroundWindow()
+            length = _user32.GetWindowTextLengthW(hwnd)
             if length > 0:
                 buf = ctypes.create_unicode_buffer(length + 1)
-                user32.GetWindowTextW(hwnd, buf, length + 1)
+                _user32.GetWindowTextW(hwnd, buf, length + 1)
                 return buf.value[:80]
         except Exception:
             pass

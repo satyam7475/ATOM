@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import datetime
 import random
+import re
 from typing import Any, TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -465,6 +466,58 @@ def offline_fallback() -> str:
         f"I can't reason without my brain online, {b}. But I can still run commands.",
     ]
     return random.choice(pool)
+
+
+# ── RESPONSE POLISHING (BUDDY + CLARITY) ────────────────────────────
+
+_WS_RE = re.compile(r"\s+")
+_BOSS_LOWER_RE = re.compile(r"\bboss\b")
+_SOFTEN_MAP: tuple[tuple[str, str], ...] = (
+    ("I can't", "I couldn't"),
+    ("I cannot", "I couldn't"),
+    ("That didn't work", "That didn't work yet"),
+    ("error", "issue"),
+)
+
+
+def polish_response(text: str, *, source: str = "general") -> str:
+    """Polish outgoing text for clearer, buddy-style conversation.
+
+    This keeps behavior unchanged while making language more natural:
+      - cleaner spacing and punctuation
+      - gentler failure phrasing
+      - mode-aware brevity (focus/sleep)
+      - consistent owner-centric address when appropriate
+    """
+    if not text:
+        return text
+
+    verb = _verbosity()
+    t = _WS_RE.sub(" ", text).strip()
+    t = _BOSS_LOWER_RE.sub("Boss", t)
+
+    # Soften a few robotic/harsh patterns without changing semantics.
+    for old, new in _SOFTEN_MAP:
+        t = t.replace(old, new)
+
+    # Keep focus mode concise, but preserve key guidance.
+    if verb == "minimal" and len(t) > 220:
+        cut = t[:220].rsplit(" ", 1)[0].rstrip(" ,;:")
+        t = f"{cut}."
+    elif verb == "silent":
+        return ""
+
+    # Normalize terminal punctuation for better TTS rhythm.
+    if t and t[-1] not in ".!?":
+        t += "."
+
+    # For casual/buddy feel in chill mode, lightly personalize generic replies.
+    if _mode() == "chill":
+        lower = t.lower()
+        if lower in {"done.", "all done.", "handled.", "taken care of."}:
+            t = f"Done, Boss."
+
+    return t
 
 
 # ── JARVIS-LEVEL: PROACTIVE PERSONALITY RESPONSES ───────────────────
