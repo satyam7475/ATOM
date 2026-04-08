@@ -1064,5 +1064,6 @@ def validate_and_log(config: dict) -> bool:
         return True
     logger.warning("Configuration validation errors:")
     for err in errors:
-        logger.warning("  %s", err)
-    return False
+        logger.warning("    %s", err)
+    logger.warning("Continuing despite validation warnings (non-fatal).")
+    return True

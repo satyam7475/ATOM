@@ -87,6 +87,13 @@ SAFE_HOTKEYS: dict[str, str] = {
     "ctrl+shift+delete": "confirm",
     "win+r": "block", "win+x": "block",
     "ctrl+alt+delete": "block",
+    # macOS equivalents (command replaces ctrl)
+    "command+c": "safe", "command+v": "safe", "command+x": "safe",
+    "command+z": "safe", "command+a": "safe", "command+s": "safe",
+    "command+f": "safe", "command+p": "safe", "command+n": "safe",
+    "command+t": "safe", "command+tab": "safe",
+    "command+shift+tab": "safe", "option+tab": "safe",
+    "command+q": "confirm", "command+w": "confirm",
 }
 
 SAFE_KEYS: frozenset[str] = frozenset({

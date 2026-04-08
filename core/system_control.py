@@ -176,8 +176,12 @@ class SystemControl:
                 )
             elif self._is_macos:
                 result = subprocess.run(
-                    ["sudo", "dscacheutil", "-flushcache"],
+                    ["dscacheutil", "-flushcache"],
                     capture_output=True, text=True, timeout=10,
+                )
+                subprocess.run(
+                    ["killall", "-HUP", "mDNSResponder"],
+                    capture_output=True, timeout=5,
                 )
             else:
                 return SystemControlResult(False, "Unsupported platform")
@@ -227,7 +231,7 @@ class SystemControl:
             return SystemControlResult(False, f"Port scan failed: {e}")
 
     def get_wifi_networks(self) -> SystemControlResult:
-        """Scan for available WiFi networks (Windows/Linux)."""
+        """Scan for available WiFi networks."""
         try:
             if self._is_windows:
                 result = subprocess.run(
@@ -250,6 +254,10 @@ class SystemControl:
                     networks.append(current)
                 return SystemControlResult(True, f"{len(networks)} WiFi networks found",
                                             {"networks": networks})
+
+            elif self._is_macos:
+                return self._wifi_scan_macos()
+
             elif self._is_linux:
                 result = subprocess.run(
                     ["nmcli", "-t", "-f", "SSID,SIGNAL,SECURITY", "dev", "wifi"],
@@ -266,9 +274,45 @@ class SystemControl:
                         })
                 return SystemControlResult(True, f"{len(networks)} WiFi networks found",
                                             {"networks": networks})
+
             return SystemControlResult(False, "WiFi scan not supported on this platform")
         except Exception as e:
             return SystemControlResult(False, f"WiFi scan failed: {e}")
+
+    def _wifi_scan_macos(self) -> SystemControlResult:
+        """Scan WiFi via system_profiler SPAirPortDataType (airport CLI removed in macOS 15+)."""
+        import json as _json
+        try:
+            result = subprocess.run(
+                ["system_profiler", "SPAirPortDataType", "-json"],
+                capture_output=True, text=True, timeout=15,
+            )
+            data = _json.loads(result.stdout)
+            networks = []
+            for iface in data.get("SPAirPortDataType", []):
+                for iface_data in iface.get("spairport_airport_interfaces", []):
+                    for net in iface_data.get(
+                        "spairport_airport_other_local_wireless_networks", [],
+                    ):
+                        ssid = net.get("_name", "")
+                        if not ssid:
+                            continue
+                        if ssid == "<redacted>":
+                            ssid = "Hidden Network"
+                        sec = net.get("spairport_security_mode", "")
+                        sec = sec.replace("spairport_security_mode_", "").replace("_", " ")
+                        networks.append({
+                            "ssid": ssid,
+                            "channel": net.get("spairport_network_channel", ""),
+                            "security": sec,
+                            "phy_mode": net.get("spairport_network_phymode", ""),
+                        })
+            return SystemControlResult(
+                True, f"{len(networks)} WiFi networks found",
+                {"networks": networks},
+            )
+        except Exception as e:
+            return SystemControlResult(False, f"macOS WiFi scan failed: {e}")
 
     # ── Storage Management ────────────────────────────────────────
 
@@ -285,6 +329,11 @@ class SystemControl:
                 Path(os.environ.get("TEMP", "")),
                 Path(os.environ.get("TMP", "")),
                 Path.home() / "AppData" / "Local" / "Temp",
+            ]
+        elif self._is_macos:
+            temp_dirs = [
+                Path("/tmp"), Path("/var/tmp"),
+                Path.home() / "Library" / "Caches",
             ]
         else:
             temp_dirs = [Path("/tmp"), Path("/var/tmp")]
@@ -395,6 +444,37 @@ class SystemControl:
                         "command": str(item),
                         "scope": "startup_folder",
                     })
+
+        elif self._is_macos:
+            agent_dirs = [
+                (Path.home() / "Library" / "LaunchAgents", "user"),
+                (Path("/Library/LaunchAgents"), "global"),
+                (Path("/Library/LaunchDaemons"), "system"),
+            ]
+            for agent_dir, scope in agent_dirs:
+                if agent_dir.exists():
+                    for item in agent_dir.glob("*.plist"):
+                        programs.append({
+                            "name": item.stem,
+                            "command": str(item),
+                            "scope": scope,
+                        })
+            try:
+                result = subprocess.run(
+                    ["osascript", "-e",
+                     'tell application "System Events" to get the name '
+                     'of every login item'],
+                    capture_output=True, text=True, timeout=5,
+                )
+                for name in result.stdout.strip().split(", "):
+                    if name:
+                        programs.append({
+                            "name": name,
+                            "command": "login item",
+                            "scope": "login_item",
+                        })
+            except Exception:
+                pass
 
         elif self._is_linux:
             autostart = Path.home() / ".config" / "autostart"
@@ -552,9 +632,12 @@ class SystemControl:
     # ── Power Plans (Windows) ─────────────────────────────────────
 
     def set_power_plan(self, plan: str = "balanced") -> SystemControlResult:
-        """Set Windows power plan: balanced, high_performance, power_saver."""
+        """Set power plan. Windows: balanced/high_performance/power_saver. macOS: low_power/auto."""
+        if self._is_macos:
+            return self._set_power_plan_macos(plan)
+
         if not self._is_windows:
-            return SystemControlResult(False, "Power plans are Windows-only")
+            return SystemControlResult(False, "Power plans not supported on this platform")
 
         plan_guids = {
             "balanced": "381b4222-f694-41f0-9685-ff5bb260df2e",
@@ -575,6 +658,153 @@ class SystemControl:
             return SystemControlResult(False, f"Failed: {result.stderr}")
         except Exception as e:
             return SystemControlResult(False, f"Power plan change failed: {e}")
+
+    def _set_power_plan_macos(self, plan: str) -> SystemControlResult:
+        """macOS power management via pmset. Maps plan names to Low Power Mode toggle."""
+        mode_map = {
+            "power_saver": "1", "low_power": "1",
+            "balanced": "0", "auto": "0",
+            "high_performance": "0",
+        }
+        value = mode_map.get(plan)
+        if value is None:
+            return SystemControlResult(
+                False,
+                f"Unknown plan '{plan}'. Use: low_power, balanced, high_performance",
+            )
+        try:
+            result = subprocess.run(
+                ["sudo", "pmset", "-a", "lowpowermode", value],
+                capture_output=True, text=True, timeout=10,
+            )
+            if result.returncode == 0:
+                label = "Low Power Mode" if value == "1" else "Automatic"
+                return SystemControlResult(True, f"Power mode set to {label}")
+            return SystemControlResult(
+                False,
+                "pmset requires admin privileges. "
+                "Toggle Low Power Mode in System Settings → Battery.",
+            )
+        except Exception as e:
+            return SystemControlResult(False, f"Power plan change failed: {e}")
+
+    def get_power_status(self) -> SystemControlResult:
+        """Get current power/battery status."""
+        try:
+            battery = psutil.sensors_battery()
+            data = {
+                "percent": int(battery.percent) if battery else 100,
+                "plugged": battery.power_plugged if battery else True,
+                "secs_left": battery.secsleft if battery and battery.secsleft > 0 else None,
+            }
+            if self._is_macos:
+                result = subprocess.run(
+                    ["pmset", "-g"],
+                    capture_output=True, text=True, timeout=5,
+                )
+                for line in result.stdout.splitlines():
+                    line = line.strip()
+                    if line.startswith("lowpowermode"):
+                        data["low_power_mode"] = line.split()[-1] == "1"
+                    elif line.startswith("displaysleep"):
+                        val = line.split()[1]
+                        data["display_sleep_min"] = int(val) if val.isdigit() else val
+            plug_str = "plugged in" if data["plugged"] else "on battery"
+            return SystemControlResult(
+                True,
+                f"Battery {data['percent']}%, {plug_str}",
+                data,
+            )
+        except Exception as e:
+            return SystemControlResult(False, f"Power status failed: {e}")
+
+    # ── Audio & Display Control ─────────────────────────────────────
+
+    def get_volume(self) -> SystemControlResult:
+        """Get current system volume level (0-100)."""
+        if self._is_macos:
+            try:
+                result = subprocess.run(
+                    ["osascript", "-e", "get volume settings"],
+                    capture_output=True, text=True, timeout=5,
+                )
+                parts = {}
+                for pair in result.stdout.strip().split(", "):
+                    if ":" in pair:
+                        k, v = pair.split(":", 1)
+                        parts[k.strip()] = v.strip()
+                return SystemControlResult(True, f"Volume: {parts.get('output volume', '?')}%", {
+                    "output_volume": int(parts.get("output volume", 0)),
+                    "input_volume": int(parts.get("input volume", 0)),
+                    "muted": parts.get("output muted", "false") == "true",
+                })
+            except Exception as e:
+                return SystemControlResult(False, f"Volume query failed: {e}")
+        return SystemControlResult(False, "Volume query not implemented for this platform")
+
+    def set_volume(self, level: int) -> SystemControlResult:
+        """Set system volume (0-100)."""
+        level = max(0, min(100, level))
+        if self._is_macos:
+            try:
+                subprocess.run(
+                    ["osascript", "-e", f"set volume output volume {level}"],
+                    capture_output=True, timeout=5,
+                )
+                return SystemControlResult(True, f"Volume set to {level}%")
+            except Exception as e:
+                return SystemControlResult(False, f"Volume change failed: {e}")
+        return SystemControlResult(False, "Volume control not implemented for this platform")
+
+    def toggle_mute(self) -> SystemControlResult:
+        """Toggle system audio mute."""
+        if self._is_macos:
+            try:
+                result = subprocess.run(
+                    ["osascript", "-e", "get volume settings"],
+                    capture_output=True, text=True, timeout=5,
+                )
+                is_muted = "output muted:true" in result.stdout
+                new_state = "false" if is_muted else "true"
+                subprocess.run(
+                    ["osascript", "-e",
+                     f"set volume output muted {new_state}"],
+                    capture_output=True, timeout=5,
+                )
+                label = "unmuted" if is_muted else "muted"
+                return SystemControlResult(True, f"Audio {label}")
+            except Exception as e:
+                return SystemControlResult(False, f"Mute toggle failed: {e}")
+        return SystemControlResult(False, "Mute control not implemented for this platform")
+
+    def set_brightness(self, level: int) -> SystemControlResult:
+        """Set display brightness (0-100). macOS: requires Accessibility permission."""
+        level = max(0, min(100, level))
+        if self._is_macos:
+            try:
+                steps = abs(level - 50) // 6
+                key_code = "144" if level > 50 else "145"
+                for _ in range(16):
+                    subprocess.run(
+                        ["osascript", "-e",
+                         'tell application "System Events" to key code 145'],
+                        capture_output=True, timeout=2,
+                    )
+                for _ in range(steps + (level // 6)):
+                    subprocess.run(
+                        ["osascript", "-e",
+                         'tell application "System Events" to key code 144'],
+                        capture_output=True, timeout=2,
+                    )
+                return SystemControlResult(
+                    True,
+                    f"Brightness adjusted toward {level}% (approximate via key simulation)",
+                )
+            except Exception as e:
+                return SystemControlResult(False, f"Brightness change failed: {e}")
+        return SystemControlResult(
+            False, "Brightness control not implemented for this platform",
+        )
 
     # ── Summary for Voice ─────────────────────────────────────────
 
@@ -598,7 +828,8 @@ class SystemControl:
         ]
 
         if gpu.get("name") and "No dedicated" not in gpu["name"]:
-            parts.append(f"GPU: {gpu['name']} with {gpu.get('vram_gb', 0):.0f} gigs VRAM.")
+            mem_label = "Unified Memory" if self._is_macos else "VRAM"
+            parts.append(f"GPU: {gpu['name']} with {gpu.get('vram_gb', 0):.0f} gigs {mem_label}.")
 
         if uptime.success:
             parts.append(f"Uptime: {uptime.data.get('uptime_human', 'unknown')}.")

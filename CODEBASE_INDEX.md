@@ -12,7 +12,7 @@ ATOM is Satyam's **personal cognitive AI operating system** — a local-first, J
 
 **Owner:** Satyam ("Boss")
 **Language:** Python 3.11+ (98.4%), HTML (1.6%)
-**LLM:** Offline via llama-cpp-python (Qwen3-8B-Q4_K_M GGUF, full GPU offload)
+**LLM:** Offline via llama-cpp-python (current: Qwen3-8B-Q4_K_M GGUF). Planned: MLX dual-model — Qwen3-4B (primary) + Qwen3-1.7B (fast brain)
 **Voice:** faster-whisper STT + Edge Neural TTS (en-GB-RyanNeural)
 **UI:** aiohttp web dashboard with Three.js animated orb + WebSocket push
 
@@ -172,14 +172,19 @@ The nervous system. Everything flows through here.
 | `task_scheduler.py` | ~250 | Async task scheduling with priorities |
 | `priority_scheduler.py` | ~200 | Priority-based execution queue |
 
-#### GPU Management
+#### Apple Silicon Compute Layer
 | File | Lines | What it does |
 |------|-------|-------------|
-| `gpu_resource_manager.py` | 343 | VRAM budgets, model slots (LLM/STT/embeddings), load/evict policy |
-| `gpu_governor.py` | ~250 | GPU thermal monitoring and throttling |
-| `gpu_scheduler.py` | ~200 | GPU workload scheduling |
-| `gpu_watchdog.py` | ~150 | GPU stall detection and recovery |
-| `gpu_execution_coordinator.py` | ~200 | Cross-module GPU admission control |
+| `apple_silicon_monitor.py` | 294 | Hardware data source: Unified Memory, thermal pressure, battery, GPU info |
+| `silicon_governor.py` | 145 | Monitoring loop + thermal/memory event emission (Apple Silicon-only) |
+| `inference_guard.py` | 155 | Model slot tracking, memory pressure admission, idle unload policy |
+| `gpu_watchdog.py` | 73 | Inference stall detection (platform-agnostic) |
+
+#### macOS Native Modules (`core/macos/`)
+| File | Lines | What it does |
+|------|-------|-------------|
+| `__init__.py` | 1 | Package init |
+| `fs_watcher.py` | ~200 | **FSEvents** kernel-level file watcher. Near-zero CPU, same mechanism as Spotlight. Watches Desktop/Downloads/Documents for proactive awareness |
 
 #### System & Health
 | File | Lines | What it does |
@@ -282,28 +287,30 @@ Higher-order reasoning, planning, and learning.
 | `behavior_model.py` | ~200 | V4 behavior model |
 | `proactive_engine.py` | ~200 | V4 proactive intelligence |
 | `skill_engine.py` | ~200 | Skill definition and execution |
-| `gpu_pipeline.py` | ~250 | GPU-optimized inference pipeline |
+| ~~`gpu_pipeline.py`~~ | — | DELETED (Step 1.3A — 1 useful line inlined) |
 | `local_cognitive_pipeline.py` | ~250 | In-process cognitive pipeline (V4) |
 
 ---
 
-### `voice/` — Perception & Expression (12 files, ~4,800 lines)
+### `voice/` — Perception & Expression (13 files, ~5,400 lines)
 
 Audio input/output pipeline.
 
 | File | Lines | What it does |
 |------|-------|-------------|
 | `stt_async.py` | 969 | faster-whisper STT: bilingual (EN+HI), audio preprocessing, noise gate, hallucination detection |
+| `stt_macos.py` | ~280 | **macOS native STT**: SFSpeechRecognizer + AVAudioEngine. On-device Neural Engine, ~50ms commands, built-in wake word, HW noise suppression |
 | `tts_async.py` | 252 | Windows SAPI TTS: COM-based, async speak, barge-in, markdown cleanup |
 | `tts_edge.py` | 784 | Edge Neural TTS: Microsoft neural voices, SSML, sentence streaming, emotion profiles, RMS normalization |
+| `tts_macos.py` | ~350 | **macOS native TTS**: NSSpeechSynthesizer (direct API, 4.4ms barge-in, 184 voices) + `say` fallback. Premium neural voice auto-detection |
 | `tts_kokoro.py` | 146 | Kokoro TTS alternative backend |
 | `mic_manager.py` | 350 | Microphone ownership lock: device profiling, auto-selection, quality scoring |
 | `speech_detector.py` | ~250 | VAD, energy detection, silence timeout, noise word filtering |
 | `audio_preprocessor.py` | ~200 | DC removal, pre-emphasis, spectral noise gate |
 | `voice_profiles.py` | 160 | Voice emotion profiles: rate/pitch/volume per context |
 | `emotion_detector.py` | ~150 | Audio emotion detection from speech patterns |
-| `wake_word.py` | 192 | Wake word detection ("Hey ATOM") |
-| `media_watcher.py` | ~150 | Media playback state monitoring |
+| `wake_word.py` | 192 | Wake word detection ("Hey ATOM") — superseded by stt_macos.py keyword detection |
+| `media_watcher.py` | ~230 | **macOS native**: AppleScript queries for Spotify, Music, browser media. Winsdk fallback on Windows |
 
 ---
 
@@ -332,7 +339,7 @@ Audio input/output pipeline.
 |------|-------|-------------|
 | `context_engine.py` | ~300 | Clipboard + active window context capture |
 | `privacy_filter.py` | ~200 | Redacts sensitive data (passwords, keys, PII) from context |
-| `screen_reader.py` | ~100 | Screen content reading |
+| `screen_reader.py` | ~270 | **Apple Vision OCR** (Neural Engine, 109ms avg) + EasyOCR fallback. Screenshot via screencapture |
 
 ---
 
@@ -417,7 +424,7 @@ Each runs as a separate process, communicating via ZMQ.
 | Section | Key settings |
 |---------|-------------|
 | `owner` | name="Satyam", title="Boss" |
-| `brain` | model_path="models/qwen3-8b-q4_k_m.gguf", n_ctx=8192, n_gpu_layers=-1, temperature=0.7 |
+| `brain` | model_path="models/qwen3-8b-q4_k_m.gguf", n_ctx=8192, n_gpu_layers=-1, temperature=0.7. **Planned:** Qwen3-4B primary + Qwen3-1.7B fast brain (dual-model, Phase 3) |
 | `stt` | engine="faster_whisper", model="small", bilingual=true, sample_rate=16000 |
 | `tts` | engine="edge", voice="en-GB-RyanNeural" |
 | `ui` | web_port=8765, mode="desktop" |
@@ -477,34 +484,40 @@ SLEEP ──→ IDLE ──→ LISTENING ──→ THINKING ──→ SPEAKING
 
 | Package | Purpose |
 |---------|---------|
-| `llama-cpp-python` | Local LLM inference (GGUF models) |
-| `faster-whisper` | Offline STT (Whisper) |
-| `edge-tts` | Microsoft neural TTS |
-| `aiohttp` | Web dashboard server |
-| `pygame` | Audio playback for TTS |
-| `pyaudio` / `SpeechRecognition` | Mic capture |
+| `llama-cpp-python` | Local LLM inference (GGUF models, Metal GPU offload) |
+| `pyobjc-framework-*` | macOS native bridge (~18MB): STT, TTS, OCR, FSEvents, AVFoundation |
 | `chromadb` | Vector store |
-| `sentence-transformers` | Embedding model |
+| `sentence-transformers` | Embedding model (MPS-accelerated on Apple Silicon) |
+| `aiohttp` | Web dashboard server |
 | `psutil` | System monitoring |
 | `numpy` | Audio processing |
 | `pyzmq` | IPC (V3/V4 multi-process) |
+| `faster-whisper` | (optional) Offline STT — replaced by native SFSpeechRecognizer on macOS |
+| `edge-tts` | (optional) Neural TTS — replaced by NSSpeechSynthesizer on macOS |
+| `easyocr` | (optional) OCR — replaced by Apple Vision on macOS |
 
 ---
 
 ## 10. macOS / Apple Silicon Notes
 
-- **GPU:** llama-cpp-python uses Metal (MPS) on Apple Silicon. Set `n_gpu_layers=-1` for full offload
-- **Mic:** macOS uses CoreAudio. `prefer_bluetooth` setting handles AirPods HFP quality issues
-- **TTS:** Edge TTS works cross-platform (network-based). SAPI TTS is Windows-only
-- **Platform:** `core/platform_adapter.py` handles OS differences. Many Windows-specific paths (PowerShell, WMIC) need macOS equivalents
-- **PyAudio:** May need `brew install portaudio` before `pip install pyaudio`
+- **GPU:** llama-cpp-python uses Metal (MPS) on Apple Silicon. Set `n_gpu_layers=-1` for full offload.
+- **Planned LLM (Phase 3):** Dual-model via MLX — Qwen3-4B primary (3GB, 50-70 tok/s, thinking mode) + Qwen3-1.7B fast brain (1.2GB, 120-160 tok/s). Total 4.2GB, leaves 5.8GB headroom on 16GB M5. Same Qwen3 family = zero prompt/tool-call adaptation.
+- **STT:** `voice/stt_macos.py` — SFSpeechRecognizer + AVAudioEngine. On-device Neural Engine, ~50ms. Replaces faster-whisper + PyAudio on macOS.
+- **TTS:** `voice/tts_macos.py` — NSSpeechSynthesizer (no subprocess, 4.4ms barge-in). Download premium voices: System Settings > Accessibility > Spoken Content > Manage Voices.
+- **OCR:** `context/screen_reader.py` — Apple Vision framework. Neural Engine, 109ms avg. Replaces EasyOCR.
+- **Media:** `voice/media_watcher.py` — AppleScript queries for Spotify, Music, browser. Replaces broken winsdk.
+- **FileWatch:** `core/macos/fs_watcher.py` — FSEvents kernel-level monitoring. Near-zero CPU.
+- **Mic:** AVAudioEngine with Voice Processing I/O (hardware echo cancellation + noise suppression). No PyAudio/PortAudio needed.
+- **Embeddings:** `core/embedding_engine.py` auto-detects MPS for Apple Silicon GPU acceleration
+- **Platform:** `core/platform_adapter.py` handles OS differences. Most Windows paths now have macOS equivalents.
+- **Dependencies:** pyobjc (~18MB) bridges to Apple frameworks already in macOS RAM. Replaces ~2.8GB of third-party voice/OCR deps.
 
 ---
 
 ## 11. Quick Navigation Guide
 
 **"I want to understand how ATOM processes a voice command"**
-→ `voice/stt_async.py` → `core/intent_engine/` → `core/router/router.py` → `cursor_bridge/local_brain_controller.py`
+→ `voice/stt_macos.py` (macOS) or `voice/stt_async.py` (cross-platform) → `core/intent_engine/` → `core/router/router.py` → `cursor_bridge/local_brain_controller.py`
 
 **"I want to understand the LLM brain"**
 → `brain/mini_llm.py` → `cursor_bridge/structured_prompt_builder.py` → `cursor_bridge/local_brain_controller.py`

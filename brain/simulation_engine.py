@@ -5,6 +5,9 @@ success_probability = base_prediction * blend + historical_success_rate * (1 - b
 
 V7: ``SimulationMode`` selects blend — heuristic-only, hybrid, or memory-weighted.
 """
+
+from __future__ import annotations
+
 import hashlib
 import logging
 from enum import Enum

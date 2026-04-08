@@ -1,11 +1,10 @@
 """
-Low-latency GPU-aware RAG engine.
+Low-latency RAG engine (Apple Silicon).
 
 - Smart skip (query classifier)
 - TTL caches (embed + retrieval)
 - Hybrid vector + keyword re-rank + recency
 - Optional Qdrant + Chroma VectorStore fallback
-- Optional GPUExecutionCoordinator for embed admission
 """
 
 from __future__ import annotations
@@ -24,9 +23,6 @@ from core.rag.embedding_disk_cache import PersistentEmbeddingCache
 from core.rag.graph_rag import graph_snippets_for_query
 from core.rag.query_classifier import QueryComplexity, classify_query
 from core.rag.rag_cache import RagCaches
-
-if TYPE_CHECKING:
-    from core.gpu_execution_coordinator import GPUExecutionCoordinator
 
 logger = logging.getLogger("atom.rag.engine")
 
@@ -67,13 +63,13 @@ class RagRetrieveResult:
 
 
 class RagEngine:
-    """RAG retrieval with GPU-aware embedding and hybrid search."""
+    """RAG retrieval with hybrid embedding and search."""
 
     def __init__(
         self,
         config: dict | None = None,
         vector_store: Any = None,
-        coordinator: "GPUExecutionCoordinator | None" = None,
+        coordinator: Any = None,
     ) -> None:
         self._config = config or {}
         self._rag_cfg = self._config.get("rag", {})
@@ -127,8 +123,9 @@ class RagEngine:
     def set_vector_store(self, store: Any) -> None:
         self._vector_store = store
 
-    def set_coordinator(self, coord: "GPUExecutionCoordinator | None") -> None:
-        self._coord = coord
+    def set_coordinator(self, coord: Any) -> None:
+        """Legacy shim — coordinator no longer used on Apple Silicon."""
+        self._coord = None
 
     def set_memory_graph(self, mg: Any) -> None:
         self._memory_graph = mg
@@ -162,7 +159,7 @@ class RagEngine:
         return gs.gpu_util_pct >= self._skip_embed_util
 
     async def _embed_query(self, query: str) -> tuple[list[float], bool]:
-        """Returns (embedding, skipped_due_to_gpu busy policy)."""
+        """Returns (embedding, skipped_due_to_busy policy)."""
         cached = self._caches.get_embedding(query)
         if cached is not None:
             return cached, False
@@ -173,59 +170,13 @@ class RagEngine:
                 self._caches.set_embedding(query, disk_vec)
                 return disk_vec, False
 
-        # Avoid scheduling embed during active LLM GPU phase (reduce VRAM spikes)
-        if self._coord is not None:
-            try:
-                from core.gpu_execution_coordinator import Phase
-                if self._coord.phase == Phase.LLM:
-                    vec = self._embed.embed_sync(query)
-                    self._caches.set_embedding(query, vec)
-                    if self._disk_cache is not None:
-                        self._disk_cache.put(query, vec)
-                    return vec, True
-            except Exception:
-                pass
-
         if self._should_skip_embed_for_gpu():
-            logger.debug("RAG: sync embed path (GPU busy policy)")
+            logger.debug("RAG: sync embed path (busy policy)")
             vec = self._embed.embed_sync(query)
             self._caches.set_embedding(query, vec)
             if self._disk_cache is not None:
                 self._disk_cache.put(query, vec)
             return vec, True
-
-        if self._coord is not None:
-            from core.gpu_execution_coordinator import PRIORITY_MEMORY, TaskIntent
-
-            loop = asyncio.get_running_loop()
-            fut: asyncio.Future[list[float]] = loop.create_future()
-
-            async def _job() -> None:
-                try:
-                    v = await self._embed.embed(query)
-                    self._caches.set_embedding(query, v)
-                    if self._disk_cache is not None:
-                        self._disk_cache.put(query, v)
-                    if not fut.done():
-                        fut.set_result(v)
-                except Exception as e:
-                    if not fut.done():
-                        fut.set_exception(e)
-
-            await self._coord.submit_task(
-                kind="embed",
-                priority=PRIORITY_MEMORY,
-                intent=TaskIntent.MEMORY_UPDATE,
-                name="rag_query_embed",
-                run=_job,
-                vram_required_mb=float(self._rag_cfg.get("embed_vram_mb", 200)),
-                estimated_duration_ms=80.0,
-                allow_overlap=True,
-            )
-            vec = await fut
-            if self._disk_cache is not None:
-                self._disk_cache.put(query, vec)
-            return vec, False
 
         vec = await self._embed.embed(query)
         self._caches.set_embedding(query, vec)

@@ -244,7 +244,25 @@ async def main() -> None:
 
         tts_cfg = config.get("tts", {})
         tts_engine = (tts_cfg.get("engine") or "sapi").lower()
-        if tts_engine == "kokoro":
+
+        # Auto-detect: on macOS, prefer native TTS unless explicitly set
+        if tts_engine == "sapi" and sys.platform == "darwin":
+            tts_engine = "macos_native"
+            logger.info("macOS detected — auto-selecting native TTS")
+
+        if tts_engine == "macos_native":
+            from voice.tts_macos import MacOSTTSAsync
+            tts = MacOSTTSAsync(
+                bus, state,
+                max_lines=tts_cfg.get("max_lines", 4),
+                voice=tts_cfg.get("macos_voice", "Daniel"),
+                rate=tts_cfg.get("macos_rate", 200),
+            )
+            logger.info("TTS: macOS Native (voice=%s, rate=%d — offline, ~5ms)",
+                        tts_cfg.get("macos_voice", "Daniel"),
+                        tts_cfg.get("macos_rate", 200))
+
+        elif tts_engine == "kokoro":
             try:
                 from voice.tts_kokoro import KokoroTTSAsync
                 tts = KokoroTTSAsync(
@@ -276,7 +294,7 @@ async def main() -> None:
                     rate=tts_cfg.get("rate", 2),
                 )
                 logger.warning("Edge-TTS unavailable, using offline SAPI")
-        elif tts_engine != "kokoro":
+        elif tts_engine not in ("kokoro", "macos_native"):
             from voice.tts_async import TTSAsync
             tts = TTSAsync(
                 bus, state, max_lines=tts_cfg.get("max_lines", 4),
@@ -313,7 +331,6 @@ async def main() -> None:
             local_brain.attach_mode_resolver(mode_resolver)
             try:
                 from brain.memory_graph import MemoryGraph
-                from core.gpu_execution_coordinator import get_gpu_execution_coordinator
                 from core.rag.prefetch_engine import RagPrefetchEngine
                 from core.rag.rag_engine import RagEngine
 
@@ -324,14 +341,11 @@ async def main() -> None:
                 local_brain.attach_memory_graph(shared_memory_graph)
                 _rag_cfg = config.get("rag") or {}
                 if _rag_cfg.get("enabled", True):
-                    gpu_exec = get_gpu_execution_coordinator(bus, config, metrics)
-                    rag_engine = RagEngine(
-                        config, vector_store=None, coordinator=gpu_exec,
-                    )
+                    rag_engine = RagEngine(config, vector_store=None)
                     rag_engine.set_memory_graph(shared_memory_graph)
                     rag_engine.set_feedback_engine(feedback_engine)
                     prefetch_eng = RagPrefetchEngine(rag_engine, config)
-                    local_brain.attach_rag(rag_engine, gpu_exec)
+                    local_brain.attach_rag(rag_engine, None)
                     local_brain.attach_prefetch_engine(prefetch_eng)
                     logger.info(
                         "V7 intelligence: RAG + prefetch + MemoryGraph + timeline + "
@@ -363,28 +377,24 @@ async def main() -> None:
     else:
         logger.info("Priority scheduler OFF (use_priority_scheduler=false)")
 
-    gpu_rm = None
-    gpu_sched_v7 = None
+    inference_guard = None
     recovery_mgr = None
     gpu_stall_wd = None
     if (config.get("v7_gpu") or {}).get("enabled", True):
-        from core.gpu_resource_manager import GPUResourceManager
-        from core.gpu_scheduler import GPUScheduler
+        from core.inference_guard import InferenceGuard
         from core.recovery_manager import RecoveryManager
         from core.gpu_watchdog import GPUStallWatchdog
 
-        gpu_rm = GPUResourceManager(bus, config)
-        gpu_sched_v7 = GPUScheduler(priority_sched, gpu_resource_manager=gpu_rm)
+        inference_guard = InferenceGuard(bus, config)
         recovery_mgr = RecoveryManager(bus, config)
         gpu_stall_wd = GPUStallWatchdog(bus, config)
         gpu_stall_wd.start()
-        gpu_rm.start_power_task()
+        inference_guard.start_power_task()
         if brain_enabled and local_brain is not None:
-            local_brain.attach_gpu_resource_manager(gpu_rm)
+            local_brain.attach_inference_guard(inference_guard)
         logger.info(
-            "ATOM V7: GPUResourceManager + GPUScheduler + RecoveryManager + GPUStallWatchdog",
+            "ATOM V7: InferenceGuard + RecoveryManager + GPUStallWatchdog (Apple Silicon)",
         )
-        _ = (gpu_sched_v7, recovery_mgr, gpu_stall_wd)
 
     pipeline_timer = PipelineTimer(bus, metrics)
     pipeline_timer.register()
@@ -470,17 +480,19 @@ async def main() -> None:
     if config.get("screen_reader", {}).get("enabled", True):
         from context.screen_reader import ScreenReader
         screen_reader = ScreenReader(config)
-        logger.info("Screen reader: %s", "OCR available" if screen_reader.is_available else "fallback mode")
+        logger.info(
+            "Screen reader: %s (%s)",
+            "OCR available" if screen_reader.is_available else "fallback mode",
+            screen_reader.ocr_backend,
+        )
 
-    # ── GPU Governor ───────────────────────────────────────────────
-    gpu_governor = None
+    # ── Silicon Governor (Apple Silicon hardware monitoring) ──────
+    silicon_governor = None
     if config.get("gpu", {}).get("enabled", True):
-        from core.gpu_governor import GPUGovernor
-        gpu_governor = GPUGovernor(bus, config)
-        if gpu_governor.is_available:
-            logger.info("GPU Governor: monitoring active")
-        else:
-            logger.info("GPU Governor: NVML not available (pynvml not installed)")
+        from core.silicon_governor import SiliconGovernor
+        silicon_governor = SiliconGovernor(bus, config)
+        if silicon_governor.is_available:
+            logger.info("Silicon Governor: monitoring active (%s)", silicon_governor.gpu_name)
 
     # ── Security Fortress + Self-Healing + Code Introspection ──────
     from core.security_fortress import SecurityFortress
@@ -520,9 +532,26 @@ async def main() -> None:
     system_indexer.start()
     media_watcher.start()
 
+    # ── FSEvents File Watcher (macOS native, kernel-level) ──────
+    fs_watcher = None
+    if sys.platform == "darwin":
+        try:
+            from core.macos.fs_watcher import FSWatcher
+            fs_watcher = FSWatcher(bus)
+            fs_watcher.watch([
+                "~/Desktop", "~/Downloads", "~/Documents",
+            ])
+            if fs_watcher.start():
+                logger.info("FSWatcher: monitoring Desktop, Downloads, Documents")
+            else:
+                logger.debug("FSWatcher: could not start")
+        except Exception:
+            logger.debug("FSWatcher init failed", exc_info=True)
+
     logger.info(
         "JARVIS intelligence initialized: PlatformAdapter(%s) + "
-        "SystemScanner + SystemIndexer + MediaWatcher + OwnerUnderstanding",
+        "SystemScanner + SystemIndexer + MediaWatcher + OwnerUnderstanding"
+        + (" + FSWatcher" if fs_watcher else ""),
         platform_adapter.os_type.name,
     )
 
@@ -620,9 +649,13 @@ async def main() -> None:
             "Kokoro (offline neural)"
             if tts_engine == "kokoro"
             else (
-                tts_cfg.get("edge_voice", "Edge")
-                if tts_engine == "edge"
-                else "SAPI (offline)"
+                f"macOS Native ({tts_cfg.get('macos_voice', 'Daniel')})"
+                if tts_engine == "macos_native"
+                else (
+                    tts_cfg.get("edge_voice", "Edge")
+                    if tts_engine == "edge"
+                    else "SAPI (offline)"
+                )
             )
         )
         _brain_label = "Local LLM"
@@ -1024,8 +1057,8 @@ async def main() -> None:
     if wake_word_engine is not None and wake_word_engine.is_available:
         wake_word_engine.start(running_loop)
 
-    if gpu_governor is not None and gpu_governor.is_available:
-        gpu_governor.start()
+    if silicon_governor is not None and silicon_governor.is_available:
+        silicon_governor.start()
 
     # ── Start JARVIS-level modules ──────────────────────────────
     system_scanner.start()
@@ -1407,8 +1440,8 @@ async def main() -> None:
             logger.info("Cognitive layer stopped and persisted")
         if wake_word_engine is not None:
             wake_word_engine.shutdown()
-        if gpu_governor is not None:
-            gpu_governor.shutdown()
+        if silicon_governor is not None:
+            silicon_governor.shutdown()
         if workflow_engine is not None:
             workflow_engine.persist()
         if document_engine is not None:
@@ -1424,6 +1457,8 @@ async def main() -> None:
         system_scanner.persist()
         system_indexer.stop()
         media_watcher.stop()
+        if fs_watcher is not None:
+            fs_watcher.shutdown()
         logger.info("JARVIS intelligence modules stopped and persisted")
         maintenance_task.cancel()
         for _t in _bg_tasks:

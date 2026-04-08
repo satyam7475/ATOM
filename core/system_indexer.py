@@ -25,7 +25,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from core.platform_adapter import adapter
+from core.platform_adapter import get_platform_adapter as _get_adapter
+
+adapter = _get_adapter()
 
 logger = logging.getLogger("atom.system_indexer")
 

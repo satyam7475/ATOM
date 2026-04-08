@@ -134,7 +134,7 @@
         }
     },
     "ui": {
-        "mode": "desktop",
+        "mode": "web",
         "web_port": 8765,
         "auto_open_browser": false,
         "password_auth_enabled": false

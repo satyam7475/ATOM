@@ -25,7 +25,7 @@ from __future__ import annotations
 import logging
 import time
 from dataclasses import dataclass, field
-from typing import Any, Callable
+from typing import Any, Callable, Optional
 
 from core.reasoning.tool_parser import ToolCall
 from core.reasoning.tool_registry import ToolRegistry, get_tool_registry
@@ -33,7 +33,7 @@ from core.security_policy import SecurityPolicy
 
 logger = logging.getLogger("atom.action_executor")
 
-DispatchFn = Callable[[str, dict], str | None]
+DispatchFn = Callable[[str, dict], Optional[str]]
 
 
 @dataclass

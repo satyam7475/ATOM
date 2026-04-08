@@ -39,7 +39,10 @@ logger = logging.getLogger("atom.embedding")
 
 
 def _resolve_embedding_device(requested: str) -> str:
-    """Map ``auto`` → CUDA when available; otherwise CPU."""
+    """Map ``auto`` → best available accelerator.
+
+    Priority: CUDA (NVIDIA) → MPS (Apple Silicon) → CPU.
+    """
     r = (requested or "cpu").strip().lower()
     if r != "auto":
         return r
@@ -47,6 +50,8 @@ def _resolve_embedding_device(requested: str) -> str:
         import torch
         if torch.cuda.is_available():
             return "cuda"
+        if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            return "mps"
     except Exception:
         pass
     return "cpu"

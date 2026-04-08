@@ -19,7 +19,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from core.config_manager import load_config
 from core.ipc.zmq_bus import ZmqEventBus
 from core.ipc.interrupt_manager import SystemInterruptManager
-from core.gpu_resource_manager import EVENT_GPU_ACK, EVENT_GPU_UNLOAD
+from core.inference_guard import EVENT_MODEL_ACK, EVENT_MODEL_UNLOAD
 from cursor_bridge.local_brain_controller import LocalBrainController
 
 logger = logging.getLogger("atom.services.llm")
@@ -52,7 +52,7 @@ class LLMWorker:
         
         # Register handlers
         self.bus.on("llm_query_request", self.handle_query_request)
-        self.bus.on(EVENT_GPU_UNLOAD, self.handle_v7_gpu_unload)
+        self.bus.on(EVENT_MODEL_UNLOAD, self.handle_v7_gpu_unload)
 
     def _zmq_emit_chunk(self, chunk: str) -> None:
         """Intercept chunks from the brain and send them over ZMQ."""
@@ -94,7 +94,7 @@ class LLMWorker:
         logger.info("V7 GPU: unloading LLM in worker (power policy)")
         try:
             self.brain.unload_llm_for_power()
-            self.bus.emit(EVENT_GPU_ACK, slot="llm", unloaded=True)
+            self.bus.emit(EVENT_MODEL_ACK, slot="llm", unloaded=True)
         except Exception as e:
             logger.error("V7 GPU unload LLM failed: %s", e)
 

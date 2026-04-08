@@ -473,9 +473,12 @@ class Router:
         Returns the response text, or None to use default response.
         """
         handler = self._ACTION_DISPATCH.get(action)
-        if handler is None:
-            return None
-        return handler(self, action, args)
+        if handler is not None:
+            return handler(self, action, args)
+        method_name = self._LATE_DISPATCH.get(action)
+        if method_name is not None:
+            return getattr(self, method_name)(action, args)
+        return None
 
     async def _dispatch_action_async(self, action: str, args: dict) -> str | None:
         """Async wrapper that offloads slow/blocking actions to a thread.
@@ -819,19 +822,22 @@ class Router:
         "set_performance_mode": _do_set_performance_mode,
         "set_brain_profile": _do_set_brain_profile,
         "set_assistant_mode": _do_set_assistant_mode,
-        "remember": _do_remember,
-        "recall": _do_recall,
-        "learn_document": _do_learn_document,
-        "run_code": _do_run_code,
-        "calculate": _do_calculate,
-        "record_workflow": _do_record_workflow,
-        "stop_recording": _do_stop_recording,
-        "run_workflow": _do_run_workflow,
-        "list_workflows": _do_list_workflows,
-        "screen_read": _do_screen_read,
-        "show_dream_summary": _do_show_dream_summary,
-        "set_goal": _do_set_goal,
-        "show_goals": _do_show_goals,
+    }
+
+    _LATE_DISPATCH = {
+        "remember": "_do_remember",
+        "recall": "_do_recall",
+        "learn_document": "_do_learn_document",
+        "run_code": "_do_run_code",
+        "calculate": "_do_calculate",
+        "record_workflow": "_do_record_workflow",
+        "stop_recording": "_do_stop_recording",
+        "run_workflow": "_do_run_workflow",
+        "list_workflows": "_do_list_workflows",
+        "screen_read": "_do_screen_read",
+        "show_dream_summary": "_do_show_dream_summary",
+        "set_goal": "_do_set_goal",
+        "show_goals": "_do_show_goals",
     }
 
     # ── Reasoning Engine actions ───────────────────────────────────────

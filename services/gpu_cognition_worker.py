@@ -1,8 +1,8 @@
 """
 ATOM V7 — Optional fused GPU cognition worker (single process).
 
-Runs STT + LocalBrainController + shared GPUResourceManager policy in one process
-to minimize cross-process VRAM churn. Enable via config ``v7_gpu.fused_gpu_worker: true``
+Runs STT + LocalBrainController + shared InferenceGuard policy in one process
+for maximum compute locality. Enable via config ``v7_gpu.fused_gpu_worker: true``
 and launch this script instead of separate stt_worker + llm_worker when desired.
 
 Owner: Satyam
@@ -18,7 +18,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from core.config_manager import load_config
-from core.gpu_resource_manager import GPUResourceManager
+from core.inference_guard import InferenceGuard
 from core.ipc.zmq_bus import ZmqEventBus
 from core.state_manager import StateManager
 from cursor_bridge.local_brain_controller import LocalBrainController
@@ -39,7 +39,7 @@ class GpuCognitionWorker:
         self.mic_manager = MicManager()
         self.mic_manager.profile_devices()
 
-        self.gpu_rm = GPUResourceManager(self.bus, self.config)
+        self.gpu_rm = InferenceGuard(self.bus, self.config)
 
         self.prompt_builder = StructuredPromptBuilder(self.config)
         self.brain = LocalBrainController(
@@ -47,7 +47,7 @@ class GpuCognitionWorker:
             self.prompt_builder,
             self.config,
         )
-        self.brain.attach_gpu_resource_manager(self.gpu_rm)
+        self.brain.attach_inference_guard(self.gpu_rm)
 
         self.stt = STTAsync(
             self.bus,

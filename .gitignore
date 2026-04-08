@@ -1,11 +1,18 @@
+# Runtime data (SQLite, caches, security vault, voice profiles)
+data/
+
 # Logs
 logs/
 *.log
+
+# Environment
+.env
 
 # Python
 __pycache__/
 *.pyc
 *.pyo
+.venv/
 
 # IDE / workspace
 .vscode/

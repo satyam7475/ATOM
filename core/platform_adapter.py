@@ -226,7 +226,14 @@ class PlatformAdapter:
         return platform.processor() or "Unknown CPU"
 
     def _get_gpu_info(self) -> tuple[str, float]:
-        """Get GPU name and VRAM. Returns ('', 0.0) if unavailable."""
+        """Get GPU name and memory. Returns ('', 0.0) if unavailable.
+
+        On Apple Silicon, reports the integrated GPU name (e.g. 'Apple M5')
+        and total system RAM as shared GPU memory (Unified Memory architecture).
+        """
+        if self.os_type == OSType.MACOS:
+            return self._get_gpu_info_macos()
+
         try:
             import pynvml
             pynvml.nvmlInit()
@@ -261,6 +268,38 @@ class PlatformAdapter:
                 pass
         return "", 0.0
 
+    def _get_gpu_info_macos(self) -> tuple[str, float]:
+        """Apple Silicon GPU info via system_profiler.
+
+        Apple Silicon uses Unified Memory — CPU, GPU, and Neural Engine all
+        share the same RAM pool. There is no discrete VRAM. We report total
+        system RAM as the shared GPU memory budget.
+        """
+        try:
+            import json as _json
+            result = subprocess.run(
+                ["system_profiler", "SPDisplaysDataType", "-json"],
+                capture_output=True, text=True, timeout=10,
+            )
+            data = _json.loads(result.stdout)
+            gpu_entries = data.get("SPDisplaysDataType", [])
+            if gpu_entries:
+                gpu = gpu_entries[0]
+                name = gpu.get("sppci_model", "Apple Silicon GPU")
+                cores = gpu.get("sppci_cores", "")
+                if cores:
+                    name = f"{name} ({cores}-core GPU)"
+                mem = psutil.virtual_memory()
+                vram_gb = round(mem.total / (1024 ** 3), 2)
+                return name, vram_gb
+        except Exception:
+            logger.debug("macOS GPU info failed", exc_info=True)
+        try:
+            mem = psutil.virtual_memory()
+            return "Apple Silicon GPU", round(mem.total / (1024 ** 3), 2)
+        except Exception:
+            return "Apple Silicon GPU", 0.0
+
     def _get_display_info(self) -> tuple[int, str]:
         """Get display count and primary resolution."""
         if self.os_type == OSType.WINDOWS:
@@ -272,6 +311,8 @@ class PlatformAdapter:
                 return max(1, count), f"{w}x{h}"
             except Exception:
                 pass
+        elif self.os_type == OSType.MACOS:
+            return self._get_display_info_macos()
         elif self.os_type == OSType.LINUX:
             try:
                 result = subprocess.run(
@@ -285,6 +326,39 @@ class PlatformAdapter:
                         return max(1, count), res
             except Exception:
                 pass
+        return 1, "unknown"
+
+    def _get_display_info_macos(self) -> tuple[int, str]:
+        """macOS display info via system_profiler SPDisplaysDataType."""
+        try:
+            import json as _json
+            result = subprocess.run(
+                ["system_profiler", "SPDisplaysDataType", "-json"],
+                capture_output=True, text=True, timeout=10,
+            )
+            data = _json.loads(result.stdout)
+            displays = []
+            for gpu in data.get("SPDisplaysDataType", []):
+                for disp in gpu.get("spdisplays_ndrvs", []):
+                    displays.append(disp)
+
+            if not displays:
+                return 1, "unknown"
+
+            main_display = displays[0]
+            resolution = main_display.get("_spdisplays_resolution", "")
+            if not resolution:
+                resolution = main_display.get("_spdisplays_pixels", "unknown")
+
+            disp_type = main_display.get("spdisplays_display_type", "")
+            if "retina" in disp_type.lower():
+                pixel_res = main_display.get("spdisplays_pixelresolution", "")
+                if pixel_res:
+                    resolution += f" ({pixel_res.replace('spdisplays_', '')})"
+
+            return len(displays), resolution
+        except Exception:
+            logger.debug("macOS display info failed", exc_info=True)
         return 1, "unknown"
 
     # ── Foreground Window ──────────────────────────────────────────
@@ -351,19 +425,33 @@ class PlatformAdapter:
 
     def _fg_window_macos(self) -> dict[str, str]:
         try:
-            script = '''
-            tell application "System Events"
-                set frontApp to first application process whose frontmost is true
-                set appName to name of frontApp
-            end tell
-            return appName
-            '''
+            script = (
+                'tell application "System Events"\n'
+                '  set frontApp to first application process whose frontmost is true\n'
+                '  set appName to name of frontApp\n'
+                '  set appPID to unix id of frontApp\n'
+                '  try\n'
+                '    set winTitle to name of front window of frontApp\n'
+                '  on error\n'
+                '    set winTitle to ""\n'
+                '  end try\n'
+                'end tell\n'
+                'return appName & "|" & appPID & "|" & winTitle'
+            )
             result = subprocess.run(
                 ["osascript", "-e", script],
                 capture_output=True, text=True, timeout=5,
             )
-            app_name = result.stdout.strip()
-            return {"title": app_name, "app_name": app_name, "process_name": "", "pid": ""}
+            parts = result.stdout.strip().split("|", 2)
+            app_name = parts[0] if len(parts) > 0 else ""
+            pid = parts[1] if len(parts) > 1 else ""
+            title = parts[2] if len(parts) > 2 else app_name
+            return {
+                "title": title or app_name,
+                "app_name": app_name,
+                "process_name": app_name,
+                "pid": pid,
+            }
         except Exception:
             return {"title": "", "app_name": "", "process_name": "", "pid": ""}
 
@@ -751,6 +839,26 @@ class PlatformAdapter:
                         })
                     except Exception:
                         pass
+            elif self.os_type == OSType.MACOS:
+                result = subprocess.run(
+                    ["launchctl", "list"],
+                    capture_output=True, text=True, timeout=10,
+                )
+                for line in result.stdout.strip().split("\n")[1:]:
+                    parts = line.split("\t")
+                    if len(parts) >= 3:
+                        pid = parts[0].strip()
+                        status = parts[1].strip()
+                        label = parts[2].strip()
+                        is_running = pid != "-" and pid != ""
+                        if filter_running and not is_running:
+                            continue
+                        services.append({
+                            "name": label,
+                            "display_name": label,
+                            "status": "running" if is_running else "stopped",
+                            "pid": pid if is_running else "",
+                        })
             elif self.os_type == OSType.LINUX:
                 result = subprocess.run(
                     ["systemctl", "list-units", "--type=service",
@@ -810,6 +918,12 @@ class PlatformAdapter:
 
     # ── Summary for LLM Context ──────────────────────────────────
 
+    @property
+    def is_apple_silicon(self) -> bool:
+        """True if running on Apple Silicon (M-series chip)."""
+        return (self.os_type == OSType.MACOS
+                and platform.machine() == "arm64")
+
     def get_system_summary(self) -> str:
         """Generate a human-readable system summary for LLM context injection."""
         p = self.get_system_profile()
@@ -820,7 +934,12 @@ class PlatformAdapter:
             f"RAM: {p.ram_available_gb:.1f}GB free / {p.ram_total_gb:.1f}GB total",
         ]
         if p.gpu_name:
-            lines.append(f"GPU: {p.gpu_name} ({p.gpu_vram_gb:.1f}GB VRAM)")
+            if self.is_apple_silicon:
+                lines.append(
+                    f"GPU: {p.gpu_name} ({p.gpu_vram_gb:.1f}GB Unified Memory)"
+                )
+            else:
+                lines.append(f"GPU: {p.gpu_name} ({p.gpu_vram_gb:.1f}GB VRAM)")
         if p.has_battery:
             plug = "plugged" if p.is_plugged else "on battery"
             lines.append(f"Battery: {p.battery_percent:.0f}% ({plug})")

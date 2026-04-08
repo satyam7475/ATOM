@@ -19,7 +19,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from core.config_manager import load_config
 from core.ipc.zmq_bus import ZmqEventBus
-from core.gpu_resource_manager import EVENT_GPU_ACK, EVENT_GPU_UNLOAD
+from core.inference_guard import EVENT_MODEL_ACK, EVENT_MODEL_UNLOAD
 from voice.stt_async import STTAsync
 
 logger = logging.getLogger("atom.services.stt")
@@ -55,7 +55,7 @@ class STTWorker:
         self.bus.on("stt_preload_request", self.handle_preload_request)
         self.bus.on("stt_start_listening", self.handle_start_listening)
         self.bus.on("interrupt", self.handle_interrupt)
-        self.bus.on(EVENT_GPU_UNLOAD, self.handle_v7_gpu_unload)
+        self.bus.on(EVENT_MODEL_UNLOAD, self.handle_v7_gpu_unload)
 
     async def handle_preload_request(self, event: str, **data) -> None:
         """Handle request to preload faster-whisper models."""
@@ -77,7 +77,7 @@ class STTWorker:
         if data.get("slot") != "stt":
             return
         logger.info("V7 GPU: STT unload requested (ack; model stays until STTAsync supports unload)")
-        self.bus.emit(EVENT_GPU_ACK, slot="stt", unloaded=True)
+        self.bus.emit(EVENT_MODEL_ACK, slot="stt", unloaded=True)
 
     async def handle_interrupt(self, event: str, **data) -> None:
         """Handle global interrupt signal."""

@@ -1,85 +1,86 @@
-# ATOM v18 -- Pinned dependencies (JARVIS-Level Upgrade)
-# Python 3.11+
+# ATOM v19 — Apple Silicon M5 Dependencies (macOS Native Edition)
+# Python 3.9+ (3.11+ recommended)
 #
-# Personal desktop: use requirements-desktop.txt (same pins + install header).
+# Platform: macOS (Apple Silicon / arm64)
+# Strategy: Use native macOS frameworks (pyobjc) wherever possible.
+#           Same philosophy as using MLX for LLM — leverage the OS.
 #
-# Regenerate after upgrading:
-#   pip freeze --local | findstr /i "speech numpy comtypes edge-tts pygame psutil keyboard jsonschema aiohttp truststore mss pillow llama-cpp cffi pyaudio sentence-transformers chromadb easyocr openwakeword pymupdf python-docx pynvml faster-whisper kokoro-tts sounddevice winsdk pyzmq"
+# Build: llama-cpp-python requires Metal:
+#   CMAKE_ARGS="-DGGML_METAL=on" pip install llama-cpp-python
+
+# ─── macOS Native Frameworks (pyobjc) ────────────────────────────────────
+# These bridge Python to Apple frameworks already loaded in macOS RAM.
+# Total: ~18MB pip packages → replaces ~2.8GB of third-party alternatives.
+pyobjc-core>=11.0
+pyobjc-framework-Cocoa>=11.0         # Foundation + AppKit (NSSpeechSynthesizer TTS)
+pyobjc-framework-AVFoundation>=11.0  # AVAudioEngine (mic input, no PyAudio needed)
+pyobjc-framework-Speech>=11.0        # SFSpeechRecognizer (on-device STT, Neural Engine)
+pyobjc-framework-Vision>=11.0        # VNRecognizeTextRequest (OCR, Neural Engine)
+pyobjc-framework-Quartz>=11.0        # CGImage for Vision OCR input
+pyobjc-framework-FSEvents>=11.0      # Kernel-level file system monitoring
+pyobjc-framework-NaturalLanguage>=11.0  # NLEmbedding (quick similarity)
+pyobjc-framework-CoreML>=11.0        # CoreML model inference
 
 # ─── Core (required for default run) ─────────────────────────────────────
-# Voice: STT (faster-whisper offline -- primary, Vosk -- legacy, Google -- fallback)
-faster-whisper==1.2.1
-kokoro-tts==2.3.0
-sounddevice==0.5.1
-winsdk==1.0.0.post10
-pyzmq==26.0.3
-
-SpeechRecognition==3.14.6
-PyAudio==0.2.14
-cffi==2.0.0
-
-# Audio pipeline (Edge TTS postprocess, resampling, emotion analysis)
+# Audio pipeline (resampling, emotion analysis)
 numpy==2.4.3
 
-# TTS: SAPI fallback
-comtypes==1.4.15
-
-# TTS: Edge Neural (primary)
-edge-tts==7.2.7
-pygame==2.6.1
-
-# System monitoring
+# System monitoring (Unified Memory, thermal, battery)
 psutil==7.2.2
 
-# Global hotkey Ctrl+Alt+A
-keyboard==0.13.5
-
-# Config validation (optional at runtime; basic validation used if missing)
+# Config validation
 jsonschema==4.26.0
 
 # Web dashboard
 aiohttp==3.13.3
 
-# Corporate SSL (Windows certificate store)
-truststore==0.10.4
-
-# Desktop capture (screenshot intent, automation)
-mss==10.1.0
+# Desktop capture (screenshot for Vision OCR)
 Pillow==12.1.1
 
+# IPC (V3/V4 multi-process modes)
+pyzmq==26.0.3
+
+# Audio output device
+sounddevice==0.5.1
+
 # ─── Local LLM Brain (brain.enabled=true) ──────────────────────────────────
-# Requires a C++ compiler (Visual Studio Build Tools) or a pre-built wheel.
-# After install, place GGUF model in models/ and set brain.model_path in settings.json.
+# Built with Metal (GPU acceleration via Apple Silicon):
+#   CMAKE_ARGS="-DGGML_METAL=on" pip install llama-cpp-python==0.3.2
+# After install, place GGUF model in models/ and set brain.model_path.
 llama-cpp-python==0.3.2
 
-# ─── v18: Semantic Memory (embedding + vector store) ───────────────────────
-# Embedding engine for semantic search (CPU, ~260MB model)
+# ─── Semantic Memory (embedding + vector store) ──────────────────────────
+# Embedding engine for semantic search (~260MB model)
+# Note: embedding_engine.py now detects MPS (Apple Silicon GPU) automatically
 sentence-transformers>=3.0.0
 
-# Persistent vector database (ChromaDB backend)
-# Falls back to in-memory JSON store if not installed
+# Persistent vector database (falls back to in-memory JSON if not installed)
 chromadb>=0.5.0
 
-# ─── v18: Document Ingestion (RAG pipeline) ───────────────────────────────
-# PDF text extraction
+# ─── Document Ingestion (RAG pipeline) ───────────────────────────────────
 PyMuPDF>=1.24.0
-
-# DOCX text extraction
 python-docx>=1.1.0
 
-# ─── v18: Perception Upgrade ──────────────────────────────────────────────
-# Wake word detection ("Hey ATOM")
-# Optional: falls back to always-listen if not installed
-# openwakeword>=0.6.0
+# ─── Optional: Legacy / Cross-platform voice (not needed on macOS) ───────
+# These are REPLACED by native macOS frameworks on Apple Silicon:
+#   faster-whisper → SFSpeechRecognizer (pyobjc-framework-Speech)
+#   SpeechRecognition + PyAudio → AVAudioEngine (pyobjc-framework-AVFoundation)
+#   easyocr → Vision framework (pyobjc-framework-Vision)
+#   openwakeword → SFSpeechRecognizer keyword detection
+#   edge-tts + pygame → NSSpeechSynthesizer (pyobjc-framework-Cocoa)
+#
+# Install these only if you need cross-platform or specific features:
+# faster-whisper==1.2.1    # Whisper STT (cross-platform, GPU via CTranslate2)
+# SpeechRecognition==3.14.6  # Mic capture wrapper
+# PyAudio==0.2.14          # PortAudio binding (needs brew install portaudio)
+# edge-tts==7.2.7          # Microsoft neural TTS (needs network)
+# pygame==2.6.1            # Audio playback for Edge TTS
+# openwakeword>=0.6.0      # Wake word detection (replaced by SFSpeech)
+# easyocr>=1.7.0           # Screen OCR (replaced by Vision framework)
+# kokoro-tts==2.3.0        # Kokoro TTS alternative
+# keyboard==0.13.5         # Global hotkey (needs root on macOS)
+# mss==10.1.0              # Fast screenshots (screencapture is sufficient)
 
-# Screen OCR (local text extraction from screenshots)
-# Optional: falls back to clipboard + window title if not installed
-# easyocr>=1.7.0
-
-# ─── v18: GPU Monitoring ──────────────────────────────────────────────────
-# NVIDIA GPU telemetry (temperature, VRAM, utilization)
-# Optional: GPU governor degrades gracefully without it
-# pynvml>=12.0.0
-
-# ─── Optional: install only if you use the feature ─────────────────────────
-# soxr>=0.3.0         # Optional: better audio resample quality
+# ─── Dev / CI ────────────────────────────────────────────────────────────
+# pytest>=8.0.0
+# pytest-asyncio>=0.24.0

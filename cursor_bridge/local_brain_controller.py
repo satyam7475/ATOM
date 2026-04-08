@@ -83,10 +83,7 @@ class LocalBrainController:
         self._total_react_loops = 0
         self._first_token_latencies: list[float] = []
 
-        self._gpu_pipeline = None
-        if (config.get("v7_gpu") or {}).get("enabled", True):
-            from brain.gpu_pipeline import GPUPipeline
-            self._gpu_pipeline = GPUPipeline(config, gpu_resource_manager=None)
+        self._inference_guard: Any = None
 
         self._rag_engine: Any = None
         self._gpu_coord: Any = None
@@ -161,8 +158,11 @@ class LocalBrainController:
         )
 
     def attach_gpu_resource_manager(self, mgr: Any) -> None:
-        if self._gpu_pipeline is not None:
-            self._gpu_pipeline.attach_gpu_manager(mgr)
+        """Legacy shim — use attach_inference_guard instead."""
+        self._inference_guard = mgr
+
+    def attach_inference_guard(self, guard: Any) -> None:
+        self._inference_guard = guard
 
     def set_action_executor(self, executor: "ActionExecutor") -> None:
         """Inject the ActionExecutor after Router initialization."""
@@ -226,8 +226,8 @@ class LocalBrainController:
         logger.info("Agentic brain query: '%s'", _redact(text[:120]))
 
         trace_id = _kw.get("trace_id")
-        if self._gpu_pipeline:
-            self._gpu_pipeline.refresh_gpu_budget()
+        if self._inference_guard is not None:
+            self._inference_guard.refresh_vram()
 
         if self._feedback_engine is not None and self._prev_predictions:
             try:

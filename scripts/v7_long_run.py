@@ -31,8 +31,8 @@ def main() -> None:
     while time.time() < end:
         row = {"t": time.time(), "kind": "v7_long_run_tick"}
         try:
-            from core.gpu_resource_manager import get_nvml_vram_mb
-            used, total = get_nvml_vram_mb()
+            from core.apple_silicon_monitor import get_apple_silicon_memory_mb
+            used, total = get_apple_silicon_memory_mb()
             row["vram_used_mb"] = round(used, 1)
             row["vram_total_mb"] = round(total, 1)
         except Exception as e:

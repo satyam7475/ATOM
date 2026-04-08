@@ -4,6 +4,8 @@ Backward compatible: defaults preserve prior behavior unless env overrides.
 
 ATOM V7: DegradationMode (FULL → LIMITED → SAFE) for graceful GPU/system degradation.
 """
+from __future__ import annotations
+
 import os
 from enum import Enum
 
