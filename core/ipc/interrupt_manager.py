@@ -7,15 +7,14 @@ Ensures ATOM feels alive and responsive when the user barges in.
 Owner: Satyam
 """
 
-import asyncio
+import inspect
 import logging
-from typing import Callable, List
-from .zmq_bus import ZmqEventBus
+from typing import Any, Callable, List
 
 logger = logging.getLogger("atom.ipc.interrupt")
 
 class SystemInterruptManager:
-    def __init__(self, bus: ZmqEventBus, worker_name: str):
+    def __init__(self, bus: Any, worker_name: str):
         self.bus = bus
         self.worker_name = worker_name
         self._cancel_callbacks: List[Callable] = []
@@ -30,11 +29,11 @@ class SystemInterruptManager:
     async def broadcast_interrupt(self):
         """Broadcast a global interrupt to all workers."""
         logger.warning(f"[{self.worker_name}] Broadcasting global INTERRUPT_ALL")
-        # We don't wait for ACKs here to ensure it's fast, 
-        # but the bus will handle high priority routing.
-        self.bus.emit("INTERRUPT_ALL", source_worker=self.worker_name)
+        emit = getattr(self.bus, "emit_fast", None) or getattr(self.bus, "emit", None)
+        if callable(emit):
+            emit("INTERRUPT_ALL", source_worker=self.worker_name)
 
-    async def _handle_interrupt(self, event: str, **data):
+    async def _handle_interrupt(self, event: str = "", **data):
         """Handle incoming global interrupt."""
         source = data.get("source_worker", "unknown")
         if source == self.worker_name:
@@ -45,12 +44,13 @@ class SystemInterruptManager:
         # Execute all registered cancel callbacks
         for cb in self._cancel_callbacks:
             try:
-                if asyncio.iscoroutinefunction(cb):
-                    await cb()
-                else:
-                    cb()
+                result = cb()
+                if inspect.isawaitable(result):
+                    await result
             except Exception as e:
                 logger.error(f"Error in interrupt callback: {e}")
                 
         # Send ACK back
-        self.bus.emit(f"INTERRUPT_ACK_{source}", worker=self.worker_name)
+        emit = getattr(self.bus, "emit_fast", None) or getattr(self.bus, "emit", None)
+        if callable(emit):
+            emit(f"INTERRUPT_ACK_{source}", worker=self.worker_name)

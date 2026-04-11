@@ -38,6 +38,8 @@ import random
 import re
 from typing import Any, TYPE_CHECKING
 
+from core.identity_engine import IdentityEngine
+
 if TYPE_CHECKING:
     from core.owner_understanding import OwnerUnderstanding
     from core.personality_modes import PersonalityModes
@@ -47,65 +49,74 @@ _OWNER_TITLE = "Boss"
 
 _owner_engine: OwnerUnderstanding | None = None
 _modes_engine: PersonalityModes | None = None
+_identity_engine = IdentityEngine()
 
 
 def set_owner(name: str = "Satyam", title: str = "Boss") -> None:
     global _OWNER_NAME, _OWNER_TITLE
     _OWNER_NAME = name or "Satyam"
     _OWNER_TITLE = title or "Boss"
+    _identity_engine.configure_owner(_OWNER_NAME, _OWNER_TITLE)
 
 
 def attach_owner(owner: OwnerUnderstanding) -> None:
     """Wire the OwnerUnderstanding engine for adaptive responses."""
     global _owner_engine
     _owner_engine = owner
+    _identity_engine.attach_owner(owner)
 
 
 def attach_modes(modes: PersonalityModes) -> None:
     """Wire the PersonalityModes engine for mode-aware responses."""
     global _modes_engine
     _modes_engine = modes
+    _identity_engine.attach_modes(modes)
+
+
+def get_identity_snapshot(context: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Expose the composed identity snapshot for other modules."""
+    return _identity_engine.get_identity_snapshot(context)
+
+
+def get_voice_profile(context: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Expose the current voice/response profile."""
+    return _identity_engine.get_voice_profile(context)
 
 
 def _b() -> str:
-    return _OWNER_TITLE
+    return str(get_identity_snapshot().get("owner_title") or _OWNER_TITLE)
 
 
 def _o() -> str:
-    return _OWNER_NAME
+    return str(get_identity_snapshot().get("owner_name") or _OWNER_NAME)
 
 
 def _emotion() -> str:
-    if _owner_engine:
-        return _owner_engine.emotion.primary
-    return "neutral"
+    return str(get_identity_snapshot().get("owner_emotion") or "neutral")
 
 
 def _energy() -> str:
-    if _owner_engine:
-        return _owner_engine.anticipation.current_energy_level
-    return "normal"
+    return str(get_identity_snapshot().get("owner_energy") or "normal")
 
 
 def _mode() -> str:
-    if _modes_engine:
-        return _modes_engine.current_mode
-    return "work"
+    return str(get_identity_snapshot().get("personality_mode") or "work")
 
 
 def _session_depth() -> int:
-    if _owner_engine:
-        return _owner_engine._total_interactions
-    return 0
+    return int(get_identity_snapshot().get("relationship_depth") or 0)
 
 
 def _active_project() -> str:
-    if _owner_engine and _owner_engine.context.active_projects:
-        return _owner_engine.context.active_projects[0].get("name", "")
-    return ""
+    return str(get_identity_snapshot().get("active_project") or "")
 
 
 def _verbosity() -> str:
+    voice_verbosity = str(get_voice_profile().get("verbosity", "")).strip().lower()
+    if voice_verbosity == "silent":
+        return "silent"
+    if voice_verbosity in {"minimal", "terse"}:
+        return "minimal"
     if _modes_engine:
         return _modes_engine.verbosity
     return "full"
@@ -256,6 +267,10 @@ _ACTION_TEMPLATES: dict[str, list[str]] = {
     "open_app": ["Opening {detail}.", "{detail} coming right up.", "Launching {detail}."],
     "close_app": ["Closed {detail}.", "{detail} is shut down."],
     "search": ["Searching now.", "Pulling up results."],
+    "spotlight_search": [
+        "Spotlight is on it for {detail}.",
+        "Searching your Mac for {detail}.",
+    ],
     "set_volume": ["Volume at {detail} percent.", "Adjusted to {detail}."],
     "play_youtube": ["Playing {detail}.", "Here's {detail}."],
     "stop_music": ["Paused.", "Audio off."],
@@ -493,6 +508,9 @@ def polish_response(text: str, *, source: str = "general") -> str:
         return text
 
     verb = _verbosity()
+    voice_profile = get_voice_profile()
+    voice_verbosity = str(voice_profile.get("verbosity", "")).strip().lower()
+    voice_tone = str(voice_profile.get("tone", "")).strip().lower()
     t = _WS_RE.sub(" ", text).strip()
     t = _BOSS_LOWER_RE.sub("Boss", t)
 
@@ -506,10 +524,15 @@ def polish_response(text: str, *, source: str = "general") -> str:
         t = f"{cut}."
     elif verb == "silent":
         return ""
+    elif voice_verbosity == "brief" and len(t) > 160:
+        cut = t[:160].rsplit(" ", 1)[0].rstrip(" ,;:")
+        t = f"{cut}."
 
     # Normalize terminal punctuation for better TTS rhythm.
     if t and t[-1] not in ".!?":
         t += "."
+    if voice_tone in {"calm", "gentle"}:
+        t = t.replace("!", ".")
 
     # For casual/buddy feel in chill mode, lightly personalize generic replies.
     if _mode() == "chill":

@@ -93,7 +93,9 @@ class TTSWorker:
     async def handle_interrupt(self) -> None:
         """Handle global interrupt signal."""
         logger.info("TTS Worker received interrupt signal. Stopping playback.")
-        self.tts_engine.stop()
+        result = self.tts_engine.stop()
+        if asyncio.iscoroutine(result):
+            await result
 
     async def run(self) -> None:
         """Main worker loop."""

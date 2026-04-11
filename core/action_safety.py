@@ -46,7 +46,7 @@ def default_risk_for_action(action: str) -> ActionRisk:
         "move_path", "copy_path", "delete_path", "close_app",
         "create_folder", "play_youtube", "type_text",
     }
-    medium = {"open_app", "open_url", "set_reminder"}
+    medium = {"open_app", "open_url", "set_reminder", "spotlight_search"}
     if action in critical:
         return ActionRisk.CRITICAL
     if action in high:

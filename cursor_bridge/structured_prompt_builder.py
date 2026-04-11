@@ -178,6 +178,7 @@ class StructuredPromptBuilder:
         self._system_prompt_cache: str | None = None
         self._system_prompt_hash: int | None = None
         self._tools_prompt_cache: str | None = None
+        self._query_hint_cache: dict[str, str] = {}
         self._tool_registry = None
         self._context_fusion = None
         self._real_world_intel = None
@@ -273,7 +274,7 @@ class StructuredPromptBuilder:
         'lost in the middle' syndrome and save tokens.
         """
         parts: list[str] = []
-        hint = _query_type_hint(query)
+        hint = self._query_type_hint_cached(query)
         
         # 1. Always include time and mood
         now = datetime.now()
@@ -285,6 +286,11 @@ class StructuredPromptBuilder:
 
         if hint:
             parts.append(hint)
+
+        if context:
+            routing_hint = (context.get("llm_routing_hint") or "").strip()
+            if routing_hint:
+                parts.append(f"Inference hint: {routing_hint}")
 
         # 2. Context Router: Only inject what's needed
         q_lower = query.lower()
@@ -333,6 +339,19 @@ class StructuredPromptBuilder:
         if not parts:
             return ""
         return "CURRENT CONTEXT:\n" + "\n".join(parts) + "\n"
+
+    def _query_type_hint_cached(self, query: str) -> str:
+        key = _compress_text((query or "").lower(), max_len=160)
+        if not key:
+            return ""
+        cached = self._query_hint_cache.get(key)
+        if cached is not None:
+            return cached
+        hint = _query_type_hint(query)
+        if len(self._query_hint_cache) >= 64:
+            self._query_hint_cache.pop(next(iter(self._query_hint_cache)))
+        self._query_hint_cache[key] = hint
+        return hint
 
     def _build_memory_layer(self, memory_summaries: list[str] | None) -> str:
         """Layer 4: Long-Term Memory Context."""
@@ -448,7 +467,23 @@ class StructuredPromptBuilder:
                       len(prompt), _estimate_tokens(prompt))
         return prompt
 
+    def precompile(self, query: str = "", *, prompt_hint: str = "") -> dict[str, object]:
+        """Warm prompt-builder caches for a likely future query."""
+        query = _compress_text(query or "help")
+        self._build_system_layer()
+        self._build_tools_layer()
+        query_hint = self._query_type_hint_cached(query)
+        query_layer = self._build_query_layer(query)
+        return {
+            "system_prompt_hash": self.system_prompt_hash,
+            "tools_cached": self._tools_prompt_cache is not None,
+            "query_hint": query_hint,
+            "routing_hint": (prompt_hint or "").strip(),
+            "query_chars": len(query_layer),
+        }
+
     def invalidate_cache(self) -> None:
         self._system_prompt_cache = None
         self._system_prompt_hash = None
         self._tools_prompt_cache = None
+        self._query_hint_cache.clear()

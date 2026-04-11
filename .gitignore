@@ -23,6 +23,10 @@ __pycache__/
 models/*.gguf
 models/vosk-*/
 models/*.onnx
+models/*-mlx/
+
+# macOS
+.DS_Store
 
 # Temp / audio
 *.tmp

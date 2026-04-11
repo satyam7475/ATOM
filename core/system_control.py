@@ -37,6 +37,8 @@ from pathlib import Path
 from typing import Any
 import psutil
 
+from core.macos import AppleScriptEngine
+
 logger = logging.getLogger("atom.sysctl")
 
 
@@ -60,6 +62,7 @@ class SystemControl:
         self._is_windows = sys.platform.startswith("win")
         self._is_linux = sys.platform.startswith("linux")
         self._is_macos = sys.platform == "darwin"
+        self._applescript = AppleScriptEngine() if self._is_macos else None
         logger.info("System control engine initialized (%s)", sys.platform)
 
     # ── Process Management ────────────────────────────────────────
@@ -724,20 +727,20 @@ class SystemControl:
         """Get current system volume level (0-100)."""
         if self._is_macos:
             try:
-                result = subprocess.run(
-                    ["osascript", "-e", "get volume settings"],
-                    capture_output=True, text=True, timeout=5,
+                if self._applescript is None:
+                    return SystemControlResult(False, "AppleScript engine unavailable")
+                parts = self._applescript.get_volume_settings()
+                if not parts:
+                    return SystemControlResult(False, "Volume query failed")
+                return SystemControlResult(
+                    True,
+                    f"Volume: {parts.get('output volume', '?')}%",
+                    {
+                        "output_volume": int(parts.get("output volume", 0)),
+                        "input_volume": int(parts.get("input volume", 0)),
+                        "muted": bool(parts.get("output muted", False)),
+                    },
                 )
-                parts = {}
-                for pair in result.stdout.strip().split(", "):
-                    if ":" in pair:
-                        k, v = pair.split(":", 1)
-                        parts[k.strip()] = v.strip()
-                return SystemControlResult(True, f"Volume: {parts.get('output volume', '?')}%", {
-                    "output_volume": int(parts.get("output volume", 0)),
-                    "input_volume": int(parts.get("input volume", 0)),
-                    "muted": parts.get("output muted", "false") == "true",
-                })
             except Exception as e:
                 return SystemControlResult(False, f"Volume query failed: {e}")
         return SystemControlResult(False, "Volume query not implemented for this platform")
@@ -747,11 +750,11 @@ class SystemControl:
         level = max(0, min(100, level))
         if self._is_macos:
             try:
-                subprocess.run(
-                    ["osascript", "-e", f"set volume output volume {level}"],
-                    capture_output=True, timeout=5,
-                )
-                return SystemControlResult(True, f"Volume set to {level}%")
+                if self._applescript is None:
+                    return SystemControlResult(False, "AppleScript engine unavailable")
+                if self._applescript.set_volume(level):
+                    return SystemControlResult(True, f"Volume set to {level}%")
+                return SystemControlResult(False, "Volume change failed")
             except Exception as e:
                 return SystemControlResult(False, f"Volume change failed: {e}")
         return SystemControlResult(False, "Volume control not implemented for this platform")
@@ -760,17 +763,12 @@ class SystemControl:
         """Toggle system audio mute."""
         if self._is_macos:
             try:
-                result = subprocess.run(
-                    ["osascript", "-e", "get volume settings"],
-                    capture_output=True, text=True, timeout=5,
-                )
-                is_muted = "output muted:true" in result.stdout
-                new_state = "false" if is_muted else "true"
-                subprocess.run(
-                    ["osascript", "-e",
-                     f"set volume output muted {new_state}"],
-                    capture_output=True, timeout=5,
-                )
+                if self._applescript is None:
+                    return SystemControlResult(False, "AppleScript engine unavailable")
+                settings = self._applescript.get_volume_settings()
+                is_muted = bool(settings.get("output muted", False))
+                if not self._applescript.set_muted(not is_muted):
+                    return SystemControlResult(False, "Mute toggle failed")
                 label = "unmuted" if is_muted else "muted"
                 return SystemControlResult(True, f"Audio {label}")
             except Exception as e:
@@ -782,20 +780,13 @@ class SystemControl:
         level = max(0, min(100, level))
         if self._is_macos:
             try:
+                if self._applescript is None:
+                    return SystemControlResult(False, "AppleScript engine unavailable")
                 steps = abs(level - 50) // 6
-                key_code = "144" if level > 50 else "145"
                 for _ in range(16):
-                    subprocess.run(
-                        ["osascript", "-e",
-                         'tell application "System Events" to key code 145'],
-                        capture_output=True, timeout=2,
-                    )
+                    self._applescript.press_key(145)
                 for _ in range(steps + (level // 6)):
-                    subprocess.run(
-                        ["osascript", "-e",
-                         'tell application "System Events" to key code 144'],
-                        capture_output=True, timeout=2,
-                    )
+                    self._applescript.press_key(144)
                 return SystemControlResult(
                     True,
                     f"Brightness adjusted toward {level}% (approximate via key simulation)",

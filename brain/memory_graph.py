@@ -95,6 +95,14 @@ class VectorMemory:
         except Exception as e:
             logger.error(f"Failed to add to vector memory: {e}")
 
+    def delete_many(self, node_ids: List[str]) -> None:
+        if not self.enabled or not node_ids:
+            return
+        try:
+            self.collection.delete(ids=list(node_ids))
+        except Exception as e:
+            logger.error(f"Failed to delete from vector memory: {e}")
+
     def search(
         self,
         query: str,
@@ -152,11 +160,23 @@ class VectorMemory:
             return []
 
 class MemoryGraph:
-    def __init__(self, db_path: str = "atom_memory.db"):
+    def __init__(self, db_path: str = "atom_memory.db", config: Optional[Dict[str, Any]] = None):
+        mem_cfg = (config or {}).get("memory", {}) if isinstance(config, dict) else {}
         self.db_path = db_path
         self.vector_db = VectorMemory()
         self._query_cache: "OrderedDict[str, List[MemoryNode]]" = OrderedDict()
         self._query_cache_max = 500
+        self._max_vector_results = max(1, int(mem_cfg.get("max_vector_results", 5)))
+        self._max_nodes = max(1, int(mem_cfg.get("max_graph_nodes", 1000)))
+        self._pressure_threshold_pct = float(mem_cfg.get("pressure_threshold_pct", 85.0))
+        self._pressure_relief_pct = float(
+            mem_cfg.get("pressure_relief_pct", max(0.0, self._pressure_threshold_pct - 10.0)),
+        )
+        self._pressure_query_limit = max(
+            1,
+            min(int(mem_cfg.get("pressure_query_limit", 3)), self._max_vector_results),
+        )
+        self._memory_pressure_active = False
         self._init_db()
 
     def _init_db(self):
@@ -189,6 +209,91 @@ class MemoryGraph:
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_source ON memory_edges(source_id)')
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_target ON memory_edges(target_id)')
             conn.commit()
+
+    def node_count(self) -> int:
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT COUNT(*) FROM memory_nodes")
+            row = cursor.fetchone()
+            return int(row[0]) if row and row[0] is not None else 0
+
+    def prune_to_limit(self, max_nodes: Optional[int] = None) -> int:
+        limit = max(1, int(max_nodes or self._max_nodes))
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT COUNT(*) FROM memory_nodes")
+            row = cursor.fetchone()
+            total = int(row[0]) if row and row[0] is not None else 0
+            overflow = total - limit
+            if overflow <= 0:
+                return 0
+
+            cursor.execute(
+                """
+                SELECT id
+                FROM memory_nodes
+                ORDER BY
+                    CASE
+                        WHEN type = 'episodic' THEN 0
+                        WHEN type IN ('task', 'procedural') THEN 1
+                        ELSE 2
+                    END ASC,
+                    importance ASC,
+                    access_count ASC,
+                    timestamp ASC
+                LIMIT ?
+                """,
+                (overflow,),
+            )
+            ids_to_delete = [row[0] for row in cursor.fetchall()]
+            if not ids_to_delete:
+                return 0
+
+            for node_id in ids_to_delete:
+                cursor.execute(
+                    "DELETE FROM memory_edges WHERE source_id = ? OR target_id = ?",
+                    (node_id, node_id),
+                )
+                cursor.execute("DELETE FROM memory_nodes WHERE id = ?", (node_id,))
+            conn.commit()
+
+        self.invalidate_query_cache()
+        self.vector_db.delete_many(ids_to_delete)
+        logger.info(
+            "MemoryGraph pruned %d nodes to cap growth at %d",
+            len(ids_to_delete),
+            limit,
+        )
+        return len(ids_to_delete)
+
+    def apply_memory_pressure(self, memory_pct: float) -> Dict[str, Any]:
+        active = memory_pct >= self._pressure_threshold_pct
+        if self._memory_pressure_active:
+            active = memory_pct > self._pressure_relief_pct
+
+        changed = active != self._memory_pressure_active
+        self._memory_pressure_active = active
+        pruned = 0
+
+        if changed and active:
+            logger.warning(
+                "MemoryGraph pressure mode ON at %.0f%%: semantic query path reduced",
+                memory_pct,
+            )
+            self.invalidate_query_cache()
+            target = max(1, min(self._max_nodes, int(self._max_nodes * 0.9)))
+            pruned = self.prune_to_limit(target)
+        elif changed and not active:
+            logger.info(
+                "MemoryGraph pressure mode OFF at %.0f%%: semantic query path restored",
+                memory_pct,
+            )
+
+        return {
+            "active": self._memory_pressure_active,
+            "memory_pct": round(memory_pct, 1),
+            "pruned": pruned,
+        }
             
     def add_node(self, node: MemoryNode):
         """Add a memory node and its relationships to the graph."""
@@ -219,6 +324,8 @@ class MemoryGraph:
                 metadata={"type": node.type, "importance": node.importance, "timestamp": node.timestamp},
                 memory_index=_memory_index_for_node_type(node.type),
             )
+        if self.node_count() > self._max_nodes:
+            self.prune_to_limit(self._max_nodes)
             
     def get_node(self, node_id: str) -> Optional[MemoryNode]:
         """Retrieve a specific node by ID."""
@@ -280,6 +387,8 @@ class MemoryGraph:
         top_k = int(qp.pop("top_k", limit))
         similarity_threshold = float(qp.pop("similarity_threshold", 0.7))
         effective_limit = max(1, min(top_k, 64))
+        if self._memory_pressure_active:
+            effective_limit = min(effective_limit, self._pressure_query_limit)
 
         cache_key = self._query_cache_key(
             {"qp": qp, "query_type": query_type, "top_k": effective_limit, "sim": similarity_threshold},
@@ -294,10 +403,10 @@ class MemoryGraph:
         semantic_scores = {}
         
         # 1. Semantic Search (Vector Layer) — routed index + top_k + threshold
-        if "text" in qp and self.vector_db.enabled:
+        if "text" in qp and self.vector_db.enabled and not self._memory_pressure_active:
             vector_results = self.vector_db.search(
                 qp["text"],
-                limit=effective_limit * 2,
+                limit=min(max(1, effective_limit * 2), self._max_vector_results),
                 query_type=query_type,
                 similarity_threshold=similarity_threshold,
             )
@@ -386,6 +495,9 @@ class MemoryGraph:
                     cursor.execute('DELETE FROM memory_edges WHERE source_id = ? OR target_id = ?', (node_id, node_id))
                 
             conn.commit()
+        if ids_to_delete:
+            self.vector_db.delete_many(ids_to_delete)
+            self.invalidate_query_cache()
 
     # ---------------- Memory Evolution Utilities ----------------
     def index_experience(self, experience: dict) -> None:

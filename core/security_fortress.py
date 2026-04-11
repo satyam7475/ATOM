@@ -12,7 +12,8 @@ The impenetrable security layer for ATOM. This module ensures that:
 
 Architecture:
   - OwnerAuthenticator: Challenge-response + passphrase authentication
-  - EncryptedVault: Fernet-encrypted key-value store for secrets
+  - EncryptedVault: Fernet-encrypted key-value store for secrets (default)
+  - KeychainVault (macOS): optional ``security`` CLI backing via ``security_fortress``
   - IntegrityMonitor: SHA-256 hash verification of all ATOM source files
   - SessionManager: Token-based sessions with TTL and auto-expiry
   - SecurityAuditTrail: Tamper-evident, hash-chained audit log
@@ -29,6 +30,7 @@ import json
 import logging
 import os
 import secrets
+import sys
 import time
 import uuid
 from datetime import datetime
@@ -265,6 +267,74 @@ class EncryptedVault:
     @property
     def is_encrypted(self) -> bool:
         return self._using_encryption
+
+    @property
+    def backend_name(self) -> str:
+        return "fernet" if self._using_encryption else "obfuscated"
+
+
+def _use_macos_keychain(config: dict | None) -> bool:
+    """Prefer Keychain on macOS unless ``security_fortress.use_macos_keychain`` is false."""
+    if sys.platform != "darwin":
+        return False
+    sec = (config or {}).get("security_fortress", {}) or {}
+    if sec.get("use_macos_keychain") is False:
+        return False
+    return True
+
+
+def _migrate_fernet_vault_into_keychain(kv: Any) -> None:
+    """Copy existing ``vault.enc`` entries into Keychain once, then retire the file."""
+    if kv.keys():
+        return
+    if not _VAULT_FILE.exists():
+        return
+    try:
+        old = EncryptedVault()
+    except Exception:
+        logger.debug("Could not open legacy vault for migration", exc_info=True)
+        return
+    legacy_keys = old.keys()
+    if not legacy_keys:
+        return
+    migrated = 0
+    for k in legacy_keys:
+        val = old.get(k)
+        if val and kv.put(k, val):
+            migrated += 1
+    kv.persist()
+    if migrated == 0:
+        return
+    try:
+        backup = _VAULT_FILE.with_suffix(_VAULT_FILE.suffix + ".bak")
+        if backup.exists():
+            backup.unlink()
+        _VAULT_FILE.rename(backup)
+        logger.info(
+            "Security vault: migrated %d entries to macOS Keychain (%s)",
+            migrated,
+            backup.name,
+        )
+    except OSError:
+        logger.warning("Could not rename vault.enc after Keychain migration", exc_info=True)
+
+
+def _select_security_vault(config: dict) -> Any:
+    if _use_macos_keychain(config):
+        try:
+            from core.macos.keychain_store import KeychainVault
+
+            sec = config.get("security_fortress", {}) or {}
+            service = str(sec.get("keychain_service") or "com.atom.fortress")
+            kv = KeychainVault(service=service)
+            _migrate_fernet_vault_into_keychain(kv)
+            return kv
+        except Exception:
+            logger.warning(
+                "macOS Keychain vault unavailable; falling back to EncryptedVault.",
+                exc_info=True,
+            )
+    return EncryptedVault()
 
 
 class IntegrityMonitor:
@@ -709,7 +779,7 @@ class SecurityFortress:
     def __init__(self, config: dict | None = None) -> None:
         self._config = config or {}
         self._authenticator = OwnerAuthenticator(config)
-        self._vault = EncryptedVault()
+        self._vault = _select_security_vault(self._config)
         self._integrity = IntegrityMonitor()
         self._sessions = SessionManager()
         self._audit = SecurityAuditTrail()
@@ -724,7 +794,7 @@ class SecurityFortress:
         self._voice_auth.attach_vault(self._vault)
         self._behavior_auth = BehavioralAuth(config)
 
-        sec_cfg = self._config.get("security_fortress", {})
+        sec_cfg = self._config.get("security_fortress", {}) or {}
         if not sec_cfg.get("require_auth", False):
             self._auto_authenticated = True
             self._active_session_token = self._sessions.create_session()
@@ -734,7 +804,7 @@ class SecurityFortress:
             "Security Fortress initialized: auth=%s, vault=%s, integrity=%d files, "
             "sessions=%d, audit=%d entries, voice=%s, behavior=%s",
             "enrolled" if self._authenticator.is_enrolled else "not_enrolled",
-            "encrypted" if self._vault.is_encrypted else "obfuscated",
+            self.vault_backend_label,
             self._integrity.file_count,
             self._sessions.active_count,
             self._audit.entry_count,
@@ -855,6 +925,14 @@ class SecurityFortress:
     def trust_score(self) -> float:
         return self._behavior_auth.trust_score
 
+    @property
+    def vault_backend_label(self) -> str:
+        """Short label for logs (``keychain``, ``fernet``, ``obfuscated``)."""
+        bn = getattr(self._vault, "backend_name", None)
+        if isinstance(bn, str) and bn:
+            return bn
+        return "encrypted" if self._vault.is_encrypted else "obfuscated"
+
     # ── Vault ───────────────────────────────────────────────────────
 
     def vault_store(self, key: str, value: str) -> None:
@@ -947,7 +1025,7 @@ class SecurityFortress:
             f" ({self._voice_auth.method})",
             f"  Behavioral trust: {self._behavior_auth.trust_score:.0%}"
             f" ({self._behavior_auth.get_trust_level()})",
-            f"  Vault: {'encrypted (AES)' if self._vault.is_encrypted else 'obfuscated'}, "
+            f"  Vault: {self.vault_backend_label}, "
             f"{len(self._vault.keys())} secrets stored",
             f"  Integrity: {self._integrity.file_count} files baselined",
             f"  Active sessions: {self._sessions.active_count}",

@@ -30,7 +30,9 @@ import logging
 import queue
 import re
 import time
+import uuid
 from collections import deque
+from functools import partial
 from typing import TYPE_CHECKING, Any, Dict
 
 from core.reasoning.tool_parser import parse_tool_calls
@@ -70,8 +72,8 @@ class LocalBrainController:
         self._prompt_builder = prompt_builder
         self._config = config
 
-        from brain.mini_llm import MiniLLM
-        self._llm = MiniLLM(config)
+        from brain.mlx_llm import MLXBrain
+        self._llm = MLXBrain(config)
         if brain_mode_manager is not None:
             self._llm.set_brain_mode_manager(brain_mode_manager)
 
@@ -100,6 +102,7 @@ class LocalBrainController:
         self._feedback_engine: Any = None
         self._system_monitor: Any = None
         self._suggester: Any = None
+        self._runtime_watchdog: Any = None
         self._prev_predictions: list[str] = []
         self._last_retrieval_source: str = ""
         self._v7_context_last: V7RuntimeContext | None = None
@@ -142,6 +145,7 @@ class LocalBrainController:
         history: list[tuple[str, str]] | None,
         res: Any,
         trace_id: str | None,
+        query_plan: Any | None = None,
         late_depth: int = 0,
     ) -> None:
         """Single follow-up generation with high-confidence RAG after budget miss."""
@@ -152,6 +156,7 @@ class LocalBrainController:
             context=context,
             history=history or [],
             trace_id=trace_id,
+            query_plan=query_plan,
             enriched_rag_result=res,
             _retry_from_late=True,
             _late_depth=late_depth + 1,
@@ -163,6 +168,21 @@ class LocalBrainController:
 
     def attach_inference_guard(self, guard: Any) -> None:
         self._inference_guard = guard
+
+    def attach_runtime_watchdog(self, watchdog: Any) -> None:
+        self._runtime_watchdog = watchdog
+
+    def apply_memory_pressure(self, memory_pct: float) -> None:
+        if self._rag_engine is not None:
+            try:
+                self._rag_engine.apply_memory_pressure(memory_pct)
+            except Exception:
+                logger.debug("Local brain RAG pressure hook failed", exc_info=True)
+        if self._memory_graph is not None:
+            try:
+                self._memory_graph.apply_memory_pressure(memory_pct)
+            except Exception:
+                logger.debug("Local brain MemoryGraph pressure hook failed", exc_info=True)
 
     def set_action_executor(self, executor: "ActionExecutor") -> None:
         """Inject the ActionExecutor after Router initialization."""
@@ -181,24 +201,80 @@ class LocalBrainController:
         self._llm.request_abort_preempt()
 
     def unload_llm_for_power(self) -> None:
-        """V7: release VRAM (next query will reload)."""
+        """V7: release model memory (next query will reload)."""
         self._llm.shutdown()
 
-    async def warm_up(self) -> None:
+    async def warm_up(
+        self,
+        *,
+        model_role: str | None = None,
+        load_all: bool = False,
+    ) -> bool:
         if not self._llm.is_available():
-            logger.warning("Local brain not available (model missing or llama_cpp not installed)")
-            return
-        logger.info("Local brain: warming up (loading model to GPU)...")
+            logger.warning(
+                "Local brain not available "
+                "(MLX model directory missing or mlx/mlx_lm not installed)",
+            )
+            return False
+        role_label = "all_roles" if load_all else (model_role or "default_role")
+        logger.info("Local brain: warming up MLX model (%s)...", role_label)
         loop = asyncio.get_running_loop()
         t0 = time.monotonic()
-        loaded = await loop.run_in_executor(None, self._llm.preload)
+        loaded = await loop.run_in_executor(
+            None,
+            partial(self._llm.preload, model_role=model_role, load_all=load_all),
+        )
         elapsed = (time.monotonic() - t0) * 1000
         if loaded:
-            logger.info("Local brain ready in %.0fms (GPU-accelerated, agentic mode)", elapsed)
+            logger.info(
+                "Local brain ready in %.0fms (MLX, role=%s, agentic mode)",
+                elapsed,
+                role_label,
+            )
         else:
-            logger.warning("Local brain warm-up failed")
+            logger.warning("Local brain warm-up failed (role=%s)", role_label)
+        return bool(loaded)
+
+    async def _handle_query_failure(self, source: str, exc: Exception) -> None:
+        logger.exception("Local brain %s failed: %s", source, exc)
+        try:
+            self._bus.emit("metrics_event", counter="errors_total")
+        except Exception:
+            pass
+        try:
+            self._bus.emit("llm_error", source="local", error=str(exc)[:200])
+        except Exception:
+            pass
+        try:
+            self._bus.emit_long(
+                "response_ready",
+                text="Local brain hit an error, Boss. Check the log and try again.",
+            )
+        except Exception:
+            logger.debug("Local brain fallback response failed", exc_info=True)
 
     async def on_query(
+        self,
+        text: str,
+        memory_context: list[str] | None = None,
+        context: dict[str, str] | None = None,
+        history: list[tuple[str, str]] | None = None,
+        **_kw: Any,
+    ) -> None:
+        try:
+            await self._on_query_impl(
+                text,
+                memory_context=memory_context,
+                context=context,
+                history=history,
+                **_kw,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            await self._handle_query_failure("on_query", exc)
+
+    async def _on_query_impl(
         self,
         text: str,
         memory_context: list[str] | None = None,
@@ -218,7 +294,10 @@ class LocalBrainController:
         if not self._llm.is_available():
             self._bus.emit_long(
                 "response_ready",
-                text="Local brain is not available. Check that the model file exists and llama-cpp-python is installed.",
+                text=(
+                    "Local brain is not available. Check that the MLX model "
+                    "directories exist and that mlx/mlx_lm are installed."
+                ),
             )
             return
 
@@ -235,7 +314,45 @@ class LocalBrainController:
             except Exception:
                 pass
 
-        mode_override = _kw.get("runtime_mode_override")
+        query_plan = _kw.get("query_plan")
+        plan_mode = str(getattr(query_plan, "runtime_mode", "") or "").upper()
+        if plan_mode not in {"FAST", "SMART", "DEEP", "SECURE"}:
+            plan_mode = ""
+        plan_model_role = str(getattr(query_plan, "model_role", "") or "").strip().lower()
+        if plan_model_role not in {"fast", "primary"}:
+            plan_model_role = None
+        plan_use_rag = getattr(query_plan, "use_rag", None) if query_plan is not None else None
+        plan_use_memory = getattr(query_plan, "use_memory", None) if query_plan is not None else None
+        plan_prompt_hint = str(getattr(query_plan, "prompt_hint", "") or "").strip()
+        plan_reduce_context = bool(getattr(query_plan, "reduce_context", False)) if query_plan is not None else False
+        plan_memory_limit = int(getattr(query_plan, "memory_limit", 0) or 0) if query_plan is not None else 0
+        plan_history_turn_limit = int(getattr(query_plan, "history_turn_limit", 0) or 0) if query_plan is not None else 0
+        plan_rag_budget_ms = float(getattr(query_plan, "rag_budget_ms", 0.0) or 0.0) if query_plan is not None else 0.0
+        plan_budget_tier = str(getattr(query_plan, "budget_tier", "") or "").strip().lower() if query_plan is not None else ""
+        plan_requested_tier = str(getattr(query_plan, "requested_tier", "") or "").strip().lower() if query_plan is not None else ""
+        plan_base_budget_ms = float(getattr(query_plan, "base_budget_ms", 0.0) or 0.0) if query_plan is not None else 0.0
+
+        mode_override = _kw.get("runtime_mode_override") or (plan_mode or None)
+        if query_plan is not None:
+            try:
+                logger.info(
+                    "Local brain plan: tier=%s requested=%s path=%s role=%s mode=%s rag=%s think=%s base=%.0fms budget=%.0fms rag_budget=%.0fms reduce_context=%s reason=%s",
+                    plan_budget_tier or "?",
+                    plan_requested_tier or "?",
+                    getattr(getattr(query_plan, "path", None), "value", getattr(query_plan, "path", "")),
+                    plan_model_role or "primary",
+                    plan_mode or "SMART",
+                    getattr(query_plan, "use_rag", False),
+                    getattr(query_plan, "thinking", False),
+                    plan_base_budget_ms,
+                    float(getattr(query_plan, "budget_ms", 0.0) or 0.0),
+                    plan_rag_budget_ms,
+                    plan_reduce_context,
+                    getattr(query_plan, "reason", ""),
+                )
+            except Exception:
+                logger.debug("Local brain query_plan logging failed", exc_info=True)
+
         gpu_util = 0.0
         if self._gpu_coord is not None:
             try:
@@ -301,7 +418,8 @@ class LocalBrainController:
                 context=mode_ctx,
             )
         else:
-            self._current_runtime_mode, self._last_mode_info = "SMART", {}
+            self._current_runtime_mode = mode_override or "SMART"
+            self._last_mode_info = {"reason": "query_plan"} if plan_mode else {}
 
         v7_ctx = mode_ctx.with_mode(self._current_runtime_mode, self._last_mode_info)
         self._v7_context_last = v7_ctx
@@ -324,13 +442,28 @@ class LocalBrainController:
         tool_depth = 0
         MAX_TOOL_DEPTH = 3
 
+        prompt_memory_context = memory_context if plan_use_memory is not False else None
+        if prompt_memory_context and plan_memory_limit > 0:
+            prompt_memory_context = list(prompt_memory_context[:plan_memory_limit])
+        prompt_history = list(history or [])
+        if plan_history_turn_limit > 0:
+            prompt_history = prompt_history[-plan_history_turn_limit:]
+        prompt_context: dict[str, str] | None = context
+        if plan_prompt_hint:
+            prompt_context = dict(context or {})
+            prompt_context["llm_routing_hint"] = plan_prompt_hint
+
         rag_document_context: list[str] | None = None
         rag_enrichment: str | None = None
         enriched_in = _kw.get("enriched_rag_result")
         if enriched_in is not None:
             rag_document_context = enriched_in.document_context
             rag_enrichment = enriched_in.enrichment_block or None
-        elif self._rag_engine is not None and not _kw.get("_retry_from_late"):
+        elif (
+            self._rag_engine is not None
+            and not _kw.get("_retry_from_late")
+            and plan_use_rag is not False
+        ):
             try:
                 from core.rag.query_classifier import classify_query
                 from core.rag.rag_engine import RagEngine, retrieve_with_time_budget
@@ -359,12 +492,21 @@ class LocalBrainController:
                     vram_pressure=vram_p,
                     prefetch_hit=prefetch_hit_guess,
                 )
+                if self._runtime_watchdog is not None:
+                    budget_ms = self._runtime_watchdog.cap_budget_ms(
+                        "rag_retrieval",
+                        budget_ms,
+                    )
+                if plan_rag_budget_ms > 0:
+                    budget_ms = min(budget_ms, plan_rag_budget_ms)
                 if self._current_runtime_mode == "SECURE":
                     budget_ms *= float(
                         (self._config.get("v7_intelligence") or {}).get(
                             "secure_rag_budget_factor", 0.75,
                         ),
                     )
+                if plan_reduce_context:
+                    budget_ms *= 0.85
                 late_thr = float(
                     (self._config.get("rag") or {}).get("late_restart_confidence", 0.82),
                 )
@@ -416,6 +558,7 @@ class LocalBrainController:
                             history,
                             res,
                             trace_id,
+                            query_plan=query_plan,
                             late_depth=late_depth,
                         ),
                         name="atom_rag_late_restart",
@@ -463,16 +606,19 @@ class LocalBrainController:
         while react_step <= MAX_REACT_STEPS:
             prompt = self._prompt_builder.build(
                 text,
-                memory_summaries=memory_context,
-                history=history or [],
-                context=context,
+                memory_summaries=prompt_memory_context,
+                history=prompt_history,
+                context=prompt_context,
                 document_context=rag_document_context if react_step == 0 else None,
                 observations=observations if observations else None,
                 rag_enrichment=rag_enrichment if react_step == 0 else None,
             )
 
             raw_response, first_token_ms, preempted = await self._run_llm_streaming(
-                prompt, t0_total, emit_partial=(react_step == 0 and not observations),
+                prompt,
+                t0_total,
+                emit_partial=(react_step == 0 and not observations),
+                model_role=plan_model_role,
             )
 
             if preempted:
@@ -505,7 +651,22 @@ class LocalBrainController:
 
             step_observations: list[str] = []
             for tc in parsed.tool_calls:
-                result = self._action_executor.execute(tc)
+                if self._runtime_watchdog is not None:
+                    from core.reasoning.action_executor import ActionResult
+
+                    tool_result = await self._runtime_watchdog.run_async(
+                        "tool_execution",
+                        self._action_executor.execute_async(tc),
+                        default=ActionResult(
+                            tool_name=tc.name,
+                            success=False,
+                            error="Tool execution timed out.",
+                        ),
+                        metadata={"tool": tc.name},
+                    )
+                    result = tool_result.value
+                else:
+                    result = await self._action_executor.execute_async(tc)
                 self._total_tool_calls += 1
                 step_observations.append(result.observation)
                 all_tool_results.append(result.observation)
@@ -665,6 +826,8 @@ class LocalBrainController:
         t0_total: float,
         *,
         emit_partial: bool = True,
+        model_role: str | None = None,
+        _watchdog_guard: bool = False,
     ) -> tuple[str, float, bool]:
         """Run LLM inference with optional streaming to TTS.
 
@@ -672,6 +835,21 @@ class LocalBrainController:
         When emit_partial=True, sentences are streamed to TTS in real-time.
         When False (ReAct follow-up), we collect silently.
         """
+        if self._runtime_watchdog is not None and not _watchdog_guard:
+            watched = await self._runtime_watchdog.run_async(
+                "llm_inference",
+                self._run_llm_streaming(
+                    prompt,
+                    t0_total,
+                    emit_partial=emit_partial,
+                    model_role=model_role,
+                    _watchdog_guard=True,
+                ),
+                default=("", 0.0, True),
+                metadata={"prompt_chars": len(prompt)},
+            )
+            return watched.value
+
         loop = asyncio.get_running_loop()
         token_queue: asyncio.Queue[tuple[str, bool]] = asyncio.Queue()
         first_token_time: list[float | None] = [None]
@@ -682,87 +860,104 @@ class LocalBrainController:
             # Thread-safe push to asyncio queue (eliminates polling latency)
             loop.call_soon_threadsafe(token_queue.put_nowait, (token_text, is_done))
 
+        generate_kwargs: dict[str, Any] = {"on_token": _on_token}
+        if model_role:
+            generate_kwargs["model_role"] = model_role
         generate_task = asyncio.create_task(
-            self._llm.generate_streaming(prompt, on_token=_on_token)
+            self._llm.generate_streaming(prompt, **generate_kwargs)
         )
 
+        stream_id = uuid.uuid4().hex
         sentence_buffer = ""
         sentences_emitted = 0
         full_response_parts: list[str] = []
+        trailing_sentence = ""
+        try:
+            while True:
+                # Wait for the next token without polling
+                get_task = asyncio.create_task(token_queue.get())
+                done, pending = await asyncio.wait(
+                    [get_task, generate_task],
+                    return_when=asyncio.FIRST_COMPLETED
+                )
 
-        while True:
-            # Wait for the next token without polling
-            get_task = asyncio.create_task(token_queue.get())
-            done, pending = await asyncio.wait(
-                [get_task, generate_task],
-                return_when=asyncio.FIRST_COMPLETED
-            )
-            
-            if get_task in done:
-                token_text, is_done = get_task.result()
-            else:
-                # generate_task finished but queue might not be empty
-                get_task.cancel()
-                try:
-                    token_text, is_done = token_queue.get_nowait()
-                except asyncio.QueueEmpty:
+                if get_task in done:
+                    token_text, is_done = get_task.result()
+                else:
+                    # generate_task finished but queue might not be empty
+                    get_task.cancel()
+                    try:
+                        token_text, is_done = token_queue.get_nowait()
+                    except asyncio.QueueEmpty:
+                        break
+
+                if is_done:
+                    trailing_sentence = sentence_buffer.strip()
                     break
 
-            if is_done:
-                if sentence_buffer.strip():
-                    sentences_emitted += 1
-                    if emit_partial:
+                if not token_text:
+                    continue
+
+                sentence_buffer += token_text
+
+                if emit_partial:
+                    ready = self._extract_complete_sentence(sentence_buffer)
+                    if ready:
+                        sentence_text, remainder = ready
+                        sentences_emitted += 1
                         self._bus.emit_long(
                             "partial_response",
-                            text=sentence_buffer.strip(),
+                            text=sentence_text.strip(),
                             is_first=(sentences_emitted == 1),
-                            is_last=True,
+                            is_last=False,
                             source="local",
+                            stream_id=stream_id,
                         )
-                    full_response_parts.append(sentence_buffer.strip())
-                break
+                        full_response_parts.append(sentence_text.strip())
+                        sentence_buffer = remainder
 
-            if not token_text:
-                continue
+            result = await generate_task
+            answer, preempted = result
 
-            sentence_buffer += token_text
-
-            if emit_partial:
-                ready = self._extract_complete_sentence(sentence_buffer)
-                if ready:
-                    sentence_text, remainder = ready
-                    sentences_emitted += 1
+            if trailing_sentence and not preempted:
+                sentences_emitted += 1
+                if emit_partial:
                     self._bus.emit_long(
                         "partial_response",
-                        text=sentence_text.strip(),
+                        text=trailing_sentence,
                         is_first=(sentences_emitted == 1),
-                        is_last=False,
+                        is_last=True,
                         source="local",
+                        stream_id=stream_id,
                     )
-                    full_response_parts.append(sentence_text.strip())
-                    sentence_buffer = remainder
+                full_response_parts.append(trailing_sentence)
 
-        result = await generate_task
-        answer, preempted = result
+            full_text = " ".join(full_response_parts) if full_response_parts else answer
 
-        full_text = " ".join(full_response_parts) if full_response_parts else answer
+            if sentences_emitted == 0 and full_text and emit_partial and not preempted:
+                self._bus.emit_long(
+                    "partial_response",
+                    text=full_text,
+                    is_first=True,
+                    is_last=True,
+                    source="local",
+                    stream_id=stream_id,
+                )
 
-        if sentences_emitted == 0 and full_text and emit_partial:
-            self._bus.emit_long(
-                "partial_response",
-                text=full_text,
-                is_first=True,
-                is_last=True,
-                source="local",
+            first_token_ms = (
+                (first_token_time[0] - t0_total) * 1000
+                if first_token_time[0] is not None
+                else 0.0
             )
 
-        first_token_ms = (
-            (first_token_time[0] - t0_total) * 1000
-            if first_token_time[0] is not None
-            else 0.0
-        )
-
-        return full_text, first_token_ms, preempted
+            return full_text, first_token_ms, preempted
+        except asyncio.CancelledError:
+            generate_task.cancel()
+            try:
+                await generate_task
+            except Exception:
+                pass
+            raise
 
     def _emit_final_metrics(
         self,
@@ -835,7 +1030,11 @@ class LocalBrainController:
             self._total_tool_calls, self._total_react_loops,
             avg_first_token,
         )
-        self._llm.shutdown()
+        close_fn = getattr(self._llm, "close", None)
+        if callable(close_fn):
+            close_fn()
+        else:
+            self._llm.shutdown()
 
     def get_stats(self) -> dict:
         avg_first_token = (

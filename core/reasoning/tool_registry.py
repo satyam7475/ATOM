@@ -208,6 +208,17 @@ class ToolRegistry:
             Tool("list_apps", "List all running applications", "apps", "safe"),
             Tool("search", "Search the web for information", "web", "moderate",
                  [ToolParameter("query", "string", "Search query", True)]),
+            Tool(
+                "spotlight_search",
+                "Search this Mac with Spotlight (files, apps, mail metadata)",
+                "files",
+                "moderate",
+                [
+                    ToolParameter("query", "string", "Spotlight query or filename", True),
+                    ToolParameter("limit", "integer", "Max paths to return", False, 10),
+                ],
+                examples=["spotlight search for budget.pdf", "search my mac for ATOM"],
+            ),
             Tool("open_url", "Open a URL in the browser", "web", "moderate",
                  [ToolParameter("url", "string", "URL to open", True)]),
             Tool("set_volume", "Set system volume level", "media", "safe",

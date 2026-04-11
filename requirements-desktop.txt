@@ -28,6 +28,10 @@
 # Regenerate after upgrading:
 #   pip freeze --local | findstr /i "speech numpy comtypes edge-tts pygame psutil keyboard jsonschema aiohttp truststore mss pillow llama-cpp cffi pyaudio sentence-transformers chromadb easyocr openwakeword pymupdf python-docx pynvml faster-whisper kokoro-tts sounddevice winsdk pyzmq"
 
+# macOS-only deep UI control + kernel file events (FSWatcher)
+pyobjc-framework-ApplicationServices>=11.0; platform_system == "Darwin"
+pyobjc-framework-FSEvents>=11.0; platform_system == "Darwin"
+
 # ─── Core (required for default run) ─────────────────────────────────────
 # Voice: STT (faster-whisper offline -- primary, Vosk -- legacy, Google -- fallback)
 faster-whisper==1.2.1

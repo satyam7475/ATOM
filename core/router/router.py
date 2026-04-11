@@ -45,8 +45,10 @@ if TYPE_CHECKING:
     from context.context_engine import ContextEngine
     from core.async_event_bus import AsyncEventBus
     from core.cache_engine import CacheEngine
+    from core.cognitive_kernel import CognitiveKernel
     from core.intent_engine import IntentEngine
     from core.memory_engine import MemoryEngine
+    from core.runtime_watchdog import RuntimeWatchdog
     from core.self_evolution import SelfEvolutionEngine
     from core.state_manager import StateManager
     from core.task_scheduler import TaskScheduler
@@ -124,6 +126,9 @@ class Router:
         self._conv_memory = conversation_memory
         self._timeline = timeline_memory
 
+        self._cognitive_kernel: CognitiveKernel | None = None
+        self._runtime_watchdog: RuntimeWatchdog | None = None
+
         # Extracted modules
         self._conv_mgr = ConversationManager(self._conv_memory)
         self._confirmation = ConfirmationManager(self._security)
@@ -132,6 +137,7 @@ class Router:
         from core.reasoning.action_executor import ActionExecutor
         self._action_executor = ActionExecutor(
             dispatch_fn=self._dispatch_action,
+            async_dispatch_fn=self._dispatch_action_async,
             timeline=timeline_memory,
             security=self._security,
         )
@@ -143,6 +149,48 @@ class Router:
     def action_executor(self):
         """Expose the ActionExecutor for wiring to LocalBrainController."""
         return self._action_executor
+
+    def attach_cognitive_kernel(self, kernel: "CognitiveKernel") -> None:
+        """Wire the Cognitive Kernel for intelligent LLM routing."""
+        self._cognitive_kernel = kernel
+        logger.info("Cognitive Kernel attached to Router")
+
+    def attach_runtime_watchdog(self, watchdog: "RuntimeWatchdog") -> None:
+        """Wire RuntimeWatchdog so hot router stages use active budgets."""
+        self._runtime_watchdog = watchdog
+        logger.info("RuntimeWatchdog attached to Router")
+
+    async def _handle_component_failure(
+        self,
+        source: str,
+        exc: Exception,
+        *,
+        user_message: str,
+    ) -> None:
+        logger.exception("Router %s failed: %s", source, exc)
+        try:
+            self._bus.emit_fast("metrics_event", counter="errors_total")
+        except Exception:
+            pass
+        if self._timeline is not None:
+            try:
+                self._timeline.append_event(
+                    "error",
+                    {
+                        "source": source,
+                        "message": str(exc)[:300],
+                    },
+                )
+            except Exception:
+                pass
+        try:
+            self._emit_response(user_message)
+        except Exception:
+            logger.debug("Router fallback response failed", exc_info=True)
+        try:
+            await self._state.on_error(source=source)
+        except Exception:
+            logger.debug("Router recovery hook failed", exc_info=True)
 
     def _emit_response(self, text: str, **kw) -> None:
         """Emit response through adaptive output polishing."""
@@ -158,7 +206,19 @@ class Router:
             logger.warning("Queuing speech '%s' -- at concurrency limit",
                            text[:40])
         async with self._processing_semaphore:
-            await self._route(text)
+            try:
+                await self._route(text)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                await self._handle_component_failure(
+                    "router.on_speech",
+                    exc,
+                    user_message=(
+                        "Something went wrong while routing that, Boss. "
+                        "Try again in a moment."
+                    ),
+                )
 
     async def _route(self, text: str) -> None:
         from core.state_manager import AtomState
@@ -234,9 +294,25 @@ class Router:
             logger.info("Router: '%s' -> %s (CACHED, 0ms)",
                          clean_text[:60], result.intent)
         else:
-            result = self._intent.classify(clean_text)
-            classify_ms = (time.perf_counter() - t0) * 1000
-            cmd_cache.put(clean_text, result)
+            if self._runtime_watchdog is not None:
+                from core.intent_engine import IntentResult
+
+                classify_result = await self._runtime_watchdog.run_sync(
+                    "intent_engine",
+                    self._intent.classify,
+                    clean_text,
+                    default=IntentResult("fallback"),
+                    metadata={"query": clean_text[:80]},
+                )
+                result = classify_result.value
+                classify_ms = classify_result.elapsed_ms
+                timed_out = classify_result.timed_out
+            else:
+                result = self._intent.classify(clean_text)
+                classify_ms = (time.perf_counter() - t0) * 1000
+                timed_out = False
+            if not timed_out:
+                cmd_cache.put(clean_text, result)
             used_intent_cache = False
             if result.intent in self._INFO_INTENTS:
                 intent_cached = cmd_cache.get("info:" + result.intent)
@@ -464,6 +540,7 @@ class Router:
         "list_apps", "resource_report", "resource_trend",
         "system_analyze", "research_topic", "self_check",
         "self_diagnostic", "behavior_report",
+        "spotlight_search",
     })
 
     def _dispatch_action(self, action: str, args: dict) -> str | None:
@@ -510,6 +587,33 @@ class Router:
     def _do_search(self, _action: str, args: dict) -> str:
         network_actions.web_search(args.get("url", ""))
         return personality.action_done("search")
+
+    def _do_spotlight_search(self, _action: str, args: dict) -> str:
+        import sys
+
+        if sys.platform != "darwin":
+            return "Spotlight search only runs on macOS, Boss."
+        from core.macos.spotlight_engine import SpotlightEngine
+
+        q = (args.get("query") or "").strip()
+        if not q:
+            return "What should I search for on your Mac, Boss?"
+        try:
+            limit = int(args.get("limit", 10))
+        except (TypeError, ValueError):
+            limit = 10
+        limit = max(1, min(limit, 50))
+
+        hits = SpotlightEngine().search(q, limit=limit, timeout=15.0)
+        if not hits:
+            return f"No Spotlight results for «{q[:120]}», Boss."
+
+        paths = [h.get("path", "") for h in hits if h.get("path")]
+        body = "\n".join(paths)
+        if len(body) > 4000:
+            body = body[:4000] + "\n…(truncated)"
+        intro = personality.action_done("spotlight_search", q[:80])
+        return f"{intro}\n{body}"
 
     def _do_play_youtube(self, _action: str, args: dict) -> str:
         query = args.get("query", "music")
@@ -775,6 +879,7 @@ class Router:
         "close_app": _do_close_app,
         "list_apps": _do_list_apps,
         "search": _do_search,
+        "spotlight_search": _do_spotlight_search,
         "play_youtube": _do_play_youtube,
         "stop_music": _do_stop_music,
         "set_volume": _do_set_volume,
@@ -969,19 +1074,72 @@ class Router:
         if is_repeat:
             logger.info("Repeat query detected -- bypassing cache")
 
-        cache_task = asyncio.create_task(
-            asyncio.get_running_loop().run_in_executor(
-                None, self._cache.get, cache_key)
-        )
-        memory_task = asyncio.create_task(
-            self._memory.retrieve(clean_text, k=2))
-        cached, memory_ctx = await asyncio.gather(cache_task, memory_task)
+        query_plan = None
+        if self._cognitive_kernel is not None:
+            try:
+                query_plan = self._cognitive_kernel.route(
+                    clean_text,
+                    allow_cache=not is_repeat,
+                )
+            except Exception:
+                logger.debug("Cognitive Kernel routing failed", exc_info=True)
 
-        if cached and not is_repeat:
-            logger.info("Serving from cache (%.1fms)",
-                        (time.perf_counter() - t_lookup) * 1000)
-            self._emit_response(cached)
+        if (
+            query_plan is not None
+            and getattr(query_plan, "skip_llm", False)
+            and getattr(query_plan, "direct_response", None)
+        ):
+            logger.info(
+                "Cognitive Kernel served %s in fallback path (%.1fms)",
+                getattr(query_plan, "reason", "direct"),
+                (time.perf_counter() - t_lookup) * 1000,
+            )
+            self._emit_response(query_plan.direct_response)
             return
+
+        if query_plan is None:
+            if self._runtime_watchdog is not None:
+                cache_task = asyncio.create_task(
+                    self._runtime_watchdog.run_sync(
+                        "cache_lookup",
+                        self._cache.get,
+                        cache_key,
+                        default=None,
+                        metadata={"query": cache_key[:80]},
+                    ),
+                )
+            else:
+                cache_task = asyncio.create_task(
+                    asyncio.get_running_loop().run_in_executor(
+                        None, self._cache.get, cache_key)
+                )
+
+            from core.quick_replies import try_quick_reply
+
+            memory_task = asyncio.create_task(self._memory.retrieve(clean_text, k=2))
+            cached_result, memory_ctx = await asyncio.gather(cache_task, memory_task)
+            cached = (
+                cached_result.value
+                if self._runtime_watchdog is not None
+                else cached_result
+            )
+
+            if cached and not is_repeat:
+                logger.info("Serving from cache (%.1fms)",
+                            (time.perf_counter() - t_lookup) * 1000)
+                self._emit_response(cached)
+                return
+
+            qr = try_quick_reply(clean_text, self._config)
+            if qr:
+                logger.info("Quick reply served (no LLM)")
+                self._emit_response(qr)
+                return
+        else:
+            memory_ctx = None
+            if getattr(query_plan, "use_memory", False):
+                memory_k = max(1, int(getattr(query_plan, "memory_limit", 2) or 2))
+                memory_ctx = await self._memory.retrieve(clean_text, k=memory_k)
 
         if is_repeat:
             repeat_hint = (
@@ -990,14 +1148,6 @@ class Router:
                 "more thorough response.]"
             )
             original_text = original_text + repeat_hint
-
-        from core.quick_replies import try_quick_reply
-
-        qr = try_quick_reply(clean_text, self._config)
-        if qr:
-            logger.info("Quick reply served (no LLM)")
-            self._emit_response(qr)
-            return
 
         if self._assistant_mode_mgr is not None:
             if not self._assistant_mode_mgr.allows_llm_fallback():
@@ -1045,6 +1195,7 @@ class Router:
             memory_context=memory_ctx,
             context=context_bundle,
             history=history,
+            query_plan=query_plan,
         )
 
     # ── Contextual follow-up ────────────────────────────────────────

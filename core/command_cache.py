@@ -4,7 +4,8 @@ ATOM -- Command result cache for instant repeat commands.
 LRU cache that stores recent intent classification results.
 If the same command text is seen again within the TTL window,
 the cached IntentResult is returned instantly (~0ms) without
-re-running the intent engine.
+re-running the intent engine. Dynamic info intents stay uncached
+so answers like time/cpu/ram remain fresh.
 
 Designed for rapid-fire commands like:
     "open chrome" -> "open chrome" -> "mute" -> "mute"
@@ -22,6 +23,18 @@ DEFAULT_MAX_SIZE = 64
 DEFAULT_TTL_S = 120.0
 
 _SKIP_INTENTS = frozenset({"fallback", "confirm", "deny"})
+_DYNAMIC_INFO_INTENTS = frozenset({
+    "time", "date", "cpu", "ram", "battery", "disk",
+    "system_info", "ip", "wifi", "uptime", "top_processes",
+    "resource_report", "resource_trend", "app_history",
+    "show_reminders", "self_diagnostic", "system_analyze",
+    "self_check", "behavior_report",
+})
+
+
+def _should_cache_result(result: object) -> bool:
+    intent = getattr(result, "intent", None)
+    return intent not in _SKIP_INTENTS and intent not in _DYNAMIC_INFO_INTENTS
 
 
 class CommandCache:
@@ -50,9 +63,8 @@ class CommandCache:
         return result
 
     def put(self, text: str, result: object) -> None:
-        """Cache an IntentResult (skip fallback/confirm/deny intents)."""
-        intent = getattr(result, "intent", None)
-        if intent in _SKIP_INTENTS:
+        """Cache an IntentResult when it is safe to reuse."""
+        if not _should_cache_result(result):
             return
         key = text.lower().strip()
         self._store[key] = (time.monotonic(), result)
@@ -61,8 +73,8 @@ class CommandCache:
             self._store.popitem(last=False)
 
     def put_intent_key(self, intent_key: str, result: object) -> None:
-        """Cache by intent key for intent-based reuse (e.g. info:time, info:cpu)."""
-        if not intent_key:
+        """Cache by intent key when the result is safe to reuse."""
+        if not intent_key or not _should_cache_result(result):
             return
         self._store[intent_key] = (time.monotonic(), result)
         self._store.move_to_end(intent_key)

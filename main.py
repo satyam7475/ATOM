@@ -308,6 +308,8 @@ async def main() -> None:
     prompt_builder = StructuredPromptBuilder(config)
 
     local_brain = None
+    prefetch_eng = None
+    shared_memory_graph = None
     if brain_enabled:
         if distributed_mode:
             logger.info("%s mode: initializing BrainProxy...", distributed_mode_label)
@@ -337,7 +339,7 @@ async def main() -> None:
                 _mg_path = (config.get("memory") or {}).get(
                     "graph_db_path", "data/atom_memory.db",
                 )
-                shared_memory_graph = MemoryGraph(db_path=_mg_path)
+                shared_memory_graph = MemoryGraph(db_path=_mg_path, config=config)
                 local_brain.attach_memory_graph(shared_memory_graph)
                 _rag_cfg = config.get("rag") or {}
                 if _rag_cfg.get("enabled", True):
@@ -494,6 +496,69 @@ async def main() -> None:
         if silicon_governor.is_available:
             logger.info("Silicon Governor: monitoring active (%s)", silicon_governor.gpu_name)
 
+    _memory_pressure_threshold = float(
+        (config.get("memory") or {}).get("pressure_threshold_pct", 85.0),
+    )
+    _memory_pressure_relief = float(
+        (config.get("memory") or {}).get(
+            "pressure_relief_pct",
+            max(0.0, _memory_pressure_threshold - 10.0),
+        ),
+    )
+    _embedding_pressure_unloaded = False
+
+    async def _on_silicon_stats_update(stats=None, **_kw) -> None:
+        nonlocal _embedding_pressure_unloaded
+        if not isinstance(stats, dict):
+            return
+        try:
+            memory_pct = float(stats.get("memory_pct", 0.0) or 0.0)
+        except Exception:
+            return
+
+        try:
+            memory.apply_memory_pressure(memory_pct)
+        except Exception:
+            logger.debug("MemoryEngine pressure hook failed", exc_info=True)
+
+        if local_brain is not None and hasattr(local_brain, "apply_memory_pressure"):
+            try:
+                local_brain.apply_memory_pressure(memory_pct)
+            except Exception:
+                logger.debug("Local brain pressure hook failed", exc_info=True)
+
+        if inference_guard is None:
+            return
+
+        if memory_pct >= _memory_pressure_threshold:
+            if not _embedding_pressure_unloaded:
+                inference_guard.mark_loaded("embeddings", False)
+                inference_guard.request_unload("embeddings", "memory_pressure")
+                _embedding_pressure_unloaded = True
+        elif memory_pct <= _memory_pressure_relief:
+            _embedding_pressure_unloaded = False
+
+    bus.on("silicon_stats_update", _on_silicon_stats_update)
+
+    # ── Cognitive Kernel (central brain coordinator) ────────────────
+    from core.cognitive_kernel import CognitiveKernel, ExecPath
+
+    cognitive_kernel = CognitiveKernel(
+        config=config,
+        bus=bus,
+        intent_engine=intent_engine,
+        cache_engine=cache,
+        metrics=metrics,
+        inference_guard=inference_guard,
+        silicon_governor=silicon_governor,
+        state_manager=state,
+    )
+    router.attach_cognitive_kernel(cognitive_kernel)
+    logger.info(
+        "Cognitive Kernel: routing through %s paths",
+        ", ".join(e.value for e in ExecPath),
+    )
+
     # ── Security Fortress + Self-Healing + Code Introspection ──────
     from core.security_fortress import SecurityFortress
     from core.code_introspector import CodeIntrospector
@@ -511,7 +576,7 @@ async def main() -> None:
     logger.info(
         "Production systems initialized: SecurityFortress(%s) + "
         "CodeIntrospector(%d files) + SelfHealingEngine",
-        "encrypted" if security_fortress._vault.is_encrypted else "obfuscated",
+        security_fortress.vault_backend_label,
         code_introspector.module_count,
     )
 
@@ -537,14 +602,19 @@ async def main() -> None:
     if sys.platform == "darwin":
         try:
             from core.macos.fs_watcher import FSWatcher
-            fs_watcher = FSWatcher(bus)
-            fs_watcher.watch([
-                "~/Desktop", "~/Downloads", "~/Documents",
-            ])
-            if fs_watcher.start():
-                logger.info("FSWatcher: monitoring Desktop, Downloads, Documents")
-            else:
-                logger.debug("FSWatcher: could not start")
+            from core.macos.fs_watcher_config import fs_watcher_settings
+
+            _fw = fs_watcher_settings(config)
+            if _fw["enabled"]:
+                fs_watcher = FSWatcher(bus)
+                fs_watcher.watch(list(_fw["paths"]))
+                if fs_watcher.start():
+                    logger.info(
+                        "FSWatcher: monitoring %s",
+                        ", ".join(_fw["paths"]),
+                    )
+                else:
+                    logger.debug("FSWatcher: could not start")
         except Exception:
             logger.debug("FSWatcher init failed", exc_info=True)
 
@@ -573,6 +643,10 @@ async def main() -> None:
         prediction_engine = PredictionEngine(
             bus, behavior, memory, behavior_model, config,
         )
+        prediction_engine.attach_prompt_builder(prompt_builder)
+        prediction_engine.attach_cognitive_kernel(cognitive_kernel)
+        if prefetch_eng is not None:
+            prediction_engine.attach_prefetch_engine(prefetch_eng)
         self_optimizer = SelfOptimizer(bus, metrics, config)
         personality_modes = PersonalityModes(bus, behavior_model, config)
 
@@ -588,7 +662,13 @@ async def main() -> None:
     # ── JARVIS Core (intelligence fusion) ───────────────────────────
     from core.jarvis_core import JarvisCore
 
-    jarvis_core = JarvisCore(bus, owner_understanding, system_scanner, config)
+    jarvis_core = JarvisCore(
+        bus,
+        owner_understanding,
+        system_scanner,
+        personality_modes,
+        config,
+    )
     logger.info("JARVIS Core initialized (proactive anticipation + contextual inference)")
 
     # ── Context Fusion + Real World Intelligence + Proactive Engine ──
@@ -764,48 +844,64 @@ async def main() -> None:
         await _execute_mode_switch(mode)
     bus.on("set_performance_mode", _on_bus_set_mode)
 
+    from core.boot.cold_start import ColdStartOptimizer
+
+    cold_start = ColdStartOptimizer(
+        config=config,
+        bus=bus,
+        state_manager=state,
+        local_brain=local_brain,
+        memory_store=memory,
+        conversation_memory=conv_memory,
+        intent_engine=intent_engine,
+        system_monitor=system_monitor,
+    )
+
     await tts.init_voice()
-
-    warmup_tasks = []
-    if local_brain and local_brain.available:
-        logger.info("Local LLM pre-warm (background load)...")
-        warmup_tasks.append(local_brain.warm_up())
-    if warmup_tasks:
-        await asyncio.gather(*warmup_tasks)
-    else:
-        logger.info("No brains to pre-warm")
-
     stt_preload_done = asyncio.Event()
+    _bg_tasks: list[asyncio.Task] = []
 
     async def _background_stt_preload() -> None:
         t0 = time.monotonic()
         logger.info("STT model loading in background...")
 
-        loop = asyncio.get_running_loop()
-        if not distributed_mode:
-            devices = await loop.run_in_executor(None, mic_manager.profile_devices)
-            if devices:
-                best = mic_manager.get_best_device(
-                    prefer_bluetooth=config.get("mic", {}).get("prefer_bluetooth", True),
-                )
-                if best:
-                    mic_manager.active_device = best
-                    logger.info(
-                        "Audio device selected: '%s' (%s, quality=%d/100)",
-                        best.name, best.device_type, best.quality_score,
+        try:
+            loop = asyncio.get_running_loop()
+            if not distributed_mode:
+                devices = await loop.run_in_executor(None, mic_manager.profile_devices)
+                if devices:
+                    best = mic_manager.get_best_device(
+                        prefer_bluetooth=config.get("mic", {}).get("prefer_bluetooth", True),
                     )
+                    if best:
+                        mic_manager.active_device = best
+                        logger.info(
+                            "Audio device selected: '%s' (%s, quality=%d/100)",
+                            best.name, best.device_type, best.quality_score,
+                        )
 
-        await stt.preload()
-        elapsed = (time.monotonic() - t0) * 1000
-        logger.info("STT pipeline ready (%.0fms: devices + model + preprocessor)", elapsed)
-        stt_preload_done.set()
-
-    _bg_tasks: list[asyncio.Task] = []
+            await stt.preload()
+            elapsed = (time.monotonic() - t0) * 1000
+            logger.info("STT pipeline ready (%.0fms: devices + model + preprocessor)", elapsed)
+        except Exception:
+            logger.exception("STT preload failed")
+        finally:
+            stt_preload_done.set()
 
     if config.get("stt", {}).get("preload", True):
         _bg_tasks.append(asyncio.create_task(_background_stt_preload()))
     else:
         stt_preload_done.set()
+
+    cold_start_report = await cold_start.warm_up()
+    logger.info(
+        "Cold-start bootstrap: %.0fms (fast=%s embeddings=%s session=%d cache=%d)",
+        cold_start_report.elapsed_ms,
+        cold_start_report.fast_model_ready,
+        cold_start_report.embeddings_ready,
+        cold_start_report.restored_turns,
+        cold_start_report.cached_commands,
+    )
 
     _obs_v7 = (config.get("v7_intelligence") or {}).get("observability") or {}
     _snap_iv = float(_obs_v7.get("debug_snapshot_interval_s", 120.0))
@@ -869,11 +965,14 @@ async def main() -> None:
         _bg_tasks.append(asyncio.create_task(_v7_periodic_snapshot()))
 
     runtime_watchdog = RuntimeWatchdog(bus, state, config)
+    runtime_watchdog.attach_local_brain(local_brain)
+    router.attach_runtime_watchdog(runtime_watchdog)
+    local_brain.attach_runtime_watchdog(runtime_watchdog)
     bus.on("state_changed", runtime_watchdog.on_state_changed)
 
     # ── Wire all event handlers (extracted for testability) ────────
     _wiring_ctx = wire_events(
-        bus=bus, state=state, stt=stt, tts=tts, router=router,
+        bus=bus, state=state, shutdown_event=shutdown_event, stt=stt, tts=tts, router=router,
         indicator=indicator, cache=cache, memory=memory, metrics=metrics,
         config=config, local_brain=local_brain, llm_queue=llm_queue,
         assistant_mode_mgr=assistant_mode_mgr,
@@ -1157,6 +1256,7 @@ async def main() -> None:
                         logger.debug("Dashboard cognitive broadcast failed", exc_info=True)
         _bg_tasks.append(asyncio.create_task(_push_habits_periodically()))
 
+    await cold_start.emit_restored_context()
     state.always_listen = True
     logger.info(
         "ATOM -- Supernatural Intelligence OS | always listening | perf=%s | health=%.0fs watcher=%.0fs maint=%.0fs",
@@ -1490,6 +1590,7 @@ async def main() -> None:
             await web_dashboard.shutdown_async()
         else:
             indicator.shutdown()
+        cold_start.persist_snapshot()
         snap = metrics.snapshot()
         logger.info(
             "SESSION_SUMMARY queries=%d cache_hit_pct=%.1f llm_calls=%d perceived_avg_ms=%s",

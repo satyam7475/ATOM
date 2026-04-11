@@ -176,10 +176,11 @@ class AsyncEventBus(PriorityEventBus):
 
     _HIGH_EVENTS: frozenset[str] = frozenset({
         "speech_final", "speech_partial", "interrupt",
+        "resume_listening", "user_interrupt", "INTERRUPT_ALL",
         "wake_word", "silence_timeout",
     })
     _LOW_EVENTS: frozenset[str] = frozenset({
-        "system_scan", "media_update", "log", "metrics",
+        "system_scan", "media_update", "log", "metrics", "fs_event",
     })
 
     def _get_priority(self, event: str) -> int:

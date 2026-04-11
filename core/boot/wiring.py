@@ -26,6 +26,7 @@ def wire_events(
     llm_queue=None,
     assistant_mode_mgr=None,
     behavior,
+    shutdown_event: asyncio.Event | None = None,
     scheduler=None,
     process_mgr=None,
     evolution=None,
@@ -41,11 +42,37 @@ def wire_events(
     from core.state_manager import AtomState
     from core.metrics import log_health
 
+    if shutdown_event is None:
+        shutdown_event = asyncio.Event()
+
+    def _guard_handler(event: str, handler, *, source: str):
+        async def _wrapped(**kw) -> None:
+            try:
+                await handler(**kw)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.exception(
+                    "Wiring handler failed source=%s event=%s: %s",
+                    source,
+                    event,
+                    exc,
+                )
+                try:
+                    metrics.inc("errors_total")
+                except Exception:
+                    pass
+        return _wrapped
+
     _didnt_catch_count = {"n": 0}
     _perceived = {"t_speech_final": 0.0, "logged": False}
     _last_perceived_ms = {"ms": None}
-    _proactive_state = {"last_query_time": time.monotonic(), "low_battery_warned": False}
-    _stream_buffer = {"text": ""}
+    _proactive_state = {
+        "last_query_time": time.monotonic(),
+        "low_battery_warned": False,
+        "last_fs_hint": 0.0,
+    }
+    _stream_buffer = {"text": "", "stream_id": ""}
     _ttfa_gate = {"sent": False}
     _llm_latency_history: list[float] = []
     _thinking_progress_task: dict[str, asyncio.Task | None] = {"task": None}
@@ -53,15 +80,40 @@ def wire_events(
 
     # Global Interrupt Manager
     from core.ipc.interrupt_manager import SystemInterruptManager
+    from voice.interrupt_handler import VoiceInterruptHandler
+
     interrupt_mgr = SystemInterruptManager(bus, "main_core")
-    bus.on("state_changed", indicator.on_state_changed)
-    bus.on("state_changed", stt.on_state_changed)
+    voice_interrupt = VoiceInterruptHandler(
+        bus=bus,
+        state=state,
+        tts=tts,
+        interrupt_manager=interrupt_mgr,
+        local_brain=local_brain,
+        indicator=indicator,
+    )
+    bus.on(
+        "state_changed",
+        _guard_handler(
+            "state_changed",
+            indicator.on_state_changed,
+            source="indicator.on_state_changed",
+        ),
+    )
+    bus.on(
+        "state_changed",
+        _guard_handler(
+            "state_changed",
+            stt.on_state_changed,
+            source="stt.on_state_changed",
+        ),
+    )
     if priority_sched is not None:
         from core.priority_scheduler import PRIORITY_VOICE
 
         async def _speech_via_priority(text: str, **kw) -> None:
             if shutdown_event.is_set():
                 return
+            await voice_interrupt.prepare_for_new_speech(text, **kw)
             if local_brain is not None:
                 local_brain.request_preempt()
 
@@ -76,17 +128,32 @@ def wire_events(
             priority_sched.submit(PRIORITY_VOICE, "speech_final", _factory)
 
         if not v4:
-            bus.on("speech_final", _speech_via_priority)
+            bus.on(
+                "speech_final",
+                _guard_handler(
+                    "speech_final",
+                    _speech_via_priority,
+                    source="router.on_speech.priority",
+                ),
+            )
     else:
         async def _speech_final_direct(text: str, **kw) -> None:
             if shutdown_event.is_set():
                 return
+            await voice_interrupt.prepare_for_new_speech(text, **kw)
             if local_brain is not None:
                 local_brain.request_preempt()
             await router.on_speech(text, **kw)
 
         if not v4:
-            bus.on("speech_final", _speech_final_direct)
+            bus.on(
+                "speech_final",
+                _guard_handler(
+                    "speech_final",
+                    _speech_final_direct,
+                    source="router.on_speech.direct",
+                ),
+            )
 
     # ── Local LLM only (offline) — serial queue + fast bus handler ─
     if local_brain is not None:
@@ -104,8 +171,8 @@ def wire_events(
                     bus.emit_long(
                         "response_ready",
                         text=(
-                            "Local brain is not ready, Boss. Check brain.model_path in "
-                            "settings.json and that llama-cpp-python is installed."
+                            "Local brain is not ready, Boss. Check the MLX model "
+                            "directories in settings and that mlx/mlx_lm are installed."
                         ),
                     )
                     return
@@ -116,6 +183,7 @@ def wire_events(
                             memory_context=kw.get("memory_context"),
                             context=kw.get("context"),
                             history=kw.get("history"),
+                            query_plan=kw.get("query_plan"),
                         )
                     else:
                         await local_brain.on_query(text, **kw)
@@ -139,7 +207,14 @@ def wire_events(
                 return
             await _run_brain()
 
-        bus.on("cursor_query", _local_brain_query)
+        bus.on(
+            "cursor_query",
+            _guard_handler(
+                "cursor_query",
+                _local_brain_query,
+                source="local_brain.on_query",
+            ),
+        )
 
         async def _on_pending_tool_confirmation(tool_call=None, result=None, **_kw) -> None:
             """Store pending tool confirmation from agentic LLM for the Router."""
@@ -150,54 +225,108 @@ def wire_events(
                     "created_at": time.monotonic(),
                 }
 
-        bus.on("pending_tool_confirmation", _on_pending_tool_confirmation)
+        bus.on(
+            "pending_tool_confirmation",
+            _guard_handler(
+                "pending_tool_confirmation",
+                _on_pending_tool_confirmation,
+                source="router.pending_tool_confirmation",
+            ),
+        )
 
-    bus.on("response_ready", tts.on_response)
-    bus.on("partial_response", tts.on_partial_response)
-    bus.on("tts_complete", state.on_tts_complete)
-    bus.on("silence_timeout", state.on_silence_timeout)
+    bus.on(
+        "response_ready",
+        _guard_handler(
+            "response_ready",
+            tts.on_response,
+            source="tts.on_response",
+        ),
+    )
+    bus.on(
+        "partial_response",
+        _guard_handler(
+            "partial_response",
+            tts.on_partial_response,
+            source="tts.on_partial_response",
+        ),
+    )
+    bus.on(
+        "tts_complete",
+        _guard_handler(
+            "tts_complete",
+            state.on_tts_complete,
+            source="state.on_tts_complete",
+        ),
+    )
+    bus.on(
+        "silence_timeout",
+        _guard_handler(
+            "silence_timeout",
+            state.on_silence_timeout,
+            source="state.on_silence_timeout",
+        ),
+    )
 
     # ── Media / error recovery ────────────────────────────────────
     async def _on_media_started(**_kw) -> None:
         stt.on_media_started()
-    bus.on("media_started", _on_media_started)
+    bus.on(
+        "media_started",
+        _guard_handler(
+            "media_started",
+            _on_media_started,
+            source="stt.on_media_started",
+        ),
+    )
 
     async def on_llm_error(source: str = "local", **_kw) -> None:
         logger.error("LLM error from %s -- triggering recovery", source)
         await state.on_error(source=source)
-    bus.on("llm_error", on_llm_error)
+    bus.on(
+        "llm_error",
+        _guard_handler(
+            "llm_error",
+            on_llm_error,
+            source="state.on_llm_error",
+        ),
+    )
 
     # ── Sleep / barge-in / resume (hotkey + dashboard UNSTICK) ─
-    async def on_resume_listening(**_kw) -> None:
-        # Global Interrupt Handling
-        await interrupt_mgr.broadcast_interrupt()
-        
-        if state.current is AtomState.SLEEP:
-            logger.info("Leaving SLEEP via hotkey / resume")
-            await state.transition(AtomState.LISTENING)
-            indicator.add_log("action", "I'm back, Boss.")
-            return
-        if state.current is AtomState.ERROR_RECOVERY:
-            logger.info("Resume during ERROR_RECOVERY -> IDLE")
-            await state.transition(AtomState.IDLE)
-        if state.current is AtomState.THINKING:
-            logger.info("Interrupt during THINKING")
-            indicator.add_log("info", "Interrupted. Go ahead, Boss.")
-            if local_brain is not None:
-                local_brain.request_preempt()
-        if state.current is AtomState.SPEAKING:
-            logger.info("Barge-in -- stopping TTS")
-            tts.stop()
-            
-        await state.transition(AtomState.LISTENING)
-    bus.on("resume_listening", on_resume_listening)
+    async def on_resume_listening(
+        source: str = "",
+        reason: str = "",
+        partial_text: str = "",
+        user_interrupt: bool = False,
+        **_kw,
+    ) -> None:
+        await voice_interrupt.interrupt_to_listening(
+            trigger=source or "resume_listening",
+            reason=reason,
+            partial_text=partial_text,
+            user_interrupt=(bool(user_interrupt) or source == "voice_interrupt"),
+        )
+    bus.on(
+        "resume_listening",
+        _guard_handler(
+            "resume_listening",
+            on_resume_listening,
+            source="resume_listening",
+        ),
+    )
 
     async def _on_enter_sleep(**_kw) -> None:
         logger.info("Entering SLEEP mode -- Ctrl+Alt+A to resume listening")
         stt.stop()
         await state.transition(AtomState.SLEEP)
         indicator.add_log("action", "Silent mode. Press Ctrl+Alt+A to resume listening.")
-    bus.on("enter_sleep_mode", _on_enter_sleep)
+    bus.on(
+        "enter_sleep_mode",
+        _guard_handler(
+            "enter_sleep_mode",
+            _on_enter_sleep,
+            source="enter_sleep_mode",
+        ),
+    )
 
     # ── STT recovery ─────────────────────────────────────────────
     async def on_restart_listening(**_kw) -> None:
@@ -206,7 +335,14 @@ def wire_events(
             if state.current is AtomState.LISTENING:
                 if not (v3 or v4):
                     asyncio.create_task(stt.start_listening())
-    bus.on("restart_listening", on_restart_listening)
+    bus.on(
+        "restart_listening",
+        _guard_handler(
+            "restart_listening",
+            on_restart_listening,
+            source="restart_listening",
+        ),
+    )
 
     async def on_stt_did_not_catch(**_kw) -> None:
         _didnt_catch_count["n"] += 1
@@ -224,8 +360,22 @@ def wire_events(
                           text="Background noise is high. Move closer or reduce noise.")
         elif state.current is not AtomState.LISTENING:
             await state.transition(AtomState.LISTENING)
-    bus.on("stt_did_not_catch", on_stt_did_not_catch)
-    bus.on("stt_too_noisy", on_stt_too_noisy)
+    bus.on(
+        "stt_did_not_catch",
+        _guard_handler(
+            "stt_did_not_catch",
+            on_stt_did_not_catch,
+            source="stt.did_not_catch",
+        ),
+    )
+    bus.on(
+        "stt_too_noisy",
+        _guard_handler(
+            "stt_too_noisy",
+            on_stt_too_noisy,
+            source="stt.too_noisy",
+        ),
+    )
 
     # ── UI logging ───────────────────────────────────────────────
     async def log_response(text: str, **_kw) -> None:
@@ -245,15 +395,26 @@ def wire_events(
         indicator.add_log("action", "Thinking with local brain...")
         _start_thinking_progress()
 
-    async def log_partial(text: str, is_first: bool = False, is_last: bool = False, **_kw) -> None:
+    async def log_partial(
+        text: str,
+        is_first: bool = False,
+        is_last: bool = False,
+        stream_id: str = "",
+        **_kw,
+    ) -> None:
         if is_first:
             _stream_buffer["text"] = ""
+            _stream_buffer["stream_id"] = stream_id or ""
+        elif stream_id and _stream_buffer["stream_id"] and stream_id != _stream_buffer["stream_id"]:
+            return
         if text.strip():
             _stream_buffer["text"] += (" " if _stream_buffer["text"] else "") + text.strip()
             indicator.add_log("speaking", _stream_buffer["text"])
-        if is_last and _stream_buffer["text"]:
-            indicator.add_log("action", _stream_buffer["text"])
+        if is_last:
+            if _stream_buffer["text"]:
+                indicator.add_log("action", _stream_buffer["text"])
             _stream_buffer["text"] = ""
+            _stream_buffer["stream_id"] = ""
 
     async def show_hearing(text: str, **_kw) -> None:
         indicator.show_hearing(text)
@@ -326,9 +487,22 @@ def wire_events(
     bus.on("speech_final", _on_speech_final_consolidated)
     bus.on("intent_classified", _on_intent_classified)
     bus.on("partial_response", _measure_perceived)
-    bus.on("speech_partial", show_hearing)
-    if hasattr(tts, "on_speech_partial"):
-        bus.on("speech_partial", tts.on_speech_partial)
+    bus.on(
+        "speech_partial",
+        _guard_handler(
+            "speech_partial",
+            show_hearing,
+            source="indicator.show_hearing",
+        ),
+    )
+    bus.on(
+        "speech_partial",
+        _guard_handler(
+            "speech_partial",
+            voice_interrupt.on_speech_partial,
+            source="voice_interrupt.on_speech_partial",
+        ),
+    )
     async def on_text_display(text: str, **_kw) -> None:
         """Screen-only overflow text (not spoken, shown on dashboard)."""
         if text.strip():
@@ -474,6 +648,38 @@ def wire_events(
     bus.on("state_changed", update_mic_on_listen)
     bus.on("state_changed", auto_recover_to_listening)
     bus.on("mic_changed", on_mic_changed)
+
+    # ── FSEvents → optional proactive hints (Downloads + notable extensions) ─
+    async def on_fs_event(path: str = "", event: str = "", is_dir: bool = False, **_kw) -> None:
+        from core.macos.fs_watcher_config import fs_watcher_settings, notable_file_hint
+
+        s = fs_watcher_settings(config)
+        if not s["hints_enabled"]:
+            return
+        hint = notable_file_hint(
+            path=path, event=event, is_dir=is_dir, config=config,
+        )
+        if not hint:
+            return
+        now = time.monotonic()
+        cooldown = float(s["hint_cooldown_s"])
+        if now - float(_proactive_state.get("last_fs_hint", 0.0)) < cooldown:
+            return
+        _proactive_state["last_fs_hint"] = now
+        try:
+            indicator.add_log("info", hint)
+        except Exception:
+            logger.debug("FS hint indicator log failed", exc_info=True)
+        if s["emit_voice"]:
+            try:
+                bus.emit_long("response_ready", text=hint)
+            except Exception:
+                logger.debug("FS hint voice emit failed", exc_info=True)
+
+    bus.on(
+        "fs_event",
+        _guard_handler("fs_event", on_fs_event, source="wiring.on_fs_event"),
+    )
 
     return {
         "perceived": _perceived,

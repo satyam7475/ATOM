@@ -255,8 +255,13 @@ class MacOSTTSAsync:
         self._available = sys.platform == "darwin"
 
         self._active_source: str | None = None
-        self._chunk_buffer: list = []
+        self._active_stream_id: str | None = None
+        self._chunk_buffer: list[str] = []
+        self._screen_buffer: list[str] = []
         self._spoken_word_count: int = 0
+        self._stream_queue: asyncio.Queue[tuple[str, bool]] | None = None
+        self._stream_task: asyncio.Task | None = None
+        self._stream_generation: int = 0
 
     # ── Initialization ─────────────────────────────────────────────
 
@@ -339,6 +344,97 @@ class MacOSTTSAsync:
                 except Exception:
                     pass
 
+    def _normalize_stream_text(self, text: str) -> str:
+        cleaned = _clean_for_tts(text).strip()
+        return re.sub(r"\s+", " ", cleaned)
+
+    def _split_stream_chunk(self, text: str) -> tuple[str, str]:
+        text = self._normalize_stream_text(text)
+        if not text:
+            return "", ""
+
+        words = text.split()
+        remaining = max(0, self._SPEAK_WORD_LIMIT - self._spoken_word_count)
+        if remaining <= 0:
+            return "", text
+        if len(words) <= remaining:
+            return text, ""
+
+        speak_text = " ".join(words[:remaining]).strip()
+        overflow_text = " ".join(words[remaining:]).strip()
+
+        last_period = speak_text.rfind(".")
+        last_question = speak_text.rfind("?")
+        last_exclaim = speak_text.rfind("!")
+        cut_pos = max(last_period, last_question, last_exclaim)
+        if cut_pos > len(speak_text) // 3:
+            tail = speak_text[cut_pos + 1:].strip()
+            speak_text = speak_text[:cut_pos + 1].strip()
+            overflow_text = " ".join(part for part in (tail, overflow_text) if part).strip()
+
+        if not speak_text:
+            return "", text
+        return speak_text, overflow_text
+
+    async def _play_stream_chunks(self, generation: int) -> None:
+        queue = self._stream_queue
+        if queue is None:
+            return
+
+        try:
+            while True:
+                text, is_last = await queue.get()
+                if generation != self._stream_generation:
+                    return
+
+                if text:
+                    self._chunk_buffer.append(text)
+                    speak_text, overflow_text = self._split_stream_chunk(text)
+                    if speak_text and not self._cancel_requested:
+                        self._spoken_word_count += len(speak_text.split())
+                        logger.info(
+                            "TTS stream chunk (%d/%d words): '%s'",
+                            self._spoken_word_count,
+                            self._SPEAK_WORD_LIMIT,
+                            speak_text[:100],
+                        )
+                        await self._speak_internal(speak_text)
+                    if overflow_text:
+                        self._screen_buffer.append(overflow_text)
+
+                if is_last:
+                    break
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("TTS stream error")
+        finally:
+            if self._stream_task is asyncio.current_task():
+                self._stream_task = None
+            if generation != self._stream_generation:
+                return
+
+            overflow_text = " ".join(self._screen_buffer).strip()
+            self._chunk_buffer.clear()
+            self._screen_buffer.clear()
+            self._stream_queue = None
+            self._active_source = None
+            self._active_stream_id = None
+
+            if overflow_text:
+                logger.info(
+                    "Screen-only (%d words): '%s'",
+                    len(overflow_text.split()),
+                    overflow_text[:100],
+                )
+                self._bus.emit("text_display", text=overflow_text)
+
+            logger.info(
+                "TTS stream done: %d words spoken",
+                self._spoken_word_count,
+            )
+            self._bus.emit("tts_complete")
+
     # ── Internal speak (no tts_complete emission) ──────────────────
 
     async def _speak_internal(self, text: str,
@@ -409,6 +505,18 @@ class MacOSTTSAsync:
         """Barge-in: immediately stop all speech."""
         self._cancel_requested = True
         self._playing = False
+        self._stream_generation += 1
+        self._active_source = None
+        self._active_stream_id = None
+        self._chunk_buffer.clear()
+        self._screen_buffer.clear()
+        queue = self._stream_queue
+        self._stream_queue = None
+        if queue is not None:
+            try:
+                queue.put_nowait(("", True))
+            except Exception:
+                pass
         await self._kill_procs()
         await asyncio.sleep(0.02)
 
@@ -435,7 +543,8 @@ class MacOSTTSAsync:
         from core.state_manager import AtomState
 
         self._active_source = None
-        if self._playing:
+        self._active_stream_id = None
+        if self._playing or self._stream_queue is not None or self._stream_task is not None:
             await self.stop()
             self._cancel_requested = False
         if self._state.current is AtomState.SPEAKING:
@@ -463,81 +572,50 @@ class MacOSTTSAsync:
 
     async def on_partial_response(
         self, text: str, is_first: bool = False,
-        is_last: bool = False, source: str = "", **_kw,
+        is_last: bool = False, source: str = "", stream_id: str = "", **_kw,
     ) -> None:
         from core.state_manager import AtomState
+
+        normalized_text = self._normalize_stream_text(text) if text else ""
 
         if is_first:
             self._active_source = source or "unknown"
             self._chunk_buffer.clear()
+            self._screen_buffer.clear()
             self._spoken_word_count = 0
-            logger.info("TTS stream: source='%s'", self._active_source)
+            self._active_stream_id = stream_id or None
+            logger.info(
+                "TTS stream: source='%s' stream_id=%s'",
+                self._active_source,
+                stream_id or "none",
+            )
             await self.stop()
             self._cancel_requested = False
             await self._state.transition(AtomState.SPEAKING)
+            self._active_source = source or "unknown"
+            self._active_stream_id = stream_id or None
+            self._stream_queue = asyncio.Queue()
+            self._stream_task = asyncio.create_task(
+                self._play_stream_chunks(self._stream_generation)
+            )
         elif source and self._active_source and source != self._active_source:
             return
+        elif stream_id and self._active_stream_id and stream_id != self._active_stream_id:
+            return
 
-        if not text.strip() and not is_last:
+        if not normalized_text and not is_last:
             return
         if self._state.current is not AtomState.SPEAKING and not is_first:
             self._cancel_requested = False
             await self._state.transition(AtomState.SPEAKING)
-        if text:
-            self._chunk_buffer.append(text)
-        if is_last:
-            asyncio.create_task(self._flush_and_finish())
-
-    async def _flush_and_finish(self) -> None:
-        try:
-            full_text = " ".join(self._chunk_buffer).strip()
-            self._chunk_buffer.clear()
-            full_text = _clean_for_tts(full_text).strip()
-            full_text = re.sub(r'\s+', ' ', full_text)
-            if not full_text:
-                logger.info("TTS: empty response")
-                self._active_source = None
-                self._bus.emit("tts_complete")
-                return
-
-            words = full_text.split()
-            total_words = len(words)
-            if total_words <= self._SPEAK_WORD_LIMIT:
-                speak_text = full_text
-                overflow_text = ""
-            else:
-                speak_words = words[:self._SPEAK_WORD_LIMIT]
-                speak_text = " ".join(speak_words)
-                last_period = speak_text.rfind(".")
-                last_question = speak_text.rfind("?")
-                last_exclaim = speak_text.rfind("!")
-                cut_pos = max(last_period, last_question, last_exclaim)
-                if cut_pos > len(speak_text) // 3:
-                    speak_text = speak_text[:cut_pos + 1]
-                overflow_text = full_text[len(speak_text):].strip()
-
-            if speak_text:
-                self._spoken_word_count = len(speak_text.split())
-                logger.info(
-                    "TTS speak (%d/%d words): '%s'",
-                    self._spoken_word_count, total_words, speak_text[:100],
-                )
-                await self._speak_internal(speak_text)
-            if overflow_text:
-                logger.info(
-                    "Screen-only (%d words): '%s'",
-                    len(overflow_text.split()), overflow_text[:100],
-                )
-                self._bus.emit("text_display", text=overflow_text)
-
-            logger.info(
-                "TTS done: %d/%d words spoken",
-                self._spoken_word_count, total_words,
+        queue = self._stream_queue
+        if queue is None:
+            self._stream_queue = asyncio.Queue()
+            queue = self._stream_queue
+            self._stream_task = asyncio.create_task(
+                self._play_stream_chunks(self._stream_generation)
             )
-        except Exception:
-            logger.exception("TTS flush error")
-        self._active_source = None
-        self._bus.emit("tts_complete")
+        queue.put_nowait((normalized_text, is_last))
 
     # ── Shutdown ───────────────────────────────────────────────────
 

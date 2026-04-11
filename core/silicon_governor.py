@@ -39,7 +39,7 @@ class SiliconGovernor:
     """
 
     _THERMAL_THRESHOLD = 95
-    _MEMORY_THRESHOLD_PCT = 90
+    _MEMORY_THRESHOLD_PCT = 85
     _POLL_INTERVAL_S = 30
 
     def __init__(

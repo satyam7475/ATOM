@@ -6,10 +6,10 @@ cost because the kernel pushes events — no polling.  This is the same
 mechanism Spotlight uses.
 
 Usage:
+    from core.macos.fs_watcher_config import fs_watcher_settings
+
     watcher = FSWatcher(bus)
-    watcher.watch([
-        "~/Desktop", "~/Downloads", "~/Documents",
-    ])
+    watcher.watch(fs_watcher_settings(config)["paths"])
     watcher.start()
     # ... events emitted on the bus as "fs_event" ...
     watcher.stop()

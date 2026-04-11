@@ -59,6 +59,12 @@
         "graph_db_path": "data/atom_memory.db",
         "max_entries": 500,
         "top_k": 3,
+        "max_vector_results": 5,
+        "max_graph_nodes": 1000,
+        "pressure_threshold_pct": 85,
+        "pressure_relief_pct": 75,
+        "pressure_top_k": 2,
+        "pressure_query_limit": 3,
         "semantic_weight": 0.7,
         "v7_scoring": {
             "enabled": true,
@@ -71,6 +77,9 @@
     "brain": {
         "enabled": true,
         "model_path": "models/qwen3-8b-q4_k_m.gguf",
+        "mlx_primary_model": "models/qwen3-4b-mlx",
+        "mlx_fast_model": "models/qwen3-1.7b-mlx",
+        "mlx_default_role": "primary",
         "n_ctx": 8192,
         "n_threads": 4,
         "n_gpu_layers": -1,
@@ -189,6 +198,12 @@
         "cpu_governor_threshold": 75,
         "watchdog_thinking_timeout_s": 120,
         "watchdog_speaking_timeout_s": 300,
+        "watchdog_intent_timeout_ms": 50,
+        "watchdog_cache_timeout_ms": 100,
+        "watchdog_rag_timeout_ms": 500,
+        "watchdog_llm_timeout_s": 30,
+        "watchdog_tts_timeout_s": 15,
+        "watchdog_tool_timeout_s": 10,
         "supervisor_restart_cooldown_s": 8,
         "watchdog_poll_interval_s": 2,
         "use_priority_scheduler": true
@@ -214,6 +229,11 @@
         "behavior_update_interval_s": 900,
         "goal_evaluation_interval_s": 3600,
         "prediction_min_confidence": 0.6,
+        "prediction_preload_enabled": true,
+        "prediction_preload_min_confidence": 0.82,
+        "prediction_preload_max_items": 2,
+        "prediction_preload_cooldown_s": 120,
+        "prediction_preload_timeout_s": 2.5,
         "auto_mode_switching": true,
         "default_mode": "work",
         "max_goals": 20,
@@ -233,7 +253,7 @@
     "embedding": {
         "model": "all-MiniLM-L6-v2",
         "dimension": 384,
-        "device": "cpu"
+        "device": "auto"
     },
     "vector_store": {
         "path": "data/vector_db",
@@ -269,8 +289,39 @@
     "gpu": {
         "enabled": true,
         "thermal_threshold": 85,
-        "memory_threshold_pct": 90,
+        "memory_threshold_pct": 85,
         "poll_interval_s": 30
+    },
+    "cognitive_kernel": {
+        "quick_model": "qwen3-1.7b",
+        "full_model": "qwen3-4b",
+        "simple_query_max_chars": 48,
+        "deep_query_min_chars": 140,
+        "battery_degrade": true,
+        "thermal_degrade": true,
+        "memory_pressure_threshold": 85
+    },
+    "latency_controller": {
+        "direct_budget_ms": 50,
+        "cache_budget_ms": 100,
+        "quick_budget_ms": 1500,
+        "full_budget_ms": 5000,
+        "deep_budget_ms": 15000,
+        "simple_query_max_chars": 48,
+        "memory_pressure_pct": 85,
+        "low_battery_pct": 20,
+        "cpu_busy_pct": 88,
+        "battery_scale": 0.9,
+        "low_battery_scale": 0.72,
+        "thermal_scale": 0.68,
+        "memory_scale": 0.75,
+        "cpu_scale": 0.82,
+        "simple_scale": 0.84,
+        "deep_scale": 1.08,
+        "rag_fraction_full": 0.16,
+        "rag_fraction_deep": 0.24,
+        "rag_min_ms": 60,
+        "rag_max_ms": 650
     },
     "v7_intelligence": {
         "default_mode": "SMART",
@@ -346,12 +397,31 @@
         "enabled": true,
         "prefetch_enabled": true,
         "first_token_budget_ms": 120,
+        "top_k": 3,
+        "max_snippets": 3,
+        "pressure_threshold_pct": 85,
+        "pressure_relief_pct": 75,
+        "pressure_top_k": 1,
+        "adaptive": {
+            "budget_min_ms": 40,
+            "budget_max_ms": 280
+        },
         "graph_first": {
             "enabled": true,
             "min_confidence": 0.68,
             "min_snippets": 2,
             "project_boost": 0.12,
             "relevance_validation_min": 0.74
+        },
+        "smart_scoring": {
+            "recency_half_life_hours": 168,
+            "owner_priority_multiplier": 2.0,
+            "owner_priority_sources": ["preference", "voice", "owner", "boss", "user"],
+            "usage_boost_max": 0.12,
+            "usage_history_size": 4096,
+            "stale_after_hours": 1080,
+            "time_sensitive_stale_after_hours": 168,
+            "stale_penalty": 0.18
         }
     },
     "v7_gpu": {

@@ -17,6 +17,7 @@ pyobjc-framework-AVFoundation>=11.0  # AVAudioEngine (mic input, no PyAudio need
 pyobjc-framework-Speech>=11.0        # SFSpeechRecognizer (on-device STT, Neural Engine)
 pyobjc-framework-Vision>=11.0        # VNRecognizeTextRequest (OCR, Neural Engine)
 pyobjc-framework-Quartz>=11.0        # CGImage for Vision OCR input
+pyobjc-framework-ApplicationServices>=11.0  # Accessibility API (AXUIElement)
 pyobjc-framework-FSEvents>=11.0      # Kernel-level file system monitoring
 pyobjc-framework-NaturalLanguage>=11.0  # NLEmbedding (quick similarity)
 pyobjc-framework-CoreML>=11.0        # CoreML model inference

@@ -5,6 +5,8 @@ Voice-controlled desktop automation:
   - Scroll up/down
   - Click (center or coordinates)
   - Type text at cursor position
+  - Read/fill focused macOS text fields via Accessibility API
+  - Click macOS UI elements by accessible label
   - Press individual keys (Enter, Escape, Tab, arrows)
   - Safe hotkey combos (Ctrl+C / Cmd+C, etc.)
   - Screenshot for visual context
@@ -28,12 +30,15 @@ import sys
 import time
 from pathlib import Path
 
+from core.macos import AccessibilityAPI, AppleScriptEngine
 from core.security_policy import SecurityPolicy
 
 logger = logging.getLogger("atom.desktop")
 
 _policy = SecurityPolicy()
 _IS_MACOS = sys.platform == "darwin"
+_APPLE_SCRIPT = AppleScriptEngine() if _IS_MACOS else None
+_ACCESSIBILITY = AccessibilityAPI() if _IS_MACOS else None
 
 
 # ── pyautogui availability ───────────────────────────────────────────
@@ -91,67 +96,29 @@ def _macos_combo(combo: str) -> str:
 
 def _osascript(script: str) -> str:
     """Run an AppleScript snippet via osascript. Returns stdout."""
-    try:
-        result = subprocess.run(
-            ["osascript", "-e", script],
-            capture_output=True, text=True, timeout=5,
-        )
-        return result.stdout.strip()
-    except Exception as exc:
-        logger.debug("osascript error: %s", exc)
+    if _APPLE_SCRIPT is None:
         return ""
+    return _APPLE_SCRIPT.run(script, timeout=5.0)
 
 
 def _applescript_keystroke(key: str, modifiers: list | None = None) -> bool:
     """Send a keystroke via AppleScript System Events."""
-    mod_str = ""
-    if modifiers:
-        mod_using = []
-        for m in modifiers:
-            m = m.lower()
-            if m in ("command", "cmd"):
-                mod_using.append("command down")
-            elif m in ("option", "alt"):
-                mod_using.append("option down")
-            elif m in ("control", "ctrl"):
-                mod_using.append("control down")
-            elif m in ("shift",):
-                mod_using.append("shift down")
-        if mod_using:
-            mod_str = " using {" + ", ".join(mod_using) + "}"
-
-    if len(key) == 1:
-        script = (
-            f'tell application "System Events" to keystroke "{key}"{mod_str}'
-        )
-    else:
-        key_code_map = {
-            "enter": 36, "return": 36, "escape": 53, "esc": 53,
-            "tab": 48, "space": 49, "delete": 51, "backspace": 51,
-            "up": 126, "down": 125, "left": 123, "right": 124,
-            "home": 115, "end": 119, "pageup": 116, "pagedown": 121,
-            "f1": 122, "f2": 120, "f3": 99, "f4": 118, "f5": 96,
-            "f6": 97, "f7": 98, "f8": 100, "f9": 101, "f10": 109,
-            "f11": 103, "f12": 111,
-        }
-        code = key_code_map.get(key.lower())
-        if code is None:
-            logger.warning("No AppleScript key code for '%s'", key)
-            return False
-        script = (
-            f'tell application "System Events" to key code {code}{mod_str}'
-        )
-
-    result = _osascript(script)
-    return True
+    if _APPLE_SCRIPT is None:
+        return False
+    return _APPLE_SCRIPT.press_key(key, list(modifiers or []))
 
 
 def _applescript_type(text: str) -> bool:
     """Type text via AppleScript keystroke (handles Unicode)."""
-    safe = text.replace("\\", "\\\\").replace('"', '\\"')
-    script = f'tell application "System Events" to keystroke "{safe}"'
-    _osascript(script)
-    return True
+    if _APPLE_SCRIPT is None:
+        return False
+    return _APPLE_SCRIPT.type_text(text)
+
+
+def _accessibility_ready(prompt: bool = False) -> bool:
+    if not _IS_MACOS or _ACCESSIBILITY is None or not _ACCESSIBILITY.is_available:
+        return False
+    return _ACCESSIBILITY.is_trusted(prompt=prompt)
 
 
 def _applescript_scroll(direction: str, clicks: int) -> bool:
@@ -430,3 +397,91 @@ def get_screen_size() -> tuple:
         except Exception:
             pass
     return (1920, 1080)
+
+
+def describe_focused_element() -> str:
+    """Describe the currently focused macOS accessibility element."""
+    if not _IS_MACOS:
+        return "Focused UI inspection is only available on macOS, Boss."
+    if not _accessibility_ready(prompt=False):
+        return (
+            "macOS Accessibility permission is required to inspect UI elements, Boss."
+        )
+
+    data = _ACCESSIBILITY.get_focused_element() if _ACCESSIBILITY is not None else {}
+    role = str(data.get("role", "") or "UI element")
+    title = str(data.get("title", "") or data.get("description", "") or "").strip()
+    value = str(data.get("value", "") or "").strip()
+    app = str((data.get("frontmost_app") or {}).get("name", "") or "").strip()
+
+    parts = [role]
+    if title:
+        parts.append(f"'{title}'")
+    if value and value != title:
+        parts.append(f"value '{value[:120]}'")
+    if app:
+        parts.append(f"in {app}")
+    return "Focused element: " + " ".join(parts).strip() + "."
+
+
+def read_focused_text(max_chars: int = 500) -> str:
+    """Read the currently focused macOS text field if accessible."""
+    if not _IS_MACOS:
+        return "Focused text reading is only available on macOS, Boss."
+    if not _accessibility_ready(prompt=False):
+        return (
+            "macOS Accessibility permission is required to read focused text, Boss."
+        )
+
+    text = ""
+    if _ACCESSIBILITY is not None:
+        text = _ACCESSIBILITY.read_focused_text(max_chars=max_chars)
+    if not text:
+        return "I couldn't read text from the focused UI element, Boss."
+    _policy.audit_log("read_focused_text", f"chars={len(text)}")
+    logger.info("Read focused text (%d chars)", len(text))
+    return text
+
+
+def set_focused_text(text: str, append: bool = False) -> str:
+    """Set the focused macOS text field using the Accessibility API."""
+    if not _IS_MACOS:
+        return "Focused text filling is only available on macOS, Boss."
+    if not _accessibility_ready(prompt=True):
+        return (
+            "macOS Accessibility permission is required to fill focused text, Boss."
+        )
+
+    payload = (text or "")[:1000]
+    if not payload:
+        return "No text provided for the focused field, Boss."
+    ok = _ACCESSIBILITY.set_focused_text(payload, append=append) if _ACCESSIBILITY is not None else False
+    if not ok:
+        return "I couldn't write into the focused UI element, Boss."
+    _policy.audit_log("set_focused_text", f"chars={len(payload)} append={append}")
+    logger.info("Focused text updated (%d chars, append=%s)", len(payload), append)
+    return "Focused text field updated, Boss."
+
+
+def click_ui_element(label: str, role: str | None = None) -> str:
+    """Click a macOS UI element by accessible label."""
+    if not _IS_MACOS:
+        return "UI element clicks by label are only available on macOS, Boss."
+    if not _accessibility_ready(prompt=False):
+        return (
+            "macOS Accessibility permission is required to click UI elements, Boss."
+        )
+
+    target = (label or "").strip()[:120]
+    if not target:
+        return "No UI label provided to click, Boss."
+    ok = (
+        _ACCESSIBILITY.click_element_by_title(target, role=role)
+        if _ACCESSIBILITY is not None
+        else False
+    )
+    if not ok:
+        return f"I couldn't find a clickable UI element matching '{target}', Boss."
+    _policy.audit_log("click_ui_element", f"label={target} role={role or ''}")
+    logger.info("Clicked UI element label=%s role=%s", target, role or "")
+    return f"Clicked '{target}', Boss."

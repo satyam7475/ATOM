@@ -1,7 +1,7 @@
 # ATOM MEMORY BANK
 
 > **Purpose:** Single source of truth for evolution progress. Read this FIRST in every new session.
-> **Updated:** 2026-04-09 (Native macOS Stack)
+> **Updated:** 2026-04-11 (Prediction Preload Enabled)
 > **Hardware:** MacBook Air M5 (Apple Silicon, Unified Memory, Neural Engine, Metal GPU)
 
 ---
@@ -9,11 +9,11 @@
 ## CURRENT STATUS
 
 ```
-CURRENT_STEP  = 2.1
-OVERALL_PHASE = PHASE 2 — STABILITY & COGNITIVE KERNEL
-BLOCKER       = Python 3.11+ needed (currently 3.9.6 from CLT). Homebrew needs admin.
-LAST_ACTION   = Phase 0 + Phase 1 COMPLETE. Native macOS Stack DONE. Dual-model strategy confirmed (Qwen3-4B + Qwen3-1.7B).
-NEXT_ACTION   = Execute Step 2.1 — Create core/cognitive_kernel.py (central brain coordinator)
+CURRENT_STEP  = 4.3
+OVERALL_PHASE = PHASE 4 — INTELLIGENCE UPGRADE
+BLOCKER       = None — MLX installs in the current project venv; abbreviated integration smoke found non-fatal runtime defects only
+LAST_ACTION   = Step 4.2 DONE — upgraded the prediction engine to warm prompt/RAG/app resources for high-confidence predictions with cooldowns and degraded-mode safety.
+NEXT_ACTION   = Execute Step 4.3 — enhance `core/rag/rag_engine.py` with temporal decay, owner-priority, usage boosts, and staleness awareness
 ```
 
 ### COMPLETED PHASES SUMMARY
@@ -29,7 +29,7 @@ NEXT_ACTION   = Execute Step 2.1 — Create core/cognitive_kernel.py (central br
 
 ## QUICK CONTEXT (for AI sessions)
 
-**What is ATOM?** Satyam's JARVIS-style voice AI OS. ~51,400 lines Python. Local LLM (llama-cpp-python/GGUF), native macOS STT/TTS/OCR (pyobjc), aiohttp dashboard, 40+ tools, ReAct loop, autonomous behavior.
+**What is ATOM?** Satyam's JARVIS-style voice AI OS. ~51,400 lines Python. Local LLM now runs on MLX/Qwen3 dual-models on Apple Silicon, with the older llama-cpp/GGUF path retained only as a legacy baseline/reference path. Native macOS STT/TTS/OCR (pyobjc), aiohttp dashboard, 40+ tools, ReAct loop, autonomous behavior.
 
 **What are we doing?** Evolving ATOM from a Windows-built prototype to a production-grade cognitive OS optimized for Apple Silicon M5. The full plan is in `docs/ATOM_M5_EVOLUTION_PLAN.md`.
 
@@ -78,11 +78,11 @@ NEXT_ACTION   = Execute Step 2.1 — Create core/cognitive_kernel.py (central br
 
 | Step | Description | Files | Status | Report |
 |------|------------|-------|--------|--------|
-| 2.1 | Create `core/cognitive_kernel.py` — central brain coordinator (mode selection, query routing, resource allocation). Note: GPU stack consolidation (InferenceGuard) already done in Step 1.8A. | NEW: `core/cognitive_kernel.py` | NOT_STARTED | — |
-| 2.2 | Add error isolation wrappers to: `router.py`, `local_brain_controller.py`, `action_executor.py`, `wiring.py`, `stt_async.py`, `tts_edge.py` | 6 files | NOT_STARTED | — |
-| 2.3 | Upgrade `runtime_watchdog.py` — per-module execution budgets with timeout kill | `core/runtime_watchdog.py` | NOT_STARTED | — |
-| 2.4 | Add memory pressure protection — limits on vector results, RAG snippets, graph nodes + periodic memory check | Multiple core files | NOT_STARTED | — |
-| 2.5 | Integration test — run ATOM for 30 min, verify no crashes, no memory leaks | Terminal | NOT_STARTED | — |
+| 2.1 | Create `core/cognitive_kernel.py` — central brain coordinator (mode selection, query routing, resource allocation). Note: GPU stack consolidation (InferenceGuard) already done in Step 1.8A. | NEW: `core/cognitive_kernel.py` | **DONE** | 5 paths, circuit breakers, system-aware routing, wired to Router + main.py |
+| 2.2 | Add error isolation wrappers to: `router.py`, `local_brain_controller.py`, `action_executor.py`, `wiring.py`, `stt_async.py`, `tts_edge.py` | 6 files | **DONE** | Top-level error boundaries + guarded wiring + smoke-tested forced failures |
+| 2.3 | Upgrade `runtime_watchdog.py` — per-module execution budgets with timeout kill | `core/runtime_watchdog.py` + integration call sites | **DONE** | Active budgets for intent/cache/LLM/tools, RAG cap, TTS timeout supervision, wired + smoke-tested |
+| 2.4 | Add memory pressure protection — limits on vector results, RAG snippets, graph nodes + periodic memory check | Multiple core files | **DONE** | Vector/RAG/graph caps + `silicon_stats_update` pressure shedding + smoke-tested |
+| 2.5 | Integration test — run ATOM for 30 min, verify no crashes, no memory leaks | Terminal | **DONE** | Abbreviated smoke/integration pass per user request: no full-process crash, RSS stayed flat, several non-fatal runtime defects logged |
 
 **Phase 2 Deliverable:** ATOM is unbreakable. Cognitive Kernel routes all decisions. No single module can crash the system.
 
@@ -110,14 +110,14 @@ NEXT_ACTION   = Execute Step 2.1 — Create core/cognitive_kernel.py (central br
 
 | Step | Description | Files | Status | Report |
 |------|------------|-------|--------|--------|
-| 3.1 | Install MLX: `pip install mlx mlx-lm` | Terminal | NOT_STARTED | — |
-| 3.2 | Download MLX models: Qwen3-4B-Q4_K_M (primary) + Qwen3-1.7B-Q4_K_M (fast) | `models/` | NOT_STARTED | — |
-| 3.3 | Create `brain/mlx_llm.py` — MLX-native LLM wrapper with streaming | NEW: `brain/mlx_llm.py` | NOT_STARTED | — |
-| 3.4 | Update `local_brain_controller.py` — use MLX brain instead of llama-cpp | `cursor_bridge/local_brain_controller.py` | NOT_STARTED | — |
-| 3.5 | Implement dual-model routing in Cognitive Kernel (Qwen3-1.7B for simple, Qwen3-4B for complex, thinking mode toggle) | `core/cognitive_kernel.py` | NOT_STARTED | — |
-| 3.6 | Create `core/runtime/latency_controller.py` — dynamic latency budgets | NEW: `core/runtime/latency_controller.py` | NOT_STARTED | — |
-| 3.7 | Update `config/settings.json` — MLX model paths, Apple Silicon tuning | `config/settings.json` | NOT_STARTED | — |
-| 3.8 | Benchmark: measure MLX vs llama-cpp inference speed on M5 | Terminal | NOT_STARTED | — |
+| 3.1 | Install MLX: `pip install mlx mlx-lm` | Terminal | **DONE** | `mlx` + `mlx-lm` installed in project venv; functional imports verified |
+| 3.2 | Download MLX models: Qwen3-4B-Q4_K_M (primary) + Qwen3-1.7B-Q4_K_M (fast) | `models/` | **DONE** | Downloaded `mlx-community/Qwen3-4B-4bit` + `mlx-community/Qwen3-1.7B-4bit` into project-local model dirs |
+| 3.3 | Create `brain/mlx_llm.py` — MLX-native LLM wrapper with streaming | NEW: `brain/mlx_llm.py` | **DONE** | Added `MLXBrain` compatibility wrapper with async streaming, preempt, primary/fast roles, and local-model defaults |
+| 3.4 | Update `local_brain_controller.py` — use MLX brain instead of llama-cpp | `cursor_bridge/local_brain_controller.py` | **DONE** | Swapped controller backend to `MLXBrain`; warm-up and unload smoke verified through the controller layer |
+| 3.5 | Implement dual-model routing in Cognitive Kernel (Qwen3-1.7B for simple, Qwen3-4B for complex, thinking mode toggle) | `core/cognitive_kernel.py` + LLM handoff files | **DONE** | Kernel now emits `model_role` / `runtime_mode` / prompt hints, and the local-brain path honors them |
+| 3.6 | Create `core/runtime/latency_controller.py` — dynamic latency budgets | NEW: `core/runtime/latency_controller.py` + routing integrations | **DONE** | Dynamic latency/context budgets now flow through `QueryPlan`, router memory gating, and local-brain RAG/prompt trimming |
+| 3.7 | Update `config/settings.json` — MLX model paths, Apple Silicon tuning | `config/settings.json` + schema alignment | **DONE** | Explicit MLX paths, latency/kernel defaults, watchdog budgets, and schema validation updated |
+| 3.8 | Benchmark: measure MLX vs llama-cpp inference speed on M5 | Terminal + `tools/mlx_vs_llamacpp_benchmark.py` | **DONE** | MLX benchmark recorded on local Qwen3-4B; matching GGUF baseline downloaded but current llama-cpp 0.3.2 fails to load it |
 
 **Phase 3 Deliverable:** ATOM uses MLX for inference. Qwen3-4B (primary, ~3GB) + Qwen3-1.7B (fast, ~1.2GB) loaded simultaneously in Unified Memory. Sub-150ms via fast brain, sub-600ms via primary brain (thinking OFF), sub-2s for deep reasoning (thinking ON).
 
@@ -127,8 +127,8 @@ NEXT_ACTION   = Execute Step 2.1 — Create core/cognitive_kernel.py (central br
 
 | Step | Description | Files | Status | Report |
 |------|------------|-------|--------|--------|
-| 4.1 | Implement cognitive budget system in Cognitive Kernel | `core/cognitive_kernel.py` | NOT_STARTED | — |
-| 4.2 | Upgrade prediction engine — resource preloading for high-confidence predictions | `core/cognitive/prediction_engine.py` | NOT_STARTED | — |
+| 4.1 | Implement cognitive budget system in Cognitive Kernel | `core/cognitive_kernel.py` | **DONE** | Added concrete budget tiers, tier-aware routing, and low-pressure degradation |
+| 4.2 | Upgrade prediction engine — resource preloading for high-confidence predictions | `core/cognitive/prediction_engine.py` | **DONE** | Added lightweight prediction-driven prompt/RAG/app warming with cooldowns |
 | 4.3 | Enhance RAG — temporal decay, owner-priority, usage-frequency boost | `core/rag/rag_engine.py` | NOT_STARTED | — |
 | 4.4 | Create `core/identity_engine.py` — ATOM self-identity + owner relationship model | NEW: `core/identity_engine.py` | NOT_STARTED | — |
 | 4.5 | Integration test — verify intelligence routing, RAG quality, personality adaptation | Terminal | NOT_STARTED | — |
@@ -212,6 +212,567 @@ NEXT_ACTION   = Execute Step 2.1 — Create core/cognitive_kernel.py (central br
 **Notes for Next Step:**
   - [anything the next session needs to know]
 ```
+
+### Step 3.1 — Install MLX
+**Date:** 2026-04-11
+**Status:** DONE
+**Files Modified:** none
+**Files Created:** none
+**What Changed:**
+  - Installed `mlx` and `mlx-lm` into the active project virtual environment via `python3 -m pip install mlx mlx-lm`
+  - This also pulled the required Apple Silicon runtime package `mlx-metal`
+  - Confirmed the environment can import `mlx.core`, `mlx.nn`, and `mlx_lm`, and execute a basic MLX tensor operation
+**Test Result:**
+  - `python3 -m pip install mlx mlx-lm` completed successfully
+  - Functional import check passed:
+    - `import mlx.core as mx`
+    - `import mlx.nn as nn`
+    - `import mlx_lm`
+    - `mx.array([1, 2, 3]).tolist()` returned `[1, 2, 3]`
+**Issues Found:**
+  - Importing the Hugging Face dependency stack surfaces a `urllib3` LibreSSL warning on this Python build, but MLX itself imports and basic ops work correctly
+  - The earlier Phase 3 blocker claiming Python 3.11+ was required for MLX is no longer accurate for this environment
+**Notes for Next Step:**
+  - Step 3.2 should download the two MLX model repos into `models/` and record their on-disk locations
+  - Step 3.3 can now assume `mlx` and `mlx_lm` are available in the project venv
+
+### Step 3.2 — Download MLX Models
+**Date:** 2026-04-11
+**Status:** DONE
+**Files Modified:** none
+**Files Created:**
+  - `models/qwen3-4b-mlx/` — downloaded `mlx-community/Qwen3-4B-4bit` snapshot (config, tokenizer, sharded safetensors, README, cache metadata)
+  - `models/qwen3-1.7b-mlx/` — downloaded `mlx-community/Qwen3-1.7B-4bit` snapshot (config, tokenizer, sharded safetensors, README, cache metadata)
+**What Changed:**
+  - Downloaded the primary MLX model into `models/qwen3-4b-mlx`
+  - Downloaded the fast MLX model into `models/qwen3-1.7b-mlx`
+  - Kept both models project-local so Phase 3 code can reference stable filesystem paths instead of ad-hoc Hugging Face cache locations
+**Test Result:**
+  - Download completed successfully for both repos using `huggingface_hub.snapshot_download()`
+  - Verified on-disk sizes:
+    - `models/qwen3-4b-mlx` ≈ 2.1 GB
+    - `models/qwen3-1.7b-mlx` ≈ 939 MB
+  - Verified expected MLX model files in both directories:
+    - `config.json`
+    - `model.safetensors` + `model.safetensors.index.json`
+    - `tokenizer.json`, `tokenizer_config.json`, `special_tokens_map.json`
+    - vocabulary / merge files and README
+**Issues Found:**
+  - Hugging Face download stack still emits the LibreSSL / `urllib3` warning on this Python build, but it did not block download or local verification
+**Notes for Next Step:**
+  - Step 3.3 should use these local model directories directly in the MLX wrapper
+  - Suggested config paths for the wrapper:
+    - primary: `models/qwen3-4b-mlx`
+    - fast: `models/qwen3-1.7b-mlx`
+
+### Step 3.3 — Create MLX LLM Wrapper
+**Date:** 2026-04-11
+**Status:** DONE
+**Files Modified:** none
+**Files Created:**
+  - `brain/mlx_llm.py` — new `MLXBrain` wrapper for MLX model loading, async generation, streaming callbacks, preemption, and unload/close handling
+**What Changed:**
+  - Created `MLXBrain` as a MiniLLM-compatible bridge so `LocalBrainController` can swap from llama-cpp to MLX without redesigning its async contract first
+  - Added lazy model loading for two roles: `primary` (`models/qwen3-4b-mlx`) and `fast` (`models/qwen3-1.7b-mlx`)
+  - Implemented synchronous MLX streaming under a single-worker executor, preserving ATOM's existing async `generate()` / `generate_streaming()` surface and `(text, preempted)` return shape
+  - Added `request_abort_preempt()` handling, timeout-triggered preemption, and unload helpers that clear MLX cache so later runtime pressure or power policies can reclaim memory
+  - Preserved compatibility stubs for unused MiniLLM KV-cache methods so the replacement can be integrated incrementally
+**Test Result:**
+  - `python3 -m py_compile brain/mlx_llm.py` passed
+  - IDE lint check for `brain/mlx_llm.py` returned no diagnostics
+  - Focused smoke test passed with the fast local model:
+    - `MLXBrain(...).set_model_role("fast")`
+    - `preload()` returned `True`
+    - `generate_streaming("Say hello to Boss in one short sentence.")` returned a streamed response with `preempted=False`
+    - End-to-end wrapper smoke completed in ~3.4s on the local environment
+**Issues Found:**
+  - Importing the MLX/Hugging Face stack still emits the known LibreSSL / `urllib3` warning on this Python build, but it did not block load or generation
+  - The wrapper is not wired into `LocalBrainController` yet, so this step validates the MLX layer in isolation rather than the full ATOM response path
+**Notes for Next Step:**
+  - Step 3.4 should replace the `MiniLLM` import/instantiation in `cursor_bridge/local_brain_controller.py` with `MLXBrain`
+  - The wrapper already supports explicit `primary` vs `fast` roles; Step 3.4 can start with `primary` as the default and let Step 3.5 drive routing decisions
+  - `shutdown()` is unload-oriented and keeps the executor reusable; `close()` performs the final executor teardown if a hard close path is needed later
+
+### Step 3.4 — Wire LocalBrainController to MLX
+**Date:** 2026-04-11
+**Status:** DONE
+**Files Modified:**
+  - `cursor_bridge/local_brain_controller.py` — replaced `MiniLLM` usage with `MLXBrain`, updated lifecycle messaging, and used `close()` when available for final teardown
+**Files Created:** none
+**What Changed:**
+  - Swapped the controller's local-brain backend import from `brain.mini_llm.MiniLLM` to `brain.mlx_llm.MLXBrain`
+  - Kept the controller's existing async inference flow unchanged so the new MLX backend fits behind the same `generate_streaming()` / preempt / warm-up surface
+  - Updated warm-up and unavailable-response text to reference MLX model directories and `mlx` / `mlx_lm` instead of GGUF / llama-cpp
+  - Kept `unload_llm_for_power()` as an unload-only path while using `close()` for final teardown when the backend supports it
+**Test Result:**
+  - `python3 -m py_compile brain/mlx_llm.py cursor_bridge/local_brain_controller.py` passed
+  - IDE lint check for both edited files returned no diagnostics
+  - Focused controller smoke passed with lightweight stubs:
+    - `LocalBrainController(...).available` returned `True`
+    - `await warm_up()` completed successfully against the local MLX primary model
+    - `is_loaded` became `True`
+    - `unload_llm_for_power()` dropped `is_loaded` back to `False`
+**Issues Found:**
+  - The known LibreSSL / `urllib3` warning still appears when the MLX stack imports, but it did not block controller warm-up or unload
+  - Some non-controller diagnostics and helper scripts still mention GGUF / llama-cpp paths and wording; runtime controller wiring now uses MLX, but ancillary messaging cleanup is still pending
+**Notes for Next Step:**
+  - Step 3.5 should start routing queries onto `fast` vs `primary` model roles by pushing that decision into the Cognitive Kernel and then into the MLX backend
+  - The controller currently defaults to the wrapper's `primary` role; no query-aware model selection is wired yet
+  - Once routing exists, re-check whether startup should preload both roles or keep the fast model lazy-loaded until first use
+
+### Step 3.5 — Dual-Model Routing in Cognitive Kernel
+**Date:** 2026-04-11
+**Status:** DONE
+**Files Modified:**
+  - `core/cognitive_kernel.py` — extended `QueryPlan` with `model_role`, `runtime_mode`, and prompt-hint fields; quick/full/deep routes now map directly onto fast vs primary MLX roles
+  - `cursor_bridge/local_brain_controller.py` — consumes `query_plan` hints for MLX role selection, runtime-mode alignment, RAG gating, prompt guidance, and late-RAG retry continuity
+  - `cursor_bridge/structured_prompt_builder.py` — injects a routing hint into the prompt context layer so `DEEP` queries explicitly bias toward careful reasoning
+  - `core/llm_inference_queue.py` — preserves `query_plan` when the in-process queue coalesces and forwards work
+  - `core/boot/wiring.py` — forwards `query_plan` into the queue path and updates the local-brain unavailable messaging to MLX wording
+**Files Created:** none
+**What Changed:**
+  - Made the Cognitive Kernel the source of truth for model-role selection: `QUICK` now targets MLX role `fast`, while `FULL` and `DEEP` target MLX role `primary`
+  - Added `runtime_mode` hints to query plans so the controller's existing `FAST` / `SMART` / `DEEP` logic stays aligned with kernel routing instead of making an independent conflicting decision
+  - Added route-specific prompt guidance so fast-path prompts bias toward concise answers and deep-path prompts bias toward careful reasoning without redesigning the prompt-builder surface
+  - Taught `LocalBrainController` to honor `use_rag` / `use_memory` from the route plan, and to preserve the plan through late-RAG restart so deep queries do not silently fall back to default routing on retry
+  - Fixed the in-process LLM queue so `query_plan` survives queue submission; without this, queue-backed inference would have dropped the kernel's model-role decision before generation
+**Test Result:**
+  - `python3 -m py_compile core/cognitive_kernel.py cursor_bridge/local_brain_controller.py cursor_bridge/structured_prompt_builder.py core/boot/wiring.py core/llm_inference_queue.py` passed
+  - IDE lint check returned no diagnostics for all modified files
+  - Focused routing propagation smoke passed:
+    - Kernel classified a simple query as `quick` with `model_role=fast`, `runtime_mode=FAST`
+    - Kernel classified a medium-complexity query as `full` with `model_role=primary`, `runtime_mode=SMART`
+    - Kernel classified a long complex query as `deep` with `model_role=primary`, `runtime_mode=DEEP`, `thinking=True`
+    - Stubbed `LocalBrainController` consumed those plans and forwarded `fast` vs `primary` into `generate_streaming(...)`
+    - `LLMInferenceQueue` preserved `query_plan` and delivered it intact to `on_query(...)`
+**Issues Found:**
+  - The known LibreSSL / `urllib3` warning still appears on imports that touch the MLX/Hugging Face stack, but it did not block the routing smoke
+  - Initial Step 3.5 wiring still left router-side memory retrieval ahead of plan consumption, but that follow-up optimization was completed immediately afterward in Step 3.6
+**Notes for Next Step:**
+  - Step 3.6 should turn the kernel's path choice plus live system state into dynamic stage budgets instead of relying only on the current static per-path defaults
+  - Follow-up completed in Step 3.6: query planning now happens early enough in the router for quick-path queries to skip unnecessary semantic-memory retrieval
+  - Startup still only warms the default role; decide later whether Phase 3 should preload both MLX roles or keep the fast role lazy for better cold-start behavior
+
+### Step 3.6 — Latency Controller
+**Date:** 2026-04-11
+**Status:** DONE
+**Files Modified:**
+  - `core/cognitive_kernel.py` — applies dynamic latency decisions onto `QueryPlan` (`budget_ms`, `rag_budget_ms`, `reduce_context`, memory/history limits) and emits richer routing diagnostics
+  - `core/router/router.py` — plans before memory retrieval, serves direct/cache responses earlier, and skips semantic-memory work for quick plans that do not need it
+  - `cursor_bridge/local_brain_controller.py` — trims prompt memory/history from the plan, caps RAG budget from the plan, and keeps MLX role routing aligned with the new latency policy
+  - `core/runtime/__init__.py` — exports the latency controller for runtime modules
+**Files Created:**
+  - `core/runtime/latency_controller.py` — dynamic budget engine for total query budget, RAG budget, context trimming, and low-latency degradation
+**What Changed:**
+  - Added a dedicated `LatencyController` that converts path + system state into concrete limits: total budget, optional RAG budget, prompt context reduction, memory snippet cap, and history turn cap
+  - Integrated that controller into `CognitiveKernel` so every `QueryPlan` now carries not just the chosen path/model role, but also the latency envelope that path should run under right now
+  - Closed the outstanding router optimization gap from Step 3.5 by moving Cognitive Kernel planning ahead of semantic-memory retrieval in the fallback path
+  - Quick/direct/cache plans can now avoid unnecessary memory work earlier, while full/deep plans carry explicit context and RAG limits into `LocalBrainController`
+  - `LocalBrainController` now consumes those plan limits to trim prompt memory/history and to cap RAG retrieval time instead of relying only on static defaults
+**Test Result:**
+  - `python3 -m py_compile core/runtime/latency_controller.py core/runtime/__init__.py core/cognitive_kernel.py core/router/router.py cursor_bridge/local_brain_controller.py` passed
+  - IDE lint check returned no diagnostics for all modified files
+  - Focused smoke checks passed:
+    - Neutral-state plans now carry dynamic latency fields (`budget_ms`, `rag_budget_ms`, memory/history limits)
+    - Memory-pressure routing produced a degraded quick plan with `reduce_context=True` and `rag_budget_ms=0`
+    - Router quick-path fallback skipped semantic-memory retrieval entirely (`memory_calls=0`) while still forwarding the `query_plan`
+    - Stubbed `LocalBrainController` honored `history_turn_limit`, dropped memory context when `use_memory=False`, and still forwarded MLX role `fast`
+**Issues Found:**
+  - The known LibreSSL / `urllib3` warning still appears on imports that touch the MLX/Hugging Face stack, but it did not block latency-controller or router smoke checks
+  - Dynamic latency budgets currently shape router memory retrieval, prompt trimming, and RAG capping, but watchdog stage timeouts still remain the hard upper bound for actual execution
+**Notes for Next Step:**
+  - Step 3.7 should add the explicit MLX model path defaults and any latency-controller tuning overrides into `config/settings.json`
+  - After Step 3.7, benchmarking can compare whether the new quick-path memory skip and dynamic context trimming materially improve first-token latency on M5
+
+### Step 3.7 — Config Defaults for MLX + Apple Silicon
+**Date:** 2026-04-11
+**Status:** DONE
+**Files Modified:**
+  - `config/settings.json` — added explicit MLX model paths, latency-controller defaults, cognitive-kernel defaults, watchdog budgets, and Apple Silicon-friendly embedding config
+  - `core/config_schema.py` — added schema coverage for the new MLX/config sections and cleaned up adjacent schema drift so the checked-in settings validate cleanly
+**Files Created:** none
+**What Changed:**
+  - Added explicit `brain.mlx_primary_model`, `brain.mlx_fast_model`, and `brain.mlx_default_role` defaults so the MLX runtime no longer depends on implicit code fallbacks
+  - Added explicit `cognitive_kernel` and `latency_controller` sections to `config/settings.json` so the routing/budget heuristics introduced in Steps 3.5-3.6 are now visible, configurable defaults
+  - Added explicit watchdog stage budgets to `performance` and switched `embedding.device` from `cpu` to `auto` so Apple Silicon can use MPS when available instead of being pinned to CPU by config
+  - Added `rag.adaptive` defaults so the existing adaptive RAG-budget code has checked-in values instead of relying on internal fallbacks
+  - Expanded the config schema for MLX brain keys (`mlx_primary_model`, `mlx_fast_model`, `mlx_default_role`), existing brain tuning keys (`n_batch`, `top_p`, `repeat_penalty`, `n_gpu_layers=-1`), and the new top-level `cognitive_kernel` / `latency_controller` sections
+  - Fixed nearby schema drift for existing checked-in settings (`stt.bilingual`, cognitive dream/curiosity keys), which removed false validation errors unrelated to runtime behavior
+**Test Result:**
+  - `python3 -m py_compile core/config_schema.py` passed
+  - IDE lint check for `core/config_schema.py` returned no diagnostics
+  - Config validation passed cleanly:
+    - `validate_config(config/settings.json)` returned `0` errors
+**Issues Found:**
+  - None blocking for this step; the known LibreSSL / `urllib3` warning is unrelated to config/schema validation and did not affect the result
+**Notes for Next Step:**
+  - Step 3.8 should benchmark end-to-end MLX behavior now that model paths and tuning defaults are explicit and stable
+  - If benchmarking reveals first-token regressions, the new `latency_controller` and `cognitive_kernel` settings can be tuned without additional code changes
+
+### Step 3.8 — Benchmark MLX vs llama-cpp on M5
+**Date:** 2026-04-11
+**Status:** DONE
+**Files Modified:** none
+**Files Created:**
+  - `tools/mlx_vs_llamacpp_benchmark.py` — isolated-subprocess benchmark for preload time, RSS delta, first-token latency, and total generation time across MLX vs llama-cpp
+  - `models/Qwen3-4B-Q4_K_M.gguf` — downloaded GGUF baseline for same-family Qwen3-4B comparison (~2.33 GB)
+**What Changed:**
+  - Added a dedicated benchmark script that runs each backend in a fresh subprocess so load time and RSS are not polluted by the other backend
+  - Chose a same-family backend comparison target: MLX Qwen3-4B local model vs official Qwen3-4B `Q4_K_M` GGUF baseline
+  - Downloaded the GGUF baseline into the workspace and ran the benchmark with two measured runs per scenario after warm-up
+  - Verified that MLX loads and serves the target Qwen3-4B model locally on this M5 environment
+  - Verified that the current llama-cpp baseline in this environment fails before inference: it sees the file but cannot load the target Qwen3-4B GGUF at all
+**Test Result:**
+  - `python3 -m py_compile tools/mlx_vs_llamacpp_benchmark.py` passed
+  - IDE lint check for `tools/mlx_vs_llamacpp_benchmark.py` returned no diagnostics
+  - Benchmark run completed:
+    - `python3 tools/mlx_vs_llamacpp_benchmark.py --runs 2 --json`
+  - MLX (`models/qwen3-4b-mlx`) results:
+    - preload: `607.75ms`
+    - RSS delta after preload: `+2318.3 MB`
+    - `quick_summary`: avg first token `439.9ms`, avg total `4200.64ms`
+    - `technical_reasoning`: avg first token `430.69ms`, avg total `4092.4ms`
+  - llama-cpp baseline (`models/Qwen3-4B-Q4_K_M.gguf`) result:
+    - matching GGUF file downloaded successfully (~`2.33 GB`)
+    - current `llama-cpp-python 0.3.2` backend reported `ok=false` because preload failed before any generation run
+**Issues Found:**
+  - The direct backend speed comparison is blocked in the current environment because `llama-cpp-python 0.3.2` cannot load `Qwen3-4B-Q4_K_M.gguf`, even though the file exists and MLX runs the corresponding Qwen3-4B model correctly
+  - Because the baseline backend never reached inference, there is no valid first-token or total-latency speedup ratio to report yet
+**Notes for Next Step:**
+  - Phase 4 can proceed; the important Phase 3 takeaway is that MLX is not just configured, but actually running the target Qwen3-4B model locally on M5
+  - If a future session needs a true apples-to-apples throughput comparison, the likely next move is upgrading/rebuilding the llama-cpp baseline to a version that can load Qwen3 GGUF, or benchmarking a different supported GGUF family separately
+  - The new benchmark script is reusable for reruns once the llama-cpp baseline compatibility issue is resolved
+
+### Step 4.2 — Prediction Preload
+**Date:** 2026-04-11
+**Status:** DONE
+**Files Modified:**
+  - `core/cognitive/prediction_engine.py` — added target extraction, live `llm_query` learning, high-confidence resource preloading, cooldowns, and conservative degraded-mode gating
+  - `cursor_bridge/structured_prompt_builder.py` — added lightweight prompt precompile support and a small query-hint cache so predicted LLM work can warm prompt resources without building a full prompt
+  - `main.py` — attached the prediction engine to the prompt builder, shared RAG prefetch engine, and cognitive kernel so predictions can warm real downstream resources
+  - `core/config_schema.py` — added schema for prediction preload tuning knobs
+  - `config/settings.json` — enabled conservative defaults for preload confidence, item cap, cooldown, and timeout
+**Files Created:**
+  - `tests/test_prediction_preload.py` — focused regression coverage for multi-resource warming, cooldown behavior, degraded-mode skipping, and live `llm_query` learning
+**What Changed:**
+  - Prediction cycles now do more than publish guesses: high-confidence predictions can warm lightweight app-resolution metadata, schedule RAG prefetch for likely knowledge queries, and precompile prompt-builder layers for likely LLM work
+  - The preload path is intentionally MacBook-safe: it is capped by confidence, limited to a small number of items per cycle, guarded by cooldowns, and skips heavier RAG work when the routed plan is already degraded or context-reduced
+  - Added live `cursor_query` tracking so the prediction engine can learn recurring `llm_query` patterns, not just direct intent-engine actions
+  - Kept the design aligned with the new cognitive-budget layer from Step 4.1 by routing predicted queries through the cognitive kernel before deciding what to warm
+**Test Result:**
+  - `python3 -m py_compile core/cognitive/prediction_engine.py cursor_bridge/structured_prompt_builder.py core/config_schema.py main.py tests/test_prediction_preload.py` passed
+  - `python3 -m tests.test_prediction_preload` passed:
+    - prompt, RAG, and app warm-up all triggered for the right high-confidence predictions
+    - preload cooldown prevented repeated warming of the same prediction
+    - degraded plans skipped heavier prefetch work while still allowing cheap prompt warming
+    - live `llm_query` traffic became predictable
+  - `python3 -m tests.test_cognitive_kernel` passed
+  - `python3 -m tests.test_state_machine` passed
+  - IDE lint check returned no diagnostics for all edited files
+**Issues Found:**
+  - The app preload path intentionally warms app-resolution metadata rather than launching apps in the background; that keeps the feature useful on macOS without paying a RAM/CPU penalty from speculative app startups
+**Notes for Next Step:**
+  - Step 4.3 can now reuse the prediction preload path once smarter RAG scoring exists; better retrieval ranking will directly improve the value of prefetch hits
+  - If future profiling shows prediction preload waste is too high, the next tuning lever is tightening `prediction_preload_min_confidence` or lowering `prediction_preload_max_items`, not adding heavier preload types
+
+### Step 4.1 — Cognitive Budget System
+**Date:** 2026-04-11
+**Status:** DONE
+**Files Modified:**
+  - `core/cognitive_kernel.py` — added concrete cognitive budget tiers, requested-vs-applied budget tracking, tier-aware routing, and richer route observability/diagnostics
+  - `core/runtime/latency_controller.py` — added base-budget overrides so tier budgets now drive the final dynamic latency decision instead of only the execution path defaults
+  - `cursor_bridge/local_brain_controller.py` — expanded query-plan logging to surface the new budget-tier metadata during local-brain execution
+**Files Created:**
+  - `tests/test_cognitive_kernel.py` — focused regression coverage for command/info/simple/complex/creative routing and laptop-safe degradation on low battery
+**What Changed:**
+  - Added concrete budget tiers for `command`, `info`, `simple`, `complex`, and `creative` work, instead of routing only by raw path names like `quick`/`full`/`deep`
+  - The kernel now records both the query's requested tier and the actually applied tier, so ATOM can preserve intent while still degrading execution safely when the machine is under battery, thermal, or memory pressure
+  - Latency budgeting now honors the tier's base budget (`100ms`, `500ms`, `1500ms`, `5000ms`, `10000ms`) before applying dynamic scaling, which keeps route timing aligned with the evolution plan
+  - Added budget-tier observability to the `cognitive_route` event and diagnostics, making it easier to see when ATOM chose to protect the laptop by downshifting a demanding query into a cheaper execution tier
+**Test Result:**
+  - `python3 -m py_compile core/cognitive_kernel.py core/runtime/latency_controller.py cursor_bridge/local_brain_controller.py tests/test_cognitive_kernel.py` passed
+  - `python3 -m tests.test_cognitive_kernel` passed:
+    - command/info fast paths received the expected concrete budgets
+    - simple/complex/creative queries mapped to the intended execution paths
+    - low-battery creative work degraded to a laptop-safe quick/simple budget
+  - `python3 -m tests.test_local_brain_streaming` passed
+  - `python3 -m tests.test_voice_interrupt` passed
+  - `python3 -m tests.test_state_machine` passed
+  - IDE lint check returned no diagnostics for all edited files
+**Issues Found:**
+  - None blocking. For direct no-LLM fast paths, the new budget metadata is exposed for observability even though the router still returns immediately instead of doing extra memory enrichment work, which keeps the fast path cheap on MacBook hardware
+**Notes for Next Step:**
+  - Phase 4.2 can now build on this budget layer: high-confidence predictions should preload only the resources justified by the current tier, instead of warming everything equally
+  - The new requested-vs-applied budget fields are also a good hook for future dashboard or telemetry displays if deeper observability is needed
+
+### Step 3.11 — Native macOS Streaming TTS
+**Date:** 2026-04-11
+**Status:** DONE
+**Files Modified:**
+  - `voice/tts_macos.py` — replaced end-of-response buffering with incremental streamed chunk playback, preserved the spoken-word cap, and added stale-stream guarding for interrupted responses
+  - `cursor_bridge/local_brain_controller.py` — tagged each streamed `partial_response` turn with a lightweight `stream_id` so downstream consumers can reject stale chunks after preemption
+  - `core/boot/wiring.py` — made dashboard stream aggregation aware of `stream_id` so stale interrupted chunks do not leak into the visible streaming transcript
+  - `tests/test_local_brain_streaming.py` — extended the focused local-brain streaming regression to assert `stream_id` propagation
+**Files Created:**
+  - `tests/test_tts_macos_streaming.py` — focused regression coverage for first-chunk playback and stale-stream suppression on the native macOS TTS path
+**What Changed:**
+  - Converted the native macOS `partial_response` path into a true incremental stream: ATOM now starts speaking on the first streamed sentence chunk instead of buffering the whole answer and only speaking when the final chunk arrives
+  - Kept the implementation MacBook-friendly by using the existing event-driven TTS path rather than adding a continuous VAD/inference loop; there is no new always-on background model load from this step
+  - Added per-response `stream_id` propagation so when a user interrupts ATOM and a new answer starts, stale chunks from the older interrupted stream are ignored cleanly by both TTS and the UI transcript
+  - Preserved the existing audio budget behavior: ATOM still caps spoken output to the first ~45 words and sends the remainder to screen-only display instead of over-talking
+**Test Result:**
+  - `python3 -m py_compile voice/tts_macos.py cursor_bridge/local_brain_controller.py core/boot/wiring.py tests/test_local_brain_streaming.py tests/test_tts_macos_streaming.py` passed
+  - `python3 -m tests.test_tts_macos_streaming` passed:
+    - macOS TTS started speaking on the first streamed chunk before the last chunk arrived
+    - stale chunks from an older interrupted stream were ignored
+  - `python3 -m tests.test_local_brain_streaming` passed
+  - `python3 -m tests.test_voice_interrupt` passed
+  - `python3 -m tests.test_state_machine` passed
+  - IDE lint check returned no diagnostics for all edited files
+**Issues Found:**
+  - This step optimizes the native macOS TTS path used on the MacBook. The distributed/proxy TTS path still handles chunks more simply and was not expanded here because the goal was the lowest-overhead local path
+**Notes for Next Step:**
+  - Phase 4 can proceed; this step improves perceived responsiveness without increasing steady-state laptop load
+  - If future tuning is needed, the next low-overhead refinement is better chunk boundary shaping or faster first-ack timing, not a continuous VAD loop
+
+### Step 3.10 — Voice Interrupt System
+**Date:** 2026-04-11
+**Status:** DONE
+**Files Modified:**
+  - `core/boot/wiring.py` — inserted voice-interrupt coordination ahead of `router.on_speech`, routed `resume_listening` through the new coordinator, and replaced direct TTS `speech_partial` handling with centralized interrupt logic
+  - `core/ipc/interrupt_manager.py` — made the global interrupt manager safe for both in-process `AsyncEventBus` and distributed ZMQ buses, and switched broadcasts to the fast emit path when available
+  - `core/async_event_bus.py` — raised `resume_listening`, `user_interrupt`, and `INTERRUPT_ALL` to high-priority events so barge-in work is dispatched ahead of normal background traffic
+  - `services/tts_worker.py` — awaited async TTS `stop()` during distributed interrupt handling instead of dropping the coroutine
+**Files Created:**
+  - `voice/interrupt_handler.py` — new voice interrupt coordinator for STT partial/final detection, TTS stop, brain preemption, and clean state handoff back to `LISTENING`
+  - `tests/test_voice_interrupt.py` — focused regression coverage for speaking/thinking interrupts, partial-status heuristics, and `resume_listening` emission
+**What Changed:**
+  - Added a dedicated `VoiceInterruptHandler` so barge-in is no longer just "stop TTS if `speech_partial` happens"; it now coordinates global interrupt broadcast, local-brain preemption, TTS stop, and legal state transition back to `LISTENING`
+  - Fixed the stale-state failure mode where ATOM could keep processing a new utterance while still technically in `SPEAKING`, which blocked legal `THINKING` transitions and could cause follow-up TTS output to be ignored
+  - Moved interrupt preparation ahead of `router.on_speech(...)` for `speech_final`, so even if early partial detection does not fire, the final recognized utterance still forces a clean interrupt before the new turn is routed
+  - Added a lightweight partial-text heuristic that ignores STT arming status (`Listening...`) but treats `Processing...` or real partial transcript text as a barge-in signal, avoiding the old self-cutoff risk
+**Test Result:**
+  - `python3 -m py_compile core/boot/wiring.py core/async_event_bus.py core/ipc/interrupt_manager.py voice/interrupt_handler.py services/tts_worker.py tests/test_voice_interrupt.py` passed
+  - `python3 -m tests.test_voice_interrupt` passed:
+    - speaking interrupt stopped TTS, preempted the brain, and returned to `LISTENING`
+    - plain `Listening...` status did not trigger a false interrupt
+    - `Processing...` emitted `resume_listening` through the voice-interrupt path
+    - new user speech cleanly preempted `THINKING` before routing
+  - `python3 -m tests.test_state_machine` passed, including the existing barge-in lifecycle checks
+  - IDE lint check returned no diagnostics for all edited files
+**Issues Found:**
+  - The current faster-whisper path still does not expose a separate low-level VAD signal, so in that path the interrupt fires when STT reaches `Processing...` (captured audio) or `speech_final`, not at the very first phoneme like a dedicated VAD loop would
+**Notes for Next Step:**
+  - The natural continuation is the streaming-response step: once interruption is reliable, streamed sentence chunks into TTS will make ATOM feel much more immediate
+  - If future profiling shows barge-in still feels late on the faster-whisper path, the next refinement is adding a true low-level voice-activity detector instead of relying on STT partial/final milestones
+
+### Step 3.9 — Cold Start Optimization
+**Date:** 2026-04-11
+**Status:** DONE
+**Files Modified:**
+  - `main.py` — replaced the old one-off local-brain warm-up block with a boot-time cold-start optimizer, restored last known context after wiring, and persisted a next-boot snapshot on shutdown
+  - `cursor_bridge/local_brain_controller.py` — extended MLX warm-up to accept explicit model-role targets so startup can preload the fast role instead of only the default role
+  - `core/memory_engine.py` — added public helpers for eager embedding-model warm-up and hot-command lookup from successful interaction history
+**Files Created:**
+  - `core/boot/cold_start.py` — new cold-start orchestrator for fast-role preload, embedding warm-up, session restore, hot command-cache seeding, and lightweight system-context replay
+  - `tests/test_cold_start.py` — focused regression coverage for restore/cache/preload behavior and persisted snapshot writing
+**What Changed:**
+  - Added a dedicated `ColdStartOptimizer` that runs during boot and preloads the fast MLX role, eagerly warms the embedding model, restores a short slice of recent conversation history, and seeds the command cache from real successful commands
+  - Kept the implementation aligned with the existing architecture instead of inventing new stores: startup now reuses `ConversationMemory`, `MemoryEngine` interaction history, the existing command cache singleton, and `PersistenceManager`
+  - Added a lightweight boot snapshot (`logs/cold_start_snapshot.json`) so shutdown persists recent conversation pairs plus last known system context, and the next boot can replay that context before the first periodic health poll lands
+  - Closed the known startup gap noted after earlier Phase 3 work: boot no longer only warms the default MLX role, and simple first-query traffic now has the fast role available immediately when cold-start warm-up succeeds
+**Test Result:**
+  - `python3 -m py_compile main.py core/boot/cold_start.py core/memory_engine.py cursor_bridge/local_brain_controller.py tests/test_cold_start.py` passed
+  - `python3 -m tests.test_cold_start` passed:
+    - session restore repopulated `ConversationMemory`
+    - top commands seeded the shared command cache, including `info:*` reuse keys
+    - fast-role warm-up targeted `model_role="fast"`
+    - shutdown snapshot persistence wrote the expected conversation/system payload
+  - IDE lint check returned no diagnostics for all edited files
+**Issues Found:**
+  - The focused test environment cannot import the full intent package because `psutil` is missing there, so the new cold-start test uses a tiny local intent-result stub instead of importing the live package tree
+**Notes for Next Step:**
+  - Phase 4 can still proceed; this step mainly closes the startup-latency gap left behind after MLX routing/latency work
+  - If first-response profiling later shows the primary path is still too cold for your workload, the next tuning decision is whether to preload both MLX roles at boot or continue warming only the fast role
+
+### Step 2.5 — Integration Test (Abbreviated by User Request)
+**Date:** 2026-04-11
+**Status:** DONE
+**Files Modified:** none
+**Files Created:** none
+**What Changed:**
+  - Replaced the planned 30-minute soak with a lightweight validation pass per user direction
+  - Ran `scripts/v7_stress_test.py --n 1000` to pressure the priority scheduler
+  - Ran `scripts/v7_chaos_test.py` to validate RecoveryManager replay and worker-crash handling
+  - Ran a live `main.py` runtime monitor and sampled resident memory while watching for full-process crash / leak behavior
+**Test Result:**
+  - `scripts/v7_stress_test.py --n 1000` passed: `completed=1000`, `jobs_dropped=0`, queue drained successfully
+  - `scripts/v7_chaos_test.py` passed: ring replay worked and worker-crash handling executed cleanly
+  - Abbreviated live runtime stayed up for ~6.5 minutes until manually stopped after the user shortened the testing scope
+  - No full-process crash observed
+  - Sampled tree RSS stayed effectively flat: ~118.1 MB at 10s, ~104.5 MB at 251s, ~105.4 MB at 372s
+  - No obvious memory leak signal in the abbreviated sample window
+**Issues Found:**
+  - `voice/stt_async.py`: missing `speech_recognition` dependency triggers repeated STT failures / backoff
+  - `core/macos/fs_watcher.py`: `emit()` argument collision (`multiple values for argument 'event'`)
+  - `core/cognitive/proactive_engine.py`: `_on_system_light_scan()` references missing `_last_scan`
+  - TTS runtime is degraded in this environment (`pygame` / mixer / Edge TTS init warnings), but the process stayed alive and fell back without crashing
+**Notes for Next Step:**
+  - Full 30-minute soak was intentionally skipped per user request; this step should be treated as abbreviated validation, not final hardening
+  - The important Phase 2 signal is that ATOM stayed alive despite repeated component failures, and RSS did not trend upward in the short run
+  - The runtime defects found here are good cleanup candidates, but they are not blockers for starting Phase 3
+
+### Step 2.4 — Memory Pressure Protection
+**Date:** 2026-04-11
+**Status:** DONE
+**Files Modified:**
+  - `core/memory_engine.py` — added pressure-mode hooks, vector-result cap, and keyword-only degradation when unified memory is high
+  - `core/rag/rag_engine.py` — capped RAG snippets, added low-memory mode, and clears/embed-unloads on pressure transitions
+  - `core/rag/rag_cache.py` — added cache clear helpers so RAG can shed retrieval/embed caches under pressure
+  - `brain/memory_graph.py` — added hard node cap with pruning, semantic-result cap, pressure-mode query reduction, and vector cleanup for pruned nodes
+  - `cursor_bridge/local_brain_controller.py` — forwards memory pressure updates to the attached RAG engine and MemoryGraph
+  - `main.py` — wires periodic `silicon_stats_update` handling to MemoryEngine, LocalBrainController, and embedding unload signaling
+  - `core/silicon_governor.py` — aligned default memory warning threshold to 85% unified-memory usage
+  - `core/config_schema.py` — added config schema keys for memory/RAG pressure thresholds and caps
+  - `config/settings.json` — set explicit M5-friendly defaults: vector result cap, graph node cap, RAG snippet cap, and 85% pressure threshold
+**Files Created:** none
+**What Changed:**
+  - **Vector result protection:** Semantic memory retrieval now clamps vector fan-out to 5 results max and falls back to keyword-only retrieval when memory pressure mode is active.
+  - **RAG snippet protection:** RAG now defaults to 3 snippets max, then degrades to a smaller snippet budget during pressure mode so prompt context does not balloon while unified memory is tight.
+  - **MemoryGraph growth cap:** Graph writes now enforce a hard node ceiling (default 1000). Low-value / old episodic nodes are pruned first, and their vector entries are removed too.
+  - **Periodic memory check:** Instead of adding a second poller, ATOM now uses the existing periodic `silicon_stats_update` telemetry stream from `SiliconGovernor` to push live memory percentages into the memory-heavy modules.
+  - **Embedding shedding:** On pressure entry, semantic-heavy modules clear caches and shut down the shared embedding engine so it can be reloaded later instead of staying resident during high-memory periods.
+  - **Pressure recovery:** When memory usage drops below the relief threshold, normal retrieval limits are restored automatically.
+**Test Result:**
+  - `python3 -m py_compile` passed for all changed files: memory engine, RAG engine/cache, MemoryGraph, local brain, main, config schema, silicon governor
+  - Focused smoke test passed:
+    - MemoryGraph prunes to configured node cap
+    - MemoryGraph pressure mode reduces query result count
+    - MemoryEngine enters/exits pressure mode with reduced retrieval budget
+    - RAG enters/exits pressure mode with reduced snippet budget
+  - Zero lint errors across all modified files
+**Issues Found:**
+  - The local embedding model did not have a pre-existing bus-driven unload path for in-process memory pressure, so the pressure hooks now call embedding shutdown directly and also emit the inference-guard unload signal for coordination
+  - `MemoryGraph` originally had no built-in node cap, so pruning policy had to be introduced in this step (episodic / low-importance / low-access nodes pruned first)
+**Notes for Next Step:**
+  - Step 2.5 should run the full 30-minute integration test and specifically watch unified-memory behavior around repeated RAG + LLM + TTS usage
+  - Pressure handling now depends on `SiliconGovernor` telemetry being enabled, which it is in the current config
+  - If long-run testing still shows memory creep, the next likely hotspots are document ingestion/vector persistence growth and prompt-history accumulation rather than hot-path retrieval fan-out
+
+### Step 2.3 — RuntimeWatchdog Upgrade (Per-Module Execution Budgets)
+**Date:** 2026-04-11
+**Status:** DONE
+**Files Modified:**
+  - `core/runtime_watchdog.py` — upgraded from state-dwell watchdog to active budget enforcer with intent/cache/RAG/LLM/TTS/tool budgets, async helpers, and TTS timeout supervision
+  - `core/router/router.py` — wired RuntimeWatchdog into intent classification and LLM cache lookup so timeouts force fallback/skip behavior instead of hanging the turn
+  - `cursor_bridge/local_brain_controller.py` — capped RAG budget via watchdog, wrapped LLM streaming with 30s timeout handling, and moved tool execution onto async path for watchdog enforcement
+  - `core/reasoning/action_executor.py` — added `execute_async()` so tool calls can use Router’s async dispatch path and participate in watchdog timeouts
+  - `main.py` — attaches RuntimeWatchdog to Router and LocalBrainController at startup
+  - `core/config_schema.py` — added explicit config keys for intent/cache/RAG/LLM/TTS/tool watchdog budgets
+**Files Created:** none
+**What Changed:**
+  - **Active watchdog helpers:** `RuntimeWatchdog` now exposes `run_sync()` and `run_async()` wrappers that apply per-stage budgets and return structured timeout metadata instead of just logging after the fact.
+  - **Intent/cache budgets:** Router intent classification is now budgeted at 50ms and cache lookup at 100ms. Timeout behavior degrades cleanly: forced `fallback` intent or skip-cache path.
+  - **RAG cap:** Local brain now clamps adaptive RAG time budgets to the watchdog ceiling (500ms max), preserving the existing late-result flow while preventing runaway retrieval budgets.
+  - **LLM timeout recovery:** Local brain streaming generation is wrapped in a 30s watchdog budget. On timeout, the watchdog emits `llm_error`, requests preemption, unloads the local model for reset, and triggers the normal recovery burst.
+  - **TTS timeout supervision:** Watchdog now listens for `response_ready` / `partial_response` and `tts_complete` to detect TTS synthesis stalls. If speech exceeds budget (15s default), it skips audio and returns to listening.
+  - **Tool execution path:** ReAct tool calls now use `ActionExecutor.execute_async()` so watchdog budgets can wrap tool execution without pushing router/bus work onto unsafe background threads.
+  - **Startup recovery fix:** Smoke testing exposed that the old cooldown initialization could suppress the first recovery burst right after startup because `time.monotonic()` starts near zero in this environment. `_last_recovery` now initializes relative to the current monotonic clock so early watchdog recoveries still fire.
+**Test Result:**
+  - `python3 -m py_compile` passed for all changed files: watchdog, router, local brain, action executor, main, config schema
+  - Watchdog smoke test passed:
+    - sync budget timeout (`intent_engine`) returns fallback
+    - async budget timeout (`llm_inference`) returns timeout default
+    - watchdog emits `llm_error` + `watchdog_recoveries` on LLM timeout
+  - Zero lint errors across all modified files
+**Issues Found:**
+  - The original cooldown logic in `RuntimeWatchdog` could suppress the first recovery burst during early process startup on this Python build; fixed during this step
+  - Tool timeout enforcement is strongest on async/slow-dispatch paths. If future inline router actions prove capable of blocking unexpectedly, they may need deeper async refactoring for fully preemptive budgets
+**Notes for Next Step:**
+  - Step 2.4 should now add memory pressure protection around vector results, RAG snippet counts, and memory graph growth
+  - The new watchdog config knobs live under `performance.*` and default to the M5 evolution-plan budgets
+  - RAG already has an adaptive early-return path; memory protection should complement it rather than duplicate timeout logic
+
+### Step 2.2 — Error Isolation Wrappers (Critical Runtime Boundaries)
+**Date:** 2026-04-11
+**Status:** DONE
+**Files Modified:**
+  - `core/router/router.py` — added a top-level router error boundary around `on_speech()` with timeline logging, metrics increment, fallback response, and state recovery hook
+  - `cursor_bridge/local_brain_controller.py` — split `on_query()` into wrapper + `_on_query_impl()` so all unhandled LLM/ReAct failures are isolated and converted into `llm_error` + user-safe fallback
+  - `core/reasoning/action_executor.py` — wrapped the full `execute()` pipeline so registry/security/validation failures return `ActionResult` instead of escaping
+  - `core/boot/wiring.py` — added `_guard_handler()` for critical event registrations and fixed `shutdown_event` plumbing by passing it explicitly from `main.py`
+  - `voice/stt_async.py` — added outer runtime guards around `start_listening()`, `on_state_changed()`, and `shutdown()`
+  - `voice/tts_edge.py` — added outer runtime guards around `speak()`, `on_response()`, `on_partial_response()`, and `shutdown()`
+  - `main.py` — passes `shutdown_event` into `wire_events()`
+**Files Created:** none
+**What Changed:**
+  - **Router boundary:** If routing explodes at the top level, ATOM now logs the fault, increments error metrics, records an error event to the timeline, tells Boss something went wrong, and triggers state recovery instead of dropping the task.
+  - **Local brain boundary:** Any failure in prompt build, ReAct loop, RAG, tool execution, or streaming now gets caught by the `on_query()` wrapper. ATOM emits `llm_error` and responds with a safe fallback instead of letting the query task die.
+  - **Action executor boundary:** Tool execution was already protected at dispatch time, but registry / validation / security-path failures could still leak. The outer wrapper now collapses those into structured `ActionResult` failures.
+  - **Guarded event wiring:** Critical bus registrations now go through `_guard_handler()` so component handler failures are consistently logged and counted at the wiring boundary.
+  - **STT isolation:** Mic/listen state transitions and listen loop startup failures now back off and emit a recovery timeout instead of crashing the speech pipeline task.
+  - **TTS isolation:** Response playback and streaming entry points now fall back to on-screen text and emit `tts_complete` when needed so ATOM does not get stuck in `SPEAKING`.
+  - **Wiring bug fix:** `core/boot/wiring.py` referenced `shutdown_event` without owning it. The event is now explicitly passed from `main.py`, removing a hidden runtime failure path in the extracted wiring layer.
+**Test Result:**
+  - `python -m py_compile` passed for all changed files: router, local brain, action executor, wiring, STT, Edge TTS, main
+  - Forced-failure smoke tests passed:
+    - Router top-level failure → caught, logged, no crash
+    - Local brain top-level failure → caught, logged, no crash
+    - ActionExecutor internal failure → returns failed `ActionResult`, no exception escape
+    - STT top-level failure → caught, error counter increments, no crash
+    - Edge TTS top-level failure → caught, fallback path used, no crash
+  - Zero lint errors across all modified files
+**Issues Found:**
+  - AsyncEventBus already isolates handler exceptions, so `wiring.py` wrappers focus on critical entry points rather than every single event registration
+  - STT smoke test used a forced missing attribute (`_executor`) on a manually constructed object to validate the outer boundary; the important result is that the wrapper contained the failure
+**Notes for Next Step:**
+  - Step 2.3 should add per-module execution budgets to `core/runtime_watchdog.py`
+  - The new error boundaries reduce crash risk, but timeout enforcement still needs the watchdog step to turn hangs into recoveries
+  - `core/boot/wiring.py` now depends on `shutdown_event` being passed explicitly; `main.py` already does this
+
+---
+
+### Step 2.1 — Create core/cognitive_kernel.py (Cognitive Kernel)
+**Date:** 2026-04-11
+**Status:** DONE
+**Files Created:**
+  - `core/cognitive_kernel.py` (~310 lines) — Central brain coordinator. 5 execution paths: DIRECT (intent/quick-reply, sub-5ms), CACHE (cached LLM response, sub-10ms), QUICK (fast 1.7B model, 80-150ms), FULL (4B model thinking OFF, 300-600ms), DEEP (4B model thinking ON + RAG, 800-2000ms).
+**Files Modified:**
+  - `main.py` — Imports CognitiveKernel + ExecPath. Creates cognitive_kernel with full dependency wiring (config, bus, intent_engine, cache, metrics, inference_guard, silicon_governor, state_manager). Calls `router.attach_cognitive_kernel()`.
+  - `core/router/router.py` — Added `_cognitive_kernel` slot. Added `attach_cognitive_kernel()` method. LLM fallback path (`_handle_llm_fallback`) now calls `cognitive_kernel.route()` and passes `query_plan` in the `cursor_query` event payload.
+**What Changed:**
+  - **QueryPlan dataclass:** Describes how to process a query — path, model, RAG/memory flags, thinking toggle, latency budget, pre-resolved responses.
+  - **5 execution paths:** DIRECT (skip LLM entirely), CACHE (cached response), QUICK (fast brain), FULL (primary brain), DEEP (primary brain + thinking + RAG). Each has a calibrated latency budget.
+  - **System-aware routing:** Reads SiliconGovernor for thermal pressure, memory usage, battery state. Degrades to QUICK path on low battery (<20%), thermal throttling, or high memory pressure (>85%).
+  - **Circuit breakers:** Per-module failure tracking (intent, cache, llm_quick, llm_full, rag). After 3 failures → circuit opens for 30s → module bypassed. Auto-recovers on success.
+  - **LLM model selection:** Routes simple queries to Qwen3-1.7B (quick_model), complex queries to Qwen3-4B (full_model). Thinking mode ON only for DEEP path.
+  - **Metrics integration:** Records routing latency via MetricsCollector. Emits `cognitive_route` bus event with path, model, reason, timing.
+  - **Diagnostics API:** `get_diagnostics()` returns total routed, path distribution percentages, LLM skip rate, circuit breaker states.
+  - **User overrides:** FAST → QUICK path, DEEP → DEEP path with full RAG + thinking, SMART → FULL path.
+  - **Router integration:** Router's LLM fallback path now gets a QueryPlan attached to the `cursor_query` event. Future phases will use this to select which model to invoke.
+**Test Result:**
+  - All imports clean (95ms)
+  - 5 execution paths verified: DIRECT, CACHE, QUICK, FULL, DEEP
+  - Intent-matched commands (open chrome, what time, play music) → DIRECT path (skip LLM)
+  - Greetings (hello boss, hi) → DIRECT path via quick_reply
+  - Simple queries (set volume to 50) → QUICK path (fast model)
+  - Complex queries (explain quantum computing) → FULL path (primary model + RAG)
+  - Very long recall queries (>120 chars, complex) → DEEP path with thinking ON
+  - Cache path: cached queries served from cache
+  - Circuit breaker: opens after 3 failures, bypasses module for 30s
+  - LLM skip rate: 80% on test set (4/5 common queries skip LLM entirely)
+  - Full integration test with IntentEngine + CacheEngine: all paths correct
+  - Zero lint errors
+**Issues Found:**
+  - Python 3.9 doesn't support `@dataclass(slots=True)` — removed, using regular `@dataclass`
+  - Router integration is lightweight (passes QueryPlan as metadata in cursor_query event). Full model-selection integration requires Phase 3 (MLX dual-model loader).
+**Notes for Next Step:**
+  - Step 2.2 adds error isolation wrappers to 6 critical files
+  - When Phase 3 (MLX) is done, the `cursor_query` handler in LocalBrainController should read `query_plan.model` to select Qwen3-1.7B vs Qwen3-4B
+  - The `query_plan.thinking` flag maps to Qwen3-4B's thinking mode toggle
+  - The `query_plan.use_rag` and `query_plan.use_memory` flags should gate RAG/memory retrieval
+
+---
 
 ### Native macOS Stack — Apple Framework Integration (pyobjc)
 **Date:** 2026-04-09
@@ -893,6 +1454,62 @@ NEXT_ACTION   = Execute Step 2.1 — Create core/cognitive_kernel.py (central br
 | 2026-04-09 | Native | MODIFIED | `core/embedding_engine.py` | MPS (Apple Silicon GPU) device auto-detection |
 | 2026-04-09 | Native | MODIFIED | `main.py` | Wired FSWatcher, updated screen_reader log |
 | 2026-04-09 | Native | MODIFIED | `requirements.txt` | v19: 8 pyobjc packages, 7 third-party voice deps → optional |
+| 2026-04-11 | 2.1 | CREATED | `core/cognitive_kernel.py` | Central brain coordinator: 5 paths, circuit breakers, system-aware routing (~310L) |
+| 2026-04-11 | 2.1 | MODIFIED | `main.py` | CognitiveKernel init + wiring to Router |
+| 2026-04-11 | 2.1 | MODIFIED | `core/router/router.py` | attach_cognitive_kernel + query_plan in cursor_query event |
+| 2026-04-11 | 2.2 | MODIFIED | `core/router/router.py` | Added top-level router error boundary + recovery hook |
+| 2026-04-11 | 2.2 | MODIFIED | `cursor_bridge/local_brain_controller.py` | Wrapped on_query with outer LLM failure boundary |
+| 2026-04-11 | 2.2 | MODIFIED | `core/reasoning/action_executor.py` | Full execute() isolation, no registry/security failure escapes |
+| 2026-04-11 | 2.2 | MODIFIED | `core/boot/wiring.py` | Guarded critical event handlers + explicit shutdown_event parameter |
+| 2026-04-11 | 2.2 | MODIFIED | `voice/stt_async.py` | Error isolation for start_listening/on_state_changed/shutdown |
+| 2026-04-11 | 2.2 | MODIFIED | `voice/tts_edge.py` | Error isolation for speak/on_response/on_partial_response/shutdown |
+| 2026-04-11 | 2.2 | MODIFIED | `main.py` | Pass shutdown_event into wire_events |
+| 2026-04-11 | 2.3 | MODIFIED | `core/runtime_watchdog.py` | Active per-module budgets, async helpers, TTS timeout supervision, startup cooldown fix |
+| 2026-04-11 | 2.3 | MODIFIED | `core/router/router.py` | RuntimeWatchdog budgets for intent classification + cache lookup |
+| 2026-04-11 | 2.3 | MODIFIED | `cursor_bridge/local_brain_controller.py` | RuntimeWatchdog wired into RAG cap, LLM streaming timeout, async tool execution |
+| 2026-04-11 | 2.3 | MODIFIED | `core/reasoning/action_executor.py` | Added `execute_async()` for watchdog-compatible tool execution |
+| 2026-04-11 | 2.3 | MODIFIED | `main.py` | Attached RuntimeWatchdog to Router + LocalBrainController |
+| 2026-04-11 | 2.3 | MODIFIED | `core/config_schema.py` | Added config schema entries for watchdog stage budgets |
+| 2026-04-11 | 2.4 | MODIFIED | `core/memory_engine.py` | Vector-result cap + pressure-mode keyword-only retrieval |
+| 2026-04-11 | 2.4 | MODIFIED | `core/rag/rag_engine.py` | RAG snippet cap + low-memory mode + embed/cache shedding |
+| 2026-04-11 | 2.4 | MODIFIED | `core/rag/rag_cache.py` | Added cache clear helpers for pressure shedding |
+| 2026-04-11 | 2.4 | MODIFIED | `brain/memory_graph.py` | Node cap + pruning + pressure-mode query reduction + vector cleanup |
+| 2026-04-11 | 2.4 | MODIFIED | `cursor_bridge/local_brain_controller.py` | Forward memory pressure updates to RAG + MemoryGraph |
+| 2026-04-11 | 2.4 | MODIFIED | `main.py` | Periodic silicon_stats_update memory-pressure coordination |
+| 2026-04-11 | 2.4 | MODIFIED | `core/silicon_governor.py` | Lowered default unified-memory warning threshold to 85% |
+| 2026-04-11 | 2.4 | MODIFIED | `core/config_schema.py` | Added memory/RAG pressure config keys |
+| 2026-04-11 | 2.4 | MODIFIED | `config/settings.json` | Explicit M5 memory-pressure caps and thresholds |
+| 2026-04-11 | 2.5 | VERIFIED | `Terminal` | Abbreviated integration smoke: stress + chaos harnesses + short live runtime, no full-process crash |
+| 2026-04-11 | 3.1 | INSTALLED | `Terminal` | Installed `mlx`, `mlx-lm`, and `mlx-metal` into project venv; functional imports OK |
+| 2026-04-11 | 3.2 | DOWNLOADED | `models/qwen3-4b-mlx/` | Local snapshot of `mlx-community/Qwen3-4B-4bit` (~2.1 GB) |
+| 2026-04-11 | 3.2 | DOWNLOADED | `models/qwen3-1.7b-mlx/` | Local snapshot of `mlx-community/Qwen3-1.7B-4bit` (~939 MB) |
+| 2026-04-11 | 3.3 | CREATED | `brain/mlx_llm.py` | Added `MLXBrain` compatibility wrapper with MLX load/stream/preempt support and primary/fast model roles |
+| 2026-04-11 | 3.4 | MODIFIED | `cursor_bridge/local_brain_controller.py` | Swapped controller backend to `MLXBrain`, updated MLX lifecycle messaging, and verified warm-up/unload path |
+| 2026-04-11 | 3.5 | MODIFIED | `core/cognitive_kernel.py` | Added `model_role` / `runtime_mode` / prompt-hint routing for quick/full/deep MLX paths |
+| 2026-04-11 | 3.5 | MODIFIED | `cursor_bridge/local_brain_controller.py` | Consumes route-plan hints for MLX role selection, RAG gating, and late-RAG retry continuity |
+| 2026-04-11 | 3.5 | MODIFIED | `cursor_bridge/structured_prompt_builder.py` | Added prompt context support for route-specific inference hints |
+| 2026-04-11 | 3.5 | MODIFIED | `core/llm_inference_queue.py` | Preserves `query_plan` through queue submission/worker delivery |
+| 2026-04-11 | 3.5 | MODIFIED | `core/boot/wiring.py` | Forwarded `query_plan` into queue-backed local-brain execution and refreshed MLX wording |
+| 2026-04-11 | 3.6 | CREATED | `core/runtime/latency_controller.py` | Added dynamic latency/controller policy for per-plan total budget, RAG cap, and context trimming |
+| 2026-04-11 | 3.6 | MODIFIED | `core/runtime/__init__.py` | Exported latency controller runtime helpers |
+| 2026-04-11 | 3.6 | MODIFIED | `core/cognitive_kernel.py` | Applies latency policy onto `QueryPlan` and emits richer budget diagnostics |
+| 2026-04-11 | 3.6 | MODIFIED | `core/router/router.py` | Plans before memory retrieval and skips unnecessary semantic-memory work for quick/direct/cache fallbacks |
+| 2026-04-11 | 3.6 | MODIFIED | `cursor_bridge/local_brain_controller.py` | Uses plan-based context trimming and RAG budget caps from the latency controller |
+| 2026-04-11 | 3.7 | MODIFIED | `config/settings.json` | Added explicit MLX model paths, cognitive-kernel/latency defaults, watchdog budgets, and Apple Silicon-friendly runtime settings |
+| 2026-04-11 | 3.7 | MODIFIED | `core/config_schema.py` | Added schema coverage for MLX config and latency sections; validation now passes for checked-in settings |
+| 2026-04-11 | 3.8 | CREATED | `tools/mlx_vs_llamacpp_benchmark.py` | Added isolated-subprocess benchmark for MLX vs llama-cpp Qwen3-4B load/inference timing |
+| 2026-04-11 | 3.8 | DOWNLOADED | `models/Qwen3-4B-Q4_K_M.gguf` | Same-family GGUF baseline for Qwen3-4B benchmark (~2.33 GB) |
+| 2026-04-11 | 3.9 | CREATED | `core/boot/cold_start.py` | Added cold-start orchestration for fast-role preload, embedding warm-up, session restore, command-cache seeding, and restored system context |
+| 2026-04-11 | 3.9 | MODIFIED | `main.py` | Wired cold-start bootstrap into boot/shutdown and replayed restored context before listening starts |
+| 2026-04-11 | 3.9 | MODIFIED | `cursor_bridge/local_brain_controller.py` | Extended MLX warm-up to target specific model roles during startup |
+| 2026-04-11 | 3.9 | MODIFIED | `core/memory_engine.py` | Added eager embedding warm-up and top-command lookup helpers for cold-start seeding |
+| 2026-04-11 | 3.9 | CREATED | `tests/test_cold_start.py` | Added focused regression coverage for cold-start restore/cache/persist behavior |
+| 2026-04-11 | 3.10 | CREATED | `voice/interrupt_handler.py` | Added centralized voice-interrupt coordination for barge-in state handoff, TTS stop, and brain preemption |
+| 2026-04-11 | 3.10 | MODIFIED | `core/boot/wiring.py` | Routed `speech_partial`/`resume_listening` through the interrupt coordinator and prepared interrupts before routing new speech |
+| 2026-04-11 | 3.10 | MODIFIED | `core/ipc/interrupt_manager.py` | Made global interrupts compatible with both AsyncEventBus and ZMQ workers and used fast emit when available |
+| 2026-04-11 | 3.10 | MODIFIED | `core/async_event_bus.py` | Promoted interrupt-related events to high priority for lower-latency barge-in dispatch |
+| 2026-04-11 | 3.10 | MODIFIED | `services/tts_worker.py` | Awaited async TTS stop calls during worker interrupt handling |
+| 2026-04-11 | 3.10 | CREATED | `tests/test_voice_interrupt.py` | Added focused regression tests for voice interrupt heuristics and state transitions |
 
 ---
 
@@ -911,6 +1528,18 @@ NEXT_ACTION   = Execute Step 2.1 — Create core/cognitive_kernel.py (central br
 | 7 | GPU stack: remove dead code, defer full consolidation | gpu_scheduler.py (dead) and gpu_pipeline.py (1 useful line) deleted. Full consolidation (resource_manager + execution_coordinator → InferenceGuard) planned for Phase 2.1 after Cognitive Kernel. | 2026-04-09 |
 | 8 | Apple Silicon-only compute layer | Stripped all NVIDIA/CUDA/pynvml code. Created SiliconGovernor + InferenceGuard to replace multi-backend GPU stack. No VRAM budgets — Unified Memory with pressure-based admission. Net ~1,000 lines removed. | 2026-04-09 |
 | 9 | Native macOS stack via pyobjc | Same philosophy as MLX for LLM — use frameworks already loaded in macOS RAM. pyobjc (~18MB) bridges to Apple frameworks that replace ~2.8GB of third-party deps. STT: SFSpeechRecognizer (Neural Engine, ~50ms), TTS: NSSpeechSynthesizer (no subprocess, 4.4ms barge-in), OCR: Vision (109ms vs 3000ms), Media: AppleScript, FileWatch: FSEvents. | 2026-04-09 |
+| 10 | Cognitive Kernel as 5-path router | Single coordinator for all query routing: DIRECT (intent/quick-reply, no LLM), CACHE (cached response), QUICK (fast 1.7B), FULL (primary 4B), DEEP (4B+thinking+RAG). Circuit breakers auto-bypass failing modules. System-aware: degrades on low battery, thermal throttling, memory pressure. 80% of common queries skip LLM entirely. | 2026-04-11 |
+| 11 | Add top-level runtime boundaries before watchdog budgets | AsyncEventBus already isolates handler tasks, but critical component entry points still needed explicit outer guards so Router, LocalBrain, STT, Edge TTS, and ActionExecutor fail soft with fallback behavior instead of dying mid-task. Wiring also now receives `shutdown_event` explicitly to avoid hidden cross-module global dependency. | 2026-04-11 |
+| 12 | RuntimeWatchdog should actively budget hot paths, not just detect stuck states | Passive THINKING/SPEAKING dwell checks are too coarse for intent/cache/RAG/LLM/tool stages. The watchdog now wraps hot operations directly where possible, caps RAG budgets, and keeps state-dwell supervision as a last-resort safety net. | 2026-04-11 |
+| 13 | Use SiliconGovernor telemetry as the single periodic memory-pressure signal | Apple Silicon already has one unified-memory monitor loop. Rather than add another poller, ATOM now applies retrieval/pruning/embed-shedding behavior from the existing `silicon_stats_update` stream so every memory-heavy module degrades off the same signal. | 2026-04-11 |
+| 14 | Phase 3 can start on the current project venv without waiting for a Python upgrade | Installing `mlx` + `mlx-lm` succeeded on the active Python 3.9 project environment, so the old "Python 3.11+ required for Phase 3 kickoff" blocker is stale. Remove the blocker and continue with model download / MLX integration. | 2026-04-11 |
+| 15 | Store MLX model snapshots under project-local `models/` paths | Keeping both MLX repos inside the workspace (`models/qwen3-4b-mlx`, `models/qwen3-1.7b-mlx`) makes Phase 3 wiring deterministic, avoids depending on ephemeral global cache paths, and matches the existing project convention of local model assets. | 2026-04-11 |
+| 16 | Build the MLX migration as a MiniLLM-compatible wrapper before swapping controller wiring | Preserving the existing async/preempt/streaming contract in `brain/mlx_llm.py` lets Phase 3 switch inference backends with smaller, safer controller changes. Dual-model role support can be added now without forcing a full LocalBrainController redesign in the same step. | 2026-04-11 |
+| 17 | Swap LocalBrainController to MLX before adding dual-model routing | Moving the controller onto the MLX backend first isolates the backend migration from the upcoming routing logic. That keeps Step 3.5 focused on decision policy and model-role selection instead of mixing backend replacement with routing bugs. | 2026-04-11 |
+| 18 | Treat `QueryPlan` as the authoritative handoff for model role, runtime mode, and reasoning bias | Once the kernel chooses quick/full/deep, downstream code should consume that plan instead of recomputing its own conflicting routing. Propagating `query_plan` through the queue and retry path keeps MLX role selection, RAG behavior, and prompt style aligned. | 2026-04-11 |
+| 19 | Attach dynamic latency/context policy to `QueryPlan` instead of creating a parallel budget channel | The same plan that chooses model/path should also carry the active budget envelope. That lets the router skip pre-LLM memory work earlier, lets LocalBrainController trim memory/history and cap RAG consistently, and avoids scattering separate latency heuristics across the stack. | 2026-04-11 |
+| 20 | Make MLX/kernel/latency defaults explicit in checked-in config instead of relying on code fallbacks | Once Phase 3 runtime behavior depends on MLX model paths and latency heuristics, those values should live visibly in `config/settings.json` and validate against schema. That makes benchmarking reproducible and keeps future tuning as config changes instead of hidden code defaults. | 2026-04-11 |
+| 21 | Benchmark backend speed with same-family Qwen3 assets in isolated subprocesses | For backend comparison, the benchmark should keep model family aligned and avoid shared-process memory contamination. On this machine the current llama-cpp baseline cannot load the target Qwen3-4B GGUF, which is itself a meaningful migration result: MLX is operational for the planned Qwen3 target while the legacy backend is not. | 2026-04-11 |
 
 ---
 

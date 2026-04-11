@@ -119,7 +119,7 @@ _SENSITIVE_ACTIONS: frozenset[str] = frozenset({
     "go_back", "hotkey_combo", "type_text",
     "shutdown_pc", "restart_pc", "logoff", "sleep_pc",
     "empty_recycle_bin", "flush_dns", "open_url",
-    "play_youtube", "search", "lock_screen", "screenshot",
+    "play_youtube", "search", "spotlight_search", "lock_screen", "screenshot",
     "set_brightness",
 })
 

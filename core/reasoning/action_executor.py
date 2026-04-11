@@ -22,10 +22,11 @@ Contract:
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from dataclasses import dataclass, field
-from typing import Any, Callable, Optional
+from typing import Any, Awaitable, Callable, Optional
 
 from core.reasoning.tool_parser import ToolCall
 from core.reasoning.tool_registry import ToolRegistry, get_tool_registry
@@ -34,6 +35,7 @@ from core.security_policy import SecurityPolicy
 logger = logging.getLogger("atom.action_executor")
 
 DispatchFn = Callable[[str, dict], Optional[str]]
+AsyncDispatchFn = Callable[[str, dict], Awaitable[Optional[str]]]
 
 
 @dataclass
@@ -76,10 +78,12 @@ class ActionExecutor:
         security: SecurityPolicy,
         registry: ToolRegistry | None = None,
         *,
+        async_dispatch_fn: AsyncDispatchFn | None = None,
         timeline: Any = None,
         max_actions_per_turn: int = 5,
     ) -> None:
         self._dispatch = dispatch_fn
+        self._dispatch_async = async_dispatch_fn
         self._security = security
         self._registry = registry or get_tool_registry()
         self._timeline = timeline
@@ -91,105 +95,238 @@ class ActionExecutor:
         """Update the tool registry (e.g., after full initialization)."""
         self._registry = registry
 
+    def _record_error_timeline(self, tool_name: str, message: str) -> None:
+        if self._timeline is None:
+            return
+        try:
+            self._timeline.append_event(
+                "error",
+                {
+                    "source": "action_executor",
+                    "tool": tool_name,
+                    "message": message[:300],
+                },
+            )
+        except Exception:
+            pass
+
     def execute(self, tool_call: ToolCall) -> ActionResult:
         """Execute a single tool call through the security pipeline."""
         t0 = time.perf_counter()
-        name = tool_call.name
-        args = dict(tool_call.arguments)
-
-        tool_def = self._registry.get(name)
-        if tool_def is None:
-            logger.warning("Unknown tool: %s", name)
-            return ActionResult(
-                tool_name=name, success=False,
-                error=f"Unknown tool '{name}'. Check available tools.",
-                elapsed_ms=(time.perf_counter() - t0) * 1000,
-            )
-
-        missing = self._validate_params(tool_def, args)
-        if missing:
-            return ActionResult(
-                tool_name=name, success=False,
-                error=f"Missing required parameters: {', '.join(missing)}",
-                elapsed_ms=(time.perf_counter() - t0) * 1000,
-            )
-
-        if tool_def.safety_level == "blocked":
-            self._total_blocked += 1
-            return ActionResult(
-                tool_name=name, success=False,
-                blocked=True, block_reason="This action is permanently blocked for safety.",
-                elapsed_ms=(time.perf_counter() - t0) * 1000,
-            )
-
-        from core.execution.behavior_monitor import strip_signing_keys
-        from core.security.action_signing import merge_signed_args
-
-        signed_args = merge_signed_args(self._security, name, args)
-        allowed, reason = self._security.allow_action(name, signed_args)
-        if not allowed:
-            self._total_blocked += 1
-            logger.warning("Security BLOCKED tool call '%s': %s", name, reason)
-            if self._timeline is not None:
-                try:
-                    self._timeline.append_event(
-                        "action",
-                        {"tool": name, "blocked": True, "reason": reason[:200]},
-                    )
-                except Exception:
-                    pass
-            return ActionResult(
-                tool_name=name, success=False,
-                blocked=True, block_reason=reason,
-                elapsed_ms=(time.perf_counter() - t0) * 1000,
-            )
-
-        if self._registry.requires_confirmation(name):
-            from core import adaptive_personality as personality
-            detail = self._confirmation_detail(name, args)
-            prompt = personality.confirmation_prompt(name, detail)
-            return ActionResult(
-                tool_name=name, success=False,
-                needs_confirmation=True, confirmation_prompt=prompt,
-                elapsed_ms=(time.perf_counter() - t0) * 1000,
-            )
-
-        self._security.audit_log(
-            name, f"args={strip_signing_keys(signed_args)}" if signed_args else "",
-        )
-
+        name = getattr(tool_call, "name", "unknown")
         try:
-            response = self._dispatch(name, strip_signing_keys(signed_args))
-            elapsed = (time.perf_counter() - t0) * 1000
-            self._total_executions += 1
-            logger.info("Executed tool '%s' in %.0fms", name, elapsed)
-            if self._timeline is not None:
-                try:
-                    self._timeline.append_event(
-                        "action",
-                        {"tool": name, "success": True, "elapsed_ms": elapsed},
-                    )
-                except Exception:
-                    pass
-            return ActionResult(
-                tool_name=name, success=True,
-                output=response or "Action completed.",
-                elapsed_ms=elapsed,
+            args = dict(tool_call.arguments)
+
+            tool_def = self._registry.get(name)
+            if tool_def is None:
+                logger.warning("Unknown tool: %s", name)
+                return ActionResult(
+                    tool_name=name, success=False,
+                    error=f"Unknown tool '{name}'. Check available tools.",
+                    elapsed_ms=(time.perf_counter() - t0) * 1000,
+                )
+
+            missing = self._validate_params(tool_def, args)
+            if missing:
+                return ActionResult(
+                    tool_name=name, success=False,
+                    error=f"Missing required parameters: {', '.join(missing)}",
+                    elapsed_ms=(time.perf_counter() - t0) * 1000,
+                )
+
+            if tool_def.safety_level == "blocked":
+                self._total_blocked += 1
+                return ActionResult(
+                    tool_name=name, success=False,
+                    blocked=True, block_reason="This action is permanently blocked for safety.",
+                    elapsed_ms=(time.perf_counter() - t0) * 1000,
+                )
+
+            from core.execution.behavior_monitor import strip_signing_keys
+            from core.security.action_signing import merge_signed_args
+
+            signed_args = merge_signed_args(self._security, name, args)
+            allowed, reason = self._security.allow_action(name, signed_args)
+            if not allowed:
+                self._total_blocked += 1
+                logger.warning("Security BLOCKED tool call '%s': %s", name, reason)
+                if self._timeline is not None:
+                    try:
+                        self._timeline.append_event(
+                            "action",
+                            {"tool": name, "blocked": True, "reason": reason[:200]},
+                        )
+                    except Exception:
+                        pass
+                return ActionResult(
+                    tool_name=name, success=False,
+                    blocked=True, block_reason=reason,
+                    elapsed_ms=(time.perf_counter() - t0) * 1000,
+                )
+
+            if self._registry.requires_confirmation(name):
+                from core import adaptive_personality as personality
+                detail = self._confirmation_detail(name, args)
+                prompt = personality.confirmation_prompt(name, detail)
+                return ActionResult(
+                    tool_name=name, success=False,
+                    needs_confirmation=True, confirmation_prompt=prompt,
+                    elapsed_ms=(time.perf_counter() - t0) * 1000,
+                )
+
+            self._security.audit_log(
+                name, f"args={strip_signing_keys(signed_args)}" if signed_args else "",
             )
+
+            try:
+                response = self._dispatch(name, strip_signing_keys(signed_args))
+                elapsed = (time.perf_counter() - t0) * 1000
+                self._total_executions += 1
+                logger.info("Executed tool '%s' in %.0fms", name, elapsed)
+                if self._timeline is not None:
+                    try:
+                        self._timeline.append_event(
+                            "action",
+                            {"tool": name, "success": True, "elapsed_ms": elapsed},
+                        )
+                    except Exception:
+                        pass
+                return ActionResult(
+                    tool_name=name, success=True,
+                    output=response or "Action completed.",
+                    elapsed_ms=elapsed,
+                )
+            except Exception as exc:
+                elapsed = (time.perf_counter() - t0) * 1000
+                logger.error("Tool execution failed '%s': %s", name, exc)
+                self._record_error_timeline(name, str(exc))
+                return ActionResult(
+                    tool_name=name, success=False,
+                    error=f"Execution failed: {str(exc)[:200]}",
+                    elapsed_ms=elapsed,
+                )
         except Exception as exc:
             elapsed = (time.perf_counter() - t0) * 1000
-            logger.error("Tool execution failed '%s': %s", name, exc)
-            if self._timeline is not None:
-                try:
-                    self._timeline.append_event(
-                        "error",
-                        {"source": "action_executor", "tool": name, "message": str(exc)[:300]},
-                    )
-                except Exception:
-                    pass
+            logger.exception("ActionExecutor failed before dispatch '%s': %s", name, exc)
+            self._record_error_timeline(name, str(exc))
             return ActionResult(
-                tool_name=name, success=False,
-                error=f"Execution failed: {str(exc)[:200]}",
+                tool_name=name,
+                success=False,
+                error=f"Executor failed: {str(exc)[:200]}",
+                elapsed_ms=elapsed,
+            )
+
+    async def execute_async(self, tool_call: ToolCall) -> ActionResult:
+        """Async variant that uses Router._dispatch_action_async when available."""
+        t0 = time.perf_counter()
+        name = getattr(tool_call, "name", "unknown")
+        try:
+            args = dict(tool_call.arguments)
+
+            tool_def = self._registry.get(name)
+            if tool_def is None:
+                logger.warning("Unknown tool: %s", name)
+                return ActionResult(
+                    tool_name=name, success=False,
+                    error=f"Unknown tool '{name}'. Check available tools.",
+                    elapsed_ms=(time.perf_counter() - t0) * 1000,
+                )
+
+            missing = self._validate_params(tool_def, args)
+            if missing:
+                return ActionResult(
+                    tool_name=name, success=False,
+                    error=f"Missing required parameters: {', '.join(missing)}",
+                    elapsed_ms=(time.perf_counter() - t0) * 1000,
+                )
+
+            if tool_def.safety_level == "blocked":
+                self._total_blocked += 1
+                return ActionResult(
+                    tool_name=name, success=False,
+                    blocked=True, block_reason="This action is permanently blocked for safety.",
+                    elapsed_ms=(time.perf_counter() - t0) * 1000,
+                )
+
+            from core.execution.behavior_monitor import strip_signing_keys
+            from core.security.action_signing import merge_signed_args
+
+            signed_args = merge_signed_args(self._security, name, args)
+            allowed, reason = self._security.allow_action(name, signed_args)
+            if not allowed:
+                self._total_blocked += 1
+                logger.warning("Security BLOCKED tool call '%s': %s", name, reason)
+                if self._timeline is not None:
+                    try:
+                        self._timeline.append_event(
+                            "action",
+                            {"tool": name, "blocked": True, "reason": reason[:200]},
+                        )
+                    except Exception:
+                        pass
+                return ActionResult(
+                    tool_name=name, success=False,
+                    blocked=True, block_reason=reason,
+                    elapsed_ms=(time.perf_counter() - t0) * 1000,
+                )
+
+            if self._registry.requires_confirmation(name):
+                from core import adaptive_personality as personality
+                detail = self._confirmation_detail(name, args)
+                prompt = personality.confirmation_prompt(name, detail)
+                return ActionResult(
+                    tool_name=name, success=False,
+                    needs_confirmation=True, confirmation_prompt=prompt,
+                    elapsed_ms=(time.perf_counter() - t0) * 1000,
+                )
+
+            self._security.audit_log(
+                name, f"args={strip_signing_keys(signed_args)}" if signed_args else "",
+            )
+
+            try:
+                cleaned_args = strip_signing_keys(signed_args)
+                if self._dispatch_async is not None:
+                    response = await self._dispatch_async(name, cleaned_args)
+                else:
+                    response = self._dispatch(name, cleaned_args)
+                elapsed = (time.perf_counter() - t0) * 1000
+                self._total_executions += 1
+                logger.info("Executed tool '%s' in %.0fms", name, elapsed)
+                if self._timeline is not None:
+                    try:
+                        self._timeline.append_event(
+                            "action",
+                            {"tool": name, "success": True, "elapsed_ms": elapsed},
+                        )
+                    except Exception:
+                        pass
+                return ActionResult(
+                    tool_name=name, success=True,
+                    output=response or "Action completed.",
+                    elapsed_ms=elapsed,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                elapsed = (time.perf_counter() - t0) * 1000
+                logger.error("Async tool execution failed '%s': %s", name, exc)
+                self._record_error_timeline(name, str(exc))
+                return ActionResult(
+                    tool_name=name, success=False,
+                    error=f"Execution failed: {str(exc)[:200]}",
+                    elapsed_ms=elapsed,
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            elapsed = (time.perf_counter() - t0) * 1000
+            logger.exception("ActionExecutor async failed before dispatch '%s': %s", name, exc)
+            self._record_error_timeline(name, str(exc))
+            return ActionResult(
+                tool_name=name,
+                success=False,
+                error=f"Executor failed: {str(exc)[:200]}",
                 elapsed_ms=elapsed,
             )
 

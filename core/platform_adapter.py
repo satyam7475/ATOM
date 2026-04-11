@@ -42,6 +42,8 @@ from typing import Any
 import psutil
 import ctypes
 
+from core.macos import AppleScriptEngine
+
 logger = logging.getLogger("atom.platform")
 
 
@@ -153,6 +155,7 @@ class PlatformAdapter:
     def __init__(self) -> None:
         self.os_type = CURRENT_OS
         self._profile: SystemProfile | None = None
+        self._applescript = AppleScriptEngine() if self.os_type == OSType.MACOS else None
         logger.info("Platform adapter initialized: %s (%s)",
                      self.os_type.name, platform.platform())
 
@@ -424,36 +427,16 @@ class PlatformAdapter:
             return {"title": "", "app_name": "", "process_name": "", "pid": ""}
 
     def _fg_window_macos(self) -> dict[str, str]:
-        try:
-            script = (
-                'tell application "System Events"\n'
-                '  set frontApp to first application process whose frontmost is true\n'
-                '  set appName to name of frontApp\n'
-                '  set appPID to unix id of frontApp\n'
-                '  try\n'
-                '    set winTitle to name of front window of frontApp\n'
-                '  on error\n'
-                '    set winTitle to ""\n'
-                '  end try\n'
-                'end tell\n'
-                'return appName & "|" & appPID & "|" & winTitle'
-            )
-            result = subprocess.run(
-                ["osascript", "-e", script],
-                capture_output=True, text=True, timeout=5,
-            )
-            parts = result.stdout.strip().split("|", 2)
-            app_name = parts[0] if len(parts) > 0 else ""
-            pid = parts[1] if len(parts) > 1 else ""
-            title = parts[2] if len(parts) > 2 else app_name
-            return {
-                "title": title or app_name,
-                "app_name": app_name,
-                "process_name": app_name,
-                "pid": pid,
-            }
-        except Exception:
+        if self._applescript is None:
             return {"title": "", "app_name": "", "process_name": "", "pid": ""}
+        front = self._applescript.get_frontmost_app()
+        app_name = str(front.get("app", ""))
+        return {
+            "title": str(front.get("title", "") or app_name),
+            "app_name": app_name,
+            "process_name": app_name,
+            "pid": str(front.get("pid", "")),
+        }
 
     # ── Clipboard ──────────────────────────────────────────────────
 
@@ -810,11 +793,8 @@ class PlatformAdapter:
                 subprocess.run(["notify-send", title, message], timeout=5)
                 return True
             elif self.os_type == OSType.MACOS:
-                subprocess.run([
-                    "osascript", "-e",
-                    f'display notification "{message}" with title "{title}"',
-                ], timeout=5)
-                return True
+                if self._applescript is not None:
+                    return self._applescript.send_notification(title, message)
         except Exception:
             pass
         return False

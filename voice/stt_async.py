@@ -885,30 +885,54 @@ class STTAsync:
     def preprocessor(self):
         return self._preprocessor
 
+    async def _handle_runtime_error(
+        self,
+        source: str,
+        exc: Exception,
+        *,
+        notify_timeout: bool = True,
+    ) -> None:
+        logger.exception("STT %s failed: %s", source, exc)
+        self._consecutive_errors += 1
+        try:
+            self._bus.emit_fast("metrics_event", counter="errors_total")
+        except Exception:
+            pass
+        if notify_timeout:
+            try:
+                self._bus.emit("silence_timeout")
+            except Exception:
+                logger.debug("STT fallback timeout emit failed", exc_info=True)
+
     # ── Async wrappers ─────────────────────────────────────────────────
 
     async def start_listening(self, **_kw) -> None:
-        loop = asyncio.get_running_loop()
-        self._loop = loop
-        self._running = True
-        text = await loop.run_in_executor(self._executor, self._listen_loop)
+        try:
+            loop = asyncio.get_running_loop()
+            self._loop = loop
+            self._running = True
+            text = await loop.run_in_executor(self._executor, self._listen_loop)
 
-        if text:
-            self._consecutive_errors = 0
-            self._consecutive_noise = 0
-            lang = self._detected_language
-            logger.info("STT final [%s]: '%s'", lang, text)
-            self._bus.emit("speech_final", text=text, language=lang)
-        elif self._consecutive_errors > 0:
-            backoff = min(2 ** self._consecutive_errors, self._MAX_BACKOFF_S)
-            logger.warning("STT error backoff: %.1fs (attempt %d)",
-                           backoff, self._consecutive_errors)
-            await asyncio.sleep(backoff)
-            self._bus.emit("silence_timeout")
-        else:
-            self._consecutive_errors = 0
-            await asyncio.sleep(0.15)
-            self._bus.emit("silence_timeout")
+            if text:
+                self._consecutive_errors = 0
+                self._consecutive_noise = 0
+                lang = self._detected_language
+                logger.info("STT final [%s]: '%s'", lang, text)
+                self._bus.emit("speech_final", text=text, language=lang)
+            elif self._consecutive_errors > 0:
+                backoff = min(2 ** self._consecutive_errors, self._MAX_BACKOFF_S)
+                logger.warning("STT error backoff: %.1fs (attempt %d)",
+                               backoff, self._consecutive_errors)
+                await asyncio.sleep(backoff)
+                self._bus.emit("silence_timeout")
+            else:
+                self._consecutive_errors = 0
+                await asyncio.sleep(0.15)
+                self._bus.emit("silence_timeout")
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            await self._handle_runtime_error("start_listening", exc)
 
     def stop(self) -> None:
         self._running = False
@@ -916,30 +940,36 @@ class STTAsync:
     async def on_state_changed(self, old, new, **_kw) -> None:
         from core.state_manager import AtomState
 
-        if new in (AtomState.LISTENING, AtomState.SPEAKING):
-            if new is AtomState.SPEAKING:
-                # Elevate threshold during speaking to prevent self-triggering
-                if self._recognizer is not None:
-                    self._calibrated_threshold = max(1500.0, self._base_threshold * 2.5)
-                    self._recognizer.energy_threshold = self._calibrated_threshold
-                    self._threshold_elevated = True
-                    logger.info("Speaking: elevated threshold to %.0f for barge-in", self._calibrated_threshold)
-            
-            if old is AtomState.SPEAKING and new is AtomState.LISTENING:
-                self._came_from_speaking = True
-                self._consecutive_noise = 0
-                self._too_noisy_emitted = False
-                if self._recognizer is not None:
-                    restore = self._base_threshold
-                    self._calibrated_threshold = restore
-                    self._recognizer.energy_threshold = restore
-                    self._threshold_elevated = False
-                    logger.info("Post-TTS: threshold restored to base %.0f", restore)
-            
-            if not self._running:
-                asyncio.create_task(self.start_listening())
-        elif old in (AtomState.LISTENING, AtomState.SPEAKING) and new not in (AtomState.LISTENING, AtomState.SPEAKING):
+        try:
+            if new in (AtomState.LISTENING, AtomState.SPEAKING):
+                if new is AtomState.SPEAKING:
+                    # Elevate threshold during speaking to prevent self-triggering
+                    if self._recognizer is not None:
+                        self._calibrated_threshold = max(1500.0, self._base_threshold * 2.5)
+                        self._recognizer.energy_threshold = self._calibrated_threshold
+                        self._threshold_elevated = True
+                        logger.info("Speaking: elevated threshold to %.0f for barge-in", self._calibrated_threshold)
+
+                if old is AtomState.SPEAKING and new is AtomState.LISTENING:
+                    self._came_from_speaking = True
+                    self._consecutive_noise = 0
+                    self._too_noisy_emitted = False
+                    if self._recognizer is not None:
+                        restore = self._base_threshold
+                        self._calibrated_threshold = restore
+                        self._recognizer.energy_threshold = restore
+                        self._threshold_elevated = False
+                        logger.info("Post-TTS: threshold restored to base %.0f", restore)
+
+                if not self._running:
+                    asyncio.create_task(self.start_listening())
+            elif old in (AtomState.LISTENING, AtomState.SPEAKING) and new not in (AtomState.LISTENING, AtomState.SPEAKING):
+                self.stop()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
             self.stop()
+            await self._handle_runtime_error("on_state_changed", exc)
 
     def on_media_started(self) -> None:
         """Pre-raise threshold when media starts to filter speaker bleed."""
@@ -952,18 +982,21 @@ class STTAsync:
             logger.info("Media started -- threshold %.0f -> 600", old)
 
     def shutdown(self) -> None:
-        self._running = False
-        if self._mic_manager is not None:
-            self._mic_manager.release("stt")
-        if self._persistent_mic is not None:
-            try:
-                self._persistent_mic.__exit__(None, None, None)
-            except Exception:
-                pass
-            self._persistent_mic = None
-            self._persistent_source = None
-        if self._audio:
-            self._audio.terminate()
-            self._audio = None
-        self._executor.shutdown(wait=False)
-        logger.info("STT shut down")
+        try:
+            self._running = False
+            if self._mic_manager is not None:
+                self._mic_manager.release("stt")
+            if self._persistent_mic is not None:
+                try:
+                    self._persistent_mic.__exit__(None, None, None)
+                except Exception:
+                    pass
+                self._persistent_mic = None
+                self._persistent_source = None
+            if self._audio:
+                self._audio.terminate()
+                self._audio = None
+            self._executor.shutdown(wait=False)
+            logger.info("STT shut down")
+        except Exception:
+            logger.exception("STT shutdown failed")

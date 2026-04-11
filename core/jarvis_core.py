@@ -52,6 +52,8 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, TYPE_CHECKING
 
+from core.identity_engine import IdentityEngine
+
 if TYPE_CHECKING:
     from core.async_event_bus import AsyncEventBus
     from core.behavior_tracker import BehaviorTracker
@@ -60,6 +62,7 @@ if TYPE_CHECKING:
     from core.conversation_memory import ConversationMemory
     from core.memory_engine import MemoryEngine
     from core.owner_understanding import OwnerUnderstanding
+    from core.personality_modes import PersonalityModes
     from core.system_scanner import SystemScanner
 
 logger = logging.getLogger("atom.jarvis")
@@ -112,12 +115,14 @@ class JarvisCore:
         bus: AsyncEventBus,
         owner: OwnerUnderstanding,
         scanner: SystemScanner,
+        modes: PersonalityModes | None = None,
         config: dict | None = None,
     ) -> None:
         self._bus = bus
         self._owner = owner
         self._scanner = scanner
         self._config = config or {}
+        self._identity = IdentityEngine(config=self._config, owner=owner, modes=modes)
 
         self._task: asyncio.Task | None = None
         self._shutdown = asyncio.Event()
@@ -288,7 +293,7 @@ class JarvisCore:
                 )
 
         # Emotion-aware tone adjustment
-        adjustments = self._owner.get_personality_adjustment()
+        adjustments = self._identity.get_personality_adjustment({"hour": s.hour})
         context["suggested_tone"] = adjustments.get("tone", "normal")
         context["suggested_verbosity"] = adjustments.get("verbosity", "medium")
 
@@ -633,7 +638,7 @@ class JarvisCore:
             )
 
         # Closing tone
-        adjustments = self._owner.get_personality_adjustment()
+        adjustments = self._identity.get_personality_adjustment({"hour": s.hour})
         if adjustments.get("tone") == "supportive":
             parts.append("Take it easy today. I've got your back.")
         else:
@@ -808,7 +813,7 @@ class JarvisCore:
                 "session_minutes": s.session_duration_min,
                 "conversation_depth": s.conversation_depth,
             },
-            "personality_adjustments": self._owner.get_personality_adjustment(),
+            "personality_adjustments": self._identity.get_personality_adjustment({"hour": s.hour}),
         }
 
         if self._fusion:

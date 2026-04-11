@@ -45,6 +45,10 @@ class TTLCache(Generic[T]):
                 oldest = next(iter(self._data))
                 del self._data[oldest]
 
+    def clear(self) -> None:
+        with self._lock:
+            self._data.clear()
+
 
 class RagCaches:
     """Embedding vector cache + retrieval result cache."""
@@ -69,3 +73,7 @@ class RagCaches:
 
     def set_retrieval(self, query: str, chunks: list[str]) -> None:
         self.retrieval.set(query, chunks)
+
+    def clear(self) -> None:
+        self.embeddings.clear()
+        self.retrieval.clear()

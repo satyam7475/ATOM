@@ -3,7 +3,8 @@ Low-latency RAG engine (Apple Silicon).
 
 - Smart skip (query classifier)
 - TTL caches (embed + retrieval)
-- Hybrid vector + keyword re-rank + recency
+- Hybrid vector + keyword re-rank + temporal decay
+- Owner-priority + usage-frequency boosts + stale-result marking
 - Optional Qdrant + Chroma VectorStore fallback
 """
 
@@ -11,7 +12,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import re
+import threading
 import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Callable
@@ -25,6 +28,14 @@ from core.rag.query_classifier import QueryComplexity, classify_query
 from core.rag.rag_cache import RagCaches
 
 logger = logging.getLogger("atom.rag.engine")
+_STALE_PREFIX = "[Possibly outdated] "
+_TIME_SENSITIVE_PATTERN = re.compile(
+    r"\b("
+    r"today|current|currently|latest|recent|new|now|version|versions|release|releases|"
+    r"roadmap|deadline|eta|status|this\s+(?:week|month|year)|tomorrow|yesterday"
+    r")\b",
+    re.IGNORECASE,
+)
 
 
 def _tokenize(s: str) -> set[str]:
@@ -40,10 +51,23 @@ def _keyword_boost(query: str, text: str) -> float:
     return min(1.0, inter / max(4, len(q)))
 
 
-def _recency_boost(metadata: dict[str, Any], now: float, max_age_s: float = 86400 * 14) -> float:
-    ts = float(metadata.get("timestamp") or now)
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _temporal_decay_score(
+    metadata: dict[str, Any],
+    now: float,
+    half_life_s: float = 86400 * 7,
+) -> float:
+    ts = _safe_float(metadata.get("timestamp") or metadata.get("ts") or now, now)
     age = max(0.0, now - ts)
-    return max(0.0, 1.0 - min(1.0, age / max_age_s)) * 0.15
+    if half_life_s <= 0:
+        return 1.0
+    return float(math.exp(-age / half_life_s))
 
 
 @dataclass
@@ -77,10 +101,56 @@ class RagEngine:
         self._collections = list(
             self._rag_cfg.get("collections", ["documents", "facts", "conversations"]),
         )
-        self._top_k = int(self._rag_cfg.get("top_k", 6))
+        self._max_snippets = max(1, int(self._rag_cfg.get("max_snippets", 3)))
+        self._top_k = max(
+            1,
+            min(int(self._rag_cfg.get("top_k", self._max_snippets)), self._max_snippets),
+        )
+        self._pressure_threshold_pct = float(
+            self._rag_cfg.get("pressure_threshold_pct", 85.0),
+        )
+        self._pressure_relief_pct = float(
+            self._rag_cfg.get("pressure_relief_pct", max(0.0, self._pressure_threshold_pct - 10.0)),
+        )
+        self._pressure_top_k = max(
+            1,
+            min(int(self._rag_cfg.get("pressure_top_k", 1)), self._top_k),
+        )
         self._vec_weight = float(self._rag_cfg.get("vector_weight", 0.65))
         self._kw_weight = float(self._rag_cfg.get("keyword_weight", 0.25))
         self._rec_weight = float(self._rag_cfg.get("recency_weight", 0.10))
+        smart_cfg = self._rag_cfg.get("smart_scoring") or {}
+        owner_cfg = self._config.get("owner") or {}
+        self._owner_name = str(owner_cfg.get("name", "Satyam")).strip().lower()
+        self._owner_priority_multiplier = max(
+            1.0,
+            float(smart_cfg.get("owner_priority_multiplier", 2.0)),
+        )
+        self._owner_priority_sources = {
+            str(src).strip().lower()
+            for src in smart_cfg.get(
+                "owner_priority_sources",
+                ["preference", "voice", "owner", "boss", "user"],
+            )
+            if str(src).strip()
+        }
+        self._usage_boost_max = max(0.0, float(smart_cfg.get("usage_boost_max", 0.12)))
+        self._usage_history_size = max(64, int(smart_cfg.get("usage_history_size", 4096)))
+        self._usage_counts: dict[str, int] = {}
+        self._usage_lock = threading.Lock()
+        self._recency_half_life_s = max(
+            3600.0,
+            float(smart_cfg.get("recency_half_life_hours", 24 * 7)) * 3600.0,
+        )
+        self._stale_after_s = max(
+            3600.0,
+            float(smart_cfg.get("stale_after_hours", 24 * 45)) * 3600.0,
+        )
+        self._time_sensitive_stale_after_s = max(
+            3600.0,
+            float(smart_cfg.get("time_sensitive_stale_after_hours", 24 * 7)) * 3600.0,
+        )
+        self._stale_penalty = max(0.0, float(smart_cfg.get("stale_penalty", 0.18)))
         self._skip_embed_util = float(self._rag_cfg.get("skip_embed_gpu_util_above", 88))
         self._batch_min = int(self._rag_cfg.get("batch_embed_min", 2))
         self._fast_mode = bool(self._rag_cfg.get("fast_mode", False))
@@ -106,6 +176,7 @@ class RagEngine:
         self._memory_graph: Any = None
         self._feedback: Any = None
         self._skip_graph_first_once: bool = False
+        self._memory_pressure_active: bool = False
 
         self._qdrant = None
         if (self._rag_cfg.get("backend") or "chroma").lower() == "qdrant":
@@ -133,6 +204,169 @@ class RagEngine:
     def set_feedback_engine(self, fb: Any) -> None:
         """Optional FeedbackEngine for graph vs RAG ratio metrics."""
         self._feedback = fb
+
+    @staticmethod
+    def _normalize_chunk_text(text: str) -> str:
+        chunk = (text or "").strip()
+        if chunk.startswith(_STALE_PREFIX):
+            chunk = chunk[len(_STALE_PREFIX):].lstrip()
+        return " ".join(chunk.split())[:400]
+
+    def _merge_unique_chunks(self, *groups: list[str] | None) -> list[str]:
+        merged: list[str] = []
+        seen: set[str] = set()
+        for group in groups:
+            for chunk in group or []:
+                norm = self._normalize_chunk_text(chunk)
+                if not norm or norm in seen:
+                    continue
+                seen.add(norm)
+                merged.append(chunk)
+        return merged
+
+    def _usage_key(self, text: str) -> str:
+        return self._normalize_chunk_text(text)
+
+    def _usage_boost(self, text: str) -> float:
+        if self._usage_boost_max <= 0:
+            return 0.0
+        key = self._usage_key(text)
+        if not key:
+            return 0.0
+        with self._usage_lock:
+            count = int(self._usage_counts.get(key, 0))
+        if count <= 0:
+            return 0.0
+        capped = min(count, 12)
+        return (math.log1p(capped) / math.log1p(12)) * self._usage_boost_max
+
+    def _record_chunk_usage(self, chunks: list[str]) -> None:
+        with self._usage_lock:
+            for chunk in chunks:
+                key = self._usage_key(chunk)
+                if not key:
+                    continue
+                if key not in self._usage_counts and len(self._usage_counts) >= self._usage_history_size:
+                    oldest = next(iter(self._usage_counts))
+                    del self._usage_counts[oldest]
+                self._usage_counts[key] = self._usage_counts.get(key, 0) + 1
+
+    def _is_owner_priority_match(self, metadata: dict[str, Any]) -> bool:
+        owner_fields = (
+            "owner", "speaker", "author", "created_by", "source", "role", "tags",
+        )
+        owner_tokens = {"boss", "owner", "user"}
+        if self._owner_name:
+            owner_tokens.add(self._owner_name)
+        for field in owner_fields:
+            value = metadata.get(field)
+            if value is None:
+                continue
+            if isinstance(value, (list, tuple, set)):
+                values = [str(v).strip().lower() for v in value if str(v).strip()]
+            else:
+                values = [part.strip().lower() for part in str(value).split(",") if part.strip()]
+            for candidate in values:
+                if candidate in self._owner_priority_sources:
+                    return True
+                if candidate in owner_tokens:
+                    return True
+                if self._owner_name and self._owner_name in candidate:
+                    return True
+        return False
+
+    def _looks_time_sensitive(self, text: str, metadata: dict[str, Any]) -> bool:
+        if _TIME_SENSITIVE_PATTERN.search(text or ""):
+            return True
+        return any(
+            metadata.get(key) is not None
+            for key in ("expires_at", "last_verified", "verified_at", "updated_at")
+        )
+
+    def _is_stale(self, text: str, metadata: dict[str, Any], now: float) -> bool:
+        expires_at = _safe_float(metadata.get("expires_at"), 0.0)
+        if expires_at > 0 and now >= expires_at:
+            return True
+
+        source = str(metadata.get("source") or "").strip().lower()
+        collection = str(metadata.get("_collection") or "").strip().lower()
+        if source == "preference" and not self._looks_time_sensitive(text, metadata):
+            return False
+
+        base_ts = metadata.get("last_verified") or metadata.get("verified_at") or metadata.get("updated_at")
+        if base_ts is None:
+            base_ts = metadata.get("timestamp") or metadata.get("ts")
+        ts = _safe_float(base_ts, 0.0)
+        if ts <= 0:
+            return False
+
+        age = max(0.0, now - ts)
+        if self._looks_time_sensitive(text, metadata):
+            return age >= self._time_sensitive_stale_after_s
+
+        stale_sources = {
+            "conversation",
+            "migration",
+            "llm_conversation",
+            "voice",
+            "dream_consolidation",
+            "dream_pattern",
+            "episodic",
+            "web",
+        }
+        return (
+            age >= self._stale_after_s
+            and (collection in {"facts", "conversations"} or source in stale_sources)
+        )
+
+    def _format_chunk(self, text: str, metadata: dict[str, Any], now: float) -> str:
+        chunk = (text or "").strip()
+        if not chunk:
+            return ""
+        if self._is_stale(chunk, metadata, now) and not chunk.startswith(_STALE_PREFIX):
+            return f"{_STALE_PREFIX}{chunk}"
+        return chunk
+
+    def _effective_top_k(self) -> int:
+        if self._memory_pressure_active:
+            return self._pressure_top_k
+        return self._top_k
+
+    def apply_memory_pressure(self, memory_pct: float) -> dict[str, Any]:
+        """Shift RAG into minimal mode when unified memory is tight."""
+        active = memory_pct >= self._pressure_threshold_pct
+        if self._memory_pressure_active:
+            active = memory_pct > self._pressure_relief_pct
+
+        changed = active != self._memory_pressure_active
+        self._memory_pressure_active = active
+
+        if changed and active:
+            logger.warning(
+                "RAG pressure mode ON at %.0f%%: snippet budget reduced to %d",
+                memory_pct,
+                self._pressure_top_k,
+            )
+            try:
+                self._caches.clear()
+            except Exception:
+                logger.debug("RAG cache clear failed", exc_info=True)
+            try:
+                self._embed.shutdown()
+            except Exception:
+                logger.debug("RAG embed shutdown failed", exc_info=True)
+        elif changed and not active:
+            logger.info(
+                "RAG pressure mode OFF at %.0f%%: snippet budget restored to %d",
+                memory_pct,
+                self._top_k,
+            )
+
+        return {
+            "active": self._memory_pressure_active,
+            "memory_pct": round(memory_pct, 1),
+            "top_k": self._effective_top_k(),
+        }
 
     @staticmethod
     def compute_budget_ms(
@@ -215,26 +449,34 @@ class RagEngine:
         query: str,
         results: list[tuple[str, float, dict[str, Any]]],
         now: float,
-    ) -> list[str]:
-        scored: list[tuple[float, str]] = []
+        top_k: int,
+    ) -> list[tuple[str, dict[str, Any]]]:
+        scored: list[tuple[float, str, dict[str, Any]]] = []
         for text, vec_score, meta in results:
             if not text.strip():
                 continue
+            meta = dict(meta or {})
             kw = _keyword_boost(query, text)
-            rec = _recency_boost(meta, now)
-            final = (
+            rec = _temporal_decay_score(meta, now, self._recency_half_life_s)
+            base_score = (
                 self._vec_weight * vec_score
                 + self._kw_weight * kw
                 + self._rec_weight * rec
             )
-            scored.append((final, text))
+            if self._is_owner_priority_match(meta):
+                base_score *= self._owner_priority_multiplier
+            final = base_score + self._usage_boost(text)
+            if self._is_stale(text, meta, now):
+                final -= self._stale_penalty
+            scored.append((final, text, meta))
         scored.sort(key=lambda x: x[0], reverse=True)
-        return [t for _, t in scored[: self._top_k]]
+        return [(t, m) for _, t, m in scored[: top_k]]
 
     def _search_vector_store(
         self,
         collection: str,
         query_embedding: list[float],
+        top_k: int,
     ) -> list[tuple[str, float, dict[str, Any]]]:
         if self._vector_store is None:
             return []
@@ -242,11 +484,13 @@ class RagEngine:
             from core.vector_store import VectorSearchResult
 
             raw = self._vector_store.search(
-                collection, query_embedding, k=self._top_k * 2, min_score=0.2,
+                collection, query_embedding, k=top_k * 2, min_score=0.2,
             )
             out: list[tuple[str, float, dict[str, Any]]] = []
             for r in raw:
-                out.append((r.text, r.score, r.metadata or {}))
+                meta = dict(r.metadata or {})
+                meta["_collection"] = collection
+                out.append((r.text, r.score, meta))
             return out
         except Exception:
             logger.debug("vector_store search failed", exc_info=True)
@@ -264,6 +508,7 @@ class RagEngine:
         """Full RAG path with hybrid search and structured enrichment."""
         t0 = time.perf_counter()
         rm = (runtime_mode or "").strip().upper()
+        top_k = self._effective_top_k()
         if not self._enabled:
             cq = classify_query(query)
             return RagRetrieveResult(
@@ -282,7 +527,7 @@ class RagEngine:
         last_project: str | None = None
         if self._memory_graph is not None:
             graph_snippets, graph_conf = graph_snippets_for_query(
-                self._memory_graph, query, limit=min(10, self._top_k + 4),
+                self._memory_graph, query, limit=min(10, top_k + 4),
             )
             try:
                 last_project = self._memory_graph.get_last_active_project()
@@ -292,7 +537,7 @@ class RagEngine:
             if last_project and last_project.lower() in (query or "").lower():
                 graph_conf = min(1.0, graph_conf + float(_gf0.get("project_boost", 0.12)))
 
-        effective_fast = bool(self._fast_mode or rm == "FAST")
+        effective_fast = bool(self._fast_mode or rm == "FAST" or self._memory_pressure_active)
         _gf = self._rag_cfg.get("graph_first") or {}
 
         skip_gf_once = self._skip_graph_first_once
@@ -310,12 +555,10 @@ class RagEngine:
             and graph_conf >= float(_gf.get("min_confidence", 0.68))
             and len(graph_snippets) >= int(_gf.get("min_snippets", 2))
         ):
-            chunks = list(graph_snippets[: self._top_k])
-            if memory_summaries:
-                for ms in memory_summaries[: self._top_k]:
-                    if ms and ms not in chunks:
-                        chunks.append(ms)
-                chunks = chunks[: self._top_k]
+            chunks = self._merge_unique_chunks(
+                graph_snippets[: top_k],
+                memory_summaries[: top_k] if memory_summaries else None,
+            )[: top_k]
             block = build_rag_enrichment_block(
                 system_state=system_state,
                 gpu_snapshot=gpu_snapshot,
@@ -344,6 +587,7 @@ class RagEngine:
                 len(graph_snippets),
                 last_project or "",
             )
+            self._record_chunk_usage(chunks)
             return RagRetrieveResult(
                 chunks=chunks,
                 document_context=chunks,
@@ -360,10 +604,10 @@ class RagEngine:
 
         # Fast mode: graph + memory only — no vector embed (real-time path)
         if effective_fast:
-            chunks = list(graph_snippets)
-            if memory_summaries:
-                chunks.extend(memory_summaries[: self._top_k])
-            chunks = chunks[: self._top_k]
+            chunks = self._merge_unique_chunks(
+                graph_snippets,
+                memory_summaries[: top_k] if memory_summaries else None,
+            )[: top_k]
             block = build_rag_enrichment_block(
                 system_state=system_state,
                 gpu_snapshot=gpu_snapshot,
@@ -376,6 +620,7 @@ class RagEngine:
                     self._feedback.record_graph_hit()
                 except Exception:
                     pass
+            self._record_chunk_usage(chunks)
             return RagRetrieveResult(
                 chunks=chunks,
                 document_context=chunks,
@@ -399,8 +644,8 @@ class RagEngine:
                 retrieved_chunks=None,
                 user_query=query,
             )
-            merged_chunks = list(graph_snippets) + [c for c in cached if c not in graph_snippets]
-            merged_chunks = merged_chunks[: self._top_k]
+            merged_chunks = self._merge_unique_chunks(graph_snippets, cached)[: top_k]
+            self._record_chunk_usage(merged_chunks)
             return RagRetrieveResult(
                 chunks=merged_chunks,
                 document_context=merged_chunks,
@@ -427,12 +672,14 @@ class RagEngine:
         merged: list[tuple[str, float, dict[str, Any]]] = []
 
         if self._qdrant is not None:
-            for h in self._qdrant.search(q_emb, limit=self._top_k * 2):
-                merged.append((h.text, h.score, h.payload))
+            for h in self._qdrant.search(q_emb, limit=top_k * 2):
+                meta = dict(h.payload or {})
+                meta.setdefault("_collection", str(meta.get("collection") or "qdrant"))
+                merged.append((h.text, h.score, meta))
 
         if self._vector_store is not None:
             for coll in self._collections:
-                merged.extend(self._search_vector_store(coll, q_emb))
+                merged.extend(self._search_vector_store(coll, q_emb, top_k))
 
         seen: set[str] = set()
         deduped: list[tuple[str, float, dict[str, Any]]] = []
@@ -447,13 +694,27 @@ class RagEngine:
         if deduped:
             vec_conf = min(1.0, max(s for _, s, _ in deduped))
 
-        chunks = self._hybrid_merge(query, deduped, now)
-        for gs in reversed(graph_snippets):
-            if gs not in chunks:
-                chunks.insert(0, gs)
-        if not chunks and memory_summaries:
-            chunks = memory_summaries[:3]
-        chunks = chunks[: self._top_k]
+        ranked_chunks = self._hybrid_merge(query, deduped, now, top_k)
+        meta_by_chunk = {
+            self._normalize_chunk_text(text): metadata
+            for text, metadata in ranked_chunks
+        }
+        raw_chunks = self._merge_unique_chunks(
+            graph_snippets,
+            [text for text, _meta in ranked_chunks],
+        )
+        if not raw_chunks and memory_summaries:
+            raw_chunks = self._merge_unique_chunks(memory_summaries[:top_k])
+        raw_chunks = raw_chunks[: top_k]
+        chunks = [
+            self._format_chunk(
+                text,
+                meta_by_chunk.get(self._normalize_chunk_text(text), {}),
+                now,
+            )
+            for text in raw_chunks
+        ]
+        self._record_chunk_usage(chunks)
 
         confidence = max(vec_conf, graph_conf, 0.2)
 

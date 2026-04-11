@@ -73,6 +73,7 @@ class LLMInferenceQueue:
         memory_context: list[str] | None = None,
         context: dict[str, str] | None = None,
         history: list[tuple[str, str]] | None = None,
+        query_plan: Any | None = None,
     ) -> None:
         """Enqueue (or replace) one job. Returns immediately."""
         async with self._lock:
@@ -83,6 +84,7 @@ class LLMInferenceQueue:
                 "memory_context": memory_context,
                 "context": context,
                 "history": history or [],
+                "query_plan": query_plan,
             }
         self._wake.set()
 
@@ -109,6 +111,7 @@ class LLMInferenceQueue:
                         memory_context=job.get("memory_context"),
                         context=job.get("context"),
                         history=job.get("history") or [],
+                        query_plan=job.get("query_plan"),
                     )
                 except asyncio.CancelledError:
                     raise

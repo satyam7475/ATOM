@@ -112,7 +112,21 @@ class MemoryEngine:
     def __init__(self, config: dict | None = None) -> None:
         mem_cfg = (config or {}).get("memory", {})
         self._max_entries: int = mem_cfg.get("max_entries", 1000)
-        self._default_top_k: int = mem_cfg.get("top_k", 5)
+        self._max_vector_results: int = max(1, int(mem_cfg.get("max_vector_results", 5)))
+        self._default_top_k: int = max(
+            1,
+            min(int(mem_cfg.get("top_k", 5)), self._max_vector_results),
+        )
+        self._pressure_threshold_pct: float = float(
+            mem_cfg.get("pressure_threshold_pct", 85.0),
+        )
+        self._pressure_relief_pct: float = float(
+            mem_cfg.get("pressure_relief_pct", max(0.0, self._pressure_threshold_pct - 10.0)),
+        )
+        self._pressure_top_k: int = max(
+            1,
+            min(int(mem_cfg.get("pressure_top_k", 2)), self._default_top_k),
+        )
         self._semantic_weight: float = mem_cfg.get("semantic_weight", 0.7)
         self._keyword_weight: float = 1.0 - self._semantic_weight
         self._entries: list[dict] = []
@@ -126,6 +140,7 @@ class MemoryEngine:
         self._vectors_ready: bool = False
         self._migration_done: bool = False
         self._config = config or {}
+        self._memory_pressure_active: bool = False
         self._lock = asyncio.Lock()
         v7 = mem_cfg.get("v7_scoring") or {}
         self._v7_scoring_enabled: bool = bool(v7.get("enabled", False))
@@ -163,9 +178,46 @@ class MemoryEngine:
             logger.info("Memory engine: keyword-only mode (vectors unavailable)")
             self._vectors_ready = False
 
+    def _effective_top_k(self, k: int) -> int:
+        limit = max(1, min(int(k), self._default_top_k, self._max_vector_results))
+        if self._memory_pressure_active:
+            limit = min(limit, self._pressure_top_k)
+        return max(1, limit)
+
+    def apply_memory_pressure(self, memory_pct: float) -> dict[str, Any]:
+        """Drop vector-heavy behavior when unified memory gets tight."""
+        active = memory_pct >= self._pressure_threshold_pct
+        if self._memory_pressure_active:
+            active = memory_pct > self._pressure_relief_pct
+
+        changed = active != self._memory_pressure_active
+        self._memory_pressure_active = active
+
+        if changed and active:
+            logger.warning(
+                "MemoryEngine pressure mode ON at %.0f%%: vector retrieval suspended",
+                memory_pct,
+            )
+            if self._embedding_engine is not None:
+                try:
+                    self._embedding_engine.shutdown()
+                except Exception:
+                    logger.debug("MemoryEngine embed shutdown failed", exc_info=True)
+        elif changed and not active:
+            logger.info(
+                "MemoryEngine pressure mode OFF at %.0f%%: vector retrieval restored",
+                memory_pct,
+            )
+
+        return {
+            "active": self._memory_pressure_active,
+            "memory_pct": round(memory_pct, 1),
+            "top_k": self._pressure_top_k if self._memory_pressure_active else self._default_top_k,
+        }
+
     async def migrate_to_vectors(self) -> None:
         """Background migration of existing keyword-only entries to vector store."""
-        if self._migration_done or not self._vectors_ready:
+        if self._migration_done or not self._vectors_ready or self._memory_pressure_active:
             return
         if not self._entries:
             self._migration_done = True
@@ -248,7 +300,11 @@ class MemoryEngine:
             "success_rate": 1.0,
         }
 
-        if self._vectors_ready and self._embedding_engine is not None:
+        if (
+            self._vectors_ready
+            and self._embedding_engine is not None
+            and not self._memory_pressure_active
+        ):
             try:
                 combined = f"{clean_query} {clean_summary}"
                 emb = await self._embedding_engine.embed(combined)
@@ -312,12 +368,17 @@ class MemoryEngine:
 
     async def _retrieve_vector(self, query: str, k: int) -> list[tuple[float, str]]:
         """Semantic vector retrieval (optional V7 scoring over metadata)."""
-        if not self._vectors_ready or self._embedding_engine is None:
+        if (
+            self._memory_pressure_active
+            or not self._vectors_ready
+            or self._embedding_engine is None
+        ):
             return []
         try:
             query_emb = await self._embedding_engine.embed(query)
+            vector_k = min(max(1, k * 3), self._max_vector_results)
             vector_results = self._vector_store.search(
-                "conversations", query_emb, k=k * 3, min_score=0.25,
+                "conversations", query_emb, k=vector_k, min_score=0.25,
             )
             now = time.time()
             out: list[tuple[float, str]] = []
@@ -339,6 +400,7 @@ class MemoryEngine:
 
         Runs vector and keyword searches in parallel for lower latency.
         """
+        k = self._effective_top_k(k)
         if not self._entries and (
             not self._vectors_ready or not self._vector_store
         ):
@@ -375,7 +437,12 @@ class MemoryEngine:
 
     async def retrieve_with_scores(self, query: str, k: int = 5) -> list[tuple[str, float]]:
         """Retrieve memories with their relevance scores."""
-        if not self._vectors_ready or self._embedding_engine is None:
+        k = self._effective_top_k(k)
+        if (
+            self._memory_pressure_active
+            or not self._vectors_ready
+            or self._embedding_engine is None
+        ):
             basic = await self.retrieve(query, k)
             return [(t, 0.5) for t in basic]
 
@@ -422,6 +489,54 @@ class MemoryEngine:
         if self._vector_store is not None:
             return self._vector_store.get_stats()
         return {}
+
+    async def warm_up_embeddings(self) -> bool:
+        """Eagerly load the embedding model for the first retrieval."""
+        if (
+            self._memory_pressure_active
+            or not self._vectors_ready
+            or self._embedding_engine is None
+        ):
+            return False
+
+        try:
+            loop = asyncio.get_running_loop()
+            t0 = time.monotonic()
+            loaded = await loop.run_in_executor(
+                None,
+                self._embedding_engine.preload,
+            )
+            if loaded:
+                logger.info(
+                    "Memory engine: embeddings warm-up ready in %.0fms",
+                    (time.monotonic() - t0) * 1000,
+                )
+            return bool(loaded)
+        except Exception:
+            logger.debug("Memory engine embeddings warm-up failed", exc_info=True)
+            return False
+
+    def get_top_commands(self, limit: int = 10) -> list[str]:
+        """Return the most common successful commands from interaction history."""
+        if limit <= 0 or not self._interactions:
+            return []
+
+        command_counts: Counter[str] = Counter()
+        canonical: dict[str, str] = {}
+        for item in self._interactions:
+            command = str(item.get("command", "") or "").strip()
+            result = str(item.get("result", "success") or "success").strip().lower()
+            if not command or result not in {"", "success"}:
+                continue
+            key = command.lower()
+            command_counts[key] += 1
+            canonical[key] = command
+
+        return [
+            canonical[key]
+            for key, _count in command_counts.most_common(limit)
+            if key in canonical
+        ]
 
     # ── Interaction Log ────────────────────────────────────────────────
 

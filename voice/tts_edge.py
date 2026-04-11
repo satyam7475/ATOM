@@ -565,8 +565,18 @@ class EdgeTTSAsync:
 
     async def speak(self, text: str, emotion: str | None = None) -> None:
         """Speak text with emotion profile. Emits tts_complete when done."""
-        await self._speak_internal(text, emotion)
-        self._bus.emit("tts_complete")
+        try:
+            await self._speak_internal(text, emotion)
+            self._bus.emit("tts_complete")
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            await self._handle_runtime_error(
+                "speak",
+                exc,
+                fallback_text=text,
+                emit_complete=True,
+            )
 
     async def speak_ack(self, phrase: str) -> None:
         """Play a short acknowledgement -- instant from pre-cached audio.
@@ -637,6 +647,33 @@ class EdgeTTSAsync:
                 pass
         self._tmp_files.clear()
 
+    async def _handle_runtime_error(
+        self,
+        source: str,
+        exc: Exception,
+        *,
+        fallback_text: str | None = None,
+        emit_complete: bool = False,
+    ) -> None:
+        logger.exception("Edge-TTS %s failed: %s", source, exc)
+        self._playing = False
+        self._cancel_requested = False
+        self._active_source = None
+        try:
+            self._bus.emit_fast("metrics_event", counter="errors_total")
+        except Exception:
+            pass
+        if fallback_text:
+            try:
+                self._bus.emit("text_display", text=f"[Response on screen] {fallback_text}")
+            except Exception:
+                logger.debug("Edge-TTS text fallback failed", exc_info=True)
+        if emit_complete:
+            try:
+                self._bus.emit("tts_complete")
+            except Exception:
+                logger.debug("Edge-TTS completion fallback failed", exc_info=True)
+
     # ── Event handlers (same interface as TTSAsync) ──────────────
 
     async def on_speech_partial(self, text: str, **_kw) -> None:
@@ -649,34 +686,48 @@ class EdgeTTSAsync:
                           is_sleep: bool = False, **_kw) -> None:
         from core.state_manager import AtomState
 
-        self._active_source = None
+        try:
+            self._active_source = None
 
-        if self._playing:
-            await self.stop()
+            if self._playing:
+                await self.stop()
+                self._cancel_requested = False
+
+            if self._state.current is AtomState.SPEAKING:
+                return
+
             self._cancel_requested = False
+            await self._state.transition(AtomState.SPEAKING)
 
-        if self._state.current is AtomState.SPEAKING:
-            return
+            async def _speak_bg() -> None:
+                try:
+                    if is_sleep:
+                        await self._speak_internal(text)
+                        self._bus.emit("enter_sleep_mode")
+                        return
+                    await self.speak(text)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    await self._handle_runtime_error(
+                        "_speak_bg",
+                        exc,
+                        fallback_text=text,
+                        emit_complete=True,
+                    )
+                if is_exit:
+                    self._bus.emit("shutdown_requested")
 
-        self._cancel_requested = False
-        await self._state.transition(AtomState.SPEAKING)
-
-        async def _speak_bg() -> None:
-            try:
-                if is_sleep:
-                    await self._speak_internal(text)
-                    self._bus.emit("enter_sleep_mode")
-                    return
-                await self.speak(text)
-            except Exception:
-                logger.exception("Edge-TTS background speak error")
-                self._bus.emit("text_display",
-                               text=f"[Response on screen] {text}")
-                self._bus.emit("tts_complete")
-            if is_exit:
-                self._bus.emit("shutdown_requested")
-
-        asyncio.create_task(_speak_bg())
+            asyncio.create_task(_speak_bg())
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            await self._handle_runtime_error(
+                "on_response",
+                exc,
+                fallback_text=text,
+                emit_complete=True,
+            )
 
     async def on_partial_response(
         self,
@@ -688,31 +739,41 @@ class EdgeTTSAsync:
     ) -> None:
         from core.state_manager import AtomState
 
-        if is_first:
-            self._active_source = source or "unknown"
-            self._chunk_buffer.clear()
-            self._screen_overflow.clear()
-            self._spoken_word_count = 0
-            logger.info("TTS stream: source='%s'", self._active_source)
-            await self.stop()
-            self._cancel_requested = False
-            await self._state.transition(AtomState.SPEAKING)
-        elif source and self._active_source and source != self._active_source:
-            return
+        try:
+            if is_first:
+                self._active_source = source or "unknown"
+                self._chunk_buffer.clear()
+                self._screen_overflow.clear()
+                self._spoken_word_count = 0
+                logger.info("TTS stream: source='%s'", self._active_source)
+                await self.stop()
+                self._cancel_requested = False
+                await self._state.transition(AtomState.SPEAKING)
+            elif source and self._active_source and source != self._active_source:
+                return
 
-        if not text.strip() and not is_last:
-            return
+            if not text.strip() and not is_last:
+                return
 
-        if (self._state.current is not AtomState.SPEAKING
-                and not is_first):
-            self._cancel_requested = False
-            await self._state.transition(AtomState.SPEAKING)
+            if (self._state.current is not AtomState.SPEAKING
+                    and not is_first):
+                self._cancel_requested = False
+                await self._state.transition(AtomState.SPEAKING)
 
-        if text:
-            self._chunk_buffer.append(text)
+            if text:
+                self._chunk_buffer.append(text)
 
-        if is_last:
-            asyncio.create_task(self._flush_and_finish())
+            if is_last:
+                asyncio.create_task(self._flush_and_finish())
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            await self._handle_runtime_error(
+                "on_partial_response",
+                exc,
+                fallback_text=text if text.strip() else None,
+                emit_complete=True,
+            )
 
     async def _flush_and_finish(self) -> None:
         """Assemble full response, speak first ~45 words, show rest on screen."""
@@ -768,17 +829,22 @@ class EdgeTTSAsync:
     # ── Shutdown ─────────────────────────────────────────────────
 
     async def shutdown(self) -> None:
-        await self.stop()
-        for path in self._ack_cache.values():
-            try:
-                os.unlink(path)
-            except OSError:
-                pass
-        self._ack_cache.clear()
-        if self._mixer_ready:
-            try:
-                import pygame
-                pygame.mixer.quit()
-            except Exception:
-                pass
-        logger.info("Edge-TTS shut down (ack cache cleared)")
+        try:
+            await self.stop()
+            for path in self._ack_cache.values():
+                try:
+                    os.unlink(path)
+                except OSError:
+                    pass
+            self._ack_cache.clear()
+            if self._mixer_ready:
+                try:
+                    import pygame
+                    pygame.mixer.quit()
+                except Exception:
+                    pass
+            logger.info("Edge-TTS shut down (ack cache cleared)")
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            await self._handle_runtime_error("shutdown", exc)

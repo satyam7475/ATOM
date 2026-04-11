@@ -23,8 +23,34 @@ _COPY_PATH = re.compile(
     re.I,
 )
 
+_SPOTLIGHT_FOR = re.compile(
+    r"\bspotlight(?:\s+search)?\s+for\s+(?P<q>.+)$",
+    re.I,
+)
+_SPOTLIGHT = re.compile(r"\bspotlight\s+(?P<q>.+)$", re.I)
+_SEARCH_MY_MAC = re.compile(r"\bsearch\s+my\s+mac\s+for\s+(?P<q>.+)$", re.I)
+_FIND_ON_MAC = re.compile(
+    r"\bfind\s+(?P<q>.+?)\s+on\s+my\s+mac\b",
+    re.I,
+)
+
 
 def check(text: str) -> IntentResult | None:
+    m = _SEARCH_MY_MAC.search(text) or _SPOTLIGHT_FOR.search(text)
+    if not m:
+        m = _FIND_ON_MAC.search(text)
+    if not m:
+        m = _SPOTLIGHT.search(text)
+    if m:
+        q = clean_slot(m.group("q"))
+        if q:
+            return IntentResult(
+                "spotlight_search",
+                response=f"Searching your Mac for {q}.",
+                action="spotlight_search",
+                action_args={"query": q},
+            )
+
     m = _CREATE_FOLDER.search(text)
     if m:
         name = clean_slot(m.group("name"))
