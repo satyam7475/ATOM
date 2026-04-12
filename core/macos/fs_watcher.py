@@ -17,7 +17,7 @@ Usage:
 Events emitted on the bus:
     fs_event: {
         "path": "/Users/.../file.txt",
-        "event": "created" | "modified" | "removed" | "renamed",
+        "change": "created" | "modified" | "removed" | "renamed",  # not "event" — clashes with emit()
         "is_dir": bool,
     }
 
@@ -28,6 +28,7 @@ Owner: Satyam
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import sys
@@ -106,6 +107,7 @@ class FSWatcher:
         self._runloop_ref: Any = None
         self._event_count = 0
         self._available = _HAS_FSEVENTS and sys.platform == "darwin"
+        self._async_loop: asyncio.AbstractEventLoop | None = None
 
     @property
     def is_available(self) -> bool:
@@ -142,6 +144,11 @@ class FSWatcher:
             logger.warning("FSWatcher: none of the watched paths exist: %s",
                            self._paths)
             return False
+
+        try:
+            self._async_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            self._async_loop = asyncio.get_event_loop()
 
         self._running = True
         self._thread = threading.Thread(
@@ -182,6 +189,8 @@ class FSWatcher:
             ) -> None:
                 for i in range(num_events):
                     path = event_paths[i]
+                    if isinstance(path, bytes):
+                        path = path.decode("utf-8", errors="replace")
                     flags = event_flags[i]
 
                     if _should_ignore(path):
@@ -196,12 +205,16 @@ class FSWatcher:
                         event_type, path, "/" if is_dir else "",
                     )
 
-                    if self._bus is not None:
-                        self._bus.emit("fs_event", **{
-                            "path": path,
-                            "event": event_type,
-                            "is_dir": is_dir,
-                        })
+                    if self._bus is not None and self._async_loop is not None:
+                        _p, _c, _d = path, event_type, is_dir
+                        try:
+                            self._async_loop.call_soon_threadsafe(
+                                lambda p=_p, c=_c, d=_d: self._bus.emit(
+                                    "fs_event", path=p, change=c, is_dir=d,
+                                ),
+                            )
+                        except RuntimeError:
+                            pass
 
             stream = _FSEvents.FSEventStreamCreate(
                 None,          # allocator

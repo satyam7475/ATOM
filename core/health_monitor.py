@@ -415,8 +415,8 @@ class HealthMonitor:
         if self._tts is None:
             return issues
 
-        mixer_ready = getattr(self._tts, "_mixer_ready", False)
-        if not mixer_ready:
+        mixer_ready = getattr(self._tts, "_mixer_ready", None)
+        if mixer_ready is False:
             issues.append("TTS: mixer not initialized")
             self._degraded_components.add("tts")
 

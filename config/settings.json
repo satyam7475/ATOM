@@ -1,6 +1,6 @@
 {
     "deployment": {
-        "profile": "corporate_laptop",
+        "profile": "personal_desktop",
         "dashboard_badge": true
     },
     "session": {
@@ -27,7 +27,7 @@
         "prefer_bluetooth": true
     },
     "stt": {
-        "engine": "faster_whisper",
+        "engine": "macos_native",
         "whisper_model_size": "small",
         "bilingual": true,
         "sample_rate": 16000,
@@ -38,7 +38,7 @@
         "min_energy_threshold": 400
     },
     "tts": {
-        "engine": "edge",
+        "engine": "macos_native",
         "max_lines": 4,
         "rate": 2,
         "edge_voice": "en-GB-RyanNeural",
@@ -61,8 +61,8 @@
         "top_k": 3,
         "max_vector_results": 5,
         "max_graph_nodes": 1000,
-        "pressure_threshold_pct": 85,
-        "pressure_relief_pct": 75,
+        "pressure_threshold_pct": 82,
+        "pressure_relief_pct": 72,
         "pressure_top_k": 2,
         "pressure_query_limit": 3,
         "semantic_weight": 0.7,
@@ -79,19 +79,19 @@
         "model_path": "models/qwen3-8b-q4_k_m.gguf",
         "mlx_primary_model": "models/qwen3-4b-mlx",
         "mlx_fast_model": "models/qwen3-1.7b-mlx",
-        "mlx_default_role": "primary",
-        "n_ctx": 8192,
+        "mlx_default_role": "fast",
+        "n_ctx": 6144,
         "n_threads": 4,
         "n_gpu_layers": -1,
-        "n_batch": 512,
-        "max_tokens": 512,
+        "n_batch": 384,
+        "max_tokens": 384,
         "temperature": 0.7,
         "top_p": 0.9,
         "repeat_penalty": 1.1,
-        "timeout_seconds": 30
+        "timeout_seconds": 24
     },
     "assistant_brain": {
-        "active_profile": "brain",
+        "active_profile": "optimal",
         "restore_persisted_profile": true,
         "persist_active_profile": true,
         "audit_profile_changes": true,
@@ -114,30 +114,23 @@
             "status report": "All systems nominal. CPU cool, memory clean, brain loaded."
         },
         "profiles": {
-            "atom": {
-                "max_tokens": 256,
+            "optimal": {
+                "max_tokens": 320,
                 "n_ctx": 4096,
                 "n_threads": 4,
                 "n_gpu_layers": -1,
-                "n_batch": 512,
-                "timeout_seconds": 20,
+                "n_batch": 384,
+                "timeout_seconds": 18,
+                "temperature": 0.6,
                 "extra_stop_sequences": ["\n\nUser:", "\nUser:", "\n\nBoss:"]
             },
-            "balanced": {
+            "full_performance": {
                 "max_tokens": 512,
-                "n_ctx": 8192,
+                "n_ctx": 10240,
                 "n_threads": 4,
                 "n_gpu_layers": -1,
                 "n_batch": 512,
-                "timeout_seconds": 30
-            },
-            "brain": {
-                "max_tokens": 768,
-                "n_ctx": 16384,
-                "n_threads": 4,
-                "n_gpu_layers": -1,
-                "n_batch": 512,
-                "timeout_seconds": 45,
+                "timeout_seconds": 28,
                 "temperature": 0.65
             }
         }
@@ -145,7 +138,7 @@
     "ui": {
         "mode": "web",
         "web_port": 8765,
-        "auto_open_browser": false,
+        "auto_open_browser": true,
         "password_auth_enabled": false
     },
     "executor": {
@@ -186,8 +179,8 @@
     },
     "performance": {
         "mode": "auto",
-        "auto_threshold_high": 70,
-        "auto_threshold_mid": 40,
+        "auto_threshold_high": 78,
+        "auto_threshold_mid": 45,
         "health_check_interval_s": 120,
         "stuck_state_threshold_s": 75,
         "system_watcher_interval_s": 30,
@@ -202,7 +195,7 @@
         "watchdog_cache_timeout_ms": 100,
         "watchdog_rag_timeout_ms": 500,
         "watchdog_llm_timeout_s": 30,
-        "watchdog_tts_timeout_s": 15,
+        "watchdog_tts_timeout_s": 30,
         "watchdog_tool_timeout_s": 10,
         "supervisor_restart_cooldown_s": 8,
         "watchdog_poll_interval_s": 2,
@@ -225,27 +218,46 @@
         "predictions_enabled": true,
         "behavior_model_enabled": true,
         "self_optimizer_enabled": true,
-        "prediction_check_interval_s": 120,
-        "behavior_update_interval_s": 900,
+        "prediction_check_interval_s": 180,
+        "behavior_update_interval_s": 1200,
         "goal_evaluation_interval_s": 3600,
         "prediction_min_confidence": 0.6,
         "prediction_preload_enabled": true,
         "prediction_preload_min_confidence": 0.82,
         "prediction_preload_max_items": 2,
         "prediction_preload_cooldown_s": 120,
-        "prediction_preload_timeout_s": 2.5,
+        "prediction_preload_timeout_s": 1.5,
         "auto_mode_switching": true,
         "default_mode": "work",
         "max_goals": 20,
         "max_predictions": 5,
-        "optimizer_check_interval_s": 1800,
+        "optimizer_check_interval_s": 3600,
         "energy_inference_interval_s": 120,
         "dream_enabled": true,
-        "dream_idle_minutes": 30,
+        "dream_idle_minutes": 45,
         "dream_interval_hours": 6,
         "curiosity_enabled": true,
         "curiosity_max_per_hour": 2,
-        "curiosity_cooldown_minutes": 15
+        "curiosity_cooldown_minutes": 30,
+        "goal_tool_auto_complete": true,
+        "goal_tool_match_strict": false,
+        "dream_require_idle_signal": true,
+        "dream_min_interactions": 5,
+        "dream_prune_second_brain": true,
+        "dream_prewarm_embeddings": false,
+        "dream_prewarm_retrieve_topics": ["work", "ATOM", "project", "schedule", "personal"]
+    },
+    "proactive_engine": {
+        "check_interval_s": 600,
+        "m5_triggers": {
+            "enabled": true,
+            "battery_low_pct": 20,
+            "memory_high_pct": 82,
+            "disk_free_gb_warn": 10,
+            "project_stale_days": 3,
+            "idle_goal_nudge_minutes": 40,
+            "morning_briefing_hours": [7, 8, 9]
+        }
     },
     "conversation_memory": {
         "max_turns": 20
@@ -289,7 +301,7 @@
     "gpu": {
         "enabled": true,
         "thermal_threshold": 85,
-        "memory_threshold_pct": 85,
+        "memory_threshold_pct": 82,
         "poll_interval_s": 30
     },
     "cognitive_kernel": {
@@ -299,7 +311,7 @@
         "deep_query_min_chars": 140,
         "battery_degrade": true,
         "thermal_degrade": true,
-        "memory_pressure_threshold": 85
+        "memory_pressure_threshold": 82
     },
     "latency_controller": {
         "direct_budget_ms": 50,
@@ -308,7 +320,7 @@
         "full_budget_ms": 5000,
         "deep_budget_ms": 15000,
         "simple_query_max_chars": 48,
-        "memory_pressure_pct": 85,
+        "memory_pressure_pct": 82,
         "low_battery_pct": 20,
         "cpu_busy_pct": 88,
         "battery_scale": 0.9,
@@ -378,7 +390,7 @@
             "memory_relevance_poor_below": 0.15,
             "system_load_cpu_low_below": 55.0,
             "system_load_cpu_high_above": 88.0,
-            "system_load_ram_high_above": 90.0
+            "system_load_ram_high_above": 85.0
         },
         "warnings": {
             "warn_on_degrading_prediction": true,
@@ -399,8 +411,8 @@
         "first_token_budget_ms": 120,
         "top_k": 3,
         "max_snippets": 3,
-        "pressure_threshold_pct": 85,
-        "pressure_relief_pct": 75,
+        "pressure_threshold_pct": 82,
+        "pressure_relief_pct": 72,
         "pressure_top_k": 1,
         "adaptive": {
             "budget_min_ms": 40,
@@ -430,20 +442,59 @@
         "deployment_mode": "distributed",
         "vram_reserve_mb": 512,
         "model_slots_mb": {
-            "llm": 8192,
-            "stt": 3072,
-            "embeddings": 512
+            "llm": 6144,
+            "stt": 1536,
+            "embeddings": 384
         },
         "eviction_order": ["embeddings", "stt", "llm"],
-        "idle_unload_stt_s": 60,
-        "idle_unload_llm_s": 180,
+        "idle_unload_stt_s": 30,
+        "idle_unload_llm_s": 90,
         "idle_sleep_s": 600,
         "fused_gpu_worker": false,
         "gpu_stall_timeout_s": 120,
         "allow_cuda_reset": false,
-        "degradation_default": "full",
+        "degradation_default": "limited",
         "event_replay_max": 32,
         "speculative_response": false,
         "simulation_mode": "hybrid"
+    },
+    "cloud": {
+        "enabled": true,
+        "provider": "gemini",
+        "gemini_api_key": "",
+        "buddy_model": "gemini-2.0-flash",
+        "reasoning_model": "gemini-2.5-flash",
+        "timeout_seconds": 8,
+        "timeout_reasoning_seconds": 30,
+        "max_tokens": 1024,
+        "max_tokens_reasoning": 8192,
+        "temperature": 0.7,
+        "max_requests_per_minute": 15
+    },
+    "security_gateway": {
+        "block_system_paths": true,
+        "max_outbound_length": 500,
+        "audit_cloud_calls": true,
+        "max_requests_per_minute": 10
+    },
+    "confidence": {
+        "escalation_threshold": 0.45,
+        "cloud_only_for_abstract": true
+    },
+    "decision_engine": {
+        "enable_followups": true,
+        "enable_recommendations": true,
+        "enable_structuring": true,
+        "max_followup_length": 80
+    },
+    "search": {
+        "max_results": 5,
+        "timeout_seconds": 8
+    },
+    "semantic_cache": {
+        "enabled": true,
+        "max_size": 256,
+        "ttl_seconds": 600,
+        "threshold": 0.85
     }
 }

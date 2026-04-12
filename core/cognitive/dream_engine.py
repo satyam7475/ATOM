@@ -65,6 +65,23 @@ if TYPE_CHECKING:
 _DREAM_LOG = Path("logs/dream_log.json")
 _MIN_IDLE_MINUTES = 30
 _DREAM_INTERVAL_HOURS = 6
+_DEFAULT_PREWARM_TOPICS = ("work", "ATOM", "project", "schedule", "personal")
+
+
+def _build_pattern_summary(patterns: list[dict], connections: list[dict]) -> str:
+    parts: list[str] = []
+    for p in patterns[:5]:
+        ins = str(p.get("insight") or "").strip()
+        if ins:
+            parts.append(ins)
+    for c in connections[:4]:
+        topic = str(c.get("topic") or "").strip()
+        n = int(c.get("occurrences") or 0)
+        if topic and n > 1:
+            parts.append(f"Recurring theme «{topic}» ({n} related queries)")
+    if not parts:
+        return ""
+    return "Dream summary — " + " | ".join(parts)[:900]
 
 
 class DreamEngine:
@@ -74,12 +91,25 @@ class DreamEngine:
         self,
         bus: "AsyncEventBus",
         config: dict | None = None,
+        brain_mode_manager: Any | None = None,
     ) -> None:
         self._bus = bus
         self._config = (config or {}).get("cognitive", {})
         self._enabled = self._config.get("dream_enabled", True)
         self._min_idle = self._config.get("dream_idle_minutes", _MIN_IDLE_MINUTES)
         self._dream_interval = self._config.get("dream_interval_hours", _DREAM_INTERVAL_HOURS)
+        self._dream_require_idle = bool(
+            self._config.get("dream_require_idle_signal", False),
+        )
+        self._min_interactions = max(
+            1,
+            int(self._config.get("dream_min_interactions", 5)),
+        )
+        topics = self._config.get("dream_prewarm_retrieve_topics")
+        if isinstance(topics, list) and topics:
+            self._prewarm_topics = tuple(str(t) for t in topics[:12] if str(t).strip())
+        else:
+            self._prewarm_topics = _DEFAULT_PREWARM_TOPICS
         self._last_dream_time: float = 0.0
         self._dream_count: int = 0
         self._dream_log: list[dict] = []
@@ -87,7 +117,19 @@ class DreamEngine:
         self._task: asyncio.Task | None = None
         self._session_interactions: list[dict] = []
         self._second_brain: SecondBrain | None = None
+        self._brain_mode_mgr = brain_mode_manager
+        self._idle_eligible: bool = not self._dream_require_idle
+        self._last_idle_signal_ts: float = 0.0
         self._load_log()
+
+    def _background_enabled(self) -> bool:
+        mgr = self._brain_mode_mgr
+        if mgr is None:
+            return True
+        try:
+            return bool(mgr.feature_enabled("dream"))
+        except Exception:
+            return True
 
     def wire(self, second_brain: "SecondBrain | None" = None) -> None:
         """Wire cognitive dependencies after initialization."""
@@ -107,15 +149,35 @@ class DreamEngine:
         if not self._enabled:
             return
         self._running = True
+        self._bus.on("idle_detected", self._on_idle_detected)
         self._task = asyncio.create_task(self._dream_monitor())
-        logger.info("Dream engine started (idle threshold: %d min)", self._min_idle)
+        logger.info(
+            "Dream engine started (idle threshold: %d min, require_idle_signal=%s)",
+            self._min_idle,
+            self._dream_require_idle,
+        )
 
     def stop(self) -> None:
         self._running = False
+        try:
+            self._bus.off("idle_detected", self._on_idle_detected)
+        except Exception:
+            logger.debug("dream idle_detected off failed", exc_info=True)
         if self._task is not None:
             self._task.cancel()
             self._task = None
         self.persist()
+
+    async def _on_idle_detected(self, idle_minutes: float = 0, **_kw: Any) -> None:
+        """Mark system idle long enough for a dream cycle (M5)."""
+        try:
+            mins = float(idle_minutes)
+        except (TypeError, ValueError):
+            mins = 0.0
+        if mins >= float(self._min_idle):
+            self._idle_eligible = True
+            self._last_idle_signal_ts = time.time()
+            logger.debug("Dream idle gate OPEN (%.0f min idle)", mins)
 
     def record_interaction(self, query: str, response: str,
                            intent: str = "", emotion: str = "") -> None:
@@ -138,14 +200,26 @@ class DreamEngine:
                 if not self._running:
                     break
 
+                if not self._background_enabled():
+                    continue
+
                 hours_since_dream = (time.time() - self._last_dream_time) / 3600
                 if hours_since_dream < self._dream_interval:
                     continue
 
-                if len(self._session_interactions) < 5:
+                if len(self._session_interactions) < self._min_interactions:
                     continue
 
+                if self._dream_require_idle:
+                    if not self._idle_eligible:
+                        continue
+                    if (time.time() - self._last_idle_signal_ts) > 3600:
+                        self._idle_eligible = False
+                        continue
+
                 await self.dream()
+                if self._dream_require_idle:
+                    self._idle_eligible = False
 
             except asyncio.CancelledError:
                 break
@@ -154,6 +228,8 @@ class DreamEngine:
 
     async def dream(self) -> dict:
         """Execute a dream cycle -- consolidate and organize memories."""
+        if not self._background_enabled():
+            return {"status": "mode_gated"}
         if not self._session_interactions:
             return {"status": "nothing_to_dream"}
 
@@ -161,14 +237,26 @@ class DreamEngine:
                      len(self._session_interactions))
 
         t0 = time.monotonic()
-        dream_result = {
+        dream_result: dict[str, Any] = {
             "timestamp": time.time(),
             "interactions_processed": len(self._session_interactions),
             "patterns": [],
             "facts_extracted": [],
             "connections": [],
             "pruned": 0,
+            "brain_pruned": 0,
+            "embedding_warmups": 0,
+            "pattern_summary": "",
         }
+
+        try:
+            self._bus.emit_fast(
+                "dream_cycle_start",
+                prefer_fast_model=True,
+                min_idle_minutes=self._min_idle,
+            )
+        except Exception:
+            pass
 
         patterns = self._find_patterns()
         dream_result["patterns"] = patterns
@@ -179,10 +267,43 @@ class DreamEngine:
         connections = self._find_connections()
         dream_result["connections"] = connections
 
+        summary = _build_pattern_summary(patterns, connections)
+        dream_result["pattern_summary"] = summary
+        if summary and self._second_brain is not None:
+            try:
+                self._second_brain.learn_fact(
+                    summary,
+                    source="dream_pattern",
+                    tags=["dream", "session_summary"],
+                    importance=0.55,
+                )
+            except Exception:
+                logger.debug("Dream pattern summary learn failed", exc_info=True)
+
         await self._strengthen_memories(facts, patterns)
 
         pruned = self._prune_noise()
         dream_result["pruned"] = pruned
+
+        brain_pruned = 0
+        if self._second_brain is not None and self._config.get(
+            "dream_prune_second_brain", True,
+        ):
+            try:
+                brain_pruned = self._second_brain.prune_for_consolidation()
+            except Exception:
+                logger.debug("Dream brain prune failed", exc_info=True)
+        dream_result["brain_pruned"] = brain_pruned
+        if brain_pruned and self._second_brain is not None:
+            try:
+                self._second_brain.persist()
+            except Exception:
+                logger.debug("Dream brain persist after prune failed", exc_info=True)
+
+        warmups = 0
+        if self._config.get("dream_prewarm_embeddings", True):
+            warmups = await self._prewarm_retrieval_embeddings()
+        dream_result["embedding_warmups"] = warmups
 
         elapsed = (time.monotonic() - t0) * 1000
         self._dream_count += 1
@@ -193,14 +314,56 @@ class DreamEngine:
             self._dream_log = self._dream_log[-50:]
 
         logger.info(
-            "Dream cycle complete in %.0fms: %d patterns, %d facts, %d connections, %d pruned",
+            "Dream cycle complete in %.0fms: %d patterns, %d facts, %d connections, "
+            "%d ix-pruned, %d brain-pruned, %d embed-warmups",
             elapsed, len(patterns), len(facts), len(connections), pruned,
+            brain_pruned, warmups,
         )
 
+        try:
+            self._bus.emit_fast("dream_cycle_end", result=dream_result)
+        except Exception:
+            pass
         self._bus.emit_fast("dream_complete", result=dream_result)
         self.persist()
 
         return dream_result
+
+    async def _prewarm_retrieval_embeddings(self) -> int:
+        """Warm embedding cache from SecondBrain retrieval probes (idle, low cost)."""
+        if self._second_brain is None:
+            return 0
+        try:
+            from core.embedding_engine import get_embedding_engine
+
+            eng = get_embedding_engine()
+        except Exception:
+            return 0
+
+        loop = asyncio.get_running_loop()
+        count = 0
+
+        def _embed_lines(lines: list[str]) -> int:
+            n = 0
+            for line in lines:
+                text = (line or "").strip()
+                if len(text) < 16:
+                    continue
+                try:
+                    eng.embed_sync(text[:500])
+                    n += 1
+                except Exception:
+                    pass
+            return n
+
+        for topic in self._prewarm_topics:
+            try:
+                lines = self._second_brain.retrieve(topic, k=3)
+            except Exception:
+                lines = []
+            if lines:
+                count += await loop.run_in_executor(None, _embed_lines, lines)
+        return count
 
     def _find_patterns(self) -> list[dict]:
         """Identify repeated patterns in the session."""
@@ -402,9 +565,15 @@ class DreamEngine:
         if not self._dream_log:
             return "No dreams yet. I consolidate memories when you're away."
         last = self._dream_log[-1]
+        extra = ""
+        ps = str(last.get("pattern_summary") or "").strip()
+        if ps:
+            extra = f" Summary: {ps[:220]}{'…' if len(ps) > 220 else ''}"
         return (
             f"Last dream: processed {last.get('interactions_processed', 0)} interactions, "
             f"found {len(last.get('patterns', []))} patterns, "
-            f"extracted {len(last.get('facts_extracted', []))} facts. "
+            f"extracted {len(last.get('facts_extracted', []))} facts, "
+            f"pruned {last.get('brain_pruned', 0)} stale brain rows, "
+            f"{last.get('embedding_warmups', 0)} embedding warmups.{extra} "
             f"Total dreams: {self._dream_count}."
         )

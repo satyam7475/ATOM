@@ -44,7 +44,7 @@ class SelfOptimizer:
         "_feature_usage", "_intent_counts", "_fallback_queries",
         "_suggestions_history", "_last_check",
         "_task", "_shutdown", "_check_interval",
-        "_dirty",
+        "_dirty", "_brain_mode_mgr",
     )
 
     def __init__(
@@ -52,6 +52,7 @@ class SelfOptimizer:
         bus: AsyncEventBus,
         metrics: MetricsCollector,
         config: dict | None = None,
+        brain_mode_manager: Any | None = None,
     ) -> None:
         self._bus = bus
         self._metrics = metrics
@@ -65,10 +66,20 @@ class SelfOptimizer:
         self._suggestions_history: list[dict] = []
         self._last_check: float = 0
         self._dirty = False
+        self._brain_mode_mgr = brain_mode_manager
 
         self._task: asyncio.Task | None = None
         self._shutdown = asyncio.Event()
         self._load()
+
+    def _background_enabled(self) -> bool:
+        mgr = self._brain_mode_mgr
+        if mgr is None:
+            return True
+        try:
+            return bool(mgr.feature_enabled("self_optimizer"))
+        except Exception:
+            return True
 
     # ── Persistence ────────────────────────────────────────────────────
 
@@ -131,6 +142,8 @@ class SelfOptimizer:
             except asyncio.TimeoutError:
                 pass
             try:
+                if not self._background_enabled():
+                    continue
                 suggestions = self._analyze()
                 if suggestions:
                     self._bus.emit_fast(

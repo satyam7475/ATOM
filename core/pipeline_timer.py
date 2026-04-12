@@ -113,3 +113,11 @@ class PipelineTimer:
             self._metrics.record_latency("pipeline_intent", intent_ms)
             self._metrics.record_latency("pipeline_action", action_ms)
             self._metrics.record_latency("pipeline_tts", tts_ms)
+
+        if tts_ms > 0.05:
+            try:
+                from core.observability.per_module_latency import get_latency_board
+
+                get_latency_board().record_module_call("tts", float(tts_ms), error=False)
+            except Exception:
+                pass

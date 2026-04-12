@@ -33,8 +33,18 @@ import time
 import uuid
 from collections import deque
 from functools import partial
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict
 
+from core.query_policy import (
+    detect_response_language,
+    ResponseMode,
+    classify_response_mode,
+    normalize_query,
+    should_export_report,
+    slugify_query,
+    summarize_report,
+)
 from core.reasoning.tool_parser import parse_tool_calls
 from core.runtime.v7_context import V7RuntimeContext
 
@@ -48,6 +58,19 @@ logger = logging.getLogger("atom.local_brain")
 
 _SENTENCE_BOUNDARY = re.compile(r"[.!?]\s")
 _SENTENCE_END = re.compile(r"[.!?]$")
+_INLINE_TRACE_RE = re.compile(r"^(?:[a-z_]+\([^)]{0,200}\)\s*[→:=-]+\s*)+", re.I)
+_TRANSCRIPT_SPLIT_RE = re.compile(r"\b(?:User|Boss|ATOM|Assistant):", re.I)
+_TRANSCRIPT_LABEL_RE = re.compile(r"\b(?:User|Boss|ATOM|Assistant):\s*", re.I)
+_REPEATED_SPEAKER_RE = re.compile(r"^(?:(?:User|Boss|ATOM|Assistant)\s*:?\s*)+$", re.I)
+_INSTRUCTION_ECHO_RE = re.compile(
+    r"^(?:the final answer should|reply with|direct answer|current user request|strict output recovery|response contract|the user is asking|this is a|boss explicitly asked)\b",
+    re.I,
+)
+_IMPERATIVE_ECHO_RE = re.compile(
+    r"^(?:explain|compare|describe|tell me|answer|summarize|give)\b",
+    re.I,
+)
+_MEMORY_ACK_RE = re.compile(r'^"?((?:yes,\s*)?i remember (?:it|that))\.?"?$', re.I)
 
 MAX_REACT_STEPS = 3
 
@@ -71,6 +94,7 @@ class LocalBrainController:
         self._bus = bus
         self._prompt_builder = prompt_builder
         self._config = config
+        self._brain_mode_manager = brain_mode_manager
 
         from brain.mlx_llm import MLXBrain
         self._llm = MLXBrain(config)
@@ -96,6 +120,7 @@ class LocalBrainController:
         self._mode_resolver: Any = None
         self._prefetch_engine: Any = None
         self._memory_graph: Any = None
+        self._second_brain: Any = None
         self._recent_queries: deque[str] = deque(maxlen=12)
         self._current_runtime_mode: str = "SMART"
         self._last_mode_info: Dict[str, Any] = {}
@@ -106,6 +131,34 @@ class LocalBrainController:
         self._prev_predictions: list[str] = []
         self._last_retrieval_source: str = ""
         self._v7_context_last: V7RuntimeContext | None = None
+        self._latency_board_llm: str = "llm_large"
+        self._report_dir = Path("logs/reports")
+        self._report_export_min_words = 140
+        self._report_export_min_chars = 900
+        self._response_language: str = "english"
+
+        # v22: Cloud intelligence components
+        self._confidence_engine: Any = None
+        self._decision_engine: Any = None
+        self._gemini_client: Any = None
+        self._semantic_cache: Any = None
+        self._preference_store: Any = None
+
+        from core.cognition.intent_classifier import IntentClassifier
+        from core.cognition.planner import PlannerEngine
+        from core.cognition.state_graph import SystemStateGraph
+        
+        self._intent_classifier = IntentClassifier()
+        self._planner = PlannerEngine(ai_client=self._llm)
+        self._state_graph = SystemStateGraph()
+
+    def _prediction_prefetch_enabled(self) -> bool:
+        if self._brain_mode_manager is None:
+            return True
+        try:
+            return bool(self._brain_mode_manager.feature_enabled("prediction_prefetch"))
+        except Exception:
+            return True
 
     def attach_feedback_engine(self, engine: Any) -> None:
         self._feedback_engine = engine
@@ -128,6 +181,32 @@ class LocalBrainController:
     def attach_memory_graph(self, graph: Any) -> None:
         self._memory_graph = graph
 
+    def attach_second_brain(self, second_brain: Any) -> None:
+        self._second_brain = second_brain
+
+    def attach_cloud_intelligence(
+        self,
+        *,
+        confidence_engine: Any = None,
+        decision_engine: Any = None,
+        gemini_client: Any = None,
+        semantic_cache: Any = None,
+        preference_store: Any = None,
+    ) -> None:
+        """v22: Wire cloud intelligence components for post-LLM scoring."""
+        self._confidence_engine = confidence_engine
+        self._decision_engine = decision_engine
+        self._gemini_client = gemini_client
+        self._semantic_cache = semantic_cache
+        self._preference_store = preference_store
+        logger.info(
+            "Brain v22 cloud intelligence: confidence=%s, decision=%s, "
+            "gemini=%s, sem_cache=%s, prefs=%s",
+            confidence_engine is not None, decision_engine is not None,
+            gemini_client is not None, semantic_cache is not None,
+            preference_store is not None,
+        )
+
     def attach_rag(
         self,
         rag_engine: Any = None,
@@ -136,6 +215,240 @@ class LocalBrainController:
         """Wire low-latency RAG (optional). ``gpu_coordinator`` for observability snapshot."""
         self._rag_engine = rag_engine
         self._gpu_coord = gpu_coordinator
+
+    @staticmethod
+    def _compact_text(text: str) -> str:
+        return re.sub(r"\s+", " ", (text or "").strip())
+
+    def _sanitize_emittable_text(self, text: str) -> str:
+        cleaned = _INLINE_TRACE_RE.sub("", self._compact_text(text)).strip(" -:>")
+        if not cleaned:
+            return ""
+
+        label_hits = len(_TRANSCRIPT_LABEL_RE.findall(cleaned))
+        if label_hits >= 2:
+            assistant_segments = [
+                self._compact_text(seg).strip(" -:>")
+                for seg in re.findall(
+                    r"(?:ATOM|Assistant):\s*(.+?)(?=(?:User|Boss|ATOM|Assistant):|$)",
+                    cleaned,
+                    re.I,
+                )
+            ]
+            assistant_segments = [
+                seg for seg in assistant_segments if seg and not _REPEATED_SPEAKER_RE.match(seg)
+            ]
+            if assistant_segments:
+                cleaned = max(assistant_segments, key=len)
+            else:
+                return ""
+
+        cleaned = _TRANSCRIPT_LABEL_RE.sub("", cleaned).strip(" -:>")
+        cleaned = re.sub(
+            r"(?:\b(?:User|Boss|ATOM|Assistant)\b\s*)+$",
+            "",
+            cleaned,
+            flags=re.I,
+        ).strip(" -:>")
+        if not cleaned or _REPEATED_SPEAKER_RE.match(cleaned):
+            return ""
+
+        words = cleaned.lower().replace(":", " ").split()
+        if len(words) >= 3 and len(set(words)) == 1 and words[0] in {"atom", "user", "assistant", "boss"}:
+            return ""
+        return cleaned
+
+    def _strip_model_artifacts(self, query: str, text: str) -> str:
+        cleaned = self._compact_text(text)
+        if not cleaned:
+            return ""
+
+        compact_query = self._compact_text(query)
+        if compact_query:
+            direct_reply = re.search(
+                rf"(?:User|Boss):\s*{re.escape(compact_query)}\s*"
+                rf"(?:ATOM|Assistant):\s*(.+?)(?=(?:User|Boss|ATOM|Assistant):|$)",
+                cleaned,
+                re.I,
+            )
+            if direct_reply:
+                cleaned = direct_reply.group(1).strip()
+
+        cleaned = self._sanitize_emittable_text(cleaned)
+        if compact_query and cleaned.lower() == compact_query.lower():
+            return ""
+        return cleaned
+
+    def _finalize_inline_text(self, query: str, text: str) -> str:
+        from core import adaptive_personality as personality
+
+        cleaned = self._strip_model_artifacts(query, text)
+        if not cleaned:
+            cleaned = "I lost the thread there, Boss. Ask that again."
+        if classify_response_mode(query) is ResponseMode.SHORT:
+            cleaned = summarize_report(cleaned, max_sentences=2, max_chars=180)
+        return personality.polish_response(cleaned, source="local_brain")
+
+    @staticmethod
+    def _max_tokens_override(
+        *,
+        response_mode: ResponseMode,
+        budget_tier: str,
+        requested_tier: str,
+    ) -> int | None:
+        budget = str(budget_tier or "").strip().lower()
+        requested = str(requested_tier or "").strip().lower()
+        if response_mode is ResponseMode.SHORT or budget in {"command", "info"}:
+            return 96
+        if budget == "simple":
+            return 128
+        if response_mode is ResponseMode.DETAIL or budget == "complex" or requested == "complex":
+            return 224
+        if response_mode is ResponseMode.REPORT or budget == "creative" or requested == "creative":
+            return None
+        return 160
+
+    @staticmethod
+    def _repair_max_tokens_override(max_tokens_override: int | None) -> int:
+        if not max_tokens_override:
+            return 128
+        return max(96, min(int(max_tokens_override), 160))
+
+    def _build_repair_prompt(
+        self,
+        query: str,
+        *,
+        context: dict[str, str] | None = None,
+    ) -> str:
+        safe_query = re.sub(r"\s+", " ", (query or "").strip())
+        base_prompt = self._prompt_builder.build(
+            safe_query,
+            memory_summaries=None,
+            history=[],
+            context=context,
+            document_context=None,
+            observations=None,
+            rag_enrichment=None,
+        )
+        return (
+            f"{base_prompt}\n\n"
+            "FINAL RETRY:\n"
+            "Start immediately with the actual answer.\n"
+            "Use plain text only.\n"
+            "No role labels, no transcript format, no tool calls, no meta instructions.\n"
+            f"Question: {safe_query}\n"
+            "Answer:"
+        )
+
+    def _reject_low_quality_answer(self, query: str, text: str) -> bool:
+        clean = self._compact_text(text).strip().strip('"')
+        if not clean:
+            return True
+        if _INSTRUCTION_ECHO_RE.search(clean):
+            return True
+        normalized_query = normalize_query(query)
+        normalized_clean = normalize_query(clean)
+        if normalized_query and normalized_clean == normalized_query:
+            return True
+        if _IMPERATIVE_ECHO_RE.search(clean) and any(token in normalized_query for token in ("explain", "compare", "what is", "why", "how")):
+            return True
+        if clean.endswith("?") and normalized_clean:
+            query_words = set(normalized_query.split())
+            answer_words = set(normalized_clean.split())
+            if query_words and len(query_words & answer_words) >= max(2, min(4, len(query_words))):
+                return True
+        if _MEMORY_ACK_RE.fullmatch(clean):
+            if not any(token in normalized_query for token in ("remember", "recall", "what do you know", "have i told")):
+                return True
+        return False
+
+    def _candidate_response_text(self, query: str, raw_response: str, parsed: Any) -> str:
+        candidate = self._compact_text(getattr(parsed, "text_response", "") or "")
+        if not candidate and raw_response and not getattr(parsed, "has_tool_calls", False):
+            candidate = self._strip_model_artifacts(query, raw_response)
+        if not candidate:
+            return ""
+        if self._reject_low_quality_answer(query, candidate):
+            logger.warning("Rejected low-quality candidate response: %s", candidate[:200])
+            self._bus.emit("metrics_event", counter="llm_response_rejected")
+            return ""
+        return candidate
+
+    def _report_path_for(self, query: str) -> Path:
+        stamp = time.strftime("%Y%m%d_%H%M%S")
+        slug = slugify_query(query)
+        return self._report_dir / f"{stamp}_{slug}.txt"
+
+    def _write_report_file(self, query: str, text: str) -> Path:
+        path = self._report_path_for(query)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = (
+            f"ATOM Research Report\n"
+            f"Generated: {time.strftime('%Y-%m-%d %H:%M:%S')}\n"
+            f"Query: {query.strip()}\n"
+            f"{'-' * 72}\n\n"
+            f"{text.strip()}\n"
+        )
+        path.write_text(payload, encoding="utf-8")
+        return path
+
+    def _remember_report(self, query: str, summary: str, path: Path) -> None:
+        if self._second_brain is None:
+            return
+        try:
+            if hasattr(self._second_brain, "remember_report"):
+                self._second_brain.remember_report(
+                    topic=query,
+                    summary=summary,
+                    path=path.as_posix(),
+                )
+                return
+            self._second_brain.learn_fact(
+                (
+                    f"Saved report for '{query}': {summary} "
+                    f"(file: {path.as_posix()})"
+                ),
+                source="report_export",
+                tags=["report", "summary"],
+                importance=0.72,
+            )
+        except Exception:
+            logger.debug("Failed to remember exported report", exc_info=True)
+
+    def _maybe_export_report(
+        self,
+        query: str,
+        full_text: str,
+    ) -> tuple[str, str | None]:
+        if not should_export_report(
+            query,
+            full_text,
+            min_words=self._report_export_min_words,
+            min_chars=self._report_export_min_chars,
+        ):
+            return self._finalize_inline_text(query, full_text), None
+
+        try:
+            path = self._write_report_file(query, full_text)
+            summary = summarize_report(full_text, max_sentences=2, max_chars=200)
+            self._remember_report(query, summary, path)
+            self._bus.emit("report_saved", query=query, path=path.as_posix(), summary=summary)
+            self._bus.emit("text_display", text=f"Full report saved: {path.as_posix()}")
+            if summary:
+                return (
+                    self._finalize_inline_text(
+                        query,
+                        f"I saved the full report, Boss. Quick take: {summary}",
+                    ),
+                    path.as_posix(),
+                )
+            return (
+                self._finalize_inline_text(query, "I saved the full report, Boss."),
+                path.as_posix(),
+            )
+        except Exception:
+            logger.exception("Report export failed")
+            return self._finalize_inline_text(query, full_text), None
 
     async def _retry_with_late_rag(
         self,
@@ -303,6 +616,31 @@ class LocalBrainController:
 
         from context.privacy_filter import redact as _redact
         logger.info("Agentic brain query: '%s'", _redact(text[:120]))
+        
+        # ── Jarvis Convergence: Cognitive Pre-processing ──
+        import time
+        self._state_graph.last_query_time = time.time()
+        intent = self._intent_classifier.classify(text)
+        logger.info("Cognitive Intent detected: %s (conf: %.2f)", intent.category.name, intent.confidence)
+        
+        if intent.category.name == "PERCEPTION":
+            logger.info("PERCEPTION isolated: Bypassing inference loop for Vision AI.")
+            from core.perception.screen_reader import ScreenReader
+            vision = ScreenReader(gemini_client=self._gemini_client)
+            result = await vision.analyze_screen(text)
+            self._bus.emit_long("response_ready", text=result)
+            return
+            
+        if intent.category.name == "REASONING":
+            logger.info("REASONING isolated: Building topological plan graph.")
+            plan = await self._planner.generate_plan(text, "")
+            if plan.steps:
+                plan_text = "MACRO EXECUTION PLAN:\n" + "\n".join([f"- Step {s.step_num}: {s.description} (use tool: {s.target_tool})" for s in plan.steps])
+                if context is None:
+                    context = {}
+                context["planner_directive"] = plan_text
+                text = f"You are executing a macro plan. Please follow these steps exactly:\n{plan_text}\n\nUser request: {text}"
+        # ──────────────────────────────────────────────────
 
         trace_id = _kw.get("trace_id")
         if self._inference_guard is not None:
@@ -314,6 +652,8 @@ class LocalBrainController:
             except Exception:
                 pass
 
+        policy_query = str(_kw.get("policy_query") or text)
+
         query_plan = _kw.get("query_plan")
         plan_mode = str(getattr(query_plan, "runtime_mode", "") or "").upper()
         if plan_mode not in {"FAST", "SMART", "DEEP", "SECURE"}:
@@ -321,6 +661,7 @@ class LocalBrainController:
         plan_model_role = str(getattr(query_plan, "model_role", "") or "").strip().lower()
         if plan_model_role not in {"fast", "primary"}:
             plan_model_role = None
+        self._latency_board_llm = "llm_small" if plan_model_role == "fast" else "llm_large"
         plan_use_rag = getattr(query_plan, "use_rag", None) if query_plan is not None else None
         plan_use_memory = getattr(query_plan, "use_memory", None) if query_plan is not None else None
         plan_prompt_hint = str(getattr(query_plan, "prompt_hint", "") or "").strip()
@@ -331,6 +672,19 @@ class LocalBrainController:
         plan_budget_tier = str(getattr(query_plan, "budget_tier", "") or "").strip().lower() if query_plan is not None else ""
         plan_requested_tier = str(getattr(query_plan, "requested_tier", "") or "").strip().lower() if query_plan is not None else ""
         plan_base_budget_ms = float(getattr(query_plan, "base_budget_ms", 0.0) or 0.0) if query_plan is not None else 0.0
+        response_mode = classify_response_mode(policy_query)
+        max_tokens_override = self._max_tokens_override(
+            response_mode=response_mode,
+            budget_tier=plan_budget_tier,
+            requested_tier=plan_requested_tier,
+        )
+        repair_tokens_override = self._repair_max_tokens_override(max_tokens_override)
+        should_buffer_response = response_mode in {
+            ResponseMode.SHORT,
+            ResponseMode.DETAIL,
+            ResponseMode.REPORT,
+        }
+        repair_attempted = False
 
         mode_override = _kw.get("runtime_mode_override") or (plan_mode or None)
         if query_plan is not None:
@@ -449,8 +803,13 @@ class LocalBrainController:
         if plan_history_turn_limit > 0:
             prompt_history = prompt_history[-plan_history_turn_limit:]
         prompt_context: dict[str, str] | None = context
+        response_language = detect_response_language(policy_query, previous=self._response_language)
+        self._response_language = response_language
+        if response_language:
+            prompt_context = dict(prompt_context or {})
+            prompt_context["response_language"] = response_language
         if plan_prompt_hint:
-            prompt_context = dict(context or {})
+            prompt_context = dict(prompt_context or {})
             prompt_context["llm_routing_hint"] = plan_prompt_hint
 
         rag_document_context: list[str] | None = None
@@ -597,6 +956,14 @@ class LocalBrainController:
                             self._feedback_engine.record_prefetch_event(False)
                     except Exception:
                         pass
+                try:
+                    from core.observability.per_module_latency import get_latency_board
+
+                    rms = float(getattr(rag_res, "latency_ms", 0.0) or 0.0)
+                    if rms > 0:
+                        get_latency_board().record_module_call("rag", rms, error=False)
+                except Exception:
+                    pass
                 if rag_res.chunks:
                     rag_document_context = rag_res.document_context
                     rag_enrichment = rag_res.enrichment_block or None
@@ -617,8 +984,9 @@ class LocalBrainController:
             raw_response, first_token_ms, preempted = await self._run_llm_streaming(
                 prompt,
                 t0_total,
-                emit_partial=(react_step == 0 and not observations),
+                emit_partial=(react_step == 0 and not observations and not should_buffer_response),
                 model_role=plan_model_role,
+                max_tokens_override=max_tokens_override,
             )
 
             if preempted:
@@ -628,12 +996,66 @@ class LocalBrainController:
                 return
 
             if not raw_response:
+                if react_step == 0 and not observations and not repair_attempted:
+                    repair_attempted = True
+                    logger.warning("Brain produced no usable text; retrying in strict recovery mode")
+                    self._bus.emit("metrics_event", counter="llm_repair_retry")
+                    repair_prompt = self._build_repair_prompt(
+                        text,
+                        context=prompt_context,
+                    )
+                    raw_response, retry_first_token_ms, preempted = await self._run_llm_streaming(
+                        repair_prompt,
+                        t0_total,
+                        emit_partial=False,
+                        model_role=plan_model_role,
+                        max_tokens_override=repair_tokens_override,
+                    )
+                    if retry_first_token_ms and not first_token_ms:
+                        first_token_ms = retry_first_token_ms
+                    if preempted:
+                        logger.info("Brain preempted during strict recovery retry")
+                        self._bus.emit("metrics_event", counter="llm_preempted")
+                        return
+                    if raw_response:
+                        logger.info("Strict recovery retry produced answer text")
+                    else:
+                        logger.warning("Strict recovery retry also returned no usable text")
                 break
 
             parsed = parse_tool_calls(raw_response)
+            candidate_text = self._candidate_response_text(policy_query, raw_response, parsed)
 
-            if parsed.text_response:
-                text_response_parts.append(parsed.text_response)
+            if candidate_text:
+                text_response_parts.append(candidate_text)
+            elif not parsed.has_tool_calls and react_step == 0 and not observations and not repair_attempted:
+                repair_attempted = True
+                logger.warning("Brain produced low-quality text; retrying in strict recovery mode")
+                self._bus.emit("metrics_event", counter="llm_repair_retry")
+                repair_prompt = self._build_repair_prompt(
+                    text,
+                    context=prompt_context,
+                )
+                raw_response, retry_first_token_ms, preempted = await self._run_llm_streaming(
+                    repair_prompt,
+                    t0_total,
+                    emit_partial=False,
+                    model_role=plan_model_role,
+                    max_tokens_override=repair_tokens_override,
+                )
+                if retry_first_token_ms and not first_token_ms:
+                    first_token_ms = retry_first_token_ms
+                if preempted:
+                    logger.info("Brain preempted during strict recovery retry")
+                    self._bus.emit("metrics_event", counter="llm_preempted")
+                    return
+                parsed = parse_tool_calls(raw_response) if raw_response else parse_tool_calls("")
+                candidate_text = self._candidate_response_text(policy_query, raw_response, parsed)
+                if candidate_text:
+                    logger.info("Strict recovery retry produced valid answer text")
+                    text_response_parts.append(candidate_text)
+                elif raw_response:
+                    logger.warning("Strict recovery retry returned text, but it was rejected")
 
             if not parsed.has_tool_calls or self._action_executor is None:
                 break
@@ -671,9 +1093,25 @@ class LocalBrainController:
                 step_observations.append(result.observation)
                 all_tool_results.append(result.observation)
 
-                self._bus.emit("tool_executed",
-                               tool=tc.name, success=result.success,
-                               elapsed_ms=result.elapsed_ms)
+                try:
+                    from core.observability.per_module_latency import get_latency_board
+
+                    em = float(getattr(result, "elapsed_ms", 0.0) or 0.0)
+                    get_latency_board().record_module_call(
+                        "tool_executor",
+                        em if em > 0 else 0.01,
+                        error=not result.success,
+                    )
+                except Exception:
+                    pass
+
+                self._bus.emit(
+                    "tool_executed",
+                    tool=tc.name,
+                    success=result.success,
+                    elapsed_ms=result.elapsed_ms,
+                    arguments=dict(tc.arguments or {}),
+                )
 
                 if result.needs_confirmation:
                     confirm_text = (
@@ -710,28 +1148,108 @@ class LocalBrainController:
 
         if not full_text:
             logger.warning("Brain returned empty response (%.0fms)", elapsed_total)
+            self._bus.emit(
+                "text_display",
+                text="Recovery note: the local model returned no usable answer for this request.",
+            )
             self._bus.emit_long(
                 "response_ready",
-                text="My brain couldn't process that, Boss. Try rephrasing.",
+                text="I lost that answer, Boss. Ask it once more.",
             )
             self._bus.emit("llm_error", source="local", error="empty_response")
             return
 
-        if react_step > 0:
+        # ── v22: Post-LLM Confidence Scoring + Cloud Fallback ────────
+        if self._confidence_engine is not None:
+            try:
+                conf_score = self._confidence_engine.score(policy_query, full_text)
+                logger.info(
+                    "v22 confidence: %.3f for '%s' (%d chars)",
+                    conf_score, policy_query[:50], len(full_text),
+                )
+
+                # If confidence is low and Gemini is available → escalate
+                if (
+                    self._confidence_engine.should_escalate(conf_score)
+                    and self._gemini_client is not None
+                    and hasattr(self._gemini_client, "is_available")
+                    and self._gemini_client.is_available
+                ):
+                    logger.info(
+                        "v22 escalation: confidence=%.3f < threshold, trying Gemini",
+                        conf_score,
+                    )
+                    self._bus.emit_fast("metrics_event", counter="cloud_escalation_attempts")
+                    try:
+                        cloud_resp, cloud_ok = await self._gemini_client.ask(policy_query)
+                        if cloud_ok and cloud_resp and len(cloud_resp) > 20:
+                            cloud_score = self._confidence_engine.score(
+                                policy_query, cloud_resp,
+                            )
+                            if cloud_score > conf_score:
+                                logger.info(
+                                    "v22 escalation SUCCESS: cloud=%.3f > local=%.3f",
+                                    cloud_score, conf_score,
+                                )
+                                full_text = cloud_resp
+                                self._bus.emit_fast(
+                                    "metrics_event",
+                                    counter="cloud_escalation_success",
+                                )
+                            else:
+                                logger.info(
+                                    "v22 escalation KEPT LOCAL: cloud=%.3f <= local=%.3f",
+                                    cloud_score, conf_score,
+                                )
+                    except Exception:
+                        logger.debug("v22 cloud escalation failed", exc_info=True)
+            except Exception:
+                logger.debug("v22 confidence scoring failed", exc_info=True)
+
+        # ── v22: Decision Engine enrichment ───────────────────────────
+        if self._decision_engine is not None:
+            try:
+                enriched = self._decision_engine.enrich(policy_query, full_text)
+                if enriched.enriched:
+                    full_text = enriched.enriched
+            except Exception:
+                logger.debug("v22 decision engine enrichment failed", exc_info=True)
+
+        # ── v22: Semantic Cache — store response ─────────────────────
+        if self._semantic_cache is not None:
+            try:
+                self._semantic_cache.put(policy_query, full_text, source="local")
+            except Exception:
+                logger.debug("v22 semantic cache put failed", exc_info=True)
+
+        # ── v22: Preference learning ─────────────────────────────────
+        if self._preference_store is not None:
+            try:
+                self._preference_store.learn_from_query_pattern(policy_query)
+            except Exception:
+                logger.debug("v22 preference learning failed", exc_info=True)
+
+        final_text, saved_report_path = self._maybe_export_report(policy_query, full_text)
+        if saved_report_path:
+            logger.info("Saved long report: %s", saved_report_path)
+
+        if should_buffer_response:
+            self._bus.emit_long("response_ready", text=final_text)
+        elif react_step > 0:
             self._bus.emit_long(
                 "partial_response",
-                text=full_text,
+                text=final_text,
                 is_first=True,
                 is_last=True,
                 source="local",
             )
 
-        self._emit_final_metrics(t0_total, first_token_ms, full_text, trace_id=trace_id)
+        self._emit_final_metrics(t0_total, first_token_ms, final_text, trace_id=trace_id)
 
         self._bus.emit(
             "cursor_response",
             query=text.lower().strip(),
-            response=full_text,
+            response=final_text,
         )
 
         try:
@@ -743,7 +1261,10 @@ class LocalBrainController:
             )
             if self._rag_engine is not None and self._current_runtime_mode != "SECURE":
                 v7 = self._config.get("v7_intelligence") or {}
-                if bool(v7.get("prediction_prefetch_enabled", True)):
+                if (
+                    bool(v7.get("prediction_prefetch_enabled", True))
+                    and self._prediction_prefetch_enabled()
+                ):
                     tsnips: list[str] = []
                     active_task: dict[str, Any] | str | None = None
                     if self._timeline is not None:
@@ -827,6 +1348,7 @@ class LocalBrainController:
         *,
         emit_partial: bool = True,
         model_role: str | None = None,
+        max_tokens_override: int | None = None,
         _watchdog_guard: bool = False,
     ) -> tuple[str, float, bool]:
         """Run LLM inference with optional streaming to TTS.
@@ -843,6 +1365,7 @@ class LocalBrainController:
                     t0_total,
                     emit_partial=emit_partial,
                     model_role=model_role,
+                    max_tokens_override=max_tokens_override,
                     _watchdog_guard=True,
                 ),
                 default=("", 0.0, True),
@@ -863,6 +1386,8 @@ class LocalBrainController:
         generate_kwargs: dict[str, Any] = {"on_token": _on_token}
         if model_role:
             generate_kwargs["model_role"] = model_role
+        if max_tokens_override:
+            generate_kwargs["max_tokens_override"] = int(max_tokens_override)
         generate_task = asyncio.create_task(
             self._llm.generate_streaming(prompt, **generate_kwargs)
         )
@@ -904,35 +1429,46 @@ class LocalBrainController:
                     ready = self._extract_complete_sentence(sentence_buffer)
                     if ready:
                         sentence_text, remainder = ready
-                        sentences_emitted += 1
-                        self._bus.emit_long(
-                            "partial_response",
-                            text=sentence_text.strip(),
-                            is_first=(sentences_emitted == 1),
-                            is_last=False,
-                            source="local",
-                            stream_id=stream_id,
-                        )
-                        full_response_parts.append(sentence_text.strip())
+                        safe_sentence = self._sanitize_emittable_text(sentence_text)
+                        if safe_sentence:
+                            sentences_emitted += 1
+                            self._bus.emit_long(
+                                "partial_response",
+                                text=safe_sentence,
+                                is_first=(sentences_emitted == 1),
+                                is_last=False,
+                                source="local",
+                                stream_id=stream_id,
+                            )
+                            full_response_parts.append(safe_sentence)
                         sentence_buffer = remainder
 
             result = await generate_task
             answer, preempted = result
 
             if trailing_sentence and not preempted:
-                sentences_emitted += 1
-                if emit_partial:
-                    self._bus.emit_long(
-                        "partial_response",
-                        text=trailing_sentence,
-                        is_first=(sentences_emitted == 1),
-                        is_last=True,
-                        source="local",
-                        stream_id=stream_id,
-                    )
-                full_response_parts.append(trailing_sentence)
+                safe_trailing = self._sanitize_emittable_text(trailing_sentence)
+                if safe_trailing:
+                    sentences_emitted += 1
+                    if emit_partial:
+                        self._bus.emit_long(
+                            "partial_response",
+                            text=safe_trailing,
+                            is_first=(sentences_emitted == 1),
+                            is_last=True,
+                            source="local",
+                            stream_id=stream_id,
+                        )
+                    full_response_parts.append(safe_trailing)
 
-            full_text = " ".join(full_response_parts) if full_response_parts else answer
+            raw_full_text = " ".join(full_response_parts).strip() if full_response_parts else answer
+            full_text = " ".join(full_response_parts).strip() if full_response_parts else self._sanitize_emittable_text(answer)
+            if not full_text and raw_full_text:
+                logger.warning(
+                    "LLM output sanitized to empty: %s",
+                    self._compact_text(raw_full_text)[:240],
+                )
+                self._bus.emit("metrics_event", counter="llm_sanitized_empty")
 
             if sentences_emitted == 0 and full_text and emit_partial and not preempted:
                 self._bus.emit_long(
@@ -977,6 +1513,17 @@ class LocalBrainController:
         self._bus.emit("metrics_latency", name="llm", ms=elapsed_ms)
         if first_token_ms > 0:
             self._bus.emit("metrics_latency", name="llm_first_token", ms=first_token_ms)
+
+        try:
+            from core.observability.per_module_latency import get_latency_board
+
+            get_latency_board().record_module_call(
+                getattr(self, "_latency_board_llm", "llm_large"),
+                float(elapsed_ms),
+                error=False,
+            )
+        except Exception:
+            pass
 
         try:
             from core.unified_trace import new_trace

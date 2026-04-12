@@ -41,8 +41,8 @@ CONFIG_SCHEMA: dict[str, Any] = {
             "properties": {
                 "engine": {
                     "type": "string",
-                    "enum": ["faster_whisper"],
-                    "description": "STT engine: faster_whisper (offline, GPU-accelerated)",
+                    "enum": ["auto", "macos_native", "faster_whisper"],
+                    "description": "STT engine: auto (prefer native on macOS), macos_native, faster_whisper",
                 },
                 "whisper_model_size": {
                     "type": "string",
@@ -93,7 +93,7 @@ CONFIG_SCHEMA: dict[str, Any] = {
             "properties": {
                 "engine": {
                     "type": "string",
-                    "enum": ["sapi", "edge", "kokoro"],
+                    "enum": ["sapi", "edge", "kokoro", "macos_native"],
                 },
                 "kokoro_voice": {
                     "type": "string",
@@ -234,7 +234,7 @@ CONFIG_SCHEMA: dict[str, Any] = {
                 },
                 "model_path": {
                     "type": "string",
-                    "description": "Path to GGUF model file.",
+                    "description": "Legacy GGUF fallback model path (not used by the default MLX runtime).",
                 },
                 "mlx_primary_model": {
                     "type": "string",
@@ -311,7 +311,7 @@ CONFIG_SCHEMA: dict[str, Any] = {
             "properties": {
                 "mode": {
                     "type": "string",
-                    "enum": ["web", "tkinter"],
+                    "enum": ["web", "tkinter", "native"],
                 },
                 "web_port": {
                     "type": "integer",
@@ -476,7 +476,7 @@ CONFIG_SCHEMA: dict[str, Any] = {
         },
         "assistant_brain": {
             "type": "object",
-            "description": "Local LLM profiles (atom/balanced/brain) and static quick replies.",
+            "description": "Local LLM profiles (optimal/full_performance with legacy aliases) and static quick replies.",
             "additionalProperties": True,
         },
         "performance": {
@@ -484,20 +484,20 @@ CONFIG_SCHEMA: dict[str, Any] = {
             "properties": {
                 "mode": {
                     "type": "string",
-                    "enum": ["full", "lite", "ultra_lite", "auto"],
-                    "description": "full|lite|ultra_lite = fixed; auto = CPU-based (thresholds).",
+                    "enum": ["optimal", "full_performance", "auto", "full", "lite", "ultra_lite"],
+                    "description": "optimal/full_performance = requested M5 modes; auto = promote/demote from telemetry. Legacy full|lite|ultra_lite are accepted as aliases.",
                 },
                 "auto_threshold_high": {
                     "type": "integer",
                     "minimum": 50,
                     "maximum": 95,
-                    "description": "CPU percent above which auto mode switches to ultra_lite.",
+                    "description": "CPU percent above which the auto tuner forces Optimal mode.",
                 },
                 "auto_threshold_mid": {
                     "type": "integer",
                     "minimum": 20,
                     "maximum": 70,
-                    "description": "CPU percent above which auto mode switches to lite (below = full).",
+                    "description": "CPU percent below which the auto tuner may promote to Full Performance when other telemetry is healthy.",
                 },
                 "health_check_interval_s": {
                     "type": "number",
@@ -757,6 +757,7 @@ CONFIG_SCHEMA: dict[str, Any] = {
                     "enum": [
                         "corporate_laptop",
                         "personal",
+                        "personal_desktop",
                         "workstation",
                         "unset",
                     ],
@@ -907,6 +908,69 @@ CONFIG_SCHEMA: dict[str, Any] = {
                     "minimum": 0,
                     "maximum": 1440,
                     "description": "Cooldown between curiosity events.",
+                },
+                "goal_tool_auto_complete": {
+                    "type": "boolean",
+                    "description": "When true, completing a ReAct tool run that matches a goal step's suggested_tool auto-marks that step done.",
+                },
+                "goal_tool_match_strict": {
+                    "type": "boolean",
+                    "description": "When true, suggested_args must overlap executed tool arguments before auto-complete.",
+                },
+                "dream_require_idle_signal": {
+                    "type": "boolean",
+                    "description": "When true, dream cycles only run after HealthMonitor idle_detected exceeds dream_idle_minutes.",
+                },
+                "dream_min_interactions": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 50,
+                    "description": "Minimum session interactions buffered before a dream cycle runs.",
+                },
+                "dream_prune_second_brain": {
+                    "type": "boolean",
+                    "description": "When true, dream cycle prunes very old low-importance SecondBrain facts.",
+                },
+                "dream_prewarm_embeddings": {
+                    "type": "boolean",
+                    "description": "When true, dream cycle warms embedding cache via lightweight SecondBrain.retrieve probes.",
+                },
+                "dream_prewarm_retrieve_topics": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Topics passed to SecondBrain.retrieve during embedding prewarm.",
+                },
+            },
+            "additionalProperties": False,
+        },
+        "proactive_engine": {
+            "type": "object",
+            "description": "Background proactive intelligence scan (workflow, M5 context triggers).",
+            "properties": {
+                "check_interval_s": {
+                    "type": "number",
+                    "minimum": 60,
+                    "maximum": 3600,
+                },
+                "m5_triggers": {
+                    "type": "object",
+                    "additionalProperties": True,
+                    "properties": {
+                        "enabled": {"type": "boolean"},
+                        "battery_low_pct": {"type": "number", "minimum": 1, "maximum": 50},
+                        "memory_high_pct": {"type": "number", "minimum": 50, "maximum": 100},
+                        "disk_free_gb_warn": {"type": "number", "minimum": 1, "maximum": 128},
+                        "project_stale_days": {"type": "number", "minimum": 1, "maximum": 90},
+                        "idle_goal_nudge_minutes": {
+                            "type": "number",
+                            "minimum": 5,
+                            "maximum": 240,
+                        },
+                        "morning_briefing_hours": {
+                            "type": "array",
+                            "items": {"type": "integer", "minimum": 0, "maximum": 23},
+                        },
+                    },
                 },
             },
             "additionalProperties": False,
@@ -1257,8 +1321,8 @@ def _basic_validation(config: dict) -> list[str]:
         errors.append("stt: must be an object")
     else:
         engine = stt.get("engine")
-        if engine is not None and engine != "faster_whisper":
-            errors.append(f"stt.engine: must be faster_whisper, got {engine}")
+        if engine is not None and engine not in ("auto", "macos_native", "faster_whisper"):
+            errors.append(f"stt.engine: must be auto/macos_native/faster_whisper, got {engine}")
 
         chunk = stt.get("chunk_size")
         if chunk is not None and (not isinstance(chunk, int)
@@ -1286,8 +1350,18 @@ def _basic_validation(config: dict) -> list[str]:
     perf = config.get("performance", {})
     if isinstance(perf, dict):
         mode = perf.get("mode")
-        if mode is not None and mode not in ("full", "lite", "ultra_lite", "auto"):
-            errors.append(f"performance.mode: must be full|lite|ultra_lite|auto, got {mode}")
+        if mode is not None and mode not in (
+            "optimal",
+            "full_performance",
+            "auto",
+            "full",
+            "lite",
+            "ultra_lite",
+        ):
+            errors.append(
+                "performance.mode: must be optimal|full_performance|auto "
+                f"(legacy: full|lite|ultra_lite), got {mode}"
+            )
 
     auto = config.get("autonomy", {})
     if isinstance(auto, dict):

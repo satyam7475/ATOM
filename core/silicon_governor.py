@@ -80,10 +80,18 @@ class SiliconGovernor:
     def gpu_name(self) -> str:
         return self._monitor.gpu_name
 
-    def get_stats(self) -> AppleSiliconStats:
-        """Get current Apple Silicon hardware snapshot."""
+    @property
+    def last_stats(self) -> AppleSiliconStats:
+        return self._last_stats
+
+    def get_stats(self, *, force_refresh: bool = False) -> AppleSiliconStats:
+        """Get the current Apple Silicon snapshot.
+
+        Most call sites can use the cached snapshot; the monitor loop forces a
+        refresh on its scheduled cadence.
+        """
         try:
-            self._last_stats = self._monitor.get_stats()
+            self._last_stats = self._monitor.get_stats(force_refresh=force_refresh)
         except Exception:
             logger.debug("Silicon stats query failed", exc_info=True)
         return self._last_stats
@@ -111,7 +119,23 @@ class SiliconGovernor:
                 if not self._running:
                     break
 
-                stats = self.get_stats()
+                stats = self.get_stats(force_refresh=True)
+                payload = {
+                    "gpu_name": stats.gpu_name,
+                    "gpu_cores": stats.gpu_cores,
+                    "memory_total_mb": stats.memory_total_mb,
+                    "memory_used_mb": stats.memory_used_mb,
+                    "memory_available_mb": stats.memory_available_mb,
+                    "memory_pct": stats.memory_pct,
+                    "thermal_pressure": stats.thermal_pressure,
+                    "cpu_temp_c": stats.cpu_temp_c,
+                    "power_watts": stats.power_watts,
+                    "battery_pct": stats.battery_pct,
+                    "on_battery": stats.on_battery,
+                    "cpu_pct": stats.cpu_pct,
+                    "is_throttled": stats.is_throttled,
+                    "summary": stats.summary(),
+                }
 
                 try:
                     from core.metrics import get_metrics
@@ -123,8 +147,8 @@ class SiliconGovernor:
                     pass
 
                 if self._bus is not None:
-                    self._bus.emit_fast("silicon_stats_update", stats=stats.summary())
-                    self._bus.emit_fast("gpu_stats_update", stats=stats.summary())
+                    self._bus.emit_fast("silicon_stats_update", stats=payload)
+                    self._bus.emit_fast("gpu_stats_update", stats=payload)
 
                 thermal_triggered = stats.is_throttled
                 thermal_cleared = stats.thermal_pressure in ("nominal", "moderate", "")

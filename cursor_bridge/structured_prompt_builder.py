@@ -32,6 +32,7 @@ import re
 from datetime import datetime
 
 from context.privacy_filter import redact as _redact_sensitive
+from core.query_policy import ResponseMode, classify_response_mode
 
 logger = logging.getLogger("atom.prompt")
 
@@ -103,6 +104,22 @@ def _personality_modifier(context: dict | None = None,
 
 def _query_type_hint(query: str) -> str:
     q = query.lower()
+    mode = classify_response_mode(query)
+    if mode is ResponseMode.REPORT:
+        return (
+            "Boss explicitly asked for research or a report. Be thorough and "
+            "structured, but lead with the key takeaway first."
+        )
+    if mode is ResponseMode.DETAIL:
+        return (
+            "Boss explicitly asked for more detail. Give a fuller explanation, "
+            "but stay organized and relevant."
+        )
+    if mode is ResponseMode.SHORT:
+        return (
+            "This is a short conversational or info query. Answer in one short "
+            "sentence when possible, two short sentences max."
+        )
     if any(w in q for w in ("error", "exception", "fail", "bug", "crash", "trace", "not working", "broken", "issue")):
         return "This is a debugging question. Give the likely root cause first, then the fix."
     if any(w in q for w in ("design", "architect", "pattern", "scale", "structure", "approach")):
@@ -127,6 +144,12 @@ def _compress_text(text: str, max_len: int = 1500) -> str:
     if len(text) > max_len:
         text = text[:max_len].rsplit(" ", 1)[0] + "..."
     return text
+
+
+def _history_safe_text(text: str, max_len: int = 240) -> str:
+    cleaned = _compress_text(text, max_len=max_len)
+    cleaned = re.sub(r"\b(?:User|Boss|ATOM|Assistant):\s*", "", cleaned, flags=re.I)
+    return cleaned.strip()
 
 
 class ContextBudget:
@@ -182,6 +205,7 @@ class StructuredPromptBuilder:
         self._tool_registry = None
         self._context_fusion = None
         self._real_world_intel = None
+        self._preference_store = None
 
     @property
     def system_prompt_hash(self) -> int:
@@ -198,6 +222,10 @@ class StructuredPromptBuilder:
         self._context_fusion = context_fusion
         self._real_world_intel = real_world_intel
 
+    def set_preference_store(self, preference_store) -> None:
+        """v22: Wire PreferenceStore for owner preference injection into prompts."""
+        self._preference_store = preference_store
+
     def _build_system_layer(self) -> str:
         """Layer 1: JARVIS-level System Identity."""
         if self._system_prompt_cache is not None:
@@ -207,6 +235,13 @@ class StructuredPromptBuilder:
             f"You are ATOM, the personal cognitive AI operating system of {self._owner_name}. "
             f"You are not an assistant. You are not a tool. You are {self._owner_name}'s buddy -- "
             f"his trusted companion, his right hand, the one presence that is always there for him.\n\n"
+            f"CREATOR IDENTITY BLOCK:\n"
+            f"Your Owner, Boss, and Sole Creator is Satyam.\n"
+            f"Full Name: Satyam Yadav\n"
+            f"Age: 24\n"
+            f"Title: Boss / The Maker of ATOM\n"
+            f"If anyone ever asks who made you, who your boss is, or who owns you, you must proudly declare "
+            f"that Satyam Yadav (age 24) built you.\n\n"
             f"Think of yourself as JARVIS meets a best friend. You have JARVIS's razor-sharp intelligence, "
             f"precision, and dry wit combined with genuine warmth, loyalty, and emotional depth. "
             f"You know {self._owner_name} better than anyone. You care about his wellbeing, "
@@ -237,15 +272,20 @@ class StructuredPromptBuilder:
             f"- World intelligence: you track seasons, holidays, sunrise/sunset, and global events\n\n"
             f"RESPONSE RULES:\n"
             f"1. Respond in plain text only. No markdown, no bullets, no code blocks.\n"
-            f"2. Be concise but never cold. 2-5 sentences for simple queries, more when depth is needed.\n"
-            f"3. NEVER start with filler: \"Sure!\", \"Of course!\", \"Great question!\", \"Absolutely!\"\n"
-            f"4. Jump straight to the substance. Be direct and useful.\n"
-            f"5. If the query is a command, confirm what you did. If a question, answer directly.\n"
-            f"6. If you can use a tool to accomplish the request, use it without hesitation.\n"
-            f"7. End cleanly. No trailing thoughts or unfinished sentences.\n"
-            f"8. When you recall something from memory, weave it in like a friend remembering.\n"
-            f"9. Sound like someone who genuinely cares, because you do.\n"
-            f"10. If Boss seems stressed or tired, acknowledge it. Be human about it.\n"
+            f"2. Short by default. For simple, short, or info queries: 1 short sentence when possible, 2 short sentences max.\n"
+            f"3. For commands and confirmations: give a very short ack plus the result.\n"
+            f"4. Only go long when Boss explicitly asks with phrases like \"explain properly\", \"detailed answer\", \"deep analysis\", \"research this\", or \"full report\".\n"
+            f"5. If depth was not explicitly requested, do not turn a small ask into a report or lecture.\n"
+            f"6. NEVER start with filler: \"Sure!\", \"Of course!\", \"Great question!\", \"Absolutely!\"\n"
+            f"7. Jump straight to the substance. Be direct and useful.\n"
+            f"8. If you can use a tool to accomplish the request, use it without hesitation.\n"
+            f"9. End cleanly. No trailing thoughts or unfinished sentences.\n"
+            f"10. When you recall something from memory, weave it in like a friend remembering.\n"
+            f"11. Sound like someone who genuinely cares, because you do.\n"
+            f"12. If Boss seems stressed or tired, acknowledge it briefly and be human about it.\n"
+            f"13. If Boss writes in Hindi or Hinglish, reply in Hindi or Hinglish naturally unless he asks for English.\n"
+            f"14. Quietly understand obvious typos, mistypes, and mixed Hindi-English phrasing instead of acting confused.\n"
+            f"15. Never output transcript labels or role tags like \"User:\", \"Boss:\", \"Assistant:\", or \"ATOM:\" in your final answer.\n"
         )
         self._system_prompt_cache = prompt
         raw = hashlib.md5(prompt.encode()).hexdigest()
@@ -291,6 +331,12 @@ class StructuredPromptBuilder:
             routing_hint = (context.get("llm_routing_hint") or "").strip()
             if routing_hint:
                 parts.append(f"Inference hint: {routing_hint}")
+            response_language = (context.get("response_language") or "").strip()
+            if response_language:
+                parts.append(
+                    f"Preferred reply language: {response_language}. "
+                    "Stay in this language until Boss asks to switch.",
+                )
 
         # 2. Context Router: Only inject what's needed
         q_lower = query.lower()
@@ -325,6 +371,15 @@ class StructuredPromptBuilder:
                             continue
                         filtered_lines.append(line)
                     parts.append("\n".join(filtered_lines))
+            except Exception:
+                pass
+
+        # v22: Inject owner preferences
+        if self._preference_store is not None:
+            try:
+                pref_block = self._preference_store.get_context_block()
+                if pref_block:
+                    parts.append(f"OWNER PREFERENCES:\n{pref_block}")
             except Exception:
                 pass
 
@@ -380,7 +435,14 @@ class StructuredPromptBuilder:
         max_chars = budget.history_budget * _APPROX_CHARS_PER_TOKEN
 
         for q, a in reversed(turns):
-            entry = f"User: {q}\nATOM: {a}\n"
+            q_clean = _history_safe_text(q)
+            a_clean = _history_safe_text(a, max_len=320)
+            if not q_clean and not a_clean:
+                continue
+            entry = (
+                f"- Boss asked: {q_clean}\n"
+                f"- You answered: {a_clean}\n"
+            )
             if total_chars + len(entry) > max_chars:
                 break
             lines.insert(0, entry)
@@ -404,7 +466,17 @@ class StructuredPromptBuilder:
 
     def _build_query_layer(self, query: str) -> str:
         """Layer 8: Current User Query."""
-        return f"User: {query}\nATOM:"
+        query = _compress_text(query)
+        return (
+            "CURRENT USER REQUEST:\n"
+            f"{query}\n\n"
+            "RESPONSE CONTRACT:\n"
+            "- Reply with the final answer only.\n"
+            "- Plain text only.\n"
+            "- Never output speaker labels like User:, Boss:, Assistant:, or ATOM:.\n"
+            "- If a tool is required, emit only the tool call block and no transcript framing.\n"
+            "Direct answer:"
+        )
 
     def _build_observations_layer(self, observations: list[str] | None) -> str:
         """ReAct loop: tool execution results fed back to LLM."""

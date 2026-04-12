@@ -82,7 +82,7 @@ class ProcessManager:
             cpu = psutil.cpu_percent(interval=0.3)
             cpu_count = psutil.cpu_count()
             mem = psutil.virtual_memory()
-            disk = psutil.disk_usage("C:\\")
+            disk = psutil.disk_usage("/")
             net = psutil.net_io_counters()
             bat = psutil.sensors_battery()
             uptime_s = time.time() - psutil.boot_time()

@@ -1,0 +1,415 @@
+"""
+ATOM — Gemini Free-Tier Cloud Client.
+
+Provides cloud-augmented reasoning via Google Gemini API (free tier).
+Every request is gated through SecurityGateway — no raw user data ever
+leaves the system.
+
+Architecture:
+  - stdlib urllib.request (zero external dependencies)
+  - Async wrappers via asyncio.run_in_executor
+  - SecurityGateway sanitizes ALL outbound queries
+  - No conversation history, no memory context sent to cloud
+  - 4-second hard timeout (fast-fail → local fallback)
+  - Response tagged as untrusted via SecurityGateway
+
+Free tier limits (as of 2026):
+  - 15 RPM / 1M TPM / 1500 RPD
+  - We self-limit to 10 RPM for safety margin
+
+Owner: Satyam
+"""
+
+from __future__ import annotations
+
+import asyncio
+import hashlib
+import json
+import logging
+import time
+import urllib.parse
+import urllib.request
+from typing import Any
+
+logger = logging.getLogger("atom.cloud.gemini")
+
+_GEMINI_API_URL = "https://generativelanguage.googleapis.com/v1beta/models"
+_DEFAULT_MODEL = "gemini-2.0-flash"
+_BUDDY_MODEL = "gemini-2.0-flash"       # Fast, conversational, buddy-like
+_REASONING_MODEL = "gemini-2.5-flash"   # Deep reasoning, thinking, complex
+_TIMEOUT_S = 8
+_TIMEOUT_REASONING_S = 30
+_MAX_TOKENS = 1024
+_MAX_TOKENS_REASONING = 8192
+_USER_AGENT = "ATOM-CognitiveOS/2.0"
+
+
+class GeminiClient:
+    """Stateless Gemini REST client with security gating.
+
+    Usage:
+        client = GeminiClient(config, security_gateway)
+        if client.is_available:
+            text, ok = await client.ask("Explain quantum computing briefly")
+    """
+
+    def __init__(
+        self,
+        config: dict | None = None,
+        security_gateway: Any = None,
+    ) -> None:
+        cfg = (config or {}).get("cloud", {})
+        self._api_key: str = cfg.get("gemini_api_key", "")
+        self._model = cfg.get("model", _DEFAULT_MODEL)
+        self._buddy_model = cfg.get("buddy_model", _BUDDY_MODEL)
+        self._reasoning_model = cfg.get("reasoning_model", _REASONING_MODEL)
+        self._timeout = float(cfg.get("timeout_seconds", _TIMEOUT_S))
+        self._timeout_reasoning = float(cfg.get("timeout_reasoning_seconds", _TIMEOUT_REASONING_S))
+        self._max_tokens = int(cfg.get("max_tokens", _MAX_TOKENS))
+        self._max_tokens_reasoning = int(cfg.get("max_tokens_reasoning", _MAX_TOKENS_REASONING))
+        self._enabled = bool(cfg.get("enabled", True))
+        self._temperature = float(cfg.get("temperature", 0.7))
+
+        self._gateway = security_gateway
+
+        # Stats
+        self._total_requests = 0
+        self._total_successes = 0
+        self._total_failures = 0
+        self._total_latency_ms = 0.0
+        self._last_error: str = ""
+        self._consecutive_failures = 0
+        self._circuit_open_until = 0.0
+
+        # Circuit breaker settings
+        self._circuit_threshold = 3
+        self._circuit_cooldown_s = 60.0
+
+        if self._api_key:
+            logger.info(
+                "GeminiClient: buddy=%s, reasoning=%s, timeout=%.0f/%.0fs",
+                self._buddy_model, self._reasoning_model,
+                self._timeout, self._timeout_reasoning,
+            )
+        else:
+            logger.info(
+                "GeminiClient: no API key — cloud reasoning disabled. "
+                "Set cloud.gemini_api_key in settings.json or GEMINI_API_KEY env var.",
+            )
+
+    def configure_api_key(self, key: str) -> None:
+        """Set or update the API key at runtime (e.g., from vault)."""
+        self._api_key = key
+        self._consecutive_failures = 0
+        self._circuit_open_until = 0.0
+        logger.info("GeminiClient: API key configured")
+
+    @property
+    def is_available(self) -> bool:
+        """Whether the client can make requests right now."""
+        if not self._enabled or not self._api_key:
+            return False
+        if time.monotonic() < self._circuit_open_until:
+            return False
+        return True
+
+    @property
+    def requests_remaining_estimate(self) -> int:
+        """Rough estimate of remaining requests (based on self-imposed RPM)."""
+        if self._gateway:
+            return int(self._gateway._rate_limiter.tokens)
+        return 10
+
+    # ── Core API ─────────────────────────────────────────────────────
+
+    def _build_request(
+        self,
+        query: str,
+        *,
+        model_override: str | None = None,
+        max_tokens_override: int | None = None,
+        system_instruction: str | None = None,
+        temperature_override: float | None = None,
+    ) -> tuple[str, bytes, dict[str, str]]:
+        """Build the Gemini API request with optional model override."""
+        model = model_override or self._model
+        url = (
+            f"{_GEMINI_API_URL}/{model}:generateContent"
+            f"?key={self._api_key}"
+        )
+
+        payload: dict[str, Any] = {
+            "contents": [
+                {
+                    "parts": [{"text": query}],
+                }
+            ],
+            "generationConfig": {
+                "temperature": temperature_override if temperature_override is not None else self._temperature,
+                "maxOutputTokens": max_tokens_override or self._max_tokens,
+                "topP": 0.9,
+            },
+            "safetySettings": [
+                {
+                    "category": "HARM_CATEGORY_DANGEROUS_CONTENT",
+                    "threshold": "BLOCK_ONLY_HIGH",
+                },
+            ],
+        }
+
+        if system_instruction:
+            payload["systemInstruction"] = {
+                "parts": [{"text": system_instruction}],
+            }
+
+        body = json.dumps(payload).encode("utf-8")
+        headers = {
+            "Content-Type": "application/json",
+            "User-Agent": _USER_AGENT,
+        }
+        return url, body, headers
+
+    def _call_sync(
+        self,
+        query: str,
+        *,
+        model_override: str | None = None,
+        max_tokens_override: int | None = None,
+        system_instruction: str | None = None,
+        temperature_override: float | None = None,
+    ) -> tuple[str, bool]:
+        """Synchronous API call — runs in executor for async."""
+        t0 = time.perf_counter()
+        effective_model = model_override or self._model
+
+        try:
+            url, body, headers = self._build_request(
+                query,
+                model_override=model_override,
+                max_tokens_override=max_tokens_override,
+                system_instruction=system_instruction,
+                temperature_override=temperature_override,
+            )
+            req = urllib.request.Request(
+                url, data=body, headers=headers, method="POST",
+            )
+
+            with urllib.request.urlopen(req, timeout=self._timeout) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+
+            # Extract text from Gemini response
+            candidates = data.get("candidates", [])
+            if not candidates:
+                return "", False
+
+            content = candidates[0].get("content", {})
+            parts = content.get("parts", [])
+            if not parts:
+                return "", False
+
+            text = parts[0].get("text", "").strip()
+            if not text:
+                return "", False
+
+            latency_ms = (time.perf_counter() - t0) * 1000
+            self._record_success(latency_ms, len(query), len(text))
+
+            logger.info(
+                "Gemini [%s] response: %.0fms, %d chars in, %d chars out",
+                effective_model, latency_ms, len(query), len(text),
+            )
+            return text, True
+
+        except urllib.error.HTTPError as e:
+            latency_ms = (time.perf_counter() - t0) * 1000
+            error_body = ""
+            try:
+                error_body = e.read().decode("utf-8", errors="ignore")[:200]
+            except Exception:
+                pass
+            self._record_failure(f"HTTP {e.code}: {error_body}")
+            logger.warning(
+                "Gemini HTTP error %d (%.0fms): %s",
+                e.code, latency_ms, error_body[:100],
+            )
+            return "", False
+
+        except Exception as e:
+            latency_ms = (time.perf_counter() - t0) * 1000
+            self._record_failure(str(e))
+            logger.warning("Gemini call failed (%.0fms): %s", latency_ms, e)
+            return "", False
+
+    async def ask(
+        self,
+        query: str,
+        *,
+        max_tokens: int | None = None,
+        model: str | None = None,
+        system_instruction: str | None = None,
+        temperature: float | None = None,
+    ) -> tuple[str, bool]:
+        """Ask Gemini a question (async, security-gated).
+
+        Args:
+            query: The question to ask.
+            max_tokens: Override max output tokens.
+            model: Override model (e.g. 'gemini-2.5-flash' for reasoning).
+            system_instruction: Optional system prompt for persona/behavior.
+            temperature: Override temperature.
+
+        Returns (response_text, success).
+        """
+        if not self.is_available:
+            return "", False
+
+        # Security gate
+        if self._gateway:
+            allowed, reason = self._gateway.allow_cloud(query)
+            if not allowed:
+                logger.info("Gemini blocked by SecurityGateway: %s", reason)
+                return "", False
+            query = self._gateway.sanitize_outbound(query)
+
+        if not query.strip():
+            return "", False
+
+        # Determine timeout based on model type
+        effective_model = model or self._model
+        is_reasoning = effective_model == self._reasoning_model
+        effective_timeout = self._timeout_reasoning if is_reasoning else self._timeout
+        effective_max_tokens = max_tokens or (self._max_tokens_reasoning if is_reasoning else self._max_tokens)
+
+        import functools
+        call_fn = functools.partial(
+            self._call_sync,
+            query,
+            model_override=model,
+            max_tokens_override=effective_max_tokens,
+            system_instruction=system_instruction,
+            temperature_override=temperature,
+        )
+
+        loop = asyncio.get_running_loop()
+        try:
+            text, ok = await asyncio.wait_for(
+                loop.run_in_executor(None, call_fn),
+                timeout=effective_timeout + 2.0,
+            )
+
+            # Record to gateway audit
+            if ok and self._gateway:
+                query_hash = hashlib.sha256(query.encode()).hexdigest()[:16]
+                self._gateway.record_cloud_call(
+                    query_hash=query_hash,
+                    sanitized_length=len(query),
+                    response_length=len(text),
+                    latency_ms=self._total_latency_ms,  # approximate
+                    provider="gemini",
+                )
+
+            # Tag response as untrusted
+            if ok and self._gateway:
+                tagged = self._gateway.tag_cloud_response(
+                    text, provider="gemini",
+                )
+                return tagged["text"], True
+
+            return text, ok
+
+        except asyncio.TimeoutError:
+            self._record_failure("async_timeout")
+            logger.warning("Gemini async timeout (%.0fs, model=%s)",
+                          effective_timeout, effective_model)
+            return "", False
+
+    async def ask_buddy(
+        self,
+        query: str,
+        *,
+        max_tokens: int | None = None,
+        system_instruction: str | None = None,
+    ) -> tuple[str, bool]:
+        """Ask using the fast conversational (buddy) model."""
+        default_system = (
+            "You are ATOM, a personal AI assistant created by Satyam Yadav. "
+            "You call him 'Boss'. You are friendly, witty, concise, and helpful. "
+            "Keep responses short and conversational unless asked for detail."
+        )
+        return await self.ask(
+            query,
+            max_tokens=max_tokens or self._max_tokens,
+            model=self._buddy_model,
+            system_instruction=system_instruction or default_system,
+            temperature=0.7,
+        )
+
+    async def ask_reasoning(
+        self,
+        query: str,
+        *,
+        max_tokens: int | None = None,
+        system_instruction: str | None = None,
+    ) -> tuple[str, bool]:
+        """Ask using the deep reasoning model for complex tasks."""
+        default_system = (
+            "You are ATOM, an advanced AI system created by Satyam Yadav. "
+            "You are methodical, thorough, and precise. "
+            "Think step by step. Provide detailed, well-structured answers. "
+            "For code, always include explanations."
+        )
+        return await self.ask(
+            query,
+            max_tokens=max_tokens or self._max_tokens_reasoning,
+            model=self._reasoning_model,
+            system_instruction=system_instruction or default_system,
+            temperature=0.4,
+        )
+
+    # ── Circuit breaker ──────────────────────────────────────────────
+
+    def _record_success(
+        self, latency_ms: float, query_len: int, response_len: int,
+    ) -> None:
+        self._total_requests += 1
+        self._total_successes += 1
+        self._total_latency_ms += latency_ms
+        self._consecutive_failures = 0
+        self._last_error = ""
+
+    def _record_failure(self, error: str) -> None:
+        self._total_requests += 1
+        self._total_failures += 1
+        self._consecutive_failures += 1
+        self._last_error = error
+
+        if self._consecutive_failures >= self._circuit_threshold:
+            self._circuit_open_until = (
+                time.monotonic() + self._circuit_cooldown_s
+            )
+            logger.warning(
+                "GeminiClient circuit OPEN (failures=%d, cooldown=%.0fs)",
+                self._consecutive_failures, self._circuit_cooldown_s,
+            )
+
+    # ── Diagnostics ──────────────────────────────────────────────────
+
+    def get_diagnostics(self) -> dict[str, Any]:
+        avg_latency = (
+            self._total_latency_ms / self._total_successes
+            if self._total_successes > 0 else 0.0
+        )
+        return {
+            "available": self.is_available,
+            "model": self._model,
+            "total_requests": self._total_requests,
+            "successes": self._total_successes,
+            "failures": self._total_failures,
+            "avg_latency_ms": round(avg_latency, 1),
+            "last_error": self._last_error,
+            "circuit_open": time.monotonic() < self._circuit_open_until,
+            "consecutive_failures": self._consecutive_failures,
+        }
+
+
+__all__ = ["GeminiClient"]

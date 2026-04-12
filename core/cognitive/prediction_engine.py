@@ -84,7 +84,7 @@ class PredictionEngine:
         "_preload_max_items", "_preload_cooldown_s",
         "_preload_timeout_s", "_recent_preloads",
         "_prefetch_engine", "_prompt_builder", "_cognitive_kernel",
-        "_app_resolution_cache",
+        "_app_resolution_cache", "_brain_mode_mgr",
     )
 
     def __init__(
@@ -94,6 +94,7 @@ class PredictionEngine:
         memory: MemoryEngine,
         behavior_model: BehaviorModel,
         config: dict | None = None,
+        brain_mode_manager: Any | None = None,
     ) -> None:
         self._bus = bus
         self._behavior = behavior
@@ -134,9 +135,28 @@ class PredictionEngine:
         self._prompt_builder: StructuredPromptBuilder | None = None
         self._cognitive_kernel: CognitiveKernel | None = None
         self._app_resolution_cache: dict[str, str] = {}
+        self._brain_mode_mgr = brain_mode_manager
 
         self._task: asyncio.Task | None = None
         self._shutdown: asyncio.Event | None = None
+
+    def _background_enabled(self) -> bool:
+        mgr = self._brain_mode_mgr
+        if mgr is None:
+            return True
+        try:
+            return bool(mgr.feature_enabled("prediction_background"))
+        except Exception:
+            return True
+
+    def _prefetch_enabled_for_mode(self) -> bool:
+        mgr = self._brain_mode_mgr
+        if mgr is None:
+            return True
+        try:
+            return bool(mgr.feature_enabled("prediction_prefetch"))
+        except Exception:
+            return True
 
     # ── Lifecycle ──────────────────────────────────────────────────────
 
@@ -179,6 +199,8 @@ class PredictionEngine:
             except asyncio.TimeoutError:
                 pass
             try:
+                if not self._background_enabled():
+                    continue
                 predictions = self.predict_next()
                 if predictions:
                     await self.preload_predicted(predictions)
@@ -449,7 +471,11 @@ class PredictionEngine:
         predictions: list[PredictionResult],
     ) -> list[dict[str, Any]]:
         """Warm lightweight resources for the strongest predictions."""
-        if not self._preload_enabled or not predictions:
+        if (
+            not self._preload_enabled
+            or not predictions
+            or not self._prefetch_enabled_for_mode()
+        ):
             return []
 
         now = time.monotonic()

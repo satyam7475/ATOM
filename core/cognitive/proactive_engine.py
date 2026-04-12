@@ -43,6 +43,7 @@ if TYPE_CHECKING:
     from core.async_event_bus import AsyncEventBus
     from core.behavior_tracker import BehaviorTracker
     from core.conversation_memory import ConversationMemory
+    from core.cognitive.goal_engine import GoalEngine
     from core.jarvis_core import ProactiveInsight
     from core.owner_understanding import OwnerUnderstanding
 
@@ -69,26 +70,36 @@ class ProactiveIntelligenceEngine:
     """
 
     __slots__ = (
-        "_bus", "_behavior", "_conv_memory", "_owner", "_config",
+        "_bus", "_behavior", "_conv_memory", "_owner", "_goals", "_config",
         "_task", "_shutdown",
         "_action_sequence", "_workflow_patterns",
         "_session_start", "_normal_hours", "_last_trigger_times",
         "_check_interval",
+        "_idle_minutes", "_idle_signal_time",
+        "_morning_briefing_date",
+        "_last_download_insight",
+        "_m5",
+        "_last_scan",
+        "_brain_mode_mgr",
     )
 
     def __init__(
         self,
         bus: AsyncEventBus,
         config: dict | None = None,
+        brain_mode_manager: Any | None = None,
     ) -> None:
         self._bus = bus
         cfg = (config or {}).get("proactive_engine", {})
         self._config = cfg
         self._check_interval = cfg.get("check_interval_s", 300.0)
+        self._m5 = cfg.get("m5_triggers") or {}
+        self._brain_mode_mgr = brain_mode_manager
 
         self._behavior: BehaviorTracker | None = None
         self._conv_memory: ConversationMemory | None = None
         self._owner: OwnerUnderstanding | None = None
+        self._goals: GoalEngine | None = None
 
         self._task: asyncio.Task | None = None
         self._shutdown = asyncio.Event()
@@ -98,22 +109,40 @@ class ProactiveIntelligenceEngine:
         self._session_start = time.time()
         self._normal_hours: set[int] = set(range(8, 22))
         self._last_trigger_times: dict[str, float] = {}
+        self._idle_minutes: float = 0.0
+        self._idle_signal_time: float = 0.0
+        self._morning_briefing_date: str = ""
+        self._last_download_insight: float = 0.0
+        self._last_scan: dict[str, Any] | None = None
+
+    def _background_enabled(self) -> bool:
+        mgr = self._brain_mode_mgr
+        if mgr is None:
+            return True
+        try:
+            return bool(mgr.feature_enabled("proactive_background"))
+        except Exception:
+            return True
 
     def wire(
         self,
         behavior: BehaviorTracker | None = None,
         conv_memory: ConversationMemory | None = None,
         owner: OwnerUnderstanding | None = None,
+        goals: "GoalEngine | None" = None,
     ) -> None:
         self._behavior = behavior
         self._conv_memory = conv_memory
         self._owner = owner
+        self._goals = goals
 
     # ── Lifecycle ─────────────────────────────────────────────────────
 
     def start(self) -> None:
         self._bus.on("action_executed", self._on_action)
         self._bus.on("system_light_scan", self._on_system_light_scan)
+        self._bus.on("idle_detected", self._on_idle_detected)
+        self._bus.on("fs_event", self._on_fs_event)
         
         async def _supervisor() -> None:
             while not self._shutdown.is_set():
@@ -147,6 +176,8 @@ class ProactiveIntelligenceEngine:
             except asyncio.TimeoutError:
                 pass
             try:
+                if not self._background_enabled():
+                    continue
                 insights = self.scan()
                 for insight_data in insights:
                     self._bus.emit_long("jarvis_insight", **insight_data)
@@ -167,13 +198,13 @@ class ProactiveIntelligenceEngine:
         """Zero-latency delta monitor for the 5-minute system scan."""
         if not scan:
             return
-            
-        if not hasattr(self, "_last_scan"):
-            self._last_scan = scan
+
+        if self._last_scan is None:
+            self._last_scan = dict(scan)
             return
-            
+
         old_scan = self._last_scan
-        self._last_scan = scan
+        self._last_scan = dict(scan)
         
         latest_ram = scan.get("ram_percent", 0)
         old_ram = old_scan.get("ram_percent", 0)
@@ -199,6 +230,53 @@ class ProactiveIntelligenceEngine:
                 source="proactive_scanner"
             )
 
+    async def _on_idle_detected(self, idle_minutes: float = 0, **_kw: Any) -> None:
+        """Track idle streak for goal-aware nudges (M5 Phase 6.1)."""
+        try:
+            self._idle_minutes = float(idle_minutes)
+        except (TypeError, ValueError):
+            self._idle_minutes = 0.0
+        self._idle_signal_time = time.time()
+
+    async def _on_fs_event(
+        self,
+        path: str = "",
+        change: str = "",
+        is_dir: bool = False,
+        **_kw: Any,
+    ) -> None:
+        """Proactive download / new-file hints (debounced)."""
+        kind = change or str(_kw.get("event") or "")
+        if kind != "created" or is_dir or not path:
+            return
+        low = path.lower()
+        is_downloads = "/downloads/" in low or low.rstrip("/").endswith("downloads")
+        is_desktop = "/desktop/" in low or low.rstrip("/").endswith("/desktop")
+        if not is_downloads and not is_desktop:
+            return
+        ext = low.rsplit(".", 1)[-1] if "." in low else ""
+        interesting = {
+            "pdf", "zip", "dmg", "pkg", "doc", "docx", "xls", "xlsx", "ppt", "pptx",
+            "csv", "json", "md", "txt", "png", "jpg", "jpeg", "heic", "mp4", "mov",
+        }
+        if is_desktop and ext not in interesting:
+            return
+        now = time.time()
+        if now - self._last_download_insight < 120.0:
+            return
+        self._last_download_insight = now
+        name = path.rsplit("/", 1)[-1][:80]
+        self._bus.emit_long(
+            "jarvis_insight",
+            message=(
+                f"Boss, new file landed: {name}. "
+                f"Want a quick summary or should I file it away?"
+            ),
+            category="context_download",
+            priority=4,
+            source="proactive_fs",
+        )
+
     # ── Scan All Triggers ─────────────────────────────────────────────
 
     def scan(self) -> list[dict[str, Any]]:
@@ -211,6 +289,7 @@ class ProactiveIntelligenceEngine:
             self._scan_behavioral_triggers,
             self._scan_temporal_triggers,
             self._scan_conversation_triggers,
+            self._scan_m5_context_triggers,
         ):
             try:
                 for insight in trigger_fn(now):
@@ -219,11 +298,144 @@ class ProactiveIntelligenceEngine:
                     if now - last > 600:
                         results.append(insight)
                         self._last_trigger_times[cat] = now
+                        if cat == "temporal_morning":
+                            self._morning_briefing_date = datetime.now().strftime(
+                                "%Y-%m-%d",
+                            )
             except Exception:
                 logger.debug("Trigger scan error in %s", trigger_fn.__name__,
                              exc_info=True)
 
         return results
+
+    def _disk_free_gb_boot(self) -> float | None:
+        try:
+            import psutil
+
+            return round(psutil.disk_usage("/").free / (1024 ** 3), 2)
+        except Exception:
+            return None
+
+    def _scan_m5_context_triggers(self, now: float) -> list[dict]:
+        """Battery, memory, disk, morning briefing, idle+goals, stale projects."""
+        if not bool(self._m5.get("enabled", True)):
+            return []
+
+        insights: list[dict] = []
+        m5 = self._m5
+        battery_low = float(m5.get("battery_low_pct", 20))
+        memory_high = float(m5.get("memory_high_pct", 85))
+        disk_warn_gb = float(m5.get("disk_free_gb_warn", 10))
+        stale_days = float(m5.get("project_stale_days", 3))
+        idle_goal_min = float(m5.get("idle_goal_nudge_minutes", 25))
+        morning_hours = m5.get("morning_briefing_hours", [7, 8, 9])
+        try:
+            hours_set = {int(h) for h in morning_hours}
+        except (TypeError, ValueError):
+            hours_set = {7, 8, 9}
+
+        scan = self._last_scan or {}
+        dt = datetime.now()
+        today = dt.strftime("%Y-%m-%d")
+
+        bat = scan.get("battery") if isinstance(scan, dict) else None
+        if isinstance(bat, dict):
+            pct = float(bat.get("percent") or 0)
+            plugged = bool(bat.get("plugged"))
+            if pct > 0 and pct < battery_low and not plugged:
+                insights.append({
+                    "message": (
+                        f"Boss, battery is at {pct:.0f}%. "
+                        f"Want me to dim the screen or pause heavy jobs?"
+                    ),
+                    "category": "system_battery",
+                    "priority": 9,
+                    "source": "proactive_m5",
+                })
+
+        ram = float(scan.get("ram_percent") or 0)
+        if ram >= memory_high:
+            insights.append({
+                "message": (
+                    f"Memory pressure is high — about {ram:.0f}% RAM in use. "
+                    f"Close a few tabs or want me to list top memory apps?"
+                ),
+                "category": "system_memory",
+                "priority": 7,
+                "source": "proactive_m5",
+            })
+
+        free_gb = self._disk_free_gb_boot()
+        if free_gb is not None and free_gb < disk_warn_gb:
+            insights.append({
+                "message": (
+                    f"Boss, only about {free_gb:.1f} GB free on the system disk. "
+                    f"Worth clearing caches or archiving old projects."
+                ),
+                "category": "system_disk",
+                "priority": 8,
+                "source": "proactive_m5",
+            })
+
+        if (
+            dt.weekday() < 5
+            and dt.hour in hours_set
+            and self._morning_briefing_date != today
+            and (now - self._session_start) > 300
+        ):
+            insights.append({
+                "message": (
+                    "Good morning stretch, Boss. Want a quick briefing on "
+                    "goals and what changed overnight?"
+                ),
+                "category": "temporal_morning",
+                "priority": 5,
+                "source": "proactive_m5",
+            })
+
+        idle_min = self._idle_minutes
+        if (
+            idle_min >= idle_goal_min
+            and self._goals is not None
+            and (now - self._idle_signal_time) < 7200
+        ):
+            try:
+                active = self._goals.get_active_goals()
+            except Exception:
+                active = []
+            if active:
+                titles = ", ".join(
+                    str(g.get("title", "")) for g in active[:3] if g.get("title")
+                )
+                insights.append({
+                    "message": (
+                        f"You've been idle ~{idle_min:.0f} min but still have "
+                        f"active goals ({titles}). Want a micro-step on one of them?"
+                    ),
+                    "category": "goals_idle",
+                    "priority": 4,
+                    "source": "proactive_m5",
+                })
+
+        owner = self._owner
+        if owner and owner.context.active_projects:
+            top = owner.context.active_projects[0]
+            last = float(top.get("last_mentioned") or top.get("first_mentioned") or 0)
+            if last > 0:
+                days = (now - last) / 86400.0
+                if days >= stale_days:
+                    name = str(top.get("name", "your project"))[:60]
+                    insights.append({
+                        "message": (
+                            f"It's been ~{days:.0f} days since we touched '{name}'. "
+                            f"Still on deck or should I park it?"
+                        ),
+                        "category": "context_project",
+                        "priority": 3,
+                        "source": "proactive_m5",
+                    })
+
+        return insights
 
     # ── Workflow Triggers ─────────────────────────────────────────────
 

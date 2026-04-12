@@ -61,13 +61,6 @@ from core.boot.wiring import wire_events
 async def main() -> None:
     global shutdown_event
     shutdown_event = asyncio.Event()
-    import argparse
-    parser = argparse.ArgumentParser(description="ATOM - Personal Cognitive AI OS")
-    parser.add_argument("--v3", action="store_true", help="Run in V3 multi-process mode")
-    parser.add_argument("--v4", action="store_true", help="Run in V4 Cognitive OS mode")
-    args = parser.parse_args()
-    distributed_mode = args.v3 or args.v4
-    distributed_mode_label = "V4" if args.v4 else "V3" if args.v3 else "local"
 
     from core.logging_setup import setup_logging
     setup_logging()
@@ -116,13 +109,8 @@ async def main() -> None:
     )
     asyncio.get_running_loop().set_default_executor(executor)
 
-    if distributed_mode:
-        logger.info("Initializing distributed ZmqEventBus (%s)...", distributed_mode_label)
-        from core.ipc.zmq_bus import ZmqEventBus
-        bus = ZmqEventBus(worker_name="main_core")
-    else:
-        from core.async_event_bus import AsyncEventBus
-        bus = AsyncEventBus()
+    from core.async_event_bus import AsyncEventBus
+    bus = AsyncEventBus()
 
     from core.state_manager import StateManager, AtomState
     from core.cache_engine import CacheEngine
@@ -149,7 +137,7 @@ async def main() -> None:
     from core.cognitive.self_optimizer import SelfOptimizer
     from core.personality_modes import PersonalityModes
 
-    if distributed_mode:
+    if False:
         bus.start()
     state = StateManager(
         bus,
@@ -228,79 +216,152 @@ async def main() -> None:
     from core.fast_path import startup_warm_up
     startup_warm_up(intent_engine, cache, memory, config)
 
-    if distributed_mode:
-        logger.info("%s mode: initializing STT/TTS proxies...", distributed_mode_label)
-        from core.ipc.proxies import TTSProxy, STTProxy
-        stt = STTProxy(bus)
-        tts = TTSProxy(bus, state)
-        
-        async def on_tts_done(event: str, **data) -> None:
-            if state.current is AtomState.SPEAKING:
-                await state.transition(AtomState.LISTENING)
-        bus.on("tts_done", on_tts_done)
-    else:
+    stt_cfg = config.get("stt", {})
+    stt_runtime_label = "Voice input unavailable"
+
+    def _build_disabled_stt(reason: str):
+        class DisabledSTT:
+            def __init__(self, disable_reason: str) -> None:
+                self._reason = disable_reason
+                self.mic_name = "Voice input unavailable"
+
+            async def async_preload(self) -> None:
+                logger.warning("STT disabled: %s", self._reason)
+
+            async def async_start_listening(self, **_kw) -> None:
+                logger.warning("STT disabled: %s", self._reason)
+
+            async def on_state_changed(self, old, new, **_kw) -> None:
+                return None
+
+            def shutdown(self) -> None:
+                return None
+
+        logger.error("Voice input unavailable: %s", reason)
+        return DisabledSTT(reason)
+
+    def _build_google_stt():
+        """Build Google Online STT (primary — fast, free, accurate)."""
+        missing: list[str] = []
+        try:
+            import speech_recognition  # noqa: F401
+        except ImportError:
+            missing.append("SpeechRecognition")
+        try:
+            import pyaudio  # noqa: F401
+        except ImportError:
+            missing.append("PyAudio/PortAudio")
+
+        if missing:
+            return None, "Google STT dependencies missing: " + ", ".join(missing)
+
+        from voice.stt_google import STTGoogle
+
+        logger.info("STT: Google Online (free, fast, bilingual)")
+        return STTGoogle(
+            bus,
+            state,
+            config,
+            mic_manager=mic_manager,
+            intent_engine=intent_engine,
+        ), None
+
+    def _build_faster_whisper_stt():
+        """Build offline faster-whisper STT (fallback if no internet)."""
+        missing: list[str] = []
+        try:
+            import faster_whisper  # noqa: F401
+        except ImportError:
+            missing.append("faster-whisper")
+        try:
+            import speech_recognition  # noqa: F401
+        except ImportError:
+            missing.append("SpeechRecognition")
+        try:
+            import pyaudio  # noqa: F401
+        except ImportError:
+            missing.append("PyAudio/PortAudio")
+
+        if missing:
+            return _build_disabled_stt(
+                "Offline STT dependencies missing: " + ", ".join(missing),
+            )
+
         from voice.stt_async import STTAsync
-        stt = STTAsync(bus, state, config, mic_manager=mic_manager, intent_engine=intent_engine)
 
-        tts_cfg = config.get("tts", {})
-        tts_engine = (tts_cfg.get("engine") or "sapi").lower()
+        logger.info("STT: faster-whisper (offline fallback)")
+        return STTAsync(
+            bus,
+            state,
+            config,
+            mic_manager=mic_manager,
+            intent_engine=intent_engine,
+        )
 
-        # Auto-detect: on macOS, prefer native TTS unless explicitly set
-        if tts_engine == "sapi" and sys.platform == "darwin":
-            tts_engine = "macos_native"
-            logger.info("macOS detected — auto-selecting native TTS")
+    # Primary: Google Online STT (fast, free, accurate, no TCC issues)
+    # Fallback: faster-whisper (offline, heavier but no internet needed)
+    stt_engine_pref = stt_cfg.get("engine", "google_online").lower()
+    logger.info("STT engine preference: %s (platform=%s)", stt_engine_pref, sys.platform)
 
-        if tts_engine == "macos_native":
-            from voice.tts_macos import MacOSTTSAsync
-            tts = MacOSTTSAsync(
-                bus, state,
-                max_lines=tts_cfg.get("max_lines", 4),
-                voice=tts_cfg.get("macos_voice", "Daniel"),
-                rate=tts_cfg.get("macos_rate", 200),
-            )
-            logger.info("TTS: macOS Native (voice=%s, rate=%d — offline, ~5ms)",
-                        tts_cfg.get("macos_voice", "Daniel"),
-                        tts_cfg.get("macos_rate", 200))
+    if stt_engine_pref in ("google_online", "google", "macos_native"):
+        google_stt, google_err = _build_google_stt()
+        if google_stt is not None:
+            stt = google_stt
+            stt_runtime_label = "Google Online (free)"
+        else:
+            logger.warning("Google STT unavailable (%s) -- trying offline fallback", google_err)
+            stt = _build_faster_whisper_stt()
+            stt_runtime_label = "Faster-Whisper (offline fallback)"
+    elif stt_engine_pref == "faster_whisper":
+        stt = _build_faster_whisper_stt()
+        stt_runtime_label = "Faster-Whisper (explicit)"
+    else:
+        stt = _build_disabled_stt(f"Unknown STT engine: {stt_engine_pref}")
+        stt_runtime_label = "Disabled"
 
-        elif tts_engine == "kokoro":
-            try:
-                from voice.tts_kokoro import KokoroTTSAsync
-                tts = KokoroTTSAsync(
-                    bus, state,
-                    max_lines=tts_cfg.get("max_lines", 4),
-                    voice=tts_cfg.get("kokoro_voice", "af_heart")
-                )
-                logger.info("TTS: Kokoro Neural (offline, %s)", tts_cfg.get("kokoro_voice", "af_heart"))
-            except ImportError:
-                logger.warning("Kokoro TTS unavailable, falling back to Edge")
-                tts_engine = "edge"
-                
-        if tts_engine == "edge":
-            try:
-                from voice.tts_edge import EdgeTTSAsync
-                tts = EdgeTTSAsync(
-                    bus, state,
-                    max_lines=tts_cfg.get("max_lines", 4),
-                    voice=tts_cfg.get("edge_voice", "en-GB-RyanNeural"),
-                    rate=tts_cfg.get("edge_rate", "+15%"),
-                    enable_postprocess=tts_cfg.get("edge_postprocess", True),
-                    enable_ack_cache=tts_cfg.get("edge_ack_cache", True),
-                )
-                logger.info("TTS: Edge Neural (%s) — requires network", tts_cfg.get("edge_voice"))
-            except ImportError:
-                from voice.tts_async import TTSAsync
-                tts = TTSAsync(
-                    bus, state, max_lines=tts_cfg.get("max_lines", 4),
-                    rate=tts_cfg.get("rate", 2),
-                )
-                logger.warning("Edge-TTS unavailable, using offline SAPI")
-        elif tts_engine not in ("kokoro", "macos_native"):
-            from voice.tts_async import TTSAsync
-            tts = TTSAsync(
-                bus, state, max_lines=tts_cfg.get("max_lines", 4),
-                rate=tts_cfg.get("rate", 2),
-            )
-            logger.info("TTS: Windows SAPI (offline)")
+    logger.info("STT backend selected: %s", type(stt).__name__)
+
+    tts_cfg = config.get("tts", {})
+    tts_engine = (tts_cfg.get("engine") or "macos_native").lower()
+    tts_runtime_label = "macOS Native"
+
+    if tts_engine == "macos_native":
+        from voice.tts_macos import MacOSTTSAsync
+        tts = MacOSTTSAsync(
+            bus, state,
+            max_lines=tts_cfg.get("max_lines", 4),
+            voice=tts_cfg.get("macos_voice", "Daniel"),
+            rate=tts_cfg.get("macos_rate", 200),
+        )
+        logger.info("TTS: macOS Native (voice=%s)", tts_cfg.get("macos_voice", "Daniel"))
+        tts_runtime_label = f"macOS Native ({tts_cfg.get('macos_voice', 'Daniel')})"
+    elif tts_engine == "kokoro":
+        from voice.tts_kokoro import KokoroTTSAsync
+        tts = KokoroTTSAsync(
+            bus, state,
+            max_lines=tts_cfg.get("max_lines", 4),
+            voice=tts_cfg.get("kokoro_voice", "af_heart")
+        )
+        logger.info(
+            "TTS: Kokoro Neural fallback (offline, %s)",
+            tts_cfg.get("kokoro_voice", "af_heart"),
+        )
+        tts_runtime_label = f"Kokoro fallback ({tts_cfg.get('kokoro_voice', 'af_heart')})"
+    else:
+        from voice.tts_edge import EdgeTTSAsync
+        tts = EdgeTTSAsync(
+            bus, state,
+            max_lines=tts_cfg.get("max_lines", 4),
+            voice=tts_cfg.get("edge_voice", "en-GB-RyanNeural"),
+            rate=tts_cfg.get("edge_rate", "+15%"),
+            enable_postprocess=tts_cfg.get("edge_postprocess", True),
+            enable_ack_cache=tts_cfg.get("edge_ack_cache", True),
+        )
+        logger.info(
+            "TTS: Edge Neural fallback (%s) -- macOS native remains preferred on Apple Silicon",
+            tts_cfg.get("edge_voice"),
+        )
+        tts_runtime_label = f"Edge fallback ({tts_cfg.get('edge_voice')})"
 
     brain_enabled = config.get("brain", {}).get("enabled", False)
 
@@ -311,51 +372,47 @@ async def main() -> None:
     prefetch_eng = None
     shared_memory_graph = None
     if brain_enabled:
-        if distributed_mode:
-            logger.info("%s mode: initializing BrainProxy...", distributed_mode_label)
-            from core.ipc.proxies import BrainProxy
-            local_brain = BrainProxy(bus)
-            
-            async def on_llm_done(event: str, **data) -> None:
-                logger.debug("LLM generation complete (V3).")
-            bus.on("llm_done", on_llm_done)
-        else:
-            from cursor_bridge.local_brain_controller import LocalBrainController
-            local_brain = LocalBrainController(
-                bus, prompt_builder, config,
-                brain_mode_manager=brain_mode_mgr,
-            )
-            local_brain.set_action_executor(router.action_executor)
-            local_brain.attach_feedback_engine(feedback_engine)
-            local_brain.attach_system_monitor(system_monitor)
-            local_brain.attach_suggester(suggester_engine)
-            local_brain.attach_timeline(timeline_memory)
-            local_brain.attach_mode_resolver(mode_resolver)
-            try:
-                from brain.memory_graph import MemoryGraph
-                from core.rag.prefetch_engine import RagPrefetchEngine
-                from core.rag.rag_engine import RagEngine
+        from cursor_bridge.local_brain_controller import LocalBrainController
+        local_brain = LocalBrainController(
+            bus, prompt_builder, config,
+            brain_mode_manager=brain_mode_mgr,
+        )
+        local_brain.set_action_executor(router.action_executor)
+        local_brain.attach_feedback_engine(feedback_engine)
+        local_brain.attach_system_monitor(system_monitor)
+        local_brain.attach_suggester(suggester_engine)
+        local_brain.attach_timeline(timeline_memory)
+        local_brain.attach_mode_resolver(mode_resolver)
+        try:
+            from brain.memory_graph import MemoryGraph
+            from core.rag.prefetch_engine import RagPrefetchEngine
+            from core.rag.rag_engine import RagEngine
 
-                _mg_path = (config.get("memory") or {}).get(
-                    "graph_db_path", "data/atom_memory.db",
+            _mg_path = (config.get("memory") or {}).get(
+                "graph_db_path", "data/atom_memory.db",
+            )
+            shared_memory_graph = MemoryGraph(db_path=_mg_path, config=config)
+            local_brain.attach_memory_graph(shared_memory_graph)
+            _rag_cfg = config.get("rag") or {}
+            semantic_rag_ready = bool(getattr(cognitive_kernel, "_semantic_stack_available", False))
+            if _rag_cfg.get("enabled", True) and semantic_rag_ready:
+                rag_engine = RagEngine(config, vector_store=None)
+                rag_engine.set_memory_graph(shared_memory_graph)
+                rag_engine.set_feedback_engine(feedback_engine)
+                prefetch_eng = RagPrefetchEngine(rag_engine, config)
+                local_brain.attach_rag(rag_engine, None)
+                local_brain.attach_prefetch_engine(prefetch_eng)
+                logger.info(
+                    "V7 intelligence: RAG + prefetch + MemoryGraph + timeline + "
+                    "feedback + system awareness wired",
                 )
-                shared_memory_graph = MemoryGraph(db_path=_mg_path, config=config)
-                local_brain.attach_memory_graph(shared_memory_graph)
-                _rag_cfg = config.get("rag") or {}
-                if _rag_cfg.get("enabled", True):
-                    rag_engine = RagEngine(config, vector_store=None)
-                    rag_engine.set_memory_graph(shared_memory_graph)
-                    rag_engine.set_feedback_engine(feedback_engine)
-                    prefetch_eng = RagPrefetchEngine(rag_engine, config)
-                    local_brain.attach_rag(rag_engine, None)
-                    local_brain.attach_prefetch_engine(prefetch_eng)
-                    logger.info(
-                        "V7 intelligence: RAG + prefetch + MemoryGraph + timeline + "
-                        "feedback + system awareness wired",
-                    )
-            except Exception as exc:
-                logger.warning("V7 intelligence layer partial wiring: %s", exc)
-            logger.info("Local brain ENABLED (agentic mode, tool-use, brain.enabled=true)")
+            elif _rag_cfg.get("enabled", True):
+                logger.warning(
+                    "Semantic RAG disabled at boot: vector dependencies are unavailable, so ATOM will stay in honest keyword-only memory mode.",
+                )
+        except Exception as exc:
+            logger.warning("V7 intelligence layer partial wiring: %s", exc)
+        logger.info("Local brain ENABLED (agentic mode, tool-use, brain.enabled=true)")
     else:
         logger.info("Local brain DISABLED — enable brain.enabled for voice Q&A")
 
@@ -400,15 +457,38 @@ async def main() -> None:
 
     pipeline_timer = PipelineTimer(bus, metrics)
     pipeline_timer.register()
-    perf_mode = perf_cfg.get("mode", "lite")
-    logger.info("Performance mode: %s", perf_mode)
+    def _canonical_perf_mode(name: str | None) -> str:
+        key = (name or "auto").strip().lower().replace("-", "_").replace(" ", "_")
+        aliases = {
+            "optimal": "optimal",
+            "atom": "optimal",
+            "balanced": "optimal",
+            "lite": "optimal",
+            "ultra_lite": "optimal",
+            "full_performance": "full_performance",
+            "full": "full_performance",
+            "brain": "full_performance",
+            "auto": "auto",
+        }
+        return aliases.get(key, "auto")
 
     _PERF_DEFAULTS = {
-        "full":       {"health": 60,  "watcher": 10,  "maint": 120},
-        "lite":       {"health": 120, "watcher": 30,  "maint": 180},
-        "ultra_lite": {"health": 300, "watcher": 60,  "maint": 300},
+        "optimal": {"health": 120, "watcher": 30, "maint": 180},
+        "full_performance": {"health": 75, "watcher": 15, "maint": 120},
+        "auto": {"health": 120, "watcher": 30, "maint": 180},
     }
-    perf_d = _PERF_DEFAULTS.get(perf_mode, _PERF_DEFAULTS["lite"])
+    perf_mode = _canonical_perf_mode(perf_cfg.get("mode", "auto"))
+    perf_requested_mode = perf_mode
+    perf_effective_mode = "optimal"
+    logger.info("Performance mode request: %s", perf_requested_mode)
+
+    if perf_requested_mode == "auto":
+        brain_mode_mgr.set_profile("optimal")
+    else:
+        brain_mode_mgr.set_profile(perf_requested_mode)
+        perf_effective_mode = brain_mode_mgr.active_profile
+
+    perf_d = _PERF_DEFAULTS.get(perf_requested_mode, _PERF_DEFAULTS["optimal"])
 
     health_interval = perf_cfg.get("health_check_interval_s", perf_d["health"])
     watcher_interval = perf_cfg.get("system_watcher_interval_s", perf_d["watcher"])
@@ -423,6 +503,7 @@ async def main() -> None:
     autonomy = AutonomyEngine(
         bus, behavior, security, health_monitor, config,
         priority_sched=priority_sched,
+        brain_mode_manager=brain_mode_mgr,
     )
 
     from core.proactive_awareness import ProactiveAwareness
@@ -457,7 +538,7 @@ async def main() -> None:
     # when context_fusion and real_world_intel are actually instantiated.
 
     # ── ActionExecutor (bridges LLM tool calls -> Router dispatch) ──
-    if brain_enabled and local_brain is not None and not distributed_mode:
+    if brain_enabled and local_brain is not None:
         router.action_executor.set_registry(tool_registry)
         local_brain.set_action_executor(router.action_executor)
         logger.info("ActionExecutor connected: LLM -> security gate -> Router dispatch")
@@ -546,6 +627,7 @@ async def main() -> None:
     cognitive_kernel = CognitiveKernel(
         config=config,
         bus=bus,
+        brain_mode_manager=brain_mode_mgr,
         intent_engine=intent_engine,
         cache_engine=cache,
         metrics=metrics,
@@ -557,6 +639,78 @@ async def main() -> None:
     logger.info(
         "Cognitive Kernel: routing through %s paths",
         ", ".join(e.value for e in ExecPath),
+    )
+
+    # ── v22: Hybrid Intelligence Layer (Security Gateway + Cloud + Confidence) ──
+    from core.security_gateway import SecurityGateway
+    from core.cloud.gemini_client import GeminiClient
+    from core.confidence_engine import ConfidenceEngine
+    from core.decision_engine import DecisionEngine
+    from core.tools.search_tool import SearchTool
+    from core.memory.preference_store import PreferenceStore
+    from core.semantic_cache import SemanticCache
+
+    security_gateway = SecurityGateway(config)
+    confidence_engine = ConfidenceEngine(config)
+    decision_engine = DecisionEngine(config)
+    semantic_cache = SemanticCache(config)
+    preference_store = PreferenceStore(config)
+
+    # Gemini client: load API key from config, vault, or env
+    gemini_client = GeminiClient(config, security_gateway=security_gateway)
+    _gemini_key = (config.get("cloud", {}).get("gemini_api_key") or "").strip()
+    if not _gemini_key:
+        import os
+        _gemini_key = os.environ.get("GEMINI_API_KEY", "").strip()
+    if _gemini_key:
+        gemini_client.configure_api_key(_gemini_key)
+    else:
+        logger.info(
+            "Gemini API key not set — cloud reasoning disabled. "
+            "Set cloud.gemini_api_key in settings.json or GEMINI_API_KEY env var."
+        )
+
+    search_tool = SearchTool(
+        config, security_gateway=security_gateway, gemini_client=gemini_client,
+    )
+
+    # Wire cloud intelligence into Cognitive Kernel
+    cognitive_kernel.attach_cloud_intelligence(
+        confidence_engine=confidence_engine,
+        search_tool=search_tool,
+        gemini_client=gemini_client,
+        semantic_cache=semantic_cache,
+    )
+
+    # Wire cloud intelligence into Router
+    router.attach_cloud_intelligence(
+        gemini_client=gemini_client,
+        search_tool=search_tool,
+        confidence_engine=confidence_engine,
+        decision_engine=decision_engine,
+        semantic_cache=semantic_cache,
+        preference_store=preference_store,
+        security_gateway=security_gateway,
+    )
+
+    # Wire cloud intelligence into LocalBrainController and PromptBuilder
+    prompt_builder.set_preference_store(preference_store)
+    if local_brain is not None:
+        local_brain.attach_cloud_intelligence(
+            confidence_engine=confidence_engine,
+            decision_engine=decision_engine,
+            gemini_client=gemini_client,
+            semantic_cache=semantic_cache,
+            preference_store=preference_store,
+        )
+
+    logger.info(
+        "v22 Hybrid Intelligence: SecurityGateway + GeminiClient(%s) + "
+        "ConfidenceEngine + DecisionEngine + SearchTool + PreferenceStore + "
+        "SemanticCache(semantic=%s, threshold=%.2f)",
+        "available" if gemini_client.is_available else "no key",
+        semantic_cache.is_semantic,
+        float((config.get("semantic_cache", {}).get("threshold", 0.85))),
     )
 
     # ── Security Fortress + Self-Healing + Code Introspection ──────
@@ -571,6 +725,12 @@ async def main() -> None:
     self_healing.start()
 
     security.attach_fortress(security_fortress)
+
+    # Wire SecurityGateway → Fortress audit trail
+    try:
+        security_gateway.attach_audit_trail(security_fortress._audit)
+    except Exception:
+        logger.debug("SecurityGateway audit trail wiring skipped", exc_info=True)
 
     code_introspector.scan()
     logger.info(
@@ -638,23 +798,36 @@ async def main() -> None:
 
     if cognitive_enabled:
         second_brain = SecondBrain(memory, behavior, config)
+        if local_brain is not None:
+            local_brain.attach_second_brain(second_brain)
         goal_engine = GoalEngine(bus, second_brain, config)
         behavior_model = BehaviorModel(bus, config)
         prediction_engine = PredictionEngine(
             bus, behavior, memory, behavior_model, config,
+            brain_mode_manager=brain_mode_mgr,
         )
         prediction_engine.attach_prompt_builder(prompt_builder)
         prediction_engine.attach_cognitive_kernel(cognitive_kernel)
         if prefetch_eng is not None:
             prediction_engine.attach_prefetch_engine(prefetch_eng)
-        self_optimizer = SelfOptimizer(bus, metrics, config)
+        self_optimizer = SelfOptimizer(
+            bus,
+            metrics,
+            config,
+            brain_mode_manager=brain_mode_mgr,
+        )
         personality_modes = PersonalityModes(bus, behavior_model, config)
 
         from core.cognitive.dream_engine import DreamEngine
         from core.cognitive.curiosity_engine import CuriosityEngine
 
-        dream_engine = DreamEngine(bus, config)
-        curiosity_engine = CuriosityEngine(bus, config)
+        dream_engine = DreamEngine(bus, config, brain_mode_manager=brain_mode_mgr)
+        dream_engine.wire(second_brain=second_brain)
+        curiosity_engine = CuriosityEngine(
+            bus,
+            config,
+            brain_mode_manager=brain_mode_mgr,
+        )
         logger.info("Cognitive layer initialized (8 modules, incl. dream + curiosity)")
     else:
         logger.info("Cognitive layer DISABLED via config")
@@ -688,11 +861,16 @@ async def main() -> None:
 
     real_world_intel = RealWorldIntelligence(config)
 
-    proactive_intel = ProactiveIntelligenceEngine(bus=bus, config=config)
+    proactive_intel = ProactiveIntelligenceEngine(
+        bus=bus,
+        config=config,
+        brain_mode_manager=brain_mode_mgr,
+    )
     proactive_intel.wire(
         behavior=behavior,
         conv_memory=conv_memory,
         owner=owner_understanding,
+        goals=goal_engine,
     )
 
     if cognitive_enabled:
@@ -716,8 +894,21 @@ async def main() -> None:
     ui_mode = ui_cfg.get("mode", "web").lower()
     web_dashboard = None
 
-    if ui_mode == "web":
+    if ui_mode == "native":
+        # ── Native macOS UI (AppKit + WKWebView, no browser/server) ──
+        from ui.native_ui import NativeATOMWindow
+        indicator = NativeATOMWindow(
+            mic_name=stt.mic_name,
+            config=config,
+        )
+        logger.info("UI mode: native macOS (AppKit + WKWebView — no browser, no server)")
+    elif ui_mode == "web":
         from ui.web_dashboard import WebDashboard
+
+        def _model_display_name(raw_path: str, fallback: str) -> str:
+            name = Path(raw_path or fallback).name or fallback
+            return name.removesuffix("-mlx").removesuffix(".mlx")
+
         indicator = WebDashboard(
             mic_name=stt.mic_name,
             port=ui_cfg.get("web_port", 8765),
@@ -725,44 +916,55 @@ async def main() -> None:
             config=config,
         )
         owner_name = config.get("owner", {}).get("name", "Satyam")
-        _tts_label = (
-            "Kokoro (offline neural)"
-            if tts_engine == "kokoro"
-            else (
-                f"macOS Native ({tts_cfg.get('macos_voice', 'Daniel')})"
-                if tts_engine == "macos_native"
-                else (
-                    tts_cfg.get("edge_voice", "Edge")
-                    if tts_engine == "edge"
-                    else "SAPI (offline)"
-                )
-            )
+        brain_cfg = config.get("brain", {})
+        primary_model = _model_display_name(
+            str(brain_cfg.get("mlx_primary_model", "mlx-primary")),
+            "mlx-primary",
         )
-        _brain_label = "Local LLM"
+        fast_model = _model_display_name(
+            str(brain_cfg.get("mlx_fast_model", "mlx-fast")),
+            "mlx-fast",
+        )
+        _brain_label = "MLX local brain"
         if brain_enabled and local_brain and local_brain.available:
-            _brain_label = "Local: " + Path(
-                config.get("brain", {}).get("model_path", "model")
-            ).stem
+            _brain_label = f"MLX dual ({fast_model} + {primary_model})"
         elif brain_enabled:
-            _brain_label = "Local LLM (model not ready)"
+            _brain_label = f"MLX dual loading ({fast_model} + {primary_model})"
         else:
             _brain_label = "No LLM (commands only)"
         _badge_label, _badge_show = deployment_dashboard_badge(config)
+        semantic_rag_ready = bool(getattr(cognitive_kernel, "_semantic_stack_available", False))
+        memory_rag_status = (
+            "Semantic retrieval ready"
+            if semantic_rag_ready
+            else "Keyword-only fallback. Semantic RAG is unavailable in this runtime."
+        )
+        voice_mode = "browser_text_first"
+        voice_note = "Browser dashboard is text-first. Launch ATOM.app for production voice input."
+        if "Faster-Whisper" in stt_runtime_label:
+            voice_mode = "browser_voice_dev"
+            voice_note = "Browser voice is in development fallback mode. The bundled ATOM.app remains the production voice path."
         indicator.set_init_info(
             version="ATOM",
             owner_name=owner_name,
-            stt="Whisper (" + config.get("stt", {}).get("whisper_model_size", "small") + ")",
-            tts=_tts_label,
+            stt=stt_runtime_label,
+            tts=tts_runtime_label,
             brain=_brain_label,
-            perf_mode=perf_mode,
+            perf_mode=perf_effective_mode,
+            perf_mode_requested=perf_requested_mode,
             brain_profile=brain_mode_mgr.active_profile,
             assistant_mode=assistant_mode_mgr.active,
             deployment_badge_label=_badge_label if _badge_show else "",
+            voice_mode=voice_mode,
+            voice_note=voice_note,
+            memory_rag_status=memory_rag_status,
         )
         web_dashboard = indicator
     else:
-        from ui.floating_indicator import FloatingIndicator
-        indicator = FloatingIndicator(mic_name=stt.mic_name)
+        # Fallback: use native macOS UI
+        from ui.native_ui import NativeATOMWindow
+        indicator = NativeATOMWindow(mic_name=stt.mic_name, config=config)
+        logger.info("UI mode fallback: native macOS")
 
     if hasattr(indicator, "attach_runtime_managers"):
         indicator.attach_runtime_managers(
@@ -777,32 +979,89 @@ async def main() -> None:
             pass
 
     _MODE_LABELS = {
-        "full": "full performance", "lite": "lite",
-        "ultra_lite": "ultra lite", "auto": "auto",
+        "optimal": "Optimal",
+        "full_performance": "Full Performance",
+        "auto": "Auto",
     }
     _MODE_PHRASES = {
-        "full": "All systems at maximum performance.",
-        "lite": "Optimizing for efficiency.",
-        "ultra_lite": "Entering low resource mode.",
-        "auto": "Adapting to system load.",
+        "optimal": "Stable buddy mode tuned for your M5 Air.",
+        "full_performance": "Deeper mode when unified memory and thermals are healthy.",
+        "auto": "I'll auto-tune between Optimal and Full Performance.",
     }
+
+    def _mode_label(mode_name: str) -> str:
+        canonical = _canonical_perf_mode(mode_name)
+        return _MODE_LABELS.get(canonical, canonical.replace("_", " ").title())
+
+    def _broadcast_perf_state(reason: str = "") -> None:
+        indicator.broadcast_perf_mode(
+            perf_effective_mode,
+            requested_mode=perf_requested_mode,
+            reason=reason,
+        )
+
+    async def _sync_effective_mode(
+        target_mode: str,
+        *,
+        reason: str = "",
+        speak: bool = False,
+    ) -> bool:
+        nonlocal perf_effective_mode
+        canonical = BrainModeManager.canonical_profile_name(target_mode) or "optimal"
+        previous = perf_effective_mode
+        if canonical == previous and brain_mode_mgr.active_profile == canonical:
+            _broadcast_perf_state(reason)
+            return False
+
+        ok, _ = brain_mode_mgr.set_profile(canonical)
+        if not ok:
+            return False
+
+        perf_effective_mode = brain_mode_mgr.active_profile
+        bus.emit_fast(
+            "runtime_settings_changed",
+            brain_profile=brain_mode_mgr.active_profile,
+        )
+        _broadcast_perf_state(reason)
+
+        if speak and previous != perf_effective_mode:
+            msg = (
+                f"Boss, switching from {_mode_label(previous)} to "
+                f"{_mode_label(perf_effective_mode)}."
+            )
+            if reason:
+                msg = f"{msg} {reason}"
+            bus.emit_long(
+                "partial_response",
+                text=msg,
+                is_first=True,
+                is_last=True,
+            )
+        return previous != perf_effective_mode
 
     async def _execute_mode_switch(new_mode: str) -> None:
         """Save config, speak confirmation, then trigger graceful restart."""
+        nonlocal perf_requested_mode
         global _restart_requested
         try:
+            requested = _canonical_perf_mode(new_mode)
             cfg_path = Path("config/settings.json")
             with open(cfg_path, "r", encoding="utf-8") as f:
                 cfg_data = json.load(f)
             if "performance" not in cfg_data:
                 cfg_data["performance"] = {}
-            cfg_data["performance"]["mode"] = new_mode
+            cfg_data["performance"]["mode"] = requested
+            cfg_data.setdefault("assistant_brain", {})
+            cfg_data["assistant_brain"]["active_profile"] = (
+                "optimal" if requested == "auto" else requested
+            )
             with open(cfg_path, "w", encoding="utf-8") as f:
                 json.dump(cfg_data, f, indent=4)
-            logger.info("Performance mode updated to '%s' in settings.json", new_mode)
+            perf_requested_mode = requested
+            logger.info("Performance mode updated to '%s' in settings.json", requested)
 
-            label = _MODE_LABELS.get(new_mode, new_mode)
-            phrase = _MODE_PHRASES.get(new_mode, "")
+            label = _mode_label(requested)
+            phrase = _MODE_PHRASES.get(requested, "")
             msg = f"Switching to {label} mode, Boss. {phrase} Restarting now."
             bus.emit_long(
                 "partial_response",
@@ -840,7 +1099,7 @@ async def main() -> None:
 
         indicator.set_personality_mode_callback(_on_personality_mode_from_ui)
 
-    async def _on_bus_set_mode(mode: str = "lite", **_kw) -> None:
+    async def _on_bus_set_mode(mode: str = "optimal", **_kw) -> None:
         await _execute_mode_switch(mode)
     bus.on("set_performance_mode", _on_bus_set_mode)
 
@@ -867,20 +1126,23 @@ async def main() -> None:
 
         try:
             loop = asyncio.get_running_loop()
-            if not distributed_mode:
-                devices = await loop.run_in_executor(None, mic_manager.profile_devices)
-                if devices:
-                    best = mic_manager.get_best_device(
-                        prefer_bluetooth=config.get("mic", {}).get("prefer_bluetooth", True),
-                    )
-                    if best:
-                        mic_manager.active_device = best
-                        logger.info(
-                            "Audio device selected: '%s' (%s, quality=%d/100)",
-                            best.name, best.device_type, best.quality_score,
-                        )
 
-            await stt.preload()
+            devices = await loop.run_in_executor(None, mic_manager.profile_devices)
+            if devices:
+                best = mic_manager.get_best_device(
+                    prefer_bluetooth=config.get("mic", {}).get("prefer_bluetooth", True),
+                )
+                if best:
+                    mic_manager.active_device = best
+                    logger.info(
+                        "Audio device selected: '%s' (%s, quality=%d/100)",
+                        best.name, best.device_type, best.quality_score,
+                    )
+
+            if hasattr(stt, "async_preload"):
+                await stt.async_preload()
+            else:
+                await stt.preload()
             elapsed = (time.monotonic() - t0) * 1000
             logger.info("STT pipeline ready (%.0fms: devices + model + preprocessor)", elapsed)
         except Exception:
@@ -979,7 +1241,7 @@ async def main() -> None:
         behavior=behavior,
         scheduler=scheduler, process_mgr=process_mgr, evolution=evolution,
         priority_sched=priority_sched,
-        v3=args.v3, v4=args.v4,
+        v3=False, v4=False,
     )
     _last_perceived_ms = _wiring_ctx["last_perceived_ms"]
 
@@ -995,6 +1257,12 @@ async def main() -> None:
         assistant_mode: str | None = None,
         **_kw,
     ) -> None:
+        nonlocal perf_effective_mode
+        if brain_profile:
+            perf_effective_mode = (
+                BrainModeManager.canonical_profile_name(brain_profile) or perf_effective_mode
+            )
+            _broadcast_perf_state()
         if web_dashboard is not None:
             await web_dashboard.broadcast_runtime_settings(
                 brain_profile=brain_profile or brain_mode_mgr.active_profile,
@@ -1073,23 +1341,35 @@ async def main() -> None:
                 active_project=active_proj,
                 preemption=pre,
             )
+            try:
+                from core.observability.per_module_latency import get_latency_board
+
+                lb = get_latency_board().get_dashboard_data()
+                lb["system_state"] = ss
+            except Exception:
+                lb = {"system_state": ss, "modules": {}, "recent_events": [], "health": "idle"}
             return {
                 "health_status": health,
                 "metrics": metrics,
                 "warnings": warns,
                 "snapshot": snap,
+                "latency_board": lb,
             }
 
         web_dashboard.set_v7_health_provider(_v7_health_payload)
         await web_dashboard.start()
     else:
         indicator.start()
+    _broadcast_perf_state()
 
     if local_brain and local_brain.available:
-        model_name = Path(config.get("brain", {}).get("model_path", "local")).stem
-        brain_label = f"Intent Engine + Agentic LLM ({model_name})"
+        brain_cfg = config.get("brain", {})
+        model_name = Path(
+            brain_cfg.get("mlx_primary_model") or brain_cfg.get("mlx_fast_model") or "mlx",
+        ).stem.replace("-mlx", "")
+        brain_label = f"Intent Engine + Agentic MLX LLM ({model_name})"
     elif brain_enabled:
-        brain_label = "Intent Engine + Local LLM (model unavailable)"
+        brain_label = "Intent Engine + MLX LLM (model unavailable)"
     else:
         brain_label = "Intent Engine ONLY — set brain.enabled for local LLM"
     cognitive_label = "Cognitive Layer ON (dream+curiosity)" if cognitive_enabled else "Cognitive OFF"
@@ -1098,38 +1378,9 @@ async def main() -> None:
     if not brain_enabled:
         logger.warning("brain.enabled is false — voice Q&A disabled; commands still work")
 
-    # ── Global Hotkey (Ctrl+Alt+A) ──────────────────────────────────────
+    # Hotkey support removed — requires root/sudo on macOS.
+    # Use the UNSTICK button in the dashboard instead.
     hotkey_active = False
-    try:
-        import keyboard
-
-        def _hotkey_handler():
-            """Toggle LISTENING state via keyboard shortcut. Also resumes from SLEEP."""
-            try:
-                if state.current is AtomState.SLEEP:
-                    running_loop.call_soon_threadsafe(
-                        bus.emit, "resume_listening",
-                    )
-                    logger.info("Hotkey: SLEEP -> resume listening")
-                elif state.current is AtomState.LISTENING:
-                    running_loop.call_soon_threadsafe(
-                        lambda: asyncio.create_task(state.transition(AtomState.IDLE))
-                    )
-                    logger.info("Hotkey: LISTENING -> IDLE")
-                else:
-                    # THINKING, SPEAKING, IDLE, ERROR_RECOVERY — unstick / resume
-                    running_loop.call_soon_threadsafe(bus.emit, "resume_listening")
-                    logger.info("Hotkey: resume_listening (unstick)")
-            except Exception as e:
-                logger.warning("Hotkey handler error: %s", e)
-
-        keyboard.add_hotkey("ctrl+alt+a", _hotkey_handler, suppress=False)
-        hotkey_active = True
-        logger.info("Global hotkey registered: Ctrl+Alt+A (toggle listening)")
-    except ImportError:
-        logger.info("keyboard module not installed -- hotkey disabled (pip install keyboard)")
-    except Exception as e:
-        logger.warning("Could not register hotkey: %s", e)
 
     from core.power_governor import PowerGovernor
     power_governor = PowerGovernor(bus)
@@ -1259,69 +1510,40 @@ async def main() -> None:
     await cold_start.emit_restored_context()
     state.always_listen = True
     logger.info(
-        "ATOM -- Supernatural Intelligence OS | always listening | perf=%s | health=%.0fs watcher=%.0fs maint=%.0fs",
-        perf_mode, health_interval, watcher_interval, maint_interval,
+        "ATOM -- Supernatural Intelligence OS | always listening | requested=%s | active=%s | health=%.0fs watcher=%.0fs maint=%.0fs",
+        perf_requested_mode,
+        perf_effective_mode,
+        health_interval,
+        watcher_interval,
+        maint_interval,
     )
     await state.transition(AtomState.LISTENING)
 
     async def _startup_greeting() -> None:
         """Speak a context-aware greeting with world intelligence."""
-        mode_label = _MODE_LABELS.get(perf_mode, perf_mode)
+        mode_label = _mode_label(perf_effective_mode)
 
-        # Real-world awareness
         world_ctx = real_world_intel.get_world_context()
-        weather_line = ""
-        if not world_ctx.weather.is_stale:
-            weather_line = f" Weather outside: {world_ctx.weather.summary()}."
-        elif world_ctx.weather.condition != "unknown":
-            weather_line = f" Last known weather: {world_ctx.weather.summary()}."
-
-        news_line = ""
-        if world_ctx.headlines:
-            news_line = f" Top news: {world_ctx.headlines[0][:80]}."
-
         temporal = world_ctx.temporal
-        holiday_line = f" Today is {temporal.holiday_name}." if temporal.is_holiday else ""
+        time_g = _adaptive_personality.greeting_response()
 
-        # System awareness
-        sys_summary = platform_adapter.get_system_summary()
-        scan_health = ""
-        if system_scanner.last_scan:
-            h = system_scanner.last_scan.get("health", {}).get("overall", 0)
-            scan_health = f" System health: {h} out of 100."
-
-        # Security awareness
-        security_label = "secured" if security_fortress.is_authenticated else "awaiting authentication"
-        integrity_ok, _ = security_fortress.check_integrity()
-
-        # Cognitive awareness
-        cognitive_msg = ""
+        greeting_bits = [f"{mode_label} ready."]
         if cognitive_enabled:
             active_goals = goal_engine.active_count
             if active_goals:
-                cognitive_msg = f" You have {active_goals} active goal{'s' if active_goals > 1 else ''}."
+                greeting_bits.append(
+                    f"{active_goals} active goal{'s' if active_goals != 1 else ''}."
+                )
 
-        # Capability count
-        cap_count = tool_registry.count
+        if not world_ctx.weather.is_stale:
+            greeting_bits.append(f"Weather: {world_ctx.weather.summary()}.")
+        elif world_ctx.weather.condition != "unknown":
+            greeting_bits.append(f"Last weather: {world_ctx.weather.summary()}.")
 
-        # Build greeting using adaptive personality
-        time_g = _adaptive_personality.greeting_response()
+        if temporal.is_holiday:
+            greeting_bits.append(f"Today is {temporal.holiday_name}.")
 
-        # System Diagnostics Check
-        bottleneck_msg = ""
-        if system_scanner.bottlenecks:
-            criticals = [b for b in system_scanner.bottlenecks if b.severity in ("critical", "high")]
-            if criticals:
-                bottleneck_msg = f" Note: {criticals[0].description}"
-
-        greeting = (
-            f"{time_g} "
-            f"All systems online. {sys_summary}.{scan_health}{bottleneck_msg} "
-            f"Security: {security_label}, {'integrity clean' if integrity_ok else 'integrity alert'}. "
-            f"Running in {mode_label} mode with {cap_count} tools ready.{cognitive_msg} "
-            f"{weather_line}{holiday_line}{news_line} "
-            f"I know the world, I know you, and I only answer to you, Boss. What do you need?"
-        )
+        greeting = f"{time_g} All systems online. {' '.join(greeting_bits)} What do you need?"
 
         try:
             bat = psutil.sensors_battery()
@@ -1338,27 +1560,71 @@ async def main() -> None:
         await stt_preload_done.wait()
         logger.info("STT ready -- ATOM fully operational")
         
-        if distributed_mode:
-            # In distributed mode, external workers own the listening loop.
-            while True:
-                await asyncio.sleep(1)
+
+        if hasattr(stt, "async_start_listening"):
+            await stt.async_start_listening()
         else:
             await stt.start_listening()
 
     _bg_tasks.append(asyncio.create_task(_startup_greeting()))
 
     async def _auto_performance_loop() -> None:
-        """Latency-driven auto mode. Ignores transient CPU spikes (LLM inference)."""
-        auto_effective = "lite"
+        """Auto-tune between Optimal and Full Performance for the M5 Air."""
+        nonlocal perf_effective_mode
         interval = 45.0
-        _COOLDOWN_S = 120.0
+        _COOLDOWN_S = 180.0
         _last_switch_time = 0.0
-        _BRAIN_FOR_PERF = {"full": "brain", "lite": "balanced", "ultra_lite": "atom"}
-        try:
-            pass
-        except Exception:
-            logger.warning("Auto performance mode requires psutil")
-            return
+
+        def _telemetry() -> dict[str, float | bool | str]:
+            cpu = 0.0
+            memory_pct = 0.0
+            thermal_pressure = "nominal"
+            throttled = False
+            battery_pct = 100.0
+            on_battery = False
+
+            if silicon_governor is not None and silicon_governor.is_available:
+                try:
+                    silicon_stats = silicon_governor.get_stats()
+                    cpu = float(getattr(silicon_stats, "cpu_pct", 0.0) or 0.0)
+                    memory_pct = float(getattr(silicon_stats, "memory_pct", 0.0) or 0.0)
+                    thermal_pressure = str(
+                        getattr(silicon_stats, "thermal_pressure", "nominal") or "nominal",
+                    )
+                    throttled = bool(getattr(silicon_stats, "is_throttled", False))
+                    battery_pct = float(getattr(silicon_stats, "battery_pct", 100.0) or 100.0)
+                    on_battery = bool(getattr(silicon_stats, "on_battery", False))
+                except Exception:
+                    logger.debug("Silicon telemetry read failed", exc_info=True)
+
+            if cpu <= 0:
+                cpu = psutil.cpu_percent(interval=1.0)
+            if memory_pct <= 0:
+                memory_pct = float(psutil.virtual_memory().percent)
+
+            return {
+                "cpu": cpu,
+                "memory_pct": memory_pct,
+                "thermal_pressure": thermal_pressure,
+                "throttled": throttled,
+                "battery_pct": battery_pct,
+                "on_battery": on_battery,
+            }
+
+        def _mode_reason(telemetry: dict[str, float | bool | str], lat_s: float) -> str:
+            if bool(telemetry["throttled"]):
+                return "Thermal pressure is high, so I'm protecting the Air."
+            if float(telemetry["memory_pct"]) >= _memory_pressure_threshold:
+                return (
+                    "Unified memory is under pressure, so I'm dropping back to Optimal."
+                )
+            if float(telemetry["cpu"]) >= float(perf_cfg.get("auto_threshold_high", 70)):
+                return "CPU load is high, so I'm staying in the stable mode."
+            if lat_s >= 12.0:
+                return "Response latency climbed too much, so I'm trimming back."
+            if bool(telemetry["on_battery"]) and float(telemetry["battery_pct"]) <= 25.0:
+                return "Battery is low, so I'm reducing background load."
+            return "Memory, thermals, and latency look healthy."
 
         while not shutdown_event.is_set():
             try:
@@ -1376,53 +1642,81 @@ async def main() -> None:
                 if now - _last_switch_time < _COOLDOWN_S:
                     continue
 
-                cpu = psutil.cpu_percent(interval=2.0)
                 lat_ms = _last_perceived_ms.get("ms")
+                lat_s = (lat_ms / 1000.0) if lat_ms is not None else 0.0
+                telemetry = _telemetry()
 
-                if lat_ms is None:
-                    continue
+                promote_ready = (
+                    not bool(telemetry["throttled"])
+                    and str(telemetry["thermal_pressure"]) in ("nominal", "moderate", "")
+                    and float(telemetry["memory_pct"]) <= max(72.0, _memory_pressure_relief)
+                    and float(telemetry["cpu"]) <= float(perf_cfg.get("auto_threshold_mid", 40))
+                    and lat_s <= 6.0
+                    and (
+                        not bool(telemetry["on_battery"])
+                        or float(telemetry["battery_pct"]) >= 35.0
+                    )
+                )
+                must_demote = (
+                    bool(telemetry["throttled"])
+                    or float(telemetry["memory_pct"]) >= _memory_pressure_threshold
+                    or float(telemetry["cpu"]) >= float(perf_cfg.get("auto_threshold_high", 70))
+                    or lat_s >= 12.0
+                    or (
+                        bool(telemetry["on_battery"])
+                        and float(telemetry["battery_pct"]) <= 25.0
+                    )
+                )
 
-                lat_s = lat_ms / 1000.0
-                if lat_s > 25.0:
-                    target = "ultra_lite"
-                elif lat_s > 12.0:
-                    target = "lite"
-                elif lat_s < 8.0 and cpu < 50:
-                    target = "full"
+                target = perf_effective_mode
+                if perf_requested_mode == "optimal":
+                    target = "optimal"
+                elif perf_requested_mode == "full_performance":
+                    if must_demote:
+                        target = "optimal"
+                    elif promote_ready:
+                        target = "full_performance"
                 else:
-                    target = auto_effective
+                    if must_demote:
+                        target = "optimal"
+                    elif perf_effective_mode == "optimal" and promote_ready:
+                        target = "full_performance"
 
-                if target == auto_effective:
+                if target == perf_effective_mode:
+                    _broadcast_perf_state()
                     continue
 
-                prev_l = _MODE_LABELS.get(auto_effective, auto_effective)
-                new_l = _MODE_LABELS.get(target, target)
-                msg = f"Boss, switching from {prev_l} to {new_l} mode. Response time was {lat_s:.0f} seconds."
+                reason = _mode_reason(telemetry, lat_s)
                 logger.info(
-                    "Auto perf: latency=%.0fs CPU=%.0f%% -> %s -> %s",
-                    lat_s, cpu, auto_effective, target,
+                    "M5 auto perf: requested=%s current=%s target=%s latency=%.1fs cpu=%.0f%% mem=%.0f%% thermal=%s battery=%.0f%% on_battery=%s",
+                    perf_requested_mode,
+                    perf_effective_mode,
+                    target,
+                    lat_s,
+                    float(telemetry["cpu"]),
+                    float(telemetry["memory_pct"]),
+                    telemetry["thermal_pressure"],
+                    float(telemetry["battery_pct"]),
+                    telemetry["on_battery"],
                 )
-                _last_switch_time = now
-                auto_effective = target
-                bus.emit_long(
-                    "partial_response", text=msg,
-                    is_first=True, is_last=True,
+                switched = await _sync_effective_mode(
+                    target,
+                    reason=reason,
+                    speak=True,
                 )
-                bp = _BRAIN_FOR_PERF.get(target, "balanced")
-                if brain_mode_mgr is not None:
-                    ok, _ = brain_mode_mgr.set_profile(bp)
-                    if ok:
-                        logger.info("Auto perf: brain profile -> %s", bp)
-                indicator.broadcast_perf_mode(target)
+                if switched:
+                    _last_switch_time = now
             except Exception as exc:
                 logger.debug("Auto performance check error: %s", exc)
 
-    if perf_mode == "auto":
+    if perf_requested_mode in ("auto", "full_performance"):
         _bg_tasks.append(asyncio.create_task(_auto_performance_loop()))
         logger.info(
-            "Auto performance mode active (CPU thresholds: %s/%s; latency bands <10s / 10-30s / >30s)",
+            "M5 mode guard active (requested=%s, CPU thresholds=%s/%s, memory pressure=%.0f%%)",
+            perf_requested_mode,
             perf_cfg.get("auto_threshold_mid", 40),
             perf_cfg.get("auto_threshold_high", 70),
+            _memory_pressure_threshold,
         )
 
     _last_ttl_change_cycle = {"v": 0}
@@ -1452,8 +1746,8 @@ async def main() -> None:
 
     _proactive_state = _wiring_ctx["proactive_state"]
 
-    proactive_alerts = perf_cfg.get("proactive_alerts", perf_mode == "full")
-    idle_reminder = perf_cfg.get("idle_reminder", perf_mode == "full")
+    proactive_alerts = perf_cfg.get("proactive_alerts", perf_requested_mode == "full_performance")
+    idle_reminder = perf_cfg.get("idle_reminder", perf_requested_mode == "full_performance")
     cache_purge_cycles = max(1, 1200 // maint_interval)
     tune_cycles = max(1, 600 // maint_interval)
 
@@ -1469,7 +1763,7 @@ async def main() -> None:
                 pass
             cycle += 1
 
-            if perf_mode != "ultra_lite":
+            if perf_effective_mode == "full_performance":
                 log_health(metrics)
 
             if cycle % cache_purge_cycles == 0:
@@ -1515,12 +1809,25 @@ async def main() -> None:
 
     maintenance_task = asyncio.create_task(_periodic_maintenance())
 
+    # ── V22 Convergence: Advanced Proactive Daemon ──
+    from core.background.proactive_agent import ProactiveDaemon
+    from core.cognition.state_graph import SystemStateGraph
+    try:
+        convergence_daemon = ProactiveDaemon(state_graph=SystemStateGraph(), tts_engine=tts)
+        convergence_daemon.start()
+        logger.info("V22 Convergence Daemon started.")
+    except Exception as e:
+        logger.error(f"Failed to start convergence daemon: {e}")
+        convergence_daemon = None
+
     try:
         await shutdown_event.wait()
     except (KeyboardInterrupt, SystemExit):
         logger.info("Interrupt received")
     finally:
         logger.info("Cleaning up...")
+        if convergence_daemon:
+            convergence_daemon.stop()
         power_governor.stop()
         scheduler.stop()
         system_watcher.stop()
@@ -1569,12 +1876,7 @@ async def main() -> None:
             await asyncio.gather(*_all_cancelled, return_exceptions=True)
         behavior.persist()
         evolution.persist()
-        if hotkey_active:
-            try:
-                import keyboard
-                keyboard.unhook_all()
-            except Exception:
-                pass
+
         if llm_queue is not None:
             await llm_queue.shutdown()
         if runtime_watchdog is not None:
@@ -1622,8 +1924,7 @@ def run_atom(config_overrides: dict | None = None) -> None:
     global _restart_requested
     set_config_overrides(config_overrides or {})
 
-    if sys.platform == "win32":
-        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+
 
     MAX_RETRIES = 5
     MAX_BACKOFF_S = 30.0

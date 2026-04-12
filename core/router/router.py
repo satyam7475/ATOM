@@ -29,6 +29,7 @@ from typing import TYPE_CHECKING, Any
 from core import adaptive_personality as personality
 from core.command_cache import get_command_cache
 from core.process_manager import ProcessManager
+from core.query_policy import ResponseMode, classify_response_mode, normalize_query
 from core.router.confirmation_manager import ConfirmationManager
 from core.router.diagnostics_handler import DiagnosticsHandler
 from core.security_policy import SecurityPolicy
@@ -129,6 +130,15 @@ class Router:
         self._cognitive_kernel: CognitiveKernel | None = None
         self._runtime_watchdog: RuntimeWatchdog | None = None
 
+        # v22: Cloud intelligence components (wired via attach_cloud_intelligence)
+        self._gemini_client: Any = None
+        self._search_tool: Any = None
+        self._confidence_engine: Any = None
+        self._decision_engine: Any = None
+        self._semantic_cache: Any = None
+        self._preference_store: Any = None
+        self._security_gateway: Any = None
+
         # Extracted modules
         self._conv_mgr = ConversationManager(self._conv_memory)
         self._confirmation = ConfirmationManager(self._security)
@@ -159,6 +169,34 @@ class Router:
         """Wire RuntimeWatchdog so hot router stages use active budgets."""
         self._runtime_watchdog = watchdog
         logger.info("RuntimeWatchdog attached to Router")
+
+    def attach_cloud_intelligence(
+        self,
+        *,
+        gemini_client: Any = None,
+        search_tool: Any = None,
+        confidence_engine: Any = None,
+        decision_engine: Any = None,
+        semantic_cache: Any = None,
+        preference_store: Any = None,
+        security_gateway: Any = None,
+    ) -> None:
+        """v22: Wire all cloud intelligence components into the Router."""
+        self._gemini_client = gemini_client
+        self._search_tool = search_tool
+        self._confidence_engine = confidence_engine
+        self._decision_engine = decision_engine
+        self._semantic_cache = semantic_cache
+        self._preference_store = preference_store
+        self._security_gateway = security_gateway
+        logger.info(
+            "Router v22 cloud intelligence wired: gemini=%s, search=%s, "
+            "confidence=%s, decision=%s, sem_cache=%s, prefs=%s, gateway=%s",
+            gemini_client is not None, search_tool is not None,
+            confidence_engine is not None, decision_engine is not None,
+            semantic_cache is not None, preference_store is not None,
+            security_gateway is not None,
+        )
 
     async def _handle_component_failure(
         self,
@@ -201,6 +239,22 @@ class Router:
         polished = personality.polish_response(text or "", source="thinking_ack")
         self._bus.emit_long("thinking_ack", text=polished)
 
+    @staticmethod
+    def _should_emit_thinking_ack(clean_text: str, query_plan: Any | None) -> bool:
+        if classify_response_mode(clean_text) is ResponseMode.SHORT:
+            return False
+        if query_plan is None:
+            return True
+        path = getattr(getattr(query_plan, "path", None), "value", getattr(query_plan, "path", ""))
+        path_name = str(path or "").strip().lower()
+        if path_name in {"direct", "cache", "quick"}:
+            return False
+        budget_tier = str(getattr(query_plan, "budget_tier", "") or "").strip().lower()
+        requested_tier = str(getattr(query_plan, "requested_tier", "") or "").strip().lower()
+        if budget_tier in {"command", "info", "simple"} or requested_tier in {"command", "info", "simple"}:
+            return False
+        return True
+
     async def on_speech(self, text: str, **_kw) -> None:
         if self._processing_semaphore._value == 0:
             logger.warning("Queuing speech '%s' -- at concurrency limit",
@@ -236,7 +290,13 @@ class Router:
         if not text:
             return
 
-        clean_text = compress_query(text)
+        raw_text = compress_query(text)
+        if not raw_text:
+            return
+        normalized_text = normalize_query(raw_text)
+        if normalized_text and normalized_text != raw_text.lower().strip():
+            logger.info("Input normalized: '%s' -> '%s'", raw_text[:80], normalized_text[:80])
+        clean_text = compress_query(normalized_text or raw_text)
         if not clean_text:
             return
 
@@ -244,13 +304,13 @@ class Router:
             try:
                 self._timeline.append_event(
                     "user_query",
-                    {"text": clean_text[:2000], "source": "router"},
+                    {"text": raw_text[:2000], "source": "router"},
                 )
             except Exception:
                 pass
 
         if self._conv_memory is not None:
-            self._conv_memory.on_new_user_query(clean_text)
+            self._conv_memory.on_new_user_query(raw_text)
 
         _skill_chain: list[str] = []
         if self._skills is not None:
@@ -262,7 +322,7 @@ class Router:
                     f" +{len(match.chain)} chain" if match.chain else "",
                 )
                 clean_text = match.primary
-                text = match.primary
+                raw_text = match.primary
                 _skill_chain = list(match.chain)
 
         # ── 1. Pronoun resolution (conversational continuity) ────────
@@ -270,7 +330,7 @@ class Router:
         if resolved != clean_text:
             logger.info("Pronoun resolved: '%s' -> '%s'", clean_text, resolved)
             clean_text = resolved
-            text = resolved
+            raw_text = resolved
 
         # ── 3. Clipboard injection (implicit context) ────────────────
         clipboard_injected = False
@@ -280,7 +340,7 @@ class Router:
                 clip = (bundle or {}).get("clipboard", "")
                 if clip and len(clip) < 1000:
                     clip, _ = self._security.sanitize_input(clip)
-                    text = f"{text}\n\nReferenced content: {clip}"
+                    raw_text = f"{raw_text}\n\nReferenced content: {clip}"
                     clipboard_injected = True
                     logger.info("Clipboard injected (%d chars)", len(clip))
             except Exception:
@@ -288,6 +348,7 @@ class Router:
 
         cmd_cache = get_command_cache()
         cached = cmd_cache.get(clean_text)
+        intent_timed_out = False
         if cached is not None:
             result = cached
             classify_ms = 0.0
@@ -306,12 +367,12 @@ class Router:
                 )
                 result = classify_result.value
                 classify_ms = classify_result.elapsed_ms
-                timed_out = classify_result.timed_out
+                intent_timed_out = classify_result.timed_out
             else:
                 result = self._intent.classify(clean_text)
                 classify_ms = (time.perf_counter() - t0) * 1000
-                timed_out = False
-            if not timed_out:
+                intent_timed_out = False
+            if not intent_timed_out:
                 cmd_cache.put(clean_text, result)
             used_intent_cache = False
             if result.intent in self._INFO_INTENTS:
@@ -333,6 +394,23 @@ class Router:
                             action_args=result.action_args)
 
         _budget.warn_if_slow("intent_classify")
+
+        try:
+            from core.observability.per_module_latency import get_latency_board
+
+            b = get_latency_board()
+            route_ms = (time.perf_counter() - t0) * 1000
+            if classify_ms > 0:
+                b.record_module_call(
+                    "intent_engine",
+                    float(classify_ms),
+                    error=bool(intent_timed_out),
+                )
+            extra_router = max(0.0, route_ms - float(classify_ms or 0.0))
+            if extra_router > 0.05:
+                b.record_module_call("router", extra_router, error=False)
+        except Exception:
+            pass
 
         if self._conv_memory is not None:
             self._conv_memory.set_classified(result.intent, result.action)
@@ -406,7 +484,7 @@ class Router:
 
             self._llm_queries += 1
             self._bus.emit_fast("metrics_event", counter="llm_routed_queries")
-            await self._handle_llm_fallback(text, clean_text,
+            await self._handle_llm_fallback(raw_text, clean_text,
                                             clipboard_injected=clipboard_injected)
             return
 
@@ -842,10 +920,22 @@ class Router:
         return self._diagnostics.self_check()
 
     def _do_set_performance_mode(self, _action: str, args: dict) -> str:
-        mode = args.get("mode", "lite")
-        if mode not in ("full", "lite", "ultra_lite"):
-            return f"Unknown mode '{mode}'. Available: full, lite, ultra lite."
-        self._bus.emit_long("set_performance_mode", mode=mode)
+        mode = (args.get("mode") or "optimal").strip().lower().replace("-", "_")
+        aliases = {
+            "full": "full_performance",
+            "brain": "full_performance",
+            "lite": "optimal",
+            "ultra_lite": "optimal",
+            "optimal": "optimal",
+            "full_performance": "full_performance",
+            "auto": "auto",
+        }
+        canonical = aliases.get(mode)
+        if canonical is None:
+            return (
+                f"Unknown mode '{mode}'. Available: optimal, full performance, or auto."
+            )
+        self._bus.emit_long("set_performance_mode", mode=canonical)
         return ""
 
     def _do_set_brain_profile(self, _action: str, args: dict) -> str:
@@ -873,6 +963,131 @@ class Router:
                 assistant_mode=mgr.active,
             )
         return msg
+
+    # ── v22: Advanced System & UI Tools ───────────────────────────────
+
+    def _get_system_control(self) -> Any:
+        from core.system_control import SystemControl
+        if not hasattr(self, "_sys_ctl_cache") or self._sys_ctl_cache is None:
+            self._sys_ctl_cache = SystemControl(self._config)
+        return self._sys_ctl_cache
+
+    def _do_describe_focused_element(self, _action: str, _args: dict) -> str:
+        from core.desktop_control import describe_focused_element
+        return describe_focused_element()
+
+    def _do_read_focused_text(self, _action: str, _args: dict) -> str:
+        from core.desktop_control import read_focused_text
+        return read_focused_text()
+
+    def _do_set_focused_text(self, _action: str, args: dict) -> str:
+        from core.desktop_control import set_focused_text
+        text = args.get("text", "")
+        return set_focused_text(text)
+
+    def _do_click_ui_element(self, _action: str, args: dict) -> str:
+        from core.desktop_control import click_ui_element
+        label = args.get("label", "")
+        role = args.get("role")
+        return click_ui_element(label, role)
+
+    def _do_get_process_details(self, _action: str, args: dict) -> str:
+        pid = args.get("pid")
+        if pid is None:
+            return "Please provide a valid process ID (pid)."
+        res = self._get_system_control().get_process_details(int(pid))
+        if not res.success:
+            return res.message
+        return f"{res.message}: " + ", ".join(f"{k}={v}" for k, v in res.data.items() if str(v))
+
+    def _do_find_process_by_name(self, _action: str, args: dict) -> str:
+        name = args.get("name")
+        if not name:
+            return "Please provide a process name to find."
+        res = self._get_system_control().find_process_by_name(name)
+        if not res.success:
+            return res.message
+        matches = res.data.get("matches", [])
+        if not matches:
+            return f"No processes found matching '{name}'."
+        summary = "\n".join(f"[{m['pid']}] {m['name']} (CPU: {m['cpu']}%, RAM: {m['mem_mb']}MB)" for m in matches[:10])
+        return res.message + ":\n" + summary
+
+    def _do_set_process_priority(self, _action: str, args: dict) -> str:
+        pid = args.get("pid")
+        priority = args.get("priority", "normal")
+        if pid is None:
+            return "Please provide a process ID (pid)."
+        res = self._get_system_control().set_process_priority(int(pid), priority)
+        return res.message
+
+    def _do_optimize_for_atom(self, _action: str, _args: dict) -> str:
+        res = self._get_system_control().optimize_for_atom()
+        return res.message
+
+    def _do_get_open_ports(self, _action: str, _args: dict) -> str:
+        res = self._get_system_control().get_open_ports()
+        if not res.success:
+            return res.message
+        ports = res.data.get("ports", [])
+        summary = "\n".join(f"Port {p['port']} ({p['process'][:20] if p['process'] else 'Unknown'})" for p in ports[:20])
+        return f"{res.message}. Sample:\n{summary}"
+
+    def _do_get_wifi_networks(self, _action: str, _args: dict) -> str:
+        res = self._get_system_control().get_wifi_networks()
+        if not res.success:
+            return res.message
+        nets = res.data.get("networks", [])
+        summary = "\n".join(f"SSID: {n['ssid']}" for n in nets[:10])
+        return f"{res.message}. Sample:\n{summary}"
+
+    def _do_analyze_temp_files(self, _action: str, _args: dict) -> str:
+        res = self._get_system_control().analyze_temp_files()
+        if not res.success:
+            return res.message
+        return (
+            f"Temp Files Analysis: {res.data.get('total_size_mb')} MB total "
+            f"in {res.data.get('file_count')} files."
+        )
+
+    def _do_find_large_files(self, _action: str, args: dict) -> str:
+        path = args.get("path", "")
+        min_size = args.get("min_size_mb", 100)
+        res = self._get_system_control().find_large_files(path, min_size)
+        if not res.success:
+            return res.message
+        files = res.data.get("files", [])
+        summary = "\n".join(f"{f['size_mb']}MB: {f['path']}" for f in files[:10])
+        return f"{res.message}:\n{summary}"
+
+    def _do_execute_desktop_macro(self, _action: str, args: dict) -> str:
+        goal = args.get("goal")
+        if not goal:
+            return "Please specify a goal for the macro."
+            
+        import asyncio
+        from core.desktop_agent import DesktopAgent
+        
+        # Desktop Agent relies on Gemini for recursive reasoning
+        if hasattr(self, "_gemini_client") and self._gemini_client:
+            gemini = self._gemini_client
+        else:
+            return "Macro execution failed: Gemini Cloud intelligence must be connected."
+            
+        agent = DesktopAgent(gemini_client=gemini, router=self, config=self._config)
+        
+        # Execute it async and block on it internally
+        try:
+            loop = asyncio.get_running_loop()
+            task = loop.create_task(agent.execute_macro(goal))
+            # We want this to block the router essentially untill the macro finishes
+            import concurrent.futures
+            future = concurrent.futures.Future()
+            task.add_done_callback(lambda t: future.set_result(t.result()) if not t.exception() else future.set_exception(t.exception()))
+            return "Started Macro. Check logs." # For true blocking we'd need async action handlers
+            # Currently ATOM action handlers are synchronous. Let's just create an event loop for it if needed:
+        except RuntimeError:
+            return asyncio.run(agent.execute_macro(goal))
 
     _ACTION_DISPATCH: dict[str, Any] = {
         "open_app": _do_open_app,
@@ -927,6 +1142,21 @@ class Router:
         "set_performance_mode": _do_set_performance_mode,
         "set_brain_profile": _do_set_brain_profile,
         "set_assistant_mode": _do_set_assistant_mode,
+        
+        # v22: Advanced System Control
+        "describe_focused_element": _do_describe_focused_element,
+        "read_focused_text": _do_read_focused_text,
+        "set_focused_text": _do_set_focused_text,
+        "click_ui_element": _do_click_ui_element,
+        "get_process_details": _do_get_process_details,
+        "find_process_by_name": _do_find_process_by_name,
+        "set_process_priority": _do_set_process_priority,
+        "optimize_for_atom": _do_optimize_for_atom,
+        "get_open_ports": _do_get_open_ports,
+        "get_wifi_networks": _do_get_wifi_networks,
+        "analyze_temp_files": _do_analyze_temp_files,
+        "find_large_files": _do_find_large_files,
+        "execute_desktop_macro": _do_execute_desktop_macro,
     }
 
     _LATE_DISPATCH = {
@@ -1057,6 +1287,143 @@ class Router:
                 + (f" You asked: {_q[:80]}" if _q else "")
             )
 
+    # ── v22: Cloud execution handlers ────────────────────────────────
+
+    async def _handle_cloud_reason(
+        self,
+        original_text: str,
+        clean_text: str,
+        query_plan: Any,
+        t0: float,
+    ) -> bool:
+        """Execute CLOUD_REASON path: Gemini for abstract reasoning.
+
+        Routes to Buddy vs Reasoning model based on cognitive planning.
+        """
+        if self._gemini_client is None or not self._gemini_client.is_available:
+            logger.info("CLOUD_REASON: Gemini unavailable, falling back to local")
+            return False
+
+        model_role = getattr(query_plan, "model_role", "buddy").lower()
+        prompt_hint = getattr(query_plan, "prompt_hint", None)
+
+        ack = "On it, Boss." if model_role == "reasoning" else "Let's chat."
+        self._emit_thinking_ack(ack)
+
+        try:
+            if model_role == "reasoning":
+                response, ok = await self._gemini_client.ask_reasoning(
+                    clean_text, system_instruction=prompt_hint
+                )
+            else:
+                response, ok = await self._gemini_client.ask_buddy(
+                    clean_text, system_instruction=prompt_hint
+                )
+
+            latency_ms = (time.perf_counter() - t0) * 1000
+
+            if not ok or not response:
+                logger.info("CLOUD_REASON: Gemini [%s] failed (%.0fms), falling back", model_role, latency_ms)
+                return False
+
+            # Tag as cloud-sourced and enrich
+            if self._decision_engine is not None:
+                try:
+                    enriched = self._decision_engine.enrich(clean_text, response)
+                    response = enriched.enriched or response
+                except Exception:
+                    logger.debug("Decision engine enrichment failed", exc_info=True)
+
+            # Cache the response
+            if self._semantic_cache is not None:
+                try:
+                    self._semantic_cache.put(clean_text, response, source=f"cloud:{model_role}")
+                except Exception:
+                    pass
+
+            # Update metrics
+            self._llm_queries += 1
+            self._bus.emit_fast("metrics_event", counter=f"cloud_{model_role}_queries")
+            logger.info(
+                "CLOUD_REASON [%s] served in %.0fms (%d chars)",
+                model_role, latency_ms, len(response),
+            )
+            self._emit_response(response)
+            return True
+
+        except Exception as exc:
+            logger.warning("CLOUD_REASON failed: %s", exc)
+            return False
+
+    async def _handle_cloud_search(
+        self,
+        original_text: str,
+        clean_text: str,
+        query_plan: Any,
+        t0: float,
+    ) -> bool:
+        """Execute CLOUD_SEARCH path: DuckDuckGo search + local summarization.
+
+        Returns True if handled, False to fall through to local LLM.
+        """
+        if self._search_tool is None:
+            logger.info("CLOUD_SEARCH: SearchTool unavailable, falling back to local")
+            return False
+
+        self._emit_thinking_ack("Searching for that, Boss.")
+
+        try:
+            result = await self._search_tool.search(clean_text)
+            latency_ms = (time.perf_counter() - t0) * 1000
+
+            if not result.get("success") or not result.get("text"):
+                logger.info("CLOUD_SEARCH: no results (%.0fms), falling back", latency_ms)
+                return False
+
+            search_text = result["text"]
+            sources = result.get("sources", [])
+
+            # Summarize via Gemini if available, else serve raw results to local LLM
+            summary = ""
+            if self._gemini_client and self._gemini_client.is_available:
+                try:
+                    summary = await self._search_tool.search_and_summarize(
+                        clean_text, use_cloud_summarizer=True,
+                    )
+                except Exception:
+                    pass
+
+            if not summary:
+                summary = search_text
+
+            # Enrich
+            if self._decision_engine is not None:
+                try:
+                    enriched = self._decision_engine.enrich(clean_text, summary)
+                    summary = enriched.enriched or summary
+                except Exception:
+                    pass
+
+            # Cache
+            if self._semantic_cache is not None:
+                try:
+                    self._semantic_cache.put(clean_text, summary, source="search")
+                except Exception:
+                    pass
+
+            self._llm_queries += 1
+            self._bus.emit_fast("metrics_event", counter="cloud_search_queries")
+            logger.info(
+                "CLOUD_SEARCH served in %.0fms (%d sources)",
+                latency_ms, len(sources),
+            )
+            self._emit_response(summary)
+            return True
+
+        except Exception as exc:
+            logger.warning("CLOUD_SEARCH failed: %s", exc)
+            return False
+
     # ── LLM fallback ────────────────────────────────────────────────
 
     async def _handle_llm_fallback(self, original_text: str,
@@ -1065,7 +1432,6 @@ class Router:
         ack = self._conv_mgr.smart_ack(clean_text)
         if clipboard_injected:
             ack = "I see what's on your clipboard. " + ack
-        self._emit_thinking_ack(ack)
 
         cache_key = clean_text.lower()
         t_lookup = time.perf_counter()
@@ -1096,6 +1462,25 @@ class Router:
             )
             self._emit_response(query_plan.direct_response)
             return
+
+        # ── v22: Intercept CLOUD_REASON / CLOUD_SEARCH before LLM fallback ──
+        if query_plan is not None:
+            from core.cognitive_kernel import ExecPath
+            plan_path = getattr(query_plan, "path", None)
+
+            if plan_path is ExecPath.CLOUD_SEARCH:
+                handled = await self._handle_cloud_search(
+                    original_text, clean_text, query_plan, t_lookup,
+                )
+                if handled:
+                    return
+
+            if plan_path is ExecPath.CLOUD_REASON:
+                handled = await self._handle_cloud_reason(
+                    original_text, clean_text, query_plan, t_lookup,
+                )
+                if handled:
+                    return
 
         if query_plan is None:
             if self._runtime_watchdog is not None:
@@ -1189,9 +1574,13 @@ class Router:
             else self.get_conversation_history()
         )
 
+        if self._should_emit_thinking_ack(clean_text, query_plan):
+            self._emit_thinking_ack(ack)
+
         self._bus.emit_long(
             "cursor_query",
             text=original_text,
+            policy_query=clean_text,
             memory_context=memory_ctx,
             context=context_bundle,
             history=history,

@@ -16,6 +16,7 @@ logger = logging.getLogger("atom.deployment")
 
 PROFILE_CORPORATE_LAPTOP = "corporate_laptop"
 PROFILE_PERSONAL = "personal"
+PROFILE_PERSONAL_DESKTOP = "personal_desktop"
 PROFILE_WORKSTATION = "workstation"
 
 
@@ -48,10 +49,10 @@ def audit_corporate_alignment(config: dict[str, Any]) -> list[str]:
         )
 
     stt = config.get("stt", {}) or {}
-    eng = (stt.get("engine") or "faster_whisper").lower()
-    if eng != "faster_whisper":
+    eng = (stt.get("engine") or "auto").lower()
+    if eng not in ("auto", "macos_native", "faster_whisper"):
         warnings.append(
-            f"stt.engine is {eng} — only faster_whisper is supported.",
+            f"stt.engine is {eng} — supported: auto, macos_native, faster_whisper.",
         )
 
     tts = config.get("tts", {}) or {}
@@ -86,6 +87,8 @@ def log_deployment_bootstrap(config: dict[str, Any]) -> None:
     """Log active deployment profile and corporate alignment hints."""
     dep = config.get("deployment", {}) or {}
     profile = (dep.get("profile") or "unset").strip().lower() or "unset"
+    if profile == PROFILE_PERSONAL_DESKTOP:
+        profile = PROFILE_PERSONAL
     logger.info("Deployment profile: %s", profile)
 
     if profile == PROFILE_CORPORATE_LAPTOP:
@@ -114,6 +117,7 @@ def deployment_dashboard_badge(config: dict[str, Any]) -> tuple[str, bool]:
         PROFILE_CORPORATE_LAPTOP: "CORPORATE",
         PROFILE_WORKSTATION: "WORKSTATION",
         PROFILE_PERSONAL: "PERSONAL",
+        PROFILE_PERSONAL_DESKTOP: "PERSONAL",
     }
     label = labels.get(p, "")
     return label, bool(label)

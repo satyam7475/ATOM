@@ -23,6 +23,8 @@ import webbrowser
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Awaitable, Callable, Optional
 
+import socket
+
 from aiohttp import web
 import psutil
 
@@ -41,6 +43,19 @@ STATE_META: dict[str, dict[str, str]] = {
 }
 
 _DASHBOARD_DIR = Path(__file__).parent / "dashboard"
+
+
+def _find_free_port(preferred: int, host: str = "127.0.0.1") -> int:
+    """Return *preferred* if available, otherwise let the OS pick a free port."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        try:
+            s.bind((host, preferred))
+            return preferred
+        except OSError:
+            pass
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind((host, 0))
+        return s.getsockname()[1]
 
 
 class WebDashboard:
@@ -110,6 +125,8 @@ class WebDashboard:
         self._app.router.add_get("/", self._serve_dashboard)
         self._app.router.add_get("/v7/health", self._v7_health)
         self._app.router.add_static("/static", _DASHBOARD_DIR, show_index=False)
+
+        self._port = _find_free_port(self._port)
 
         self._runner = web.AppRunner(self._app, access_log=None)
         await self._runner.setup()
@@ -309,8 +326,17 @@ class WebDashboard:
                         except Exception:
                             logger.exception("Dashboard unstick callback failed")
                     elif msg_type == "change_mode":
-                        new_mode = data.get("mode", "")
-                        if new_mode in ("full", "lite", "ultra_lite"):
+                        raw_mode = (data.get("mode") or "").strip().lower().replace("-", "_")
+                        aliases = {
+                            "auto": "auto",
+                            "optimal": "optimal",
+                            "lite": "optimal",
+                            "ultra_lite": "optimal",
+                            "full": "full_performance",
+                            "full_performance": "full_performance",
+                        }
+                        new_mode = aliases.get(raw_mode, "")
+                        if new_mode in ("auto", "optimal", "full_performance"):
                             logger.info("UI requested mode change -> %s", new_mode)
                             await self._broadcast({
                                 "type": "restarting",
@@ -330,7 +356,7 @@ class WebDashboard:
                                 "type": "runtime_error",
                                 "message": "Brain profile changes are disabled (lock or config).",
                             })
-                        elif profile in ("atom", "balanced", "brain") and self._brain_mode_mgr:
+                        elif self._brain_mode_mgr:
                             ok, _msg = self._brain_mode_mgr.set_profile(profile)
                             if ok:
                                 am = self._assistant_mode_mgr.active if self._assistant_mode_mgr else ""
@@ -417,7 +443,7 @@ class WebDashboard:
             try:
                 cpu = psutil.cpu_percent(interval=0)
                 mem = psutil.virtual_memory()
-                disk = psutil.disk_usage("C:\\")
+                disk = psutil.disk_usage("/")
                 battery = psutil.sensors_battery()
 
                 payload: dict[str, Any] = {
@@ -594,11 +620,22 @@ class WebDashboard:
             "throttled": throttled,
         }))
 
-    def broadcast_perf_mode(self, mode: str) -> None:
-        asyncio.create_task(self._broadcast({
+    def broadcast_perf_mode(
+        self,
+        mode: str,
+        *,
+        requested_mode: str | None = None,
+        reason: str = "",
+    ) -> None:
+        payload: dict[str, Any] = {
             "type": "perf_mode",
             "mode": mode,
-        }))
+        }
+        if requested_mode is not None:
+            payload["requested_mode"] = requested_mode
+        if reason:
+            payload["reason"] = reason
+        asyncio.create_task(self._broadcast(payload))
 
     def broadcast_thinking_progress(self, elapsed_s: float, estimate_s: float) -> None:
         remaining = max(0, estimate_s - elapsed_s)

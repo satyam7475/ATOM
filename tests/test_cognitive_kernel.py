@@ -96,6 +96,19 @@ class FakeSiliconGovernor:
         return self._stats
 
 
+class FakeBrainModeManager:
+    def __init__(self, profile: str = "optimal") -> None:
+        self._profile = profile
+
+    def is_full_performance(self, profile: str | None = None) -> bool:
+        del profile
+        return self._profile == "full_performance"
+
+    def is_optimal(self, profile: str | None = None) -> bool:
+        del profile
+        return not self.is_full_performance()
+
+
 def _config() -> dict:
     return {
         "cognitive_kernel": {
@@ -178,8 +191,9 @@ def test_simple_complex_and_creative_routing() -> None:
         metrics=FakeMetrics(),
         silicon_governor=FakeSiliconGovernor(),
     )
+    kernel._semantic_stack_available = True
 
-    simple_plan = kernel.route("tell me a joke")
+    simple_plan = kernel.route("what is ai")
     assert simple_plan.path is ExecPath.QUICK
     assert simple_plan.requested_tier == CognitiveBudgetTier.SIMPLE.value
     assert simple_plan.budget_tier == CognitiveBudgetTier.SIMPLE.value
@@ -215,6 +229,24 @@ def test_simple_complex_and_creative_routing() -> None:
     print("  PASS: simple/complex/creative budgets map to the right paths")
 
 
+def test_semantic_rag_disables_when_stack_unavailable() -> None:
+    kernel = CognitiveKernel(
+        config=_config(),
+        bus=FakeBus(),
+        intent_engine=FakeIntentEngine(),
+        cache_engine=FakeCache(),
+        metrics=FakeMetrics(),
+        silicon_governor=FakeSiliconGovernor(),
+    )
+    kernel._semantic_stack_available = False
+
+    plan = kernel.route("Explain the scheduler architecture and compare the tradeoffs in detail.")
+    assert plan.path is ExecPath.FULL
+    assert plan.use_rag is False
+    assert "Semantic retrieval is unavailable" in plan.prompt_hint
+    print("  PASS: semantic RAG disables honestly when stack is unavailable")
+
+
 def test_creative_queries_degrade_safely_on_low_battery() -> None:
     kernel = CognitiveKernel(
         config=_config(),
@@ -245,8 +277,100 @@ def test_creative_queries_degrade_safely_on_low_battery() -> None:
     print("  PASS: low battery degrades creative work to a laptop-safe budget")
 
 
+def test_detail_and_report_triggers_route_deeper() -> None:
+    kernel = CognitiveKernel(
+        config=_config(),
+        bus=FakeBus(),
+        intent_engine=FakeIntentEngine(),
+        cache_engine=FakeCache(),
+        metrics=FakeMetrics(),
+        silicon_governor=FakeSiliconGovernor(),
+    )
+
+    detail_plan = kernel.route("explain properly what is docker")
+    assert detail_plan.path is ExecPath.FULL
+    assert detail_plan.requested_tier == CognitiveBudgetTier.COMPLEX.value
+    assert detail_plan.budget_tier == CognitiveBudgetTier.COMPLEX.value
+
+    report_plan = kernel.route("research best browser for coding on mac")
+    assert report_plan.path is ExecPath.DEEP
+    assert report_plan.requested_tier == CognitiveBudgetTier.CREATIVE.value
+    assert report_plan.budget_tier == CognitiveBudgetTier.CREATIVE.value
+
+    meta_plan = kernel.route("who are you")
+    assert meta_plan.path is ExecPath.DIRECT
+    print("  PASS: explicit detail/report triggers override the short default")
+
+
+def test_optimal_profile_keeps_complex_queries_on_fast_model() -> None:
+    kernel = CognitiveKernel(
+        config=_config(),
+        bus=FakeBus(),
+        brain_mode_manager=FakeBrainModeManager("optimal"),
+        intent_engine=FakeIntentEngine(),
+        cache_engine=FakeCache(),
+        metrics=FakeMetrics(),
+        silicon_governor=FakeSiliconGovernor(),
+    )
+
+    complex_plan = kernel.route("explain properly how the scheduler and router work together")
+    assert complex_plan.path is ExecPath.FULL
+    assert complex_plan.model == "qwen3-1.7b"
+    assert complex_plan.model_role == "fast"
+
+    report_plan = kernel.route(
+        "research the best local-first architecture choices for ATOM and give me a rollout plan",
+    )
+    assert report_plan.path is ExecPath.DEEP
+    assert report_plan.model == "qwen3-4b"
+    assert report_plan.model_role == "primary"
+    print("  PASS: optimal profile keeps normal complex work on the lighter model")
+
+
+def test_optimal_profile_downgrades_deep_queries_when_headroom_is_tight() -> None:
+    kernel = CognitiveKernel(
+        config=_config(),
+        bus=FakeBus(),
+        brain_mode_manager=FakeBrainModeManager("optimal"),
+        intent_engine=FakeIntentEngine(),
+        cache_engine=FakeCache(),
+        metrics=FakeMetrics(),
+        silicon_governor=FakeSiliconGovernor(memory_pct=76.0, cpu_pct=52.0),
+    )
+
+    plan = kernel.route(
+        "research the best local-first architecture choices for ATOM and give me a rollout plan",
+    )
+    assert plan.path is ExecPath.DEEP
+    assert plan.model == "qwen3-1.7b"
+    assert plan.model_role == "fast"
+    print("  PASS: optimal profile protects memory by downgrading deep work when headroom is tight")
+
+
+def test_full_performance_profile_allows_primary_model_for_complex_queries() -> None:
+    kernel = CognitiveKernel(
+        config=_config(),
+        bus=FakeBus(),
+        brain_mode_manager=FakeBrainModeManager("full_performance"),
+        intent_engine=FakeIntentEngine(),
+        cache_engine=FakeCache(),
+        metrics=FakeMetrics(),
+        silicon_governor=FakeSiliconGovernor(),
+    )
+
+    plan = kernel.route("explain properly how the scheduler and router work together")
+    assert plan.path is ExecPath.FULL
+    assert plan.model == "qwen3-4b"
+    assert plan.model_role == "primary"
+    print("  PASS: full performance mode still unlocks the primary model")
+
+
 if __name__ == "__main__":
     test_command_and_info_budgets()
     test_simple_complex_and_creative_routing()
     test_creative_queries_degrade_safely_on_low_battery()
+    test_detail_and_report_triggers_route_deeper()
+    test_optimal_profile_keeps_complex_queries_on_fast_model()
+    test_optimal_profile_downgrades_deep_queries_when_headroom_is_tight()
+    test_full_performance_profile_allows_primary_model_for_complex_queries()
     print("\ntest_cognitive_kernel: ALL PASSED")

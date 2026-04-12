@@ -19,7 +19,8 @@ import re
 import uuid
 from datetime import datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Any, Optional
+from urllib.parse import quote_plus
 
 from core.persistence_manager import persistence_manager
 
@@ -34,6 +35,135 @@ _MAX_GOALS = 20
 _MAX_STEPS = 30
 _BRIEFING_HOUR_START = 7
 _BRIEFING_HOUR_END = 10
+
+_TOOL_BRACKETS = re.compile(
+    r"\s*\[tool:([\w_]+)\](?:\s*\[args:\s*(\{[^\]]*\})\])?\s*$",
+    re.IGNORECASE,
+)
+_ALLOWED_SUGGEST_TOOLS = frozenset({
+    "open_app",
+    "search",
+    "spotlight_search",
+    "remember",
+    "set_reminder",
+    "open_url",
+    "learn_document",
+    "screenshot",
+})
+
+
+def _search_url_from_text(text: str) -> str:
+    low = text.lower()
+    for phrase in ("search for ", "look up ", "google ", "web search "):
+        if phrase in low:
+            q = text[low.index(phrase) + len(phrase) :].strip()[:240]
+            if q:
+                return "https://www.google.com/search?q=" + quote_plus(q)
+    return "https://www.google.com/search?q=" + quote_plus(text.strip()[:200])
+
+
+def infer_suggested_tool(title: str) -> tuple[Optional[str], dict[str, Any]]:
+    """Map free-text step title to a registry tool + args (heuristic, best-effort)."""
+    raw = (title or "").strip()
+    if not raw:
+        return None, {}
+
+    m = _TOOL_BRACKETS.search(raw)
+    base = _TOOL_BRACKETS.sub("", raw).strip() if m else raw
+    low = base.lower()
+
+    if m:
+        tname = m.group(1).strip().lower()
+        if tname in _ALLOWED_SUGGEST_TOOLS:
+            if m.group(2):
+                try:
+                    parsed = json.loads(m.group(2))
+                    if isinstance(parsed, dict):
+                        return tname, parsed
+                except json.JSONDecodeError:
+                    pass
+            _, args = infer_suggested_tool(base)
+            if tname == "remember" and not (args or {}).get("fact") and base.strip():
+                return tname, {"fact": base.strip()[:500]}
+            return tname, args or {}
+
+    url_m = re.search(r"https?://[^\s)]+", base)
+    if url_m:
+        return "open_url", {"url": url_m.group(0)[:2000]}
+
+    path_m = re.search(
+        r"(?:~/|/)[\w./+\-]+\.(?:pdf|md|txt|py|json|csv|docx?|xlsx?)\b",
+        base,
+    )
+    if path_m and any(k in low for k in ("read", "ingest", "learn", "document", "file")):
+        return "learn_document", {"path": path_m.group(0)[:1024]}
+
+    if any(k in low for k in ("spotlight", "find file", "locate file", "on disk")):
+        q = base.split(":", 1)[-1].strip()[:200] or base[:200]
+        return "spotlight_search", {"query": q, "limit": 15}
+
+    if any(
+        k in low
+        for k in (
+            "search online",
+            "web search",
+            "google",
+            "look up online",
+            "search the web",
+        )
+    ):
+        return "search", {"url": _search_url_from_text(base)}
+
+    if any(k in low for k in ("remind", "reminder", "schedule", "deadline alert")):
+        return "set_reminder", {
+            "label": base[:120],
+            "delay_seconds": 900,
+        }
+
+    if any(k in low for k in ("remember", "note to self", "memorize", "don't forget")):
+        return "remember", {"fact": base[:500]}
+
+    if any(k in low for k in ("screenshot", "screen shot", "capture screen")):
+        return "screenshot", {}
+
+    for kw in ("open ", "launch ", "start "):
+        if low.startswith(kw):
+            name = base[len(kw) :].strip().split(",")[0].split(" for ")[0][:80]
+            if name:
+                return "open_app", {"name": name}
+            break
+
+    return None, {}
+
+
+def _finalize_step_record(step: dict[str, Any]) -> None:
+    """Normalize title (strip optional [tool:…] brackets) and attach tool hints."""
+    raw_title = str(step.get("title", "")).strip()
+    if not raw_title:
+        return
+    display = _TOOL_BRACKETS.sub("", raw_title).strip() or raw_title
+    step["title"] = display[:200]
+    t, a = infer_suggested_tool(raw_title)
+    if t:
+        step["suggested_tool"] = t
+        step["suggested_args"] = a
+        step["tool_link_status"] = "suggested"
+    else:
+        step.setdefault("suggested_tool", None)
+        step.setdefault("suggested_args", {})
+        step.setdefault("tool_link_status", "none")
+
+
+def _args_overlap(suggested: dict[str, Any], executed: dict[str, Any]) -> bool:
+    if not suggested:
+        return True
+    for k, v in suggested.items():
+        if k not in executed:
+            continue
+        vs, es = str(v).strip().lower(), str(executed[k]).strip().lower()
+        if vs and (vs in es or es in vs or vs == es):
+            return True
+    return False
 
 
 class GoalEngine:
@@ -77,6 +207,34 @@ class GoalEngine:
         except Exception:
             logger.exception("Failed to load goals -- starting fresh")
             self._goals = []
+        self._migrate_step_tools()
+        if self._dirty:
+            self.persist()
+
+    def _migrate_step_tools(self) -> None:
+        """Backfill suggested_tool metadata on legacy goal steps."""
+        changed = False
+        for goal in self._goals:
+            for step in goal.get("steps", []):
+                if step.get("status") != "pending":
+                    continue
+                if step.get("suggested_tool"):
+                    continue
+                raw = str(step.get("title", "")).strip()
+                if len(raw) < 4:
+                    continue
+                t, a = infer_suggested_tool(raw)
+                if t:
+                    step["suggested_tool"] = t
+                    step["suggested_args"] = a
+                    step["tool_link_status"] = "suggested"
+                    changed = True
+                else:
+                    step.setdefault("tool_link_status", "none")
+                    step.setdefault("suggested_args", {})
+                    step.setdefault("suggested_tool", None)
+        if changed:
+            self._dirty = True
 
     def persist(self) -> None:
         try:
@@ -97,6 +255,7 @@ class GoalEngine:
         if not self._config.get("goals_enabled", True):
             logger.info("Goal engine disabled via config")
             return
+        self._bus.on("tool_executed", self._on_tool_executed)
         self._task = asyncio.create_task(self._run())
         logger.info(
             "Goal engine started (eval_interval=%.0fs, %d goals loaded)",
@@ -105,6 +264,10 @@ class GoalEngine:
 
     def stop(self) -> None:
         self._shutdown.set()
+        try:
+            self._bus.off("tool_executed", self._on_tool_executed)
+        except Exception:
+            logger.debug("goal_engine tool_executed off failed", exc_info=True)
         if self._task and not self._task.done():
             self._task.cancel()
             self._task = None
@@ -257,6 +420,57 @@ class GoalEngine:
                 return f"Step '{step['title']}' done. Goal '{goal['title']}' is at {pct}%."
         return "Step not found, Boss."
 
+    async def _on_tool_executed(
+        self,
+        tool: str = "",
+        success: bool = False,
+        arguments: dict[str, Any] | None = None,
+        **_kw: Any,
+    ) -> None:
+        """Advance goals when a ReAct tool run matches the next suggested step."""
+        if not success or not self._config.get("goal_tool_auto_complete", True):
+            return
+        try:
+            if self.apply_tool_completion(str(tool), dict(arguments or {})):
+                logger.info("Goal step auto-completed from tool '%s'", tool)
+        except Exception:
+            logger.debug("goal tool completion hook failed", exc_info=True)
+
+    def apply_tool_completion(self, tool: str, arguments: dict[str, Any]) -> bool:
+        """Complete the first pending step whose suggested tool matches *tool*."""
+        strict = bool(self._config.get("goal_tool_match_strict", False))
+        for goal in self.get_active_goals():
+            for step in goal.get("steps", []):
+                if step.get("status") != "pending":
+                    continue
+                sug = step.get("suggested_tool")
+                if not sug or sug != tool:
+                    continue
+                if strict and not _args_overlap(
+                    step.get("suggested_args") or {},
+                    arguments,
+                ):
+                    continue
+                step["tool_executed_at"] = datetime.now().isoformat()
+                step["tool_link_status"] = "completed"
+                self.complete_step(goal["id"], step["id"])
+                return True
+        return False
+
+    def get_next_actionable_step(self, goal_id: str) -> Optional[dict[str, Any]]:
+        goal = self._find_by_id(goal_id)
+        if not goal:
+            return None
+        for step in goal.get("steps", []):
+            if step.get("status") == "pending":
+                return {
+                    "step_id": step["id"],
+                    "title": step.get("title", ""),
+                    "suggested_tool": step.get("suggested_tool"),
+                    "suggested_args": step.get("suggested_args") or {},
+                }
+        return None
+
     # ── LLM Decomposition ─────────────────────────────────────────────
 
     async def decompose_with_llm(self, goal_id: str) -> str:
@@ -275,7 +489,11 @@ class GoalEngine:
         query = (
             f"Break down this goal into 4-8 concrete, actionable steps. "
             f"Goal: {goal['title']}. "
-            f"Return each step as a numbered list (1. Step description)."
+            f"Return each step as a numbered list (1. Step description). "
+            f"Optionally suffix a step with [tool:TOOL] where TOOL is one of: "
+            f"open_app, search, spotlight_search, remember, set_reminder, open_url, "
+            f"learn_document, screenshot — e.g. "
+            f"\"3. Open Safari for testing [tool:open_app]\"."
         )
 
         # Set up a future to capture the LLM response
@@ -313,15 +531,29 @@ class GoalEngine:
                 logger.info("LLM decomposition timed out, using default steps")
                 steps = self._generate_default_steps(goal["title"])
 
+            n_before = len(goal.get("steps", []))
             for s in steps:
                 if len(goal.get("steps", [])) >= _MAX_STEPS:
                     break
+                _finalize_step_record(s)
                 goal.setdefault("steps", []).append(s)
             self._recalc_progress(goal)
             self._dirty = True
             self.persist()
+            hints = []
+            for s in goal["steps"][n_before:]:
+                if s.get("suggested_tool"):
+                    hints.append(f"{s['title']} → {s['suggested_tool']}")
             step_list = "\n".join(f"  {i+1}. {s['title']}" for i, s in enumerate(goal["steps"]))
-            return f"Broke down '{goal['title']}' into {len(goal['steps'])} steps:\n{step_list}"
+            extra = ""
+            if hints:
+                extra = "\nSuggested tools (first runs can auto-check steps):\n  " + "\n  ".join(
+                    hints[:8],
+                )
+            return (
+                f"Broke down '{goal['title']}' into {len(goal['steps'])} steps:\n{step_list}"
+                f"{extra}"
+            )
         except Exception:
             logger.exception("Goal decomposition failed")
             return "Failed to decompose the goal, Boss. I'll try again later."
@@ -368,17 +600,20 @@ class GoalEngine:
             "Final review and completion",
         ]
         now = datetime.now().isoformat()
-        return [
-            {
+        out: list[dict[str, Any]] = []
+        for t in templates:
+            step = {
                 "id": str(uuid.uuid4())[:8],
                 "title": f"{t} for: {title[:40]}",
                 "status": "pending",
                 "minutes_logged": 0,
                 "created_at": now,
                 "updated_at": now,
+                "source": "template",
             }
-            for t in templates
-        ]
+            _finalize_step_record(step)
+            out.append(step)
+        return out
 
     # ── Evaluation ─────────────────────────────────────────────────────
 
@@ -427,6 +662,7 @@ class GoalEngine:
             self._bus.emit_long("goal_briefing", text=text)
 
     def get_daily_briefing(self) -> Optional[str]:
+        self._evaluate_goals()
         active = self.get_active_goals()
         if not active:
             return None
@@ -439,6 +675,12 @@ class GoalEngine:
             streak = g.get("streak_days", 0)
             streak_str = f", {streak}-day streak" if streak > 1 else ""
             lines.append(f"  - {g['title']}: {pct}% ({trajectory}{streak_str})")
+            nxt = self.get_next_actionable_step(g["id"])
+            if nxt and nxt.get("suggested_tool"):
+                lines.append(
+                    f"      Next: {nxt['title'][:100]} "
+                    f"(suggested tool: {nxt['suggested_tool']})",
+                )
 
         return "\n".join(lines)
 
@@ -458,25 +700,35 @@ class GoalEngine:
             for g in goals:
                 pct = int(g.get("progress", 0) * 100)
                 steps = len(g.get("steps", []))
-                lines.append(f"  - {g['title']} [{pct}%, {steps} steps]")
+                line = f"  - {g['title']} [{pct}%, {steps} steps]"
+                if status == "active":
+                    nxt = self.get_next_actionable_step(g["id"])
+                    if nxt and nxt.get("suggested_tool"):
+                        line += f" → next tool: {nxt['suggested_tool']}"
+                lines.append(line)
         return "\n".join(lines) if lines else "No goals found."
 
     def get_goals_for_dashboard(self) -> list[dict]:
-        return [
-            {
-                "id": g["id"],
-                "title": g["title"],
-                "status": g["status"],
-                "progress": g.get("progress", 0),
-                "steps": len(g.get("steps", [])),
-                "completed_steps": sum(
-                    1 for s in g.get("steps", []) if s.get("status") == "completed"
-                ),
-                "streak": g.get("streak_days", 0),
-                "trajectory": g.get("evaluation", {}).get("trajectory", "new"),
-            }
-            for g in self._goals
-        ]
+        rows: list[dict[str, Any]] = []
+        for g in self._goals:
+            nxt = self.get_next_actionable_step(g["id"]) if g.get("status") == "active" else None
+            rows.append(
+                {
+                    "id": g["id"],
+                    "title": g["title"],
+                    "status": g["status"],
+                    "progress": g.get("progress", 0),
+                    "steps": len(g.get("steps", [])),
+                    "completed_steps": sum(
+                        1 for s in g.get("steps", []) if s.get("status") == "completed"
+                    ),
+                    "streak": g.get("streak_days", 0),
+                    "trajectory": g.get("evaluation", {}).get("trajectory", "new"),
+                    "next_step_title": (nxt or {}).get("title"),
+                    "next_suggested_tool": (nxt or {}).get("suggested_tool"),
+                },
+            )
+        return rows
 
     # ── Helpers ────────────────────────────────────────────────────────
 

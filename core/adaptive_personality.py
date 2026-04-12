@@ -115,7 +115,7 @@ def _verbosity() -> str:
     voice_verbosity = str(get_voice_profile().get("verbosity", "")).strip().lower()
     if voice_verbosity == "silent":
         return "silent"
-    if voice_verbosity in {"minimal", "terse"}:
+    if voice_verbosity in {"brief", "minimal", "terse"}:
         return "minimal"
     if _modes_engine:
         return _modes_engine.verbosity
@@ -487,12 +487,22 @@ def offline_fallback() -> str:
 
 _WS_RE = re.compile(r"\s+")
 _BOSS_LOWER_RE = re.compile(r"\bboss\b")
+_SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+")
 _SOFTEN_MAP: tuple[tuple[str, str], ...] = (
     ("I can't", "I couldn't"),
     ("I cannot", "I couldn't"),
     ("That didn't work", "That didn't work yet"),
     ("error", "issue"),
 )
+
+
+def _limit_reply(text: str, *, max_sentences: int, max_chars: int) -> str:
+    parts = [part.strip() for part in _SENTENCE_SPLIT_RE.split(text) if part.strip()]
+    limited = " ".join(parts[:max_sentences]).strip() if parts else text.strip()
+    if len(limited) > max_chars:
+        limited = limited[:max_chars].rsplit(" ", 1)[0].rstrip(" ,;:")
+        limited = f"{limited}."
+    return limited
 
 
 def polish_response(text: str, *, source: str = "general") -> str:
@@ -519,14 +529,14 @@ def polish_response(text: str, *, source: str = "general") -> str:
         t = t.replace(old, new)
 
     # Keep focus mode concise, but preserve key guidance.
-    if verb == "minimal" and len(t) > 220:
-        cut = t[:220].rsplit(" ", 1)[0].rstrip(" ,;:")
-        t = f"{cut}."
-    elif verb == "silent":
+    if verb == "silent":
         return ""
-    elif voice_verbosity == "brief" and len(t) > 160:
-        cut = t[:160].rsplit(" ", 1)[0].rstrip(" ,;:")
-        t = f"{cut}."
+    if source == "thinking_ack":
+        t = _limit_reply(t, max_sentences=1, max_chars=90)
+    elif verb == "minimal":
+        t = _limit_reply(t, max_sentences=2, max_chars=140)
+    elif voice_verbosity in {"brief", "terse"}:
+        t = _limit_reply(t, max_sentences=2, max_chars=180)
 
     # Normalize terminal punctuation for better TTS rhythm.
     if t and t[-1] not in ".!?":

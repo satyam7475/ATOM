@@ -56,7 +56,7 @@ class AutonomyEngine:
         "_task", "_shutdown_event", "_throttled",
         "_last_suggested", "_last_auto_executed",
         "_last_context", "_pending_suggestion",
-        "_priority_sched",
+        "_priority_sched", "_brain_mode_mgr",
     )
 
     def __init__(
@@ -67,6 +67,7 @@ class AutonomyEngine:
         health: HealthMonitor,
         config: dict | None = None,
         priority_sched: PriorityScheduler | None = None,
+        brain_mode_manager: Any | None = None,
     ) -> None:
         self._bus = bus
         self._behavior = behavior
@@ -90,8 +91,18 @@ class AutonomyEngine:
         self._last_context: dict[str, Any] = {}
         self._pending_suggestion: dict | None = None
         self._priority_sched = priority_sched
+        self._brain_mode_mgr = brain_mode_manager
 
         _AUTONOMY_LOG.parent.mkdir(parents=True, exist_ok=True)
+
+    def _background_enabled(self) -> bool:
+        mgr = self._brain_mode_mgr
+        if mgr is None:
+            return True
+        try:
+            return bool(mgr.feature_enabled("autonomy"))
+        except Exception:
+            return True
 
     def start(self) -> None:
         if not self._enabled:
@@ -158,6 +169,8 @@ class AutonomyEngine:
                 logger.exception("Autonomy decision cycle error")
 
     def _effective_interval(self) -> float:
+        if not self._background_enabled():
+            return max(180.0, self._check_interval * 2.0)
         cpu = self._last_context.get("cpu", 30)
         if cpu < 40:
             return max(30.0, self._check_interval * 0.5)
@@ -190,6 +203,8 @@ class AutonomyEngine:
         await done.wait()
 
     async def _decision_cycle_inner(self) -> None:
+        if not self._background_enabled():
+            return
         now = time.time()
         ctx = self._last_context
         if not ctx:

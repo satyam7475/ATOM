@@ -28,6 +28,7 @@ logger = logging.getLogger("atom.apple_silicon_monitor")
 
 _GPU_NAME_CACHE: Optional[str] = None
 _GPU_CORE_COUNT_CACHE: Optional[int] = None
+_CACHE_TTL_S = 8.0
 
 
 def is_apple_silicon() -> bool:
@@ -247,8 +248,12 @@ class AppleSiliconMonitor:
     # Public API
     # ------------------------------------------------------------------
 
-    def get_stats(self) -> AppleSiliconStats:
-        """Collect a full hardware snapshot (~15-20ms total)."""
+    def get_stats(self, *, force_refresh: bool = False) -> AppleSiliconStats:
+        """Collect a hardware snapshot and briefly cache expensive probes."""
+        now = time.monotonic()
+        if not force_refresh and self._last_poll and (now - self._last_poll) < _CACHE_TTL_S:
+            return self._last_stats
+
         mem = self._read_memory()
         power = self._read_power()
 
@@ -269,7 +274,7 @@ class AppleSiliconMonitor:
         )
 
         self._last_stats = stats
-        self._last_poll = time.monotonic()
+        self._last_poll = now
         return stats
 
     @property

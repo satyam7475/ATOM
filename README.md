@@ -95,7 +95,8 @@ ATOM/
 
 | Signal | Where |
 |--------|--------|
-| Health + metrics + warnings | `GET /v7/health` |
+| Health + metrics + warnings + `latency_board` | `GET /v7/health` |
+| Per-module latency board (offline demo) | `python3 tools/observability_dashboard.py --json` |
 | Periodic snapshot | Log tag `v7_debug_snapshot` |
 | Mode decisions | `v7_mode_selected`, `v7_mode_switch` |
 | RAG / graph | `v7_rag_retrieval`, `v7_graph_*`, `v7_rag_fallback` |

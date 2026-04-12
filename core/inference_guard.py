@@ -78,7 +78,7 @@ class InferenceGuard:
 
         logger.info("InferenceGuard: Unified Memory mode (Apple Silicon)")
 
-    def _on_activity(self, **_kw: Any) -> None:
+    async def _on_activity(self, **_kw: Any) -> None:
         self._last_activity = time.monotonic()
         if self._power_mode != PowerMode.ACTIVE:
             self._power_mode = PowerMode.ACTIVE

@@ -113,7 +113,7 @@ _TYPING_SPEED = re.compile(r"\b(type|write)\s+(?P<text>.+)", re.I)
 
 _SET_PERF_MODE = re.compile(
     r"\b(?:switch|set|change|go)\s+(?:to\s+)?(?:performance\s+)?(?:mode\s+)?"
-    r"(?P<mode>full(?:\s+performance)?|lite|ultra\s*lite)"
+    r"(?P<mode>auto|adaptive|optimal|stable\s+buddy|full(?:\s+performance)?|lite|ultra\s*lite)"
     r"(?:\s+mode)?\b", re.I)
 
 # ── Self-Healing Intents ─────────────────────────────────────────────
@@ -291,7 +291,12 @@ def check(text: str) -> IntentResult | None:
     m = _SET_PERF_MODE.search(text)
     if m:
         raw = m.group("mode").strip().lower()
-        mode = "ultra_lite" if "ultra" in raw else ("full" if "full" in raw else "lite")
+        if raw in ("auto", "adaptive"):
+            mode = "auto"
+        elif "full" in raw:
+            mode = "full_performance"
+        else:
+            mode = "optimal"
         return IntentResult("set_performance_mode", action="set_performance_mode",
                             action_args={"mode": mode})
 

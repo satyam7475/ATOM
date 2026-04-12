@@ -79,15 +79,13 @@ def wire_events(
     _LLM_HISTORY_MAX = 10
 
     # Global Interrupt Manager
-    from core.ipc.interrupt_manager import SystemInterruptManager
     from voice.interrupt_handler import VoiceInterruptHandler
 
-    interrupt_mgr = SystemInterruptManager(bus, "main_core")
     voice_interrupt = VoiceInterruptHandler(
         bus=bus,
         state=state,
         tts=tts,
-        interrupt_manager=interrupt_mgr,
+        interrupt_manager=None,
         local_brain=local_brain,
         indicator=indicator,
     )
@@ -650,14 +648,15 @@ def wire_events(
     bus.on("mic_changed", on_mic_changed)
 
     # ── FSEvents → optional proactive hints (Downloads + notable extensions) ─
-    async def on_fs_event(path: str = "", event: str = "", is_dir: bool = False, **_kw) -> None:
+    async def on_fs_event(path: str = "", change: str = "", is_dir: bool = False, **_kw) -> None:
         from core.macos.fs_watcher_config import fs_watcher_settings, notable_file_hint
 
         s = fs_watcher_settings(config)
         if not s["hints_enabled"]:
             return
+        ev = change or str(_kw.get("event") or "")
         hint = notable_file_hint(
-            path=path, event=event, is_dir=is_dir, config=config,
+            path=path, event=ev, is_dir=is_dir, config=config,
         )
         if not hint:
             return

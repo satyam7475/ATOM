@@ -19,6 +19,9 @@ class FakeBus:
     def emit_long(self, event: str, **data) -> None:
         self.events.append((event, data))
 
+    def emit(self, event: str, **data) -> None:
+        self.events.append((event, data))
+
 
 class FakePreemptedLLM:
     async def generate_streaming(self, prompt: str, **kwargs):
@@ -46,6 +49,12 @@ class DummyController:
 
     def _extract_complete_sentence(self, text: str):
         return LocalBrainController._extract_complete_sentence(text)
+
+    def _sanitize_emittable_text(self, text: str):
+        return LocalBrainController._sanitize_emittable_text(self, text)
+
+    def _compact_text(self, text: str):
+        return LocalBrainController._compact_text(text)
 
 
 async def test_preempted_stream_skips_final_partial() -> None:

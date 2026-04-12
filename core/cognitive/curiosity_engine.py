@@ -27,7 +27,7 @@ import asyncio
 import logging
 import random
 import time
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 logger = logging.getLogger("atom.curiosity")
 
@@ -61,6 +61,7 @@ class CuriosityEngine:
         self,
         bus: "AsyncEventBus",
         config: dict | None = None,
+        brain_mode_manager: Any | None = None,
     ) -> None:
         self._bus = bus
         self._config = (config or {}).get("cognitive", {})
@@ -77,6 +78,16 @@ class CuriosityEngine:
         self._knowledge_gaps: list[str] = []
         self._running = False
         self._task: asyncio.Task | None = None
+        self._brain_mode_mgr = brain_mode_manager
+
+    def _background_enabled(self) -> bool:
+        mgr = self._brain_mode_mgr
+        if mgr is None:
+            return True
+        try:
+            return bool(mgr.feature_enabled("curiosity"))
+        except Exception:
+            return True
 
     def start(self) -> None:
         if not self._enabled:
@@ -140,6 +151,9 @@ class CuriosityEngine:
                 await asyncio.sleep(600)
                 if not self._running:
                     break
+
+                if not self._background_enabled():
+                    continue
 
                 if not self._can_ask():
                     continue

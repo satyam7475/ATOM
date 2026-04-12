@@ -10,14 +10,37 @@ from .base import IntentResult
 
 # Brain profile (speed vs depth) — maps to BrainModeManager
 _ATOM_PROFILE = re.compile(
-    r"\b(atom\s+mode|fast\s+brain|speed\s+mode|quick\s+brain)\b", re.I,
+    r"\b(atom\s+mode|fast\s+brain|speed\s+mode|quick\s+brain|optimal\s+mode|stable\s+buddy\s+mode)\b",
+    re.I,
 )
 _BRAIN_PROFILE = re.compile(
-    r"\b(brain\s+mode|smart\s+brain|deep\s+mode|full\s+brain)\b", re.I,
+    r"\b(brain\s+mode|smart\s+brain|deep\s+mode|full\s+brain|full\s+performance(?:\s+mode)?|full\s+feature(?:\s+mode)?)\b",
+    re.I,
 )
 _BALANCED_PROFILE = re.compile(
     r"\b(balanced\s+mode|normal\s+brain\s+mode)\b", re.I,
 )
+_MODE_SWITCH_VERB = re.compile(
+    r"\b(switch|set|change|use|enable|go(?:\s+to|\s+into)?|turn\s+on)\b",
+    re.I,
+)
+_PROFILE_EXACT_MAP = {
+    "atom mode": "optimal",
+    "fast brain": "optimal",
+    "speed mode": "optimal",
+    "quick brain": "optimal",
+    "optimal mode": "optimal",
+    "stable buddy mode": "optimal",
+    "balanced mode": "optimal",
+    "normal brain mode": "optimal",
+    "brain mode": "full_performance",
+    "smart brain": "full_performance",
+    "deep mode": "full_performance",
+    "full brain": "full_performance",
+    "full performance": "full_performance",
+    "full performance mode": "full_performance",
+    "full feature mode": "full_performance",
+}
 
 # Assistant mode (LLM on fallback or not)
 _COMMAND_ONLY = re.compile(
@@ -38,24 +61,32 @@ def check(text: str) -> IntentResult | None:
     t = text.strip()
     if not t:
         return None
+    norm = re.sub(r"\s+", " ", t.lower()).strip()
+    is_switch_command = bool(_MODE_SWITCH_VERB.search(t))
 
-    if _ATOM_PROFILE.search(t):
+    if norm in _PROFILE_EXACT_MAP:
         return IntentResult(
             intent="set_brain_profile",
             action="set_brain_profile",
-            action_args={"profile": "atom"},
+            action_args={"profile": _PROFILE_EXACT_MAP[norm]},
         )
-    if _BRAIN_PROFILE.search(t):
+    if is_switch_command and _ATOM_PROFILE.search(t):
         return IntentResult(
             intent="set_brain_profile",
             action="set_brain_profile",
-            action_args={"profile": "brain"},
+            action_args={"profile": "optimal"},
         )
-    if _BALANCED_PROFILE.search(t):
+    if is_switch_command and _BRAIN_PROFILE.search(t):
         return IntentResult(
             intent="set_brain_profile",
             action="set_brain_profile",
-            action_args={"profile": "balanced"},
+            action_args={"profile": "full_performance"},
+        )
+    if is_switch_command and _BALANCED_PROFILE.search(t):
+        return IntentResult(
+            intent="set_brain_profile",
+            action="set_brain_profile",
+            action_args={"profile": "optimal"},
         )
     if _COMMAND_ONLY.search(t):
         return IntentResult(

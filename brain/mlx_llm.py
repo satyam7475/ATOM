@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -30,13 +31,38 @@ _HAS_MLX = True
 try:
     import mlx.core as mx
     from mlx_lm import load, stream_generate
-    from mlx_lm.sample_utils import make_sampler
+    from mlx_lm.sample_utils import make_logits_processors, make_sampler
 except ImportError:
     _HAS_MLX = False
     mx = None  # type: ignore[assignment]
     load = None  # type: ignore[assignment]
     stream_generate = None  # type: ignore[assignment]
     make_sampler = None  # type: ignore[assignment]
+    make_logits_processors = None  # type: ignore[assignment]
+
+
+_DEFAULT_STOP_SEQUENCES: tuple[str, ...] = (
+    "\nUser:",
+    "\nBoss:",
+    "\nAssistant:",
+    "\nATOM:",
+    "User:",
+    "Boss:",
+    "Assistant:",
+    "ATOM:",
+)
+_LEADING_ASSISTANT_LABEL_RE = re.compile(
+    r"^\s*(?:(?:ATOM|Assistant)\s*:\s*)+",
+    re.I,
+)
+_ASSISTANT_LABEL_ONLY_RE = re.compile(
+    r"^\s*(?:(?:ATOM|Assistant)\s*:\s*){2,}\s*$",
+    re.I,
+)
+_TRAILING_ASSISTANT_LOOP_RE = re.compile(
+    r"(?:\s*(?:ATOM|Assistant)\s*:\s*){2,}\s*$",
+    re.I,
+)
 
 
 class MLXBrain:
@@ -117,7 +143,13 @@ class MLXBrain:
             "max_tokens": int(eff.get("max_tokens", self._max_tokens)),
             "temperature": float(eff.get("temperature", self._temperature)),
             "top_p": float(eff.get("top_p", self._top_p)),
+            "repeat_penalty": float(eff.get("repeat_penalty", 1.1)),
             "timeout_seconds": float(eff.get("timeout_seconds", self._timeout)),
+            "extra_stop_sequences": [
+                str(s).strip()
+                for s in eff.get("extra_stop_sequences", [])
+                if str(s).strip()
+            ][:16],
         }
 
     def _unload_role_unlocked(self, role: str) -> None:
@@ -210,12 +242,92 @@ class MLXBrain:
             return None
         return make_sampler(temp=temp, top_p=nucleus)
 
+    def _make_logits_processors(self, repeat_penalty: float):
+        penalty = float(repeat_penalty or 1.0)
+        if make_logits_processors is None or penalty <= 1.0:
+            return None
+        try:
+            return make_logits_processors(
+                repetition_penalty=penalty,
+                repetition_context_size=48,
+            )
+        except Exception:
+            logger.debug("MLX logits processor setup failed", exc_info=True)
+            return None
+
+    @staticmethod
+    def _stop_sequences(extra: list[str] | None = None) -> tuple[str, ...]:
+        merged: list[str] = list(_DEFAULT_STOP_SEQUENCES)
+        for seq in extra or []:
+            candidate = str(seq or "").strip()
+            if candidate and candidate not in merged:
+                merged.append(candidate)
+        return tuple(sorted(merged, key=len, reverse=True))
+
+    @staticmethod
+    def _find_stop_hit(text: str, stop_sequences: tuple[str, ...]) -> tuple[int, str] | None:
+        best_idx = -1
+        best_seq = ""
+        for seq in stop_sequences:
+            idx = text.find(seq)
+            if idx == -1:
+                continue
+            if best_idx == -1 or idx < best_idx or (idx == best_idx and len(seq) > len(best_seq)):
+                best_idx = idx
+                best_seq = seq
+        if best_idx == -1:
+            return None
+        return best_idx, best_seq
+
+    @staticmethod
+    def _partial_stop_suffix_len(text: str, stop_sequences: tuple[str, ...]) -> int:
+        best = 0
+        for seq in stop_sequences:
+            limit = min(len(seq) - 1, len(text))
+            for prefix_len in range(limit, 0, -1):
+                if text.endswith(seq[:prefix_len]):
+                    best = max(best, prefix_len)
+                    break
+        return best
+
+    @classmethod
+    def _guard_visible_text(
+        cls,
+        text: str,
+        stop_sequences: tuple[str, ...],
+    ) -> tuple[str, str | None, bool]:
+        if not text:
+            return "", None, False
+
+        if _ASSISTANT_LABEL_ONLY_RE.fullmatch(text):
+            return "", "speaker_label_loop", True
+
+        guarded = _LEADING_ASSISTANT_LABEL_RE.sub("", text)
+        if not guarded:
+            return "", None, False
+
+        trimmed = _TRAILING_ASSISTANT_LOOP_RE.sub("", guarded).rstrip()
+        if trimmed != guarded:
+            return trimmed, "speaker_label_loop", True
+
+        stop_hit = cls._find_stop_hit(guarded, stop_sequences)
+        if stop_hit is not None:
+            idx, seq = stop_hit
+            return guarded[:idx].rstrip(), f"stop_sequence:{seq}", True
+
+        partial_len = cls._partial_stop_suffix_len(guarded, stop_sequences)
+        if partial_len > 0:
+            return guarded[:-partial_len], None, False
+
+        return guarded, None, False
+
     def _generate_sync_streaming(
         self,
         prompt: str,
         on_token: Callable[[str, bool], None] | None = None,
         *,
         model_role: str | None = None,
+        max_tokens_override: int | None = None,
     ) -> tuple[str, bool]:
         eff = self._effective_inference(model_role)
         role = eff["model_role"]
@@ -229,10 +341,14 @@ class MLXBrain:
 
         my_gen = self._abort_generation
         sampler = self._make_sampler(eff["temperature"], eff["top_p"])
+        logits_processors = self._make_logits_processors(eff["repeat_penalty"])
+        stop_sequences = self._stop_sequences(eff["extra_stop_sequences"])
 
-        parts: list[str] = []
+        visible_text = ""
+        raw_text = ""
         last_resp: Any = None
         t0 = time.perf_counter()
+        stop_reason: str | None = None
 
         if _HAS_MLX and mx is not None:
             try:
@@ -245,8 +361,9 @@ class MLXBrain:
                 model,
                 tokenizer,
                 prompt,
-                max_tokens=eff["max_tokens"],
+                max_tokens=int(max_tokens_override or eff["max_tokens"]),
                 sampler=sampler,
+                logits_processors=logits_processors,
             ):
                 if self._abort_generation != my_gen:
                     elapsed_ms = (time.perf_counter() - t0) * 1000
@@ -263,16 +380,28 @@ class MLXBrain:
                 last_resp = resp
                 segment = getattr(resp, "text", "") or ""
                 if segment:
-                    parts.append(segment)
-                    if on_token:
-                        on_token(segment, False)
+                    raw_text += segment
+                    next_visible, reason, should_stop = self._guard_visible_text(
+                        raw_text,
+                        stop_sequences,
+                    )
+                    if len(next_visible) > len(visible_text):
+                        delta = next_visible[len(visible_text):]
+                        visible_text = next_visible
+                        if delta and on_token:
+                            on_token(delta, False)
+                    if should_stop:
+                        stop_reason = reason or "guard"
+                        break
 
             if on_token:
                 on_token("", True)
 
-            text = "".join(parts).strip()
+            text = visible_text.strip()
             elapsed_ms = (time.perf_counter() - t0) * 1000
-            generation_tokens = int(getattr(last_resp, "generation_tokens", len(parts)))
+            generation_tokens = int(
+                getattr(last_resp, "generation_tokens", max(1, len(raw_text.split()))),
+            )
             generation_tps = float(getattr(last_resp, "generation_tps", 0.0))
             peak_memory = float(getattr(last_resp, "peak_memory", 0.0))
             logger.info(
@@ -285,6 +414,8 @@ class MLXBrain:
                 generation_tps,
                 peak_memory,
             )
+            if stop_reason:
+                logger.info("MLX [%s/%s]: stopped early on %s", eff["profile"], role, stop_reason)
             return text, False
         except Exception:
             logger.exception("MLX inference error role=%s", role)
@@ -295,14 +426,26 @@ class MLXBrain:
                     pass
             return "", False
 
-    def _generate_sync(self, prompt: str, *, model_role: str | None = None) -> tuple[str, bool]:
-        return self._generate_sync_streaming(prompt, on_token=None, model_role=model_role)
+    def _generate_sync(
+        self,
+        prompt: str,
+        *,
+        model_role: str | None = None,
+        max_tokens_override: int | None = None,
+    ) -> tuple[str, bool]:
+        return self._generate_sync_streaming(
+            prompt,
+            on_token=None,
+            model_role=model_role,
+            max_tokens_override=max_tokens_override,
+        )
 
     async def generate(
         self,
         prompt: str,
         *,
         model_role: str | None = None,
+        max_tokens_override: int | None = None,
     ) -> tuple[str, bool]:
         loop = asyncio.get_running_loop()
         timeout_s = float(self._effective_inference(model_role)["timeout_seconds"])
@@ -310,7 +453,12 @@ class MLXBrain:
             return await asyncio.wait_for(
                 loop.run_in_executor(
                     self._executor,
-                    partial(self._generate_sync, prompt, model_role=model_role),
+                    partial(
+                        self._generate_sync,
+                        prompt,
+                        model_role=model_role,
+                        max_tokens_override=max_tokens_override,
+                    ),
                 ),
                 timeout=timeout_s,
             )
@@ -328,6 +476,7 @@ class MLXBrain:
         on_token: Callable[[str, bool], None] | None = None,
         *,
         model_role: str | None = None,
+        max_tokens_override: int | None = None,
     ) -> tuple[str, bool]:
         loop = asyncio.get_running_loop()
         timeout_s = float(self._effective_inference(model_role)["timeout_seconds"])
@@ -340,6 +489,7 @@ class MLXBrain:
                         prompt,
                         on_token,
                         model_role=model_role,
+                        max_tokens_override=max_tokens_override,
                     ),
                 ),
                 timeout=timeout_s,

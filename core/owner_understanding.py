@@ -40,6 +40,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, TYPE_CHECKING
 
+from core.query_policy import wants_explicit_depth
+
 if TYPE_CHECKING:
     from core.async_event_bus import AsyncEventBus
 
@@ -68,7 +70,7 @@ class CommunicationProfile:
     uses_humor: bool = True
     common_phrases: list[str] = field(default_factory=list)
     vocabulary_richness: float = 0.5
-    preferred_response_length: str = "medium"  # short, medium, long
+    preferred_response_length: str = "short"  # short, medium, long
     asks_questions_pct: float = 0.3
     gives_commands_pct: float = 0.5
     chitchat_pct: float = 0.2
@@ -175,7 +177,7 @@ class OwnerUnderstanding:
         self.communication.avg_sentence_length = comm.get("avg_sentence_length", 8.0)
         self.communication.formality_level = comm.get("formality_level", 0.3)
         self.communication.common_phrases = comm.get("common_phrases", [])
-        self.communication.preferred_response_length = comm.get("preferred_response_length", "medium")
+        self.communication.preferred_response_length = comm.get("preferred_response_length", "short")
         self.communication.asks_questions_pct = comm.get("asks_questions_pct", 0.3)
         self.communication.gives_commands_pct = comm.get("gives_commands_pct", 0.5)
 
@@ -289,14 +291,20 @@ class OwnerUnderstanding:
     def process_response_feedback(self, query: str, response: str,
                                    was_helpful: bool = True) -> None:
         """Learn from query-response pairs about what the owner values."""
-        if was_helpful and len(response) > 50:
-            words = len(response.split())
-            if words > 100:
-                self.communication.preferred_response_length = "long"
-            elif words < 30:
-                self.communication.preferred_response_length = "short"
-            else:
-                self.communication.preferred_response_length = "medium"
+        if not was_helpful or len(response) <= 20:
+            return
+
+        words = len(response.split())
+        if words < 45:
+            self.communication.preferred_response_length = "short"
+            return
+
+        # Do not globally learn "long" from one detailed/research request.
+        if wants_explicit_depth(query):
+            return
+
+        if words < 100:
+            self.communication.preferred_response_length = "medium"
 
     def process_emotion_signal(self, emotion: str, confidence: float = 0.5) -> None:
         """Accept external emotion signals (from voice emotion detector etc)."""

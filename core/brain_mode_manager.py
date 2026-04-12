@@ -1,8 +1,12 @@
 """
-ATOM -- Brain / ATOM mode profiles (production-safe).
+ATOM -- Brain / performance profiles (production-safe).
 
-Controls how the local LLM runs: ATOM mode (fast, short), Balanced, Brain mode (deeper).
-All profile names are allowlisted. Changes can be audited and optionally persisted.
+Controls how the local LLM and background cognition run on Apple Silicon.
+Canonical user-facing profiles are:
+  - optimal          -> stable daily buddy mode
+  - full_performance -> deeper mode when the Mac has headroom
+
+Legacy aliases (`atom`, `balanced`, `brain`) still resolve cleanly.
 
 This is separate from personality_modes (work/focus/chill/sleep) — that adjusts tone;
 assistant_brain profiles adjust inference parameters and optional model path.
@@ -20,8 +24,43 @@ from typing import Any
 
 logger = logging.getLogger("atom.brain_mode")
 
-ALLOWED_PROFILES: frozenset[str] = frozenset({"atom", "balanced", "brain"})
+PROFILE_ALIASES: dict[str, str] = {
+    "atom": "optimal",
+    "balanced": "optimal",
+    "optimal": "optimal",
+    "brain": "full_performance",
+    "full_performance": "full_performance",
+    "full-performance": "full_performance",
+    "fullperformance": "full_performance",
+}
+ALLOWED_PROFILES: frozenset[str] = frozenset(PROFILE_ALIASES)
+CANONICAL_PROFILES: frozenset[str] = frozenset({"optimal", "full_performance"})
 _PROFILE_RE = re.compile(r"^[a-z]+$")
+
+_PROFILE_LABELS: dict[str, str] = {
+    "optimal": "Optimal mode — stable buddy mode.",
+    "full_performance": "Full Performance mode — deeper answers when your Mac has headroom.",
+}
+_PROFILE_FEATURES: dict[str, dict[str, bool]] = {
+    "optimal": {
+        "autonomy": False,
+        "prediction_background": False,
+        "prediction_prefetch": False,
+        "dream": False,
+        "curiosity": False,
+        "self_optimizer": False,
+        "proactive_background": False,
+    },
+    "full_performance": {
+        "autonomy": True,
+        "prediction_background": True,
+        "prediction_prefetch": True,
+        "dream": True,
+        "curiosity": True,
+        "self_optimizer": True,
+        "proactive_background": True,
+    },
+}
 
 _STATE_FILE = Path("logs/atom_brain_profile.json")
 
@@ -29,16 +68,26 @@ _STATE_FILE = Path("logs/atom_brain_profile.json")
 class BrainModeManager:
     """Thread-safe active profile + merged effective brain parameters."""
 
+    @classmethod
+    def canonical_profile_name(cls, name: str | None) -> str | None:
+        if not name or not isinstance(name, str):
+            return None
+        key = name.strip().lower().replace("-", "_").replace(" ", "_")
+        return PROFILE_ALIASES.get(key)
+
+    @staticmethod
+    def display_name(name: str | None) -> str:
+        canonical = BrainModeManager.canonical_profile_name(name) or "optimal"
+        return canonical.replace("_", " ").title()
+
     def __init__(self, config: dict | None = None) -> None:
         self._config = config or {}
         self._lock = threading.RLock()
         ab = self._config.get("assistant_brain", {})
-        default = ab.get("active_profile", "balanced")
-        if default not in ALLOWED_PROFILES:
-            default = "balanced"
+        default = self.canonical_profile_name(str(ab.get("active_profile", "optimal"))) or "optimal"
         persisted = self._load_persisted_profile()
         if persisted in ALLOWED_PROFILES and ab.get("restore_persisted_profile", True):
-            self._active = persisted
+            self._active = self.canonical_profile_name(persisted) or default
         else:
             self._active = default
         self._audit = bool(self._config.get("assistant_brain", {}).get("audit_profile_changes", True))
@@ -53,15 +102,31 @@ class BrainModeManager:
         with self._lock:
             return self._active
 
+    @property
+    def active_profile_label(self) -> str:
+        return self.display_name(self.active_profile)
+
+    def is_full_performance(self, profile: str | None = None) -> bool:
+        canonical = self.canonical_profile_name(profile or self.active_profile) or "optimal"
+        return canonical == "full_performance"
+
+    def is_optimal(self, profile: str | None = None) -> bool:
+        return not self.is_full_performance(profile)
+
+    def feature_enabled(self, feature: str, profile: str | None = None) -> bool:
+        canonical = self.canonical_profile_name(profile or self.active_profile) or "optimal"
+        features = _PROFILE_FEATURES.get(canonical, _PROFILE_FEATURES["optimal"])
+        return bool(features.get(feature, True))
+
     def set_profile(self, name: str) -> tuple[bool, str]:
         """Validate and switch profile. Returns (ok, message for user)."""
         if not name or not isinstance(name, str):
             return False, "Invalid profile name."
-        key = name.strip().lower()
-        if key not in ALLOWED_PROFILES:
+        key = self.canonical_profile_name(name)
+        if key not in CANONICAL_PROFILES:
             return False, (
                 f"Unknown brain profile '{name}'. "
-                f"Say atom mode, balanced mode, or brain mode."
+                f"Say optimal mode or full performance mode."
             )
         with self._lock:
             old = self._active
@@ -77,12 +142,7 @@ class BrainModeManager:
             except Exception:
                 logger.debug("audit_log failed", exc_info=True)
         self._persist_profile(key)
-        labels = {
-            "atom": "ATOM mode — faster, shorter replies.",
-            "balanced": "Balanced mode — default speed and depth.",
-            "brain": "Brain mode — deeper answers, longer generation allowed.",
-        }
-        return True, f"Switched to {key} profile, Boss. {labels.get(key, '')}"
+        return True, f"Switched to {self.display_name(key)}, Boss. {_PROFILE_LABELS.get(key, '')}"
 
     def effective_params(self) -> dict[str, Any]:
         """Merged view for MiniLLM: base brain + active profile overrides."""
@@ -91,6 +151,11 @@ class BrainModeManager:
         base = dict(self._config.get("brain", {}))
         profiles = self._config.get("assistant_brain", {}).get("profiles", {})
         ov = dict(profiles.get(prof_name, {}) if isinstance(profiles, dict) else {})
+        if not ov and isinstance(profiles, dict):
+            for alias, canonical in PROFILE_ALIASES.items():
+                if canonical == prof_name and alias in profiles:
+                    ov = dict(profiles.get(alias, {}) or {})
+                    break
 
         def _pick(key: str, default: Any) -> Any:
             if key in ov and ov[key] is not None and ov[key] != "":
@@ -98,8 +163,6 @@ class BrainModeManager:
             return base.get(key, default)
 
         model_path = _pick("model_path", base.get("model_path", ""))
-        if not model_path:
-            model_path = base.get("model_path", "models/Llama-3.2-3B-Instruct-Q4_K_M.gguf")
 
         extra_stops = ov.get("extra_stop_sequences")
         if not isinstance(extra_stops, list):
@@ -147,8 +210,8 @@ class BrainModeManager:
             with open(_STATE_FILE, encoding="utf-8") as f:
                 data = json.load(f)
             v = data.get("active_profile", "")
-            if isinstance(v, str) and v in ALLOWED_PROFILES:
-                return v
+            if isinstance(v, str):
+                return self.canonical_profile_name(v)
         except Exception:
             pass
         return None

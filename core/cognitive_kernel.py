@@ -26,6 +26,7 @@ Integrates with:
 
 from __future__ import annotations
 
+import importlib.util
 import logging
 import re
 import time
@@ -34,11 +35,13 @@ from enum import Enum
 from typing import TYPE_CHECKING, Any
 
 from core.fast_path import LatencyBudget
+from core.query_policy import ResponseMode, classify_response_mode
 from core.rag.query_classifier import QueryComplexity, classify_query
 from core.runtime.latency_controller import LatencyController
 
 if TYPE_CHECKING:
     from core.async_event_bus import PriorityEventBus
+    from core.brain_mode_manager import BrainModeManager
     from core.cache_engine import CacheEngine
     from core.inference_guard import InferenceGuard
     from core.intent_engine import IntentEngine
@@ -57,6 +60,8 @@ class ExecPath(str, Enum):
     QUICK = "quick"
     FULL = "full"
     DEEP = "deep"
+    CLOUD_REASON = "cloud_reason"   # Cloud for abstract reasoning/knowledge
+    CLOUD_SEARCH = "cloud_search"   # Web search + summarize
 
 
 class CognitiveBudgetTier(str, Enum):
@@ -95,7 +100,29 @@ _INFO_HINTS = re.compile(
 _CREATIVE_HINTS = re.compile(
     r"\b("
     r"brainstorm|idea|ideas|write|draft|rewrite|compose|story|poem|"
-    r"lyrics|script|creative|imagine|invent|design|outline|pitch|proposal"
+    r"lyrics|script|creative|imagine|invent|design|outline|pitch|proposal|"
+    r"solve|explain|how\s+to|code|refactor|debug|summarize|propose|plan|"
+    r"analyze|thought|reason|thinking|deep\s+dive|complex|hard\s+task|logic|math"
+    r")\b",
+    re.I,
+)
+
+_BUDDY_HINTS = re.compile(
+    r"\b("
+    r"hello|hi|hey|how\s+are|sup|buddy|atom|thanks|thank\s+you|chat|"
+    r"joke|personality|tell\s+me|who\s+are\s+you|what\s+can\s+you\s+do"
+    r")\b",
+    re.I,
+)
+
+_REALTIME_HINTS = re.compile(
+    r"\b("
+    r"latest|current|today|tonight|yesterday|this week|this month|"
+    r"news|price|stock|weather|forecast|score|results?|"
+    r"happening|right now|live|trending|update|"
+    r"202[5-9]|who won|who is winning|"
+    r"breaking|recent|how much (?:is|does|are)|"
+    r"release date|when (?:is|does|will)|search|web|google|find\s+out"
     r")\b",
     re.I,
 )
@@ -167,6 +194,10 @@ class QueryPlan:
     direct_action: str | None = None
     direct_action_args: dict | None = None
 
+    # Cloud intelligence fields (v22: hybrid routing)
+    cloud_augmented: bool = False
+    confidence_score: float = -1.0  # -1 = not evaluated yet
+
 
 # ── Latency budgets per path ─────────────────────────────────────────
 
@@ -176,6 +207,8 @@ _PATH_BUDGETS: dict[ExecPath, float] = {
     ExecPath.QUICK: 1500.0,
     ExecPath.FULL: 5000.0,
     ExecPath.DEEP: 15000.0,
+    ExecPath.CLOUD_REASON: 6000.0,
+    ExecPath.CLOUD_SEARCH: 8000.0,
 }
 
 
@@ -247,6 +280,7 @@ class CognitiveKernel:
         *,
         config: dict[str, Any] | None = None,
         bus: "PriorityEventBus | None" = None,
+        brain_mode_manager: "BrainModeManager | None" = None,
         intent_engine: "IntentEngine | None" = None,
         cache_engine: "CacheEngine | None" = None,
         metrics: "MetricsCollector | None" = None,
@@ -256,6 +290,7 @@ class CognitiveKernel:
     ) -> None:
         self._config = config or {}
         self._bus = bus
+        self._brain_mode_mgr = brain_mode_manager
         self._intent = intent_engine
         self._cache = cache_engine
         self._metrics = metrics
@@ -273,6 +308,7 @@ class CognitiveKernel:
         self._thermal_degrade = bool(ck.get("thermal_degrade", True))
         self._memory_pressure_threshold = float(ck.get("memory_pressure_threshold", 85.0))
         self._rag_complexity_threshold = ck.get("rag_complexity_threshold", "complex")
+        self._semantic_stack_available = self._detect_semantic_stack()
 
         self._circuits: dict[str, _CircuitState] = {
             "intent": _CircuitState(),
@@ -280,7 +316,18 @@ class CognitiveKernel:
             "llm_quick": _CircuitState(),
             "llm_full": _CircuitState(),
             "rag": _CircuitState(),
+            "cloud_reason": _CircuitState(),
+            "cloud_search": _CircuitState(),
         }
+
+        # Cloud intelligence components (wired after construction)
+        self._confidence_engine: Any = None
+        self._search_tool: Any = None
+        self._gemini_client: Any = None
+        self._semantic_cache: Any = None
+        self._cloud_enabled = bool(
+            self._config.get("cloud", {}).get("enabled", True)
+        )
 
         self._routing_counts: dict[str, int] = {p.value: 0 for p in ExecPath}
         self._budget_counts: dict[str, int] = {
@@ -293,8 +340,30 @@ class CognitiveKernel:
             self._bus.on("silicon_memory_warn", self._on_memory_warn)
 
         logger.info(
-            "CognitiveKernel: quick=%s, full=%s, deep_min=%d chars",
+            "CognitiveKernel: quick=%s, full=%s, deep_min=%d chars, semantic_rag=%s, cloud=%s",
             self._quick_model, self._full_model, self._deep_query_min_chars,
+            self._semantic_stack_available, self._cloud_enabled,
+        )
+
+    # ── Cloud wiring (called after construction) ─────────────────────
+
+    def attach_cloud_intelligence(
+        self,
+        *,
+        confidence_engine: Any = None,
+        search_tool: Any = None,
+        gemini_client: Any = None,
+        semantic_cache: Any = None,
+    ) -> None:
+        """Wire cloud intelligence components after construction."""
+        self._confidence_engine = confidence_engine
+        self._search_tool = search_tool
+        self._gemini_client = gemini_client
+        self._semantic_cache = semantic_cache
+        logger.info(
+            "CognitiveKernel cloud wired: confidence=%s, search=%s, gemini=%s, sem_cache=%s",
+            confidence_engine is not None, search_tool is not None,
+            gemini_client is not None, semantic_cache is not None,
         )
 
     # ── Public API ───────────────────────────────────────────────────
@@ -383,6 +452,140 @@ class CognitiveKernel:
             )
             self._record(plan, t0)
             return plan
+
+        # Path 2.5: SEMANTIC CACHE — embedding-based similarity (v22)
+        if self._semantic_cache is not None:
+            try:
+                sem_hit = self._semantic_cache.get(query)
+                if sem_hit:
+                    plan = QueryPlan(
+                        path=ExecPath.CACHE,
+                        skip_llm=True,
+                        reason="semantic_cache_hit",
+                        direct_response=sem_hit,
+                        budget_ms=_PATH_BUDGETS[ExecPath.CACHE],
+                    )
+                    requested_tier = self._classify_requested_tier(
+                        query, complexity=complexity,
+                    )
+                    plan = self._apply_budget_profile(plan, requested_tier=requested_tier)
+                    plan = self._apply_latency_policy(
+                        plan, query, ctx, complexity=complexity,
+                    )
+                    self._record(plan, t0)
+                    return plan
+            except Exception:
+                logger.debug("Semantic cache lookup failed", exc_info=True)
+
+        # Path 2.6: CLOUD_SEARCH — real-time info needed (v22)
+        if (
+            self._cloud_enabled
+            and not self._circuits["cloud_search"].is_open
+            and _REALTIME_HINTS.search(query)
+            and self._search_tool is not None
+        ):
+            plan = QueryPlan(
+                path=ExecPath.CLOUD_SEARCH,
+                model="search+local",
+                model_role="search",
+                runtime_mode="SEARCH",
+                use_rag=False,
+                use_memory=False,
+                thinking=False,
+                reason="realtime_info_needed",
+                cloud_augmented=True,
+                budget_ms=_PATH_BUDGETS[ExecPath.CLOUD_SEARCH],
+                prompt_hint="Use the search results to give an accurate, up-to-date answer.",
+            )
+            requested_tier = self._classify_requested_tier(
+                query, complexity=complexity,
+            )
+            plan = self._apply_budget_profile(plan, requested_tier=requested_tier)
+            plan = self._apply_latency_policy(
+                plan, query, ctx, complexity=complexity,
+            )
+            self._record(plan, t0)
+            return plan
+
+        # Path 2.7: Pre-confidence cloud routing (v22)
+        # Check if the query is likely to produce a weak local response
+        # or if it's a specific "buddy talk" or "hard reasoning" request.
+        if (
+            self._cloud_enabled
+            and not self._circuits["cloud_reason"].is_open
+            and self._gemini_client is not None
+            and hasattr(self._gemini_client, "is_available")
+            and self._gemini_client.is_available
+        ):
+            # Dynamic routing to cloud based on "Buddy" vs "Reasoning" triggers
+            is_buddy = _BUDDY_HINTS.search(query) is not None
+            is_hard = _CREATIVE_HINTS.search(query) is not None
+            query_len = len(query)
+
+            # Cloud Buddy: Conversations & personality
+            if is_buddy and query_len < 100:
+                plan = QueryPlan(
+                    path=ExecPath.CLOUD_REASON,
+                    model="gemini",
+                    model_role="buddy",  # Trigger Buddy persona
+                    runtime_mode="BUDDY",
+                    use_rag=False,
+                    use_memory=True,
+                    thinking=False,
+                    reason="buddy_conversation_trigger",
+                    cloud_augmented=True,
+                    budget_ms=_PATH_BUDGETS[ExecPath.CLOUD_REASON],
+                    prompt_hint="Act as a friendly, witty buddy. Be concise and personal.",
+                )
+                requested_tier = CognitiveBudgetTier.SIMPLE
+                plan = self._apply_budget_profile(plan, requested_tier=requested_tier)
+                plan = self._apply_latency_policy(plan, query, ctx, complexity=complexity)
+                self._record(plan, t0)
+                return plan
+
+            # Cloud Reasoning: Complex/Hard tasks
+            if (is_hard and query_len > 40) or complexity is QueryComplexity.COMPLEX:
+                plan = QueryPlan(
+                    path=ExecPath.CLOUD_REASON,
+                    model="gemini",
+                    model_role="reasoning",  # Trigger Reasoning persona
+                    runtime_mode="REASONING",
+                    use_rag=True,
+                    use_memory=True,
+                    thinking=True,
+                    reason="deep_reasoning_trigger",
+                    cloud_augmented=True,
+                    budget_ms=_PATH_BUDGETS[ExecPath.CLOUD_REASON] * 1.5,
+                    prompt_hint="Provide a deep, logical, and thorough explanation. Think step by step.",
+                )
+                requested_tier = CognitiveBudgetTier.COMPLEX
+                plan = self._apply_budget_profile(plan, requested_tier=requested_tier)
+                plan = self._apply_latency_policy(plan, query, ctx, complexity=complexity)
+                self._record(plan, t0)
+                return plan
+
+            # Fallback Confidence check
+            if self._confidence_engine is not None:
+                pre_conf = self._confidence_engine.pre_confidence_heuristic(query)
+                if pre_conf < 0.40:
+                    plan = QueryPlan(
+                        path=ExecPath.CLOUD_REASON,
+                        model="gemini",
+                        model_role="reasoning",
+                        runtime_mode="CLOUD",
+                        use_rag=True,
+                        use_memory=True,
+                        thinking=False,
+                        reason=f"pre_confidence_low:{pre_conf:.2f}",
+                        cloud_augmented=True,
+                        confidence_score=pre_conf,
+                        budget_ms=_PATH_BUDGETS[ExecPath.CLOUD_REASON],
+                    )
+                    requested_tier = self._classify_requested_tier(query, complexity=complexity)
+                    plan = self._apply_budget_profile(plan, requested_tier=requested_tier)
+                    plan = self._apply_latency_policy(plan, query, ctx, complexity=complexity)
+                    self._record(plan, t0)
+                    return plan
 
         # Path 3-5: LLM routing based on complexity + system state
         requested_tier = self._classify_requested_tier(
@@ -526,20 +729,25 @@ class CognitiveKernel:
         full_broken = self._circuits["llm_full"].is_open
         quick_broken = self._circuits["llm_quick"].is_open
         rag_broken = self._circuits["rag"].is_open
+        rag_available = not rag_broken and self._semantic_stack_available
 
         # DEEP path: open-ended or long-form reasoning on a healthy system
         if not degraded and not full_broken and requested_tier is CognitiveBudgetTier.CREATIVE:
+            deep_model, deep_role = self._select_llm_model(ctx, deep=True)
             return QueryPlan(
                 path=ExecPath.DEEP,
-                model=self._full_model,
-                model_role="primary",
+                model=deep_model,
+                model_role=deep_role,
                 runtime_mode="DEEP",
-                use_rag=not rag_broken,
+                use_rag=rag_available,
                 use_memory=True,
                 thinking=True,
-                reason="complex_query",
+                reason="complex_query" if deep_role == "primary" else "complex_query_optimal_fast",
                 budget_ms=_PATH_BUDGETS[ExecPath.DEEP],
-                prompt_hint=self._prompt_hint_for(ExecPath.DEEP),
+                prompt_hint=self._merge_prompt_hint(
+                    self._prompt_hint_for(ExecPath.DEEP),
+                    self._rag_honesty_hint() if not rag_available else "",
+                ),
             )
 
         # FULL path: substantive queries that need the primary model
@@ -552,20 +760,24 @@ class CognitiveKernel:
             }
         ):
             use_rag = (
-                not rag_broken
+                rag_available
                 and complexity == QueryComplexity.COMPLEX
             )
+            full_model, full_role = self._select_llm_model(ctx, deep=False)
             return QueryPlan(
                 path=ExecPath.FULL,
-                model=self._full_model,
-                model_role="primary",
+                model=full_model,
+                model_role=full_role,
                 runtime_mode="SMART",
                 use_rag=use_rag,
                 use_memory=True,
                 thinking=False,
-                reason="moderate_query",
+                reason="moderate_query" if full_role == "primary" else "moderate_query_optimal_fast",
                 budget_ms=_PATH_BUDGETS[ExecPath.FULL],
-                prompt_hint=self._prompt_hint_for(ExecPath.FULL),
+                prompt_hint=self._merge_prompt_hint(
+                    self._prompt_hint_for(ExecPath.FULL),
+                    self._rag_honesty_hint() if not rag_available else "",
+                ),
             )
 
         # QUICK path: simple queries, degraded state, or fallback
@@ -613,13 +825,20 @@ class CognitiveKernel:
         low = (query or "").strip().lower()
         intent = str(direct_intent or "").strip().lower()
         action = str(direct_action or "").strip().lower()
+        response_mode = classify_response_mode(low)
 
         if action:
             return CognitiveBudgetTier.COMMAND
+        if response_mode is ResponseMode.REPORT:
+            return CognitiveBudgetTier.CREATIVE
+        if response_mode is ResponseMode.DETAIL:
+            return CognitiveBudgetTier.COMPLEX
         if intent in _INFO_INTENTS:
             return CognitiveBudgetTier.INFO
         if _INFO_HINTS.search(low):
             return CognitiveBudgetTier.INFO
+        if response_mode is ResponseMode.SHORT:
+            return CognitiveBudgetTier.SIMPLE
         if _CREATIVE_HINTS.search(low):
             return CognitiveBudgetTier.CREATIVE
         if complexity is QueryComplexity.COMPLEX and len(low) >= self._deep_query_min_chars:
@@ -650,6 +869,8 @@ class CognitiveKernel:
             return CognitiveBudgetTier.COMPLEX
         if plan.path is ExecPath.DEEP:
             return CognitiveBudgetTier.CREATIVE
+        if plan.path in (ExecPath.CLOUD_REASON, ExecPath.CLOUD_SEARCH):
+            return CognitiveBudgetTier.COMPLEX
         return requested_tier
 
     def _apply_budget_profile(
@@ -675,7 +896,41 @@ class CognitiveKernel:
 
         plan.use_memory = bool(plan.use_memory or profile.use_memory)
         plan.use_rag = bool(plan.use_rag and profile.use_rag)
+        if not self._semantic_stack_available:
+            plan.use_rag = False
+            plan.prompt_hint = self._merge_prompt_hint(
+                plan.prompt_hint,
+                self._rag_honesty_hint(),
+            )
         return plan
+
+    @staticmethod
+    def _detect_semantic_stack() -> bool:
+        has_embeddings = importlib.util.find_spec("sentence_transformers") is not None
+        has_vector_backend = (
+            importlib.util.find_spec("chromadb") is not None
+            or importlib.util.find_spec("qdrant_client") is not None
+        )
+        return has_embeddings and has_vector_backend
+
+    @staticmethod
+    def _merge_prompt_hint(base: str, extra: str) -> str:
+        left = str(base or "").strip()
+        right = str(extra or "").strip()
+        if not right:
+            return left
+        if not left:
+            return right
+        if right in left:
+            return left
+        return f"{left} {right}".strip()
+
+    @staticmethod
+    def _rag_honesty_hint() -> str:
+        return (
+            "Semantic retrieval is unavailable in this runtime. "
+            "Do not claim memory or document recall unless you truly have retrieved context."
+        )
 
     # ── System-state awareness ───────────────────────────────────────
 
@@ -714,27 +969,55 @@ class CognitiveKernel:
             reasons.append(f"memory_{ctx.memory_pct:.0f}pct")
         return "+".join(reasons) or "unknown"
 
+    def _primary_model_allowed(self, ctx: _SystemContext, *, deep: bool) -> bool:
+        mgr = self._brain_mode_mgr
+        if mgr is None:
+            return True
+        try:
+            if mgr.is_full_performance():
+                return True
+        except Exception:
+            return True
+        if not deep:
+            return False
+        memory_guard = max(60.0, min(self._memory_pressure_threshold - 8.0, 74.0))
+        if ctx.is_throttled:
+            return False
+        if ctx.memory_pct >= memory_guard:
+            return False
+        if ctx.cpu_pct >= 55.0:
+            return False
+        if ctx.on_battery and ctx.battery_pct < 35:
+            return False
+        return True
+
+    def _select_llm_model(self, ctx: _SystemContext, *, deep: bool) -> tuple[str, str]:
+        if self._primary_model_allowed(ctx, deep=deep):
+            return self._full_model, "primary"
+        return self._quick_model, "fast"
+
     @staticmethod
     def _prompt_hint_for(path: ExecPath, *, degraded: bool = False) -> str:
         if path == ExecPath.QUICK:
             if degraded:
                 return (
-                    "Respond directly and briefly. Prioritize latency and avoid "
-                    "unnecessary reasoning unless the answer would otherwise be incorrect."
+                    "Respond directly and briefly. Prioritize latency, keep short "
+                    "questions to one clean line when possible, and avoid extra "
+                    "reasoning unless accuracy would suffer."
                 )
             return (
-                "Respond directly and briefly. Prefer the fastest correct answer "
-                "and avoid unnecessary detail."
+                "Respond directly and briefly. Prefer the fastest correct answer, "
+                "keep short asks tight, and avoid unnecessary detail."
             )
         if path == ExecPath.DEEP:
             return (
-                "This query needs deeper reasoning. Think carefully before answering, "
-                "use available context or tools when helpful, and prioritize correctness "
-                "over speed while keeping the final answer clear."
+                "This query needs deeper reasoning. Think carefully, use context or "
+                "tools when they materially help, and lead with the key takeaway while "
+                "keeping the final answer organized."
             )
         return (
-            "Give a thoughtful but efficient answer. Use context when it materially "
-            "improves the response, but stay concise."
+            "Give a thoughtful but efficient answer. Stay concise unless the user "
+            "explicitly asked for more depth."
         )
 
     def _apply_latency_policy(
@@ -801,10 +1084,11 @@ class CognitiveKernel:
                 prompt_hint=self._prompt_hint_for(ExecPath.QUICK, degraded=self._should_degrade(ctx)),
             )
         if mode == "DEEP":
+            deep_model, deep_role = self._select_llm_model(ctx, deep=True)
             return QueryPlan(
                 path=ExecPath.DEEP,
-                model=self._full_model,
-                model_role="primary",
+                model=deep_model,
+                model_role=deep_role,
                 runtime_mode="DEEP",
                 use_rag=True,
                 use_memory=True,
@@ -814,10 +1098,11 @@ class CognitiveKernel:
                 prompt_hint=self._prompt_hint_for(ExecPath.DEEP),
             )
         # SMART / default → FULL
+        smart_model, smart_role = self._select_llm_model(ctx, deep=False)
         return QueryPlan(
             path=ExecPath.FULL,
-            model=self._full_model,
-            model_role="primary",
+            model=smart_model,
+            model_role=smart_role,
             runtime_mode="SMART",
             use_rag=True,
             use_memory=True,
@@ -829,10 +1114,10 @@ class CognitiveKernel:
 
     # ── Event handlers ───────────────────────────────────────────────
 
-    def _on_thermal_warn(self, **_kw: Any) -> None:
+    async def _on_thermal_warn(self, **_kw: Any) -> None:
         logger.info("Cognitive Kernel: thermal warning received, degrading routing")
 
-    def _on_memory_warn(self, **_kw: Any) -> None:
+    async def _on_memory_warn(self, **_kw: Any) -> None:
         logger.info("Cognitive Kernel: memory warning received, degrading routing")
 
     # ── Metrics + recording ──────────────────────────────────────────

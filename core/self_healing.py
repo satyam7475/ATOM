@@ -450,8 +450,8 @@ class FailureAnalyzer:
         if failure.category == "model":
             return (
                 f"AI model error: {failure.exception_message}. "
-                "The LLM model file may be corrupted, missing, or "
-                "incompatible with the installed llama-cpp-python version."
+                "The MLX model directory may be missing, corrupted, or "
+                "incompatible with the installed MLX runtime."
             )
 
         if failure.category == "network":
@@ -579,7 +579,7 @@ class FixEngine:
                 auto_fixable=True,
                 fix_commands=[
                     "Reduce brain.n_ctx in settings.json",
-                    "Switch to a smaller GGUF model",
+                    "Prefer the fast MLX role or a smaller MLX model",
                 ],
                 confidence=0.6,
                 risk_level="moderate",
@@ -592,8 +592,8 @@ class FixEngine:
                 fix_type="manual",
                 auto_fixable=False,
                 fix_commands=[
-                    "Verify brain.model_path in settings.json points to valid GGUF",
-                    "Re-download the model file if corrupted",
+                    "Verify brain.mlx_primary_model and brain.mlx_fast_model point to valid MLX model directories",
+                    "Re-download the MLX model directory if corrupted",
                 ],
                 confidence=0.5,
                 risk_level="safe",

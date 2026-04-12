@@ -19,7 +19,9 @@ _TIME = re.compile(
 
 _DATE = re.compile(
     r"\b(what('?s|\s+is)?\s+the\s+date|today('?s)?\s+date|current\s+date|"
-    r"what\s+day\s+is\s+(it|today)|aaj\s+kya\s+date)", re.I)
+    r"what\s+date\s+is\s+it|what\s+day\s+is\s+(it|today)|aaj\s+kya\s+date)",
+    re.I,
+)
 
 _CPU = re.compile(
     r"\b(check\s+cpu|cpu\s+(usage|status|load|percent)|"
@@ -53,7 +55,7 @@ _UPTIME = re.compile(
     r"\b(uptime|how\s+long\s+(running|been\s+on|active)|system\s+uptime)\b", re.I)
 
 _TOP_PROCESSES = re.compile(
-    r"\b(top\s+process|running\s+process|task\s+list|what('?s|\s+is)\s+running|"
+    r"\b(top\s+process(?:es)?|running\s+process(?:es)?|task\s+list|what('?s|\s+is)\s+running|"
     r"process\s+list|heavy\s+process|resource\s+hog|cpu\s+hog|"
     r"show\s+process|list\s+process)\b", re.I)
 
@@ -99,10 +101,10 @@ def check(text: str) -> IntentResult | None:
     if _DISK.search(text):
         pfx = personality.info_prefix()
         try:
-            d = psutil.disk_usage("C:\\")
+            d = psutil.disk_usage("/")
             free_gb = d.free / (1024 ** 3)
             total_gb = d.total / (1024 ** 3)
-            msg = (f"Disk C has {free_gb:.0f} GB free out of {total_gb:.0f} GB. "
+            msg = (f"Disk has {free_gb:.0f} GB free out of {total_gb:.0f} GB. "
                    f"{d.percent:.0f} percent used.")
             return IntentResult("disk", response=f"{pfx} {msg}".strip())
         except Exception:
@@ -113,11 +115,11 @@ def check(text: str) -> IntentResult | None:
             cpu = psutil.cpu_percent(interval=0.1)
             mem = psutil.virtual_memory()
             bat = psutil.sensors_battery()
-            disk = psutil.disk_usage("C:\\")
+            disk = psutil.disk_usage("/")
             parts = [
                 f"CPU at {cpu:.0f} percent.",
                 f"RAM at {mem.percent:.0f} percent.",
-                f"Disk C has {disk.free / (1024**3):.0f} GB free.",
+                f"Disk has {disk.free / (1024**3):.0f} GB free.",
             ]
             if bat:
                 plug = "charging" if bat.power_plugged else "on battery"

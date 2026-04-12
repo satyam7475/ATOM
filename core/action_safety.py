@@ -45,6 +45,10 @@ def default_risk_for_action(action: str) -> ActionRisk:
     high = {
         "move_path", "copy_path", "delete_path", "close_app",
         "create_folder", "play_youtube", "type_text",
+        
+        # v22 Advanced Control
+        "set_focused_text", "click_ui_element", 
+        "set_process_priority", "optimize_for_atom",
     }
     medium = {"open_app", "open_url", "set_reminder", "spotlight_search"}
     if action in critical:

@@ -2,7 +2,8 @@
 ATOM -- Local Embedding Engine (semantic vectors).
 
 Provides semantic embeddings for memory, RAG, and document retrieval.
-Use ``embedding.device: auto`` in config to prefer CUDA when available.
+Use ``embedding.device: auto`` in config to prefer the best local accelerator,
+including MPS on Apple Silicon.
 
 Uses sentence-transformers with a compact model (all-MiniLM-L6-v2, ~80MB)
 or nomic-embed-text-v1.5 (~260MB) for higher quality.
@@ -137,8 +138,9 @@ class EmbeddingEngine:
                 elapsed = (time.monotonic() - t0) * 1000
                 self._loaded = True
                 logger.info(
-                    "Embedding model loaded: %s (%d-dim, numpy=%s) in %.0fms",
+                    "Embedding model loaded: %s (%d-dim, device=%s, numpy=%s) in %.0fms",
                     self._model_name, self._dimension,
+                    self._device,
                     "yes" if _np is not None else "no", elapsed,
                 )
                 return True

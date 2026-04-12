@@ -812,20 +812,37 @@ class SystemScanner:
             import os
             atom_root = Path(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
             models_dir = atom_root / "models"
+            brain_cfg = self._config.get("brain", {})
+            mlx_candidates = []
+            for raw in (
+                brain_cfg.get("mlx_primary_model", ""),
+                brain_cfg.get("mlx_fast_model", ""),
+            ):
+                path = Path(str(raw or "")).expanduser()
+                if path and not path.is_absolute():
+                    path = atom_root / path
+                if path and path.exists():
+                    mlx_candidates.append(path)
+            if mlx_candidates:
+                names = ", ".join(sorted({p.name for p in mlx_candidates}))
+                result["status"] = "pass"
+                result["detail"] = f"MLX models ready: {names}"
+                result["model_dirs"] = [p.name for p in mlx_candidates]
+                return result
             if models_dir.exists():
                 gguf_files = list(models_dir.glob("*.gguf"))
                 if gguf_files:
                     biggest = max(gguf_files, key=lambda f: f.stat().st_size)
                     size_gb = biggest.stat().st_size / (1024 ** 3)
                     result["status"] = "pass"
-                    result["detail"] = f"LLM model found: {biggest.name} ({size_gb:.1f}GB)"
+                    result["detail"] = f"Legacy GGUF model found: {biggest.name} ({size_gb:.1f}GB)"
                     result["model_file"] = biggest.name
                     result["model_size_gb"] = round(size_gb, 1)
                     return result
             try:
                 from llama_cpp import Llama
                 result["status"] = "warn"
-                result["detail"] = "llama-cpp-python available but no model file found"
+                result["detail"] = "llama-cpp-python available, but no legacy GGUF model file was found"
                 return result
             except ImportError:
                 pass

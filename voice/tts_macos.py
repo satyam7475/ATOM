@@ -50,6 +50,8 @@ _RE_HEADER = re.compile(r'^#+\s*', re.MULTILINE)
 _RE_BULLET = re.compile(r'^\s*[-*\u2022]\s+', re.MULTILINE)
 _RE_NUMBERED = re.compile(r'^\s*\d+\.\s+', re.MULTILINE)
 _RE_BLOCKQUOTE = re.compile(r'^\s*>\s+', re.MULTILINE)
+_RE_TRANSCRIPT_LABEL = re.compile(r"\b(?:User|Boss|ATOM|Assistant):\s*", re.I)
+_RE_TRANSCRIPT_ONLY = re.compile(r"^(?:(?:User|Boss|ATOM|Assistant)\s*:?\s*)+$", re.I)
 
 _RE_SENTENCE_SPLIT = re.compile(r'(?<=[.!?])\s+')
 
@@ -228,7 +230,7 @@ class MacOSTTSAsync:
     Public API matches EdgeTTSAsync / TTSAsync for drop-in replacement.
     """
 
-    _SPEAK_WORD_LIMIT: int = 45
+    _SPEAK_WORD_LIMIT: int = 18
 
     def __init__(
         self,
@@ -259,6 +261,7 @@ class MacOSTTSAsync:
         self._chunk_buffer: list[str] = []
         self._screen_buffer: list[str] = []
         self._spoken_word_count: int = 0
+        self._recent_spoken_chunks: list[str] = []
         self._stream_queue: asyncio.Queue[tuple[str, bool]] | None = None
         self._stream_task: asyncio.Task | None = None
         self._stream_generation: int = 0
@@ -346,7 +349,17 @@ class MacOSTTSAsync:
 
     def _normalize_stream_text(self, text: str) -> str:
         cleaned = _clean_for_tts(text).strip()
-        return re.sub(r"\s+", " ", cleaned)
+        cleaned = re.sub(r"\s+", " ", cleaned)
+        label_hits = len(_RE_TRANSCRIPT_LABEL.findall(cleaned))
+        if label_hits >= 2:
+            return ""
+        cleaned = _RE_TRANSCRIPT_LABEL.sub("", cleaned).strip(" -:>")
+        if not cleaned or _RE_TRANSCRIPT_ONLY.match(cleaned):
+            return ""
+        words = cleaned.lower().replace(":", " ").split()
+        if len(words) >= 3 and len(set(words)) == 1 and words[0] in {"atom", "user", "assistant", "boss"}:
+            return ""
+        return cleaned
 
     def _split_stream_chunk(self, text: str) -> tuple[str, str]:
         text = self._normalize_stream_text(text)
@@ -376,6 +389,22 @@ class MacOSTTSAsync:
             return "", text
         return speak_text, overflow_text
 
+    @staticmethod
+    def _chunk_key(text: str) -> str:
+        lowered = re.sub(r"[^a-z0-9\s]", "", (text or "").lower())
+        return re.sub(r"\s+", " ", lowered).strip()
+
+    def _is_duplicate_chunk(self, text: str) -> bool:
+        key = self._chunk_key(text)
+        if not key:
+            return True
+        if key in self._recent_spoken_chunks:
+            return True
+        self._recent_spoken_chunks.append(key)
+        if len(self._recent_spoken_chunks) > 4:
+            self._recent_spoken_chunks = self._recent_spoken_chunks[-4:]
+        return False
+
     async def _play_stream_chunks(self, generation: int) -> None:
         queue = self._stream_queue
         if queue is None:
@@ -391,6 +420,11 @@ class MacOSTTSAsync:
                     self._chunk_buffer.append(text)
                     speak_text, overflow_text = self._split_stream_chunk(text)
                     if speak_text and not self._cancel_requested:
+                        if self._is_duplicate_chunk(speak_text):
+                            logger.info("TTS stream duplicate chunk skipped: '%s'", speak_text[:100])
+                            if overflow_text:
+                                self._screen_buffer.append(overflow_text)
+                            continue
                         self._spoken_word_count += len(speak_text.split())
                         logger.info(
                             "TTS stream chunk (%d/%d words): '%s'",
@@ -583,6 +617,7 @@ class MacOSTTSAsync:
             self._chunk_buffer.clear()
             self._screen_buffer.clear()
             self._spoken_word_count = 0
+            self._recent_spoken_chunks.clear()
             self._active_stream_id = stream_id or None
             logger.info(
                 "TTS stream: source='%s' stream_id=%s'",

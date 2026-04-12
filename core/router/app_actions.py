@@ -13,7 +13,9 @@ from __future__ import annotations
 
 import logging
 import subprocess
+import sys
 import time
+from pathlib import Path
 
 from core.security_policy import SecurityPolicy
 
@@ -46,6 +48,40 @@ def close_app(process_name: str) -> None:
 
 
 def list_installed_apps() -> str:
+    if sys.platform == "darwin":
+        roots = [
+            Path("/Applications"),
+            Path("/System/Applications"),
+            Path.home() / "Applications",
+        ]
+        names: list[str] = []
+        for root in roots:
+            if not root.is_dir():
+                continue
+            try:
+                for app in sorted(root.rglob("*.app")):
+                    names.append(app.stem)
+            except Exception:
+                logger.debug("App scan failed for %s", root, exc_info=True)
+        if not names:
+            return "I couldn't find any macOS apps right now."
+        unique: list[str] = []
+        seen: set[str] = set()
+        for name in names:
+            low = name.lower()
+            if low in seen:
+                continue
+            seen.add(low)
+            unique.append(name)
+        preview = ", ".join(unique[:25])
+        remaining = max(0, len(unique) - 25)
+        if remaining:
+            return (
+                f"I found {len(unique)} apps on this Mac. Sample: {preview}. "
+                f"And {remaining} more."
+            )
+        return f"I found {len(unique)} apps on this Mac: {preview}."
+
     cmd = [
         "powershell", "-NoProfile", "-Command",
         "Get-StartApps | Sort-Object Name "

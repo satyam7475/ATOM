@@ -56,6 +56,32 @@ _SILENCE_TIMEOUT_S = 2.0
 _MAX_RECORD_S = 15.0
 
 
+def native_stt_launch_supported() -> tuple[bool, str]:
+    """Return whether the current process can safely use SFSpeechRecognizer."""
+    if sys.platform != "darwin":
+        return False, "SFSpeechRecognizer only available on macOS"
+    if not _HAS_SPEECH or _Speech is None or _Foundation is None:
+        return False, "pyobjc speech frameworks are unavailable"
+
+    try:
+        locale = _Foundation.NSLocale.alloc().initWithLocaleIdentifier_("en-US")
+        recognizer = _Speech.SFSpeechRecognizer.alloc().initWithLocale_(locale)
+        if recognizer is None or not recognizer.isAvailable():
+            return False, "SFSpeechRecognizer is unavailable for the current locale"
+
+        auth_status = _Speech.SFSpeechRecognizer.authorizationStatus()
+        if auth_status == 3:
+            return True, ""
+        if auth_status == 0:
+            info = _Foundation.NSBundle.mainBundle().infoDictionary()
+            if info is None or "NSSpeechRecognitionUsageDescription" not in info:
+                return False, "current process bundle lacks NSSpeechRecognitionUsageDescription"
+            return True, ""
+        return False, f"speech recognition authorization status={auth_status}"
+    except Exception as exc:
+        return False, str(exc)
+
+
 class NativeSTT:
     """macOS native STT using SFSpeechRecognizer + AVAudioEngine.
 
@@ -81,13 +107,17 @@ class NativeSTT:
         self._intent_engine = intent_engine
 
         self._locale: str = self._config.get("locale", "en-US")
+        self.mic_name: str = "macOS AVAudioEngine"
         self._recognizer: Any = None
         self._audio_engine: Any = None
         self._recognition_request: Any = None
         self._recognition_task: Any = None
 
         self._available = False
+        self._permanently_disabled = False
         self._listening = False
+        self._running_async = False
+        self._async_task: asyncio.Task | None = None
         self._last_partial: str = ""
         self._last_final: str = ""
         self._last_speech_time: float = 0.0
@@ -140,10 +170,7 @@ class NativeSTT:
         auth_status = _Speech.SFSpeechRecognizer.authorizationStatus()
         if auth_status == 3:  # authorized
             self._available = True
-            logger.info(
-                "Native STT ready (SFSpeechRecognizer, locale=%s, on-device=True)",
-                self._locale,
-            )
+            logger.info("Native STT ready (SFSpeechRecognizer, locale=%s, on-device=True)", self._locale)
             return True
         elif auth_status == 0:  # notDetermined
             logger.info("Requesting Speech Recognition authorization...")
@@ -163,8 +190,7 @@ class NativeSTT:
                 return True
             else:
                 logger.warning(
-                    "Speech Recognition denied. Go to System Settings > "
-                    "Privacy & Security > Speech Recognition to enable."
+                    "Speech Recognition denied. Go to System Settings > Privacy & Security > Speech Recognition to enable."
                 )
                 return False
         else:
@@ -359,3 +385,89 @@ class NativeSTT:
         self._recognizer = None
         self._available = False
         logger.info("Native STT shut down")
+
+    # ── Async-compatible wrappers (match STTAsync interface for main.py) ──
+
+    async def async_preload(self) -> None:
+        """Async wrapper around sync preload for main.py compatibility."""
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, self.preload)
+
+    async def async_start_listening(self, **_kw) -> None:
+        """Continuous listen loop matching STTAsync.start_listening() contract.
+
+        Starts native recognition, then sleeps while active.  When
+        a final result arrives the text is emitted on the bus just like
+        STTAsync does, and recognition is restarted for the next utterance.
+        """
+        if self._permanently_disabled:
+            logger.info("STT permanently disabled (TCC/entitlements) — voice input unavailable")
+            return
+
+        loop = asyncio.get_running_loop()
+        self._loop = loop
+        self._running_async = True
+
+        def _on_final(text: str) -> None:
+            if text and text.strip():
+                loop.call_soon_threadsafe(
+                    self._bus.emit, "speech_final", text=text, language="en",
+                )
+
+        def _on_partial(text: str) -> None:
+            if text:
+                loop.call_soon_threadsafe(
+                    lambda t=text: self._bus.emit("speech_partial", text=t),
+                )
+
+        max_retries = 5
+        retries = 0
+        while getattr(self, "_running_async", False):
+            if not self._listening:
+                ok = self.start_listening(
+                    loop=loop, on_final=_on_final, on_partial=_on_partial,
+                )
+                if not ok:
+                    retries += 1
+                    if not self._available or retries > max_retries:
+                        logger.warning(
+                            "Native STT unavailable (retries=%d, available=%s) — "
+                            "voice input disabled for this session",
+                            retries, self._available,
+                        )
+                        self._running_async = False
+                        return
+                    logger.warning("Native STT start failed, retrying in 5s (%d/%d)", retries, max_retries)
+                    await asyncio.sleep(5.0)
+                    continue
+                retries = 0
+            await asyncio.sleep(0.5)
+
+    def stop(self) -> None:
+        """Stop async listen loop + underlying recognition."""
+        self._running_async = False
+        self.stop_listening()
+
+    async def on_state_changed(self, old, new, **_kw) -> None:
+        """Handle ATOM state transitions (mirrors STTAsync behaviour)."""
+        from core.state_manager import AtomState
+
+        try:
+            if self._permanently_disabled:
+                return
+
+            if new in (AtomState.LISTENING, AtomState.SPEAKING):
+                already_running = (
+                    self._async_task is not None
+                    and not self._async_task.done()
+                )
+                if not self._running_async and not already_running:
+                    self._running_async = True
+                    self._async_task = asyncio.create_task(
+                        self.async_start_listening()
+                    )
+            elif old in (AtomState.LISTENING, AtomState.SPEAKING) and \
+                    new not in (AtomState.LISTENING, AtomState.SPEAKING):
+                self.stop()
+        except Exception:
+            logger.debug("on_state_changed error", exc_info=True)

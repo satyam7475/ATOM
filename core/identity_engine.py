@@ -69,12 +69,12 @@ class IdentityEngine:
         preferred_verbosity: str,
     ) -> str:
         vv = (voice_verbosity or "").strip().lower()
-        pv = (preferred_verbosity or "medium").strip().lower()
+        pv = (preferred_verbosity or "short").strip().lower()
         if vv in {"silent", "minimal", "terse", "brief"}:
             return "short"
         if pv in {"short", "medium", "long"}:
             return pv
-        return "medium"
+        return "short"
 
     def describe_identity(self, context: dict[str, Any] | None = None) -> str:
         ctx = self.get_identity_snapshot(context)
@@ -143,7 +143,7 @@ class IdentityEngine:
         preferred_verbosity = str(
             ctx.get(
                 "preferred_verbosity",
-                owner.communication.preferred_response_length if owner is not None else "medium",
+                owner.communication.preferred_response_length if owner is not None else "short",
             ),
         )
         communication_style = str(
@@ -209,7 +209,7 @@ class IdentityEngine:
     ) -> dict[str, Any]:
         ctx = self.get_identity_snapshot(context)
         tone = "confident"
-        verbosity = "normal"
+        verbosity = "brief"
         proactive = True
 
         emotion = ctx["owner_emotion"]
@@ -238,7 +238,7 @@ class IdentityEngine:
             proactive = False
         elif mode_name == "chill":
             tone = "warm"
-            verbosity = "normal"
+            verbosity = "brief"
             proactive = True
 
         if ctx["mode_verbosity"] == "minimal" and verbosity == "normal":

@@ -173,6 +173,11 @@ _COMMAND_CHAIN_RE = re.compile(
     re.I,
 )
 
+_DELETION_INTENT_RE = re.compile(
+    r"\b(delete|remove|erase|format|wipe|trash|destroy|rmdir)\b",
+    re.I,
+)
+
 _MAX_INPUT_LENGTH = 2000
 _RATE_LIMIT_WINDOW_S = 5.0
 _RATE_LIMIT_MAX_ACTIONS = 10
@@ -230,6 +235,24 @@ class SecurityPolicy:
         self._action_timestamps.append(now)
         return True
 
+    def _calculate_risk_score(self, action: str, args: dict | None) -> float:
+        """Adaptive risk heuristic f(intent, context, tool_severity)."""
+        base_score = 0.1
+        
+        high_risk_actions = {"run_terminal_command", "click_ui_element", "set_focused_text", "delete_file"}
+        med_risk_actions = {"close_app", "kill_process", "empty_recycle_bin"}
+        
+        if action in high_risk_actions:
+            base_score += 0.6
+        elif action in med_risk_actions:
+            base_score += 0.4
+            
+        # Context modifiers
+        if args and any("password" in str(v).lower() for v in args.values()):
+            base_score += 0.3
+            
+        return min(1.0, base_score)
+
     def allow_action(
         self,
         action: str,
@@ -243,6 +266,11 @@ class SecurityPolicy:
         Includes rate limiting to prevent command flooding.
         ``policy_context='plan_validate'`` skips paranoid HMAC verification (planning dry-run).
         """
+        risk_score = self._calculate_risk_score(action, args)
+        if risk_score >= 0.9:
+            reason = f"Adaptive Security Block: Risk Score {risk_score:.2f} is too high for autonomous execution."
+            self.audit_log(action, reason, success=False)
+            return False, reason
         if action not in _SAFE_ALWAYS_INTENTS and not self._check_rate_limit():
             reason = "Too many actions in a short time. Please slow down, Boss."
             self.audit_log(action, reason, success=False)
@@ -489,6 +517,10 @@ class SecurityPolicy:
         if _COMMAND_CHAIN_RE.search(text):
             logger.warning("SECURITY: Command chaining attempt detected")
             text = _COMMAND_CHAIN_RE.sub("", text)
+
+        if _DELETION_INTENT_RE.search(text):
+            logger.warning("SECURITY: Destructive word detected and blocked per Owner Policy")
+            text = "SYSTEM_BLOCK: Deletion and destructive actions are strictly prohibited by Owner policy."
 
         text = re.sub(r"[\x01-\x08\x0b\x0c\x0e-\x1f\x7f]", "", text)
         text = re.sub(r"\s+", " ", text).strip()

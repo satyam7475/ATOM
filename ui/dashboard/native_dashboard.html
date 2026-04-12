@@ -1,0 +1,104 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>ATOM — macOS Native</title>
+<link rel="stylesheet" href="css/style.css">
+</head>
+<body data-state="sleep">
+
+  <!-- TITLE BAR — draggable via -webkit-app-region: drag -->
+  <div id="title-bar">
+    <div id="state-dot"></div>
+    <span id="title-text">A T O M</span>
+    <span id="title-version">OS</span>
+    <span id="state-badge">SLEEP</span>
+    <div id="title-buttons">
+      <button class="title-btn" id="btn-minimize" title="Minimize">─</button>
+      <button class="title-btn" id="btn-close" title="Close">✕</button>
+    </div>
+  </div>
+
+  <!-- DESKTOP GRID -->
+  <div id="desktop-grid">
+
+    <!-- LEFT COLUMN -->
+    <div class="side-column" id="left-column">
+      <div class="panel panel-tall">
+        <div class="panel-header">SYSTEM CORE</div>
+        <div class="panel-content" id="panel-system-content">
+          <div class="empty-state">Waiting for telemetry...</div>
+        </div>
+        <div class="panel-header" style="border-top:1px solid var(--panel-border)">BRAIN PATH</div>
+        <div class="panel-content" id="panel-brainpath-content" style="flex:0; min-height:48px;">
+          <div class="empty-state">Idle</div>
+        </div>
+      </div>
+      <div class="panel panel-short">
+        <div class="panel-header">AUTONOMY LOG</div>
+        <div class="panel-content" id="panel-autonomy-content">
+          <div class="empty-state">No autonomous actions yet.</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- CENTER COLUMN -->
+    <div id="center-column">
+      <div id="orb-wrapper">
+        <div id="orb-container">
+          <div class="orb-glow" id="orb-glow-outer"></div>
+          <div id="orb-core"></div>
+          <div id="reactor-center"></div>
+          <svg id="orb-svg" viewBox="0 0 240 240">
+            <g id="rings-group"></g>
+            <g id="arcs-group"></g>
+            <g id="particles-group"></g>
+          </svg>
+        </div>
+        <div id="orb-label">SLEEP</div>
+        <div id="orb-sublabel">Inactive</div>
+      </div>
+
+      <div id="hearing-strip"></div>
+
+      <div id="conv-panel">
+        <div class="panel-header">COGNITIVE STREAM</div>
+        <div id="conv-scroll"></div>
+      </div>
+    </div>
+
+    <!-- RIGHT COLUMN -->
+    <div class="side-column" id="right-column">
+      <div class="panel panel-short">
+        <div class="panel-header">COGNITIVE HORIZON</div>
+        <div class="panel-content" id="panel-cognitive-content">
+          <div class="empty-state">No predictions active.</div>
+        </div>
+      </div>
+      <div class="panel panel-tall">
+        <div class="panel-header">ACTIVE MEMORY</div>
+        <div class="panel-content" id="panel-memory-content">
+          <div class="empty-state">Context clear.</div>
+        </div>
+      </div>
+    </div>
+
+  </div>
+
+  <!-- BOTTOM METRICS -->
+  <div id="bottom-section">
+    <div id="mic-bar-row">
+      <span id="mic-bar-label">MIC</span>
+      <div id="mic-bar-track"><div id="mic-bar-fill"></div></div>
+    </div>
+    <div id="info-row">
+      <span id="mic-name">Voice I/O: Initializing...</span>
+      <span id="status-text"></span>
+      <span id="footer-label">ATOM OS &bull; APPLE SILICON NATIVE</span>
+    </div>
+  </div>
+
+  <script type="module" src="js/app.js"></script>
+</body>
+</html>

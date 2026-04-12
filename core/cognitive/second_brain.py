@@ -163,6 +163,53 @@ class SecondBrain:
 
         logger.debug("Learned fact: %s", text[:60])
 
+    def remember_report(self, topic: str, summary: str, path: str) -> None:
+        """Store compact metadata for an exported long report."""
+        topic_text = (topic or "report").strip()
+        summary_text = (summary or "").strip()
+        path_text = (path or "").strip()
+        if not summary_text or not path_text:
+            return
+        self.learn_fact(
+            (
+                f"Saved report for '{topic_text}': {summary_text} "
+                f"(file: {path_text})"
+            ),
+            source="report_export",
+            tags=["report", "summary"],
+            importance=0.72,
+        )
+
+    def prune_for_consolidation(self) -> int:
+        """Remove stale low-importance facts (dream / idle consolidation).
+
+        Drops in-memory facts that are unlikely to matter again. Vector rows
+        for removed text may remain until a future vector GC pass.
+        """
+        now = time.time()
+        kept: list[dict] = []
+        removed = 0
+        weak_sources = frozenset(
+            {"dream_consolidation", "dream_pattern", "llm_conversation"},
+        )
+        for f in self._facts:
+            imp = float(f.get("importance", 0.5))
+            age = now - float(f.get("ts", now))
+            src = str(f.get("source", ""))
+            if (
+                imp < 0.28
+                and age > 7 * 86400
+                and src in weak_sources
+            ):
+                removed += 1
+                continue
+            kept.append(f)
+        if removed:
+            self._facts = kept
+            self._dirty = True
+            logger.info("SecondBrain consolidation prune: removed %d facts", removed)
+        return removed
+
     def learn_preference(self, key: str, value: Any) -> None:
         if not key:
             return
