@@ -173,6 +173,23 @@ class CacheEngine:
             self._store.move_to_end(key)
             if len(self._store) > self._max_size:
                 self._store.popitem(last=False)
+                if self._metrics is not None:
+                    self._metrics.inc("cache_evictions")
+
+    @property
+    def max_size(self) -> int:
+        """Configured LRU capacity (``config.cache.max_size``)."""
+        return self._max_size
+
+    def stats(self) -> dict[str, float | int]:
+        """Point-in-time size/TTL for dashboards (thread-safe read)."""
+        with self._lock:
+            return {
+                "entries": len(self._store),
+                "max_size": self._max_size,
+                "ttl_seconds": round(self._ttl, 1),
+                "jaccard_scan_limit": JACCARD_SCAN_LIMIT,
+            }
 
     def invalidate(self, query: str) -> None:
         key = self._normalise(query)

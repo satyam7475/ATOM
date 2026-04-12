@@ -2,7 +2,8 @@
 ATOM v9 -- Phase 4 Context Engine Tests.
 
 Tests the ContextEngine's bundle generation, config-driven enable/disable,
-app name extraction, and failure safety -- all without mocking Win32 APIs.
+app name extraction, and failure safety (Win32 APIs are not mocked; macOS
+uses live Quartz/AppKit when available).
 
 Run: python -m tests.test_context_engine
 """
@@ -102,15 +103,14 @@ def test_custom_clipboard_max() -> None:
 
 
 def test_live_window_title() -> None:
-    """On a real Windows machine, get_active_window should return something."""
+    """On a real desktop, get_active_window should return str (often non-empty on macOS)."""
     engine = ContextEngine()
     title = engine.get_active_window()
-    # On CI or headless, this might be empty -- that's fine
     assert isinstance(title, str)
     if title:
         print(f"  PASS: Live window title: '{title[:60]}'")
     else:
-        print("  PASS: Live window title (empty -- headless or non-Windows)")
+        print("  PASS: Live window title (empty -- unsupported OS or permissions)")
 
 
 def run_all() -> None:

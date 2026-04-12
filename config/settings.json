@@ -247,6 +247,13 @@
         "dream_prewarm_embeddings": false,
         "dream_prewarm_retrieve_topics": ["work", "ATOM", "project", "schedule", "personal"]
     },
+    "proactive_coordination": {
+        "max_insights_per_hour": 20,
+        "critical_priority_max": 3,
+        "audit_log": true,
+        "audit_log_path": "logs/proactive_insights.log",
+        "window_seconds": 3600
+    },
     "proactive_engine": {
         "check_interval_s": 600,
         "m5_triggers": {
@@ -461,7 +468,7 @@
     "cloud": {
         "enabled": true,
         "provider": "gemini",
-        "gemini_api_key": "",
+        "use_secure_credentials": true,
         "buddy_model": "gemini-2.0-flash",
         "reasoning_model": "gemini-2.5-flash",
         "timeout_seconds": 8,

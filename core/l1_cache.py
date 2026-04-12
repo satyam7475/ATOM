@@ -40,12 +40,14 @@ class CacheEntry:
 class L1Cache:
     """Zero-latency in-memory cache for instant fact recall."""
 
-    __slots__ = ("_max_size", "_cache", "_sticky_cache")
+    __slots__ = ("_max_size", "_cache", "_sticky_cache", "_hits", "_misses")
 
     def __init__(self, max_size: int = 50) -> None:
         self._max_size = max_size
         self._cache: OrderedDict[str, CacheEntry] = OrderedDict()
         self._sticky_cache: dict[str, CacheEntry] = {}
+        self._hits = 0
+        self._misses = 0
 
     def set(self, key: str, value: str, sticky: bool = False) -> None:
         """Store a fact in the cache."""
@@ -77,6 +79,7 @@ class L1Cache:
             entry = self._sticky_cache[key]
             entry.access_count += 1
             entry.last_accessed = time.time()
+            self._hits += 1
             return entry.value
 
         if key in self._cache:
@@ -84,8 +87,10 @@ class L1Cache:
             entry.access_count += 1
             entry.last_accessed = time.time()
             self._cache.move_to_end(key)
+            self._hits += 1
             return entry.value
-            
+        
+        self._misses += 1
         return None
 
     def search_values(self, query: str) -> list[str]:
@@ -125,6 +130,20 @@ class L1Cache:
             return ""
             
         return " | ".join(parts)
+
+    def get_metrics(self) -> dict:
+        """Return cache hit/miss statistics."""
+        total = self._hits + self._misses
+        hit_rate = (self._hits / total * 100) if total > 0 else 0.0
+        return {
+            "hits": self._hits,
+            "misses": self._misses,
+            "total_requests": total,
+            "hit_rate_percent": round(hit_rate, 1),
+            "cached_entries": len(self._cache),
+            "sticky_entries": len(self._sticky_cache),
+            "max_size": self._max_size,
+        }
 
     def clear(self) -> None:
         """Clear non-sticky cache."""

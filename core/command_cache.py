@@ -40,25 +40,30 @@ def _should_cache_result(result: object) -> bool:
 class CommandCache:
     """LRU cache for IntentResult objects keyed by normalized text."""
 
-    __slots__ = ("_store", "_max_size", "_ttl")
+    __slots__ = ("_store", "_max_size", "_ttl", "_hits", "_misses")
 
     def __init__(self, max_size: int = DEFAULT_MAX_SIZE,
                  ttl: float = DEFAULT_TTL_S) -> None:
         self._store: OrderedDict[str, tuple[float, object]] = OrderedDict()
         self._max_size = max_size
         self._ttl = ttl
+        self._hits = 0
+        self._misses = 0
 
     def get(self, text: str) -> object | None:
         """Return cached IntentResult if fresh, else None."""
         key = text.lower().strip()
         entry = self._store.get(key)
         if entry is None:
+            self._misses += 1
             return None
         ts, result = entry
         if (time.monotonic() - ts) > self._ttl:
             del self._store[key]
+            self._misses += 1
             return None
         self._store.move_to_end(key)
+        self._hits += 1
         logger.info("Command cache HIT: '%s'", key[:40])
         return result
 
@@ -84,6 +89,20 @@ class CommandCache:
     @property
     def size(self) -> int:
         return len(self._store)
+
+    def get_metrics(self) -> dict:
+        """Return cache hit/miss statistics."""
+        total = self._hits + self._misses
+        hit_rate = (self._hits / total * 100) if total > 0 else 0.0
+        return {
+            "hits": self._hits,
+            "misses": self._misses,
+            "total_requests": total,
+            "hit_rate_percent": round(hit_rate, 1),
+            "cached_entries": len(self._store),
+            "max_size": self._max_size,
+            "ttl_seconds": self._ttl,
+        }
 
     def clear(self) -> None:
         self._store.clear()

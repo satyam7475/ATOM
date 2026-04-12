@@ -29,7 +29,7 @@ class MetricsCollector:
 
     __slots__ = (
         "_lock", "_start_time",
-        "resume_listening_events", "cache_hits", "cache_misses",
+        "resume_listening_events", "cache_hits", "cache_misses", "cache_evictions",
         "llm_calls", "llm_errors", "stt_sessions",
         "errors_total", "queries_total",
         "llm_queue_coalesced", "llm_preempted", "watchdog_recoveries",
@@ -45,6 +45,7 @@ class MetricsCollector:
         self.resume_listening_events: int = 0
         self.cache_hits: int = 0
         self.cache_misses: int = 0
+        self.cache_evictions: int = 0
         self.llm_calls: int = 0
         self.llm_errors: int = 0
         self.stt_sessions: int = 0
@@ -126,6 +127,7 @@ class MetricsCollector:
             "queries_total": self.queries_total,
             "cache_hits": self.cache_hits,
             "cache_misses": self.cache_misses,
+            "cache_evictions": self.cache_evictions,
             "cache_hit_rate_pct": round(hit_rate, 1),
             "llm_calls": self.llm_calls,
             "llm_errors": self.llm_errors,

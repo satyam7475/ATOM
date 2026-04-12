@@ -1,3 +1,11 @@
+"""
+Keyword intent classifier for the legacy ``local_cognitive_pipeline`` only.
+
+The live assistant uses :mod:`core.intent_engine`. Do not extend this module for
+new routing behavior.
+
+See ``docs/ARCHITECTURE_CANONICAL.md``.
+"""
 from __future__ import annotations
 
 import re

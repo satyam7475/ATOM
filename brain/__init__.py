@@ -1,3 +1,7 @@
+"""
+Brain package: **MLX + memory graph are canonical**; several modules duplicate
+``core/`` and are legacy — see ``docs/ARCHITECTURE_CANONICAL.md``.
+"""
 from .intent_engine import IntentEngine, Intent
 from .context_router import ContextRouter
 from .memory_graph import MemoryGraph, MemoryNode

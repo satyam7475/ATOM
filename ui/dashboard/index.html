@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>A.T.O.M. v15</title>
+<title>ATOM — Dashboard</title>
 <style>
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
 @import url('https://fonts.googleapis.com/css2?family=Sora:wght@300;400;500;600;700&family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap');
@@ -458,6 +458,8 @@ html,body{
         <div class="cockpit-card">
           <div class="cockpit-label">Runtime Truth</div>
           <div class="cockpit-value" id="memoryRagStatus">Checking runtime...</div>
+          <div class="cockpit-sub" id="executionStateText">Execution: —</div>
+          <div class="cockpit-sub" id="experienceLine">Voice & assistant —</div>
           <div class="cockpit-sub" id="recentActionText">Waiting for activity.</div>
         </div>
       </div>
@@ -465,7 +467,7 @@ html,body{
 
     <!-- Text input fallback -->
     <div class="text-input-wrap">
-      <input class="text-input" id="textInput" type="text" placeholder="Type a command or question..." autocomplete="off">
+      <input class="text-input" id="textInput" type="text" placeholder="Type here or use the mic when listening — same pipeline as speech." autocomplete="off">
       <button class="text-send-btn" id="textSendBtn">SEND</button>
     </div>
   </div>
@@ -743,6 +745,27 @@ function connect(){
         showAtomBubble('Switching to '+modeLabel(d.mode)+' mode...');
         break;
       case 'runtime_settings':updateRuntimeUI(d.brain_profile,d.assistant_mode);break;
+      case 'execution_state':
+        if($('executionStateText')){
+          const lab=d.label!=null?String(d.label):'—';
+          let line='Execution: '+lab;
+          if(d.cache_max!=null&&d.cache_entries!=null){
+            line+=' · cache '+d.cache_entries+'/'+d.cache_max;
+          }
+          $('executionStateText').textContent=line;
+        }
+        if($('experienceLine')){
+          const am=d.assistant_mode?String(d.assistant_mode).replace(/_/g,' '):'';
+          const se=d.stt_engine&&d.stt_engine!=='—'?d.stt_engine:'';
+          const te=d.tts_engine&&d.tts_engine!=='—'?d.tts_engine:'';
+          const vv=d.tts_voice?String(d.tts_voice):'';
+          const bits=[];
+          if(se||te)bits.push('STT '+ (se||'—')+' · TTS '+ (te||'—'));
+          if(vv)bits.push(vv);
+          if(am)bits.push(am);
+          $('experienceLine').textContent=bits.length?bits.join(' · '):'Voice & assistant —';
+        }
+        break;
       case 'mode_update':
         document.querySelectorAll('.pod-btn[data-mode]').forEach(b=>{if(!b.classList.contains('perf-btn'))b.classList.toggle('active',b.dataset.mode===d.current);});
         break;

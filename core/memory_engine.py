@@ -435,6 +435,22 @@ class MemoryEngine:
 
         return [s for _, s in deduped]
 
+    @staticmethod
+    def format_scored_for_prompt(
+        pairs: list[tuple[str, float]],
+        *,
+        max_items: int = 8,
+        max_chars: int = 200,
+    ) -> list[str]:
+        """Format (text, score) pairs for prompt injection — top-k with visible scores."""
+        out: list[str] = []
+        for text, score in pairs[:max_items]:
+            t = (text or "").strip().replace("\n", " ")
+            if len(t) > max_chars:
+                t = t[: max_chars - 1] + "…"
+            out.append(f"[{float(score):.2f}] {t}")
+        return out
+
     async def retrieve_with_scores(self, query: str, k: int = 5) -> list[tuple[str, float]]:
         """Retrieve memories with their relevance scores."""
         k = self._effective_top_k(k)

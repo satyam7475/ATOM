@@ -38,6 +38,7 @@ class VoiceInterruptHandler:
         tts: Any,
         interrupt_manager: Any = None,
         local_brain: Any = None,
+        llm_queue: Any = None,
         indicator: Any = None,
         emit_cooldown_s: float = 0.35,
     ) -> None:
@@ -46,6 +47,7 @@ class VoiceInterruptHandler:
         self._tts = tts
         self._interrupt_mgr = interrupt_manager
         self._local_brain = local_brain
+        self._llm_queue = llm_queue
         self._indicator = indicator
         self._emit_cooldown_s = max(0.0, float(emit_cooldown_s))
         self._lock = asyncio.Lock()
@@ -135,6 +137,11 @@ class VoiceInterruptHandler:
                         self._local_brain.request_preempt()
                     except Exception:
                         logger.debug("Voice interrupt brain preempt failed", exc_info=True)
+                if self._llm_queue is not None:
+                    try:
+                        await self._llm_queue.clear_pending()
+                    except Exception:
+                        logger.debug("Voice interrupt LLM queue clear failed", exc_info=True)
 
             if current is AtomState.SPEAKING:
                 await self._stop_tts()

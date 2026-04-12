@@ -82,7 +82,7 @@ async def main() -> None:
         from core.identity.session_manager import configure as _configure_sessions
         _configure_sessions(config)
     except Exception:
-        pass
+        logger.debug("Session manager configure skipped or failed", exc_info=True)
     logger.info(
         "ATOM owner binding: %s — access control via core/owner_gate.py",
         owner_display_name(),
@@ -363,6 +363,53 @@ async def main() -> None:
         )
         tts_runtime_label = f"Edge fallback ({tts_cfg.get('edge_voice')})"
 
+    # ── Boot order (runtime truth) ─────────────────────────────────
+    # InferenceGuard + SiliconGovernor before CognitiveKernel so routing sees
+    # VRAM/hardware state. CognitiveKernel before LocalBrain/RAG so semantic
+    # stack detection (_semantic_stack_available) gates RAG without forward refs.
+    inference_guard = None
+    recovery_mgr = None
+    gpu_stall_wd = None
+    if (config.get("v7_gpu") or {}).get("enabled", True):
+        from core.inference_guard import InferenceGuard
+        from core.recovery_manager import RecoveryManager
+        from core.gpu_watchdog import GPUStallWatchdog
+
+        inference_guard = InferenceGuard(bus, config)
+        recovery_mgr = RecoveryManager(bus, config)
+        gpu_stall_wd = GPUStallWatchdog(bus, config)
+        gpu_stall_wd.start()
+        inference_guard.start_power_task()
+        logger.info(
+            "ATOM V7: InferenceGuard + RecoveryManager + GPUStallWatchdog (Apple Silicon)",
+        )
+
+    silicon_governor = None
+    if config.get("gpu", {}).get("enabled", True):
+        from core.silicon_governor import SiliconGovernor
+        silicon_governor = SiliconGovernor(bus, config)
+        if silicon_governor.is_available:
+            logger.info("Silicon Governor: monitoring active (%s)", silicon_governor.gpu_name)
+
+    from core.cognitive_kernel import CognitiveKernel, ExecPath
+
+    cognitive_kernel = CognitiveKernel(
+        config=config,
+        bus=bus,
+        brain_mode_manager=brain_mode_mgr,
+        intent_engine=intent_engine,
+        cache_engine=cache,
+        metrics=metrics,
+        inference_guard=inference_guard,
+        silicon_governor=silicon_governor,
+        state_manager=state,
+    )
+    router.attach_cognitive_kernel(cognitive_kernel)
+    logger.info(
+        "Cognitive Kernel: routing through %s paths",
+        ", ".join(e.value for e in ExecPath),
+    )
+
     brain_enabled = config.get("brain", {}).get("enabled", False)
 
     from cursor_bridge.structured_prompt_builder import StructuredPromptBuilder
@@ -416,6 +463,53 @@ async def main() -> None:
     else:
         logger.info("Local brain DISABLED — enable brain.enabled for voice Q&A")
 
+    if inference_guard is not None and brain_enabled and local_brain is not None:
+        local_brain.attach_inference_guard(inference_guard)
+
+    _memory_pressure_threshold = float(
+        (config.get("memory") or {}).get("pressure_threshold_pct", 85.0),
+    )
+    _memory_pressure_relief = float(
+        (config.get("memory") or {}).get(
+            "pressure_relief_pct",
+            max(0.0, _memory_pressure_threshold - 10.0),
+        ),
+    )
+    _embedding_pressure_unloaded = False
+
+    async def _on_silicon_stats_update(stats=None, **_kw) -> None:
+        nonlocal _embedding_pressure_unloaded
+        if not isinstance(stats, dict):
+            return
+        try:
+            memory_pct = float(stats.get("memory_pct", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            return
+
+        try:
+            memory.apply_memory_pressure(memory_pct)
+        except Exception:
+            logger.info("MemoryEngine pressure hook failed", exc_info=True)
+
+        if local_brain is not None and hasattr(local_brain, "apply_memory_pressure"):
+            try:
+                local_brain.apply_memory_pressure(memory_pct)
+            except Exception:
+                logger.info("Local brain pressure hook failed", exc_info=True)
+
+        if inference_guard is None:
+            return
+
+        if memory_pct >= _memory_pressure_threshold:
+            if not _embedding_pressure_unloaded:
+                inference_guard.mark_loaded("embeddings", False)
+                inference_guard.request_unload("embeddings", "memory_pressure")
+                _embedding_pressure_unloaded = True
+        elif memory_pct <= _memory_pressure_relief:
+            _embedding_pressure_unloaded = False
+
+    bus.on("silicon_stats_update", _on_silicon_stats_update)
+
     from core.llm_inference_queue import LLMInferenceQueue
     from core.priority_scheduler import PriorityScheduler
     from core.runtime_watchdog import RuntimeWatchdog
@@ -435,25 +529,6 @@ async def main() -> None:
         logger.info("Priority scheduler ON (voice > LLM > background)")
     else:
         logger.info("Priority scheduler OFF (use_priority_scheduler=false)")
-
-    inference_guard = None
-    recovery_mgr = None
-    gpu_stall_wd = None
-    if (config.get("v7_gpu") or {}).get("enabled", True):
-        from core.inference_guard import InferenceGuard
-        from core.recovery_manager import RecoveryManager
-        from core.gpu_watchdog import GPUStallWatchdog
-
-        inference_guard = InferenceGuard(bus, config)
-        recovery_mgr = RecoveryManager(bus, config)
-        gpu_stall_wd = GPUStallWatchdog(bus, config)
-        gpu_stall_wd.start()
-        inference_guard.start_power_task()
-        if brain_enabled and local_brain is not None:
-            local_brain.attach_inference_guard(inference_guard)
-        logger.info(
-            "ATOM V7: InferenceGuard + RecoveryManager + GPUStallWatchdog (Apple Silicon)",
-        )
 
     pipeline_timer = PipelineTimer(bus, metrics)
     pipeline_timer.register()
@@ -511,7 +586,6 @@ async def main() -> None:
 
     # ── Reasoning Engine ───────────────────────────────────────────
     from core.reasoning.tool_registry import get_tool_registry
-    from core.reasoning.planner import ReasoningPlanner
     from core.reasoning.code_sandbox import CodeSandbox
     from core.reasoning.workflow_engine import WorkflowEngine
     from core.document_ingestion import DocumentIngestionEngine
@@ -521,15 +595,14 @@ async def main() -> None:
         config=config,
         command_registry=command_registry,
     )
-    reasoning_planner = ReasoningPlanner(config)
-    reasoning_planner.set_timeline(timeline_memory)
-    reasoning_planner.set_system_monitor(system_monitor)
+    # ReasoningPlanner (core/reasoning/planner.py) is the multi-step planning library;
+    # wire it from Router or LocalBrainController when orchestration should use it — see docs/ARCHITECTURE_CANONICAL.md
     code_sandbox = CodeSandbox(config)
     workflow_engine = WorkflowEngine(config)
     document_engine = DocumentIngestionEngine(config)
 
     logger.info(
-        "Reasoning engine initialized: %d tools, planner, sandbox, workflows, documents",
+        "Reasoning engine initialized: %d tools, sandbox, workflows, documents",
         tool_registry.count,
     )
 
@@ -569,78 +642,6 @@ async def main() -> None:
             screen_reader.ocr_backend,
         )
 
-    # ── Silicon Governor (Apple Silicon hardware monitoring) ──────
-    silicon_governor = None
-    if config.get("gpu", {}).get("enabled", True):
-        from core.silicon_governor import SiliconGovernor
-        silicon_governor = SiliconGovernor(bus, config)
-        if silicon_governor.is_available:
-            logger.info("Silicon Governor: monitoring active (%s)", silicon_governor.gpu_name)
-
-    _memory_pressure_threshold = float(
-        (config.get("memory") or {}).get("pressure_threshold_pct", 85.0),
-    )
-    _memory_pressure_relief = float(
-        (config.get("memory") or {}).get(
-            "pressure_relief_pct",
-            max(0.0, _memory_pressure_threshold - 10.0),
-        ),
-    )
-    _embedding_pressure_unloaded = False
-
-    async def _on_silicon_stats_update(stats=None, **_kw) -> None:
-        nonlocal _embedding_pressure_unloaded
-        if not isinstance(stats, dict):
-            return
-        try:
-            memory_pct = float(stats.get("memory_pct", 0.0) or 0.0)
-        except Exception:
-            return
-
-        try:
-            memory.apply_memory_pressure(memory_pct)
-        except Exception:
-            logger.debug("MemoryEngine pressure hook failed", exc_info=True)
-
-        if local_brain is not None and hasattr(local_brain, "apply_memory_pressure"):
-            try:
-                local_brain.apply_memory_pressure(memory_pct)
-            except Exception:
-                logger.debug("Local brain pressure hook failed", exc_info=True)
-
-        if inference_guard is None:
-            return
-
-        if memory_pct >= _memory_pressure_threshold:
-            if not _embedding_pressure_unloaded:
-                inference_guard.mark_loaded("embeddings", False)
-                inference_guard.request_unload("embeddings", "memory_pressure")
-                _embedding_pressure_unloaded = True
-        elif memory_pct <= _memory_pressure_relief:
-            _embedding_pressure_unloaded = False
-
-    bus.on("silicon_stats_update", _on_silicon_stats_update)
-
-    # ── Cognitive Kernel (central brain coordinator) ────────────────
-    from core.cognitive_kernel import CognitiveKernel, ExecPath
-
-    cognitive_kernel = CognitiveKernel(
-        config=config,
-        bus=bus,
-        brain_mode_manager=brain_mode_mgr,
-        intent_engine=intent_engine,
-        cache_engine=cache,
-        metrics=metrics,
-        inference_guard=inference_guard,
-        silicon_governor=silicon_governor,
-        state_manager=state,
-    )
-    router.attach_cognitive_kernel(cognitive_kernel)
-    logger.info(
-        "Cognitive Kernel: routing through %s paths",
-        ", ".join(e.value for e in ExecPath),
-    )
-
     # ── v22: Hybrid Intelligence Layer (Security Gateway + Cloud + Confidence) ──
     from core.security_gateway import SecurityGateway
     from core.cloud.gemini_client import GeminiClient
@@ -656,18 +657,18 @@ async def main() -> None:
     semantic_cache = SemanticCache(config)
     preference_store = PreferenceStore(config)
 
-    # Gemini client: load API key from config, vault, or env
+    # Gemini client: load API key from secure credentials
+    from core.secrets_manager import get_gemini_fast_key
+    
     gemini_client = GeminiClient(config, security_gateway=security_gateway)
-    _gemini_key = (config.get("cloud", {}).get("gemini_api_key") or "").strip()
-    if not _gemini_key:
-        import os
-        _gemini_key = os.environ.get("GEMINI_API_KEY", "").strip()
+    _gemini_key = get_gemini_fast_key()
+    
     if _gemini_key:
         gemini_client.configure_api_key(_gemini_key)
+        logger.info("Gemini API key loaded from secure storage")
     else:
-        logger.info(
-            "Gemini API key not set — cloud reasoning disabled. "
-            "Set cloud.gemini_api_key in settings.json or GEMINI_API_KEY env var."
+        logger.warning(
+            "Gemini API key not found. Run: python scripts/setup_api_keys.py"
         )
 
     search_tool = SearchTool(
@@ -730,7 +731,7 @@ async def main() -> None:
     try:
         security_gateway.attach_audit_trail(security_fortress._audit)
     except Exception:
-        logger.debug("SecurityGateway audit trail wiring skipped", exc_info=True)
+        logger.info("SecurityGateway audit trail wiring skipped", exc_info=True)
 
     code_introspector.scan()
     logger.info(
@@ -774,9 +775,9 @@ async def main() -> None:
                         ", ".join(_fw["paths"]),
                     )
                 else:
-                    logger.debug("FSWatcher: could not start")
+                    logger.warning("FSWatcher: could not start")
         except Exception:
-            logger.debug("FSWatcher init failed", exc_info=True)
+            logger.warning("FSWatcher init failed", exc_info=True)
 
     logger.info(
         "JARVIS intelligence initialized: PlatformAdapter(%s) + "
@@ -834,6 +835,9 @@ async def main() -> None:
 
     # ── JARVIS Core (intelligence fusion) ───────────────────────────
     from core.jarvis_core import JarvisCore
+    from core.proactive_quota import ProactiveInsightQuota
+
+    proactive_quota = ProactiveInsightQuota(config)
 
     jarvis_core = JarvisCore(
         bus,
@@ -856,6 +860,7 @@ async def main() -> None:
         scanner=system_scanner,
         memory=memory,
         conv_memory=conv_memory,
+        timeline=timeline_memory,
         jarvis=jarvis_core,
     )
 
@@ -865,12 +870,23 @@ async def main() -> None:
         bus=bus,
         config=config,
         brain_mode_manager=brain_mode_mgr,
+        proactive_quota=proactive_quota,
     )
     proactive_intel.wire(
         behavior=behavior,
         conv_memory=conv_memory,
         owner=owner_understanding,
         goals=goal_engine,
+    )
+
+    jarvis_core.wire_intelligence(
+        fusion=context_fusion,
+        behavior=behavior,
+        prediction=prediction_engine if cognitive_enabled else None,
+        conv_memory=conv_memory,
+        memory=memory,
+        goals=goal_engine if cognitive_enabled else None,
+        quota=proactive_quota,
     )
 
     if cognitive_enabled:
@@ -1294,6 +1310,53 @@ async def main() -> None:
 
         web_dashboard.set_text_input_callback(_on_text_input)
 
+        def _execution_state_payload() -> dict:
+            """Interrupt-control surface: queue + MLX + priority scheduler (best-effort)."""
+            sch_q = 0
+            if priority_sched is not None:
+                try:
+                    sch_q = int(priority_sched.get_diagnostics().get("queue_depth", 0))
+                except Exception:
+                    sch_q = 0
+            parts: list[str] = []
+            if llm_queue is not None and llm_queue.has_pending():
+                parts.append("LLM queued")
+            if local_brain is not None and local_brain.is_mlx_generating():
+                parts.append("MLX active")
+            if sch_q > 0:
+                parts.append(f"prio q={sch_q}")
+            try:
+                cs = cache.stats()
+            except Exception:
+                cs = {"entries": 0, "max_size": 0, "ttl_seconds": 0.0, "jaccard_scan_limit": 0}
+
+            stt_cfg = config.get("stt") or {}
+            tts_cfg = config.get("tts") or {}
+            stt_engine = str(stt_cfg.get("engine", "")).strip() or "—"
+            tts_engine = str(tts_cfg.get("engine", "")).strip() or "—"
+            tts_voice = str(
+                tts_cfg.get("edge_voice") or tts_cfg.get("voice") or "",
+            ).strip()
+            try:
+                assistant_mode_live = str(assistant_mode_mgr.active or "").strip()
+            except Exception:
+                assistant_mode_live = ""
+
+            return {
+                "label": " · ".join(parts) if parts else "idle",
+                "llm_queue_pending": bool(llm_queue is not None and llm_queue.has_pending()),
+                "mlx_generating": bool(local_brain is not None and local_brain.is_mlx_generating()),
+                "scheduler_queue_depth": sch_q,
+                "cache_entries": int(cs.get("entries", 0)),
+                "cache_max": int(cs.get("max_size", 0)),
+                "stt_engine": stt_engine,
+                "tts_engine": tts_engine,
+                "tts_voice": tts_voice[:48],
+                "assistant_mode": assistant_mode_live,
+            }
+
+        web_dashboard.set_execution_state_provider(_execution_state_payload)
+
         def _v7_health_payload() -> dict:
             from core.cognition.preemption import get_last_preemption_score
             from core.observability.debug_snapshot import get_debug_snapshot
@@ -1550,8 +1613,7 @@ async def main() -> None:
             if bat and bat.percent < 20:
                 greeting += f" Heads up, battery is at {bat.percent:.0f} percent."
         except Exception:
-            logger.debug("Battery check failed", exc_info=True)
-
+                    logger.info("Battery check failed", exc_info=True)
         logger.info("Startup greeting: %s", greeting[:200])
 
         await state.transition(AtomState.THINKING)
@@ -1595,7 +1657,7 @@ async def main() -> None:
                     battery_pct = float(getattr(silicon_stats, "battery_pct", 100.0) or 100.0)
                     on_battery = bool(getattr(silicon_stats, "on_battery", False))
                 except Exception:
-                    logger.debug("Silicon telemetry read failed", exc_info=True)
+                    logger.info("Silicon telemetry read failed", exc_info=True)
 
             if cpu <= 0:
                 cpu = psutil.cpu_percent(interval=1.0)

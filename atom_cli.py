@@ -92,15 +92,35 @@ def cmd_health() -> None:
     """V6.5 system health score (0–10) from telemetry + profiler snapshot."""
     try:
         from core.health_monitor import compute_v65_health_score
-    except Exception:
+        from core.l1_cache import l1_cache
+        from core.command_cache import get_command_cache
+    except Exception as e:
         print("=== ATOM health (V6.5) ===")
-        print("(health module unavailable — run from ATOM directory on PYTHONPATH)")
+        print(f"(health module unavailable: {e})")
         return
+    
     report = compute_v65_health_score()
     score = report.get("health_score_10", 0)
+    
     print("=== ATOM health (V6.5) ===")
     print(f"ATOM Health: {score} / 10")
+    print()
+    print("System Status:")
     print(json.dumps(report, indent=2))
+    
+    # Cache metrics
+    print()
+    print("Cache Performance:")
+    l1_metrics = l1_cache.get_metrics()
+    print(f"  L1 Cache: {l1_metrics['hit_rate_percent']}% hit rate "
+          f"({l1_metrics['hits']} hits, {l1_metrics['misses']} misses)")
+    print(f"    Entries: {l1_metrics['cached_entries']}/{l1_metrics['max_size']}")
+    
+    cmd_cache = get_command_cache()
+    cmd_metrics = cmd_cache.get_metrics()
+    print(f"  Command Cache: {cmd_metrics['hit_rate_percent']}% hit rate "
+          f"({cmd_metrics['hits']} hits, {cmd_metrics['misses']} misses)")
+    print(f"    Entries: {cmd_metrics['cached_entries']}/{cmd_metrics['max_size']}")
 
 
 def main(argv: list[str] | None = None) -> int:

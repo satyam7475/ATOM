@@ -81,6 +81,7 @@ class ProactiveIntelligenceEngine:
         "_m5",
         "_last_scan",
         "_brain_mode_mgr",
+        "_quota",
     )
 
     def __init__(
@@ -88,6 +89,7 @@ class ProactiveIntelligenceEngine:
         bus: AsyncEventBus,
         config: dict | None = None,
         brain_mode_manager: Any | None = None,
+        proactive_quota: Any | None = None,
     ) -> None:
         self._bus = bus
         cfg = (config or {}).get("proactive_engine", {})
@@ -114,6 +116,20 @@ class ProactiveIntelligenceEngine:
         self._morning_briefing_date: str = ""
         self._last_download_insight: float = 0.0
         self._last_scan: dict[str, Any] | None = None
+        self._quota = proactive_quota
+
+    def _emit_insight(self, insight_data: dict[str, Any]) -> None:
+        cat = str(insight_data.get("category", ""))
+        src = str(insight_data.get("source", "proactive_intel"))
+        pr_raw = insight_data.get("priority")
+        try:
+            p = int(pr_raw) if pr_raw is not None else None
+        except (TypeError, ValueError):
+            p = None
+        q = self._quota
+        if q is not None and not q.allow_emit(src, cat, p):
+            return
+        self._bus.emit_long("jarvis_insight", **insight_data)
 
     def _background_enabled(self) -> bool:
         mgr = self._brain_mode_mgr
@@ -180,7 +196,7 @@ class ProactiveIntelligenceEngine:
                     continue
                 insights = self.scan()
                 for insight_data in insights:
-                    self._bus.emit_long("jarvis_insight", **insight_data)
+                    self._emit_insight(insight_data)
             except Exception:
                 logger.debug("Proactive scan error", exc_info=True)
 
@@ -211,24 +227,28 @@ class ProactiveIntelligenceEngine:
         
         # 0ms latency mathematical delta check, keeps LLM asleep
         if latest_ram - old_ram > 20.0 and latest_ram > 75.0:
-            self._bus.emit_long(
-                "jarvis_insight",
-                message=f"Boss, your RAM usage just jumped by {latest_ram - old_ram:.0f} percent. We're at {latest_ram:.0f} percent total capacity.",
-                category="system",
-                priority=8,
-                source="proactive_scanner"
-            )
+            self._emit_insight({
+                "message": (
+                    f"Boss, your RAM usage just jumped by {latest_ram - old_ram:.0f} "
+                    f"percent. We're at {latest_ram:.0f} percent total capacity."
+                ),
+                "category": "system",
+                "priority": 8,
+                "source": "proactive_scanner",
+            })
             
         latest_cpu = scan.get("cpu_percent", 0)
         old_cpu = old_scan.get("cpu_percent", 0)
         if latest_cpu - old_cpu > 40.0 and latest_cpu > 80.0:
-            self._bus.emit_long(
-                "jarvis_insight",
-                message=f"Boss, massive CPU spike detected. We just hit {latest_cpu:.0f} percent. Something heavy just started.",
-                category="system",
-                priority=8,
-                source="proactive_scanner"
-            )
+            self._emit_insight({
+                "message": (
+                    f"Boss, massive CPU spike detected. We just hit {latest_cpu:.0f} "
+                    f"percent. Something heavy just started."
+                ),
+                "category": "system",
+                "priority": 8,
+                "source": "proactive_scanner",
+            })
 
     async def _on_idle_detected(self, idle_minutes: float = 0, **_kw: Any) -> None:
         """Track idle streak for goal-aware nudges (M5 Phase 6.1)."""
@@ -266,16 +286,15 @@ class ProactiveIntelligenceEngine:
             return
         self._last_download_insight = now
         name = path.rsplit("/", 1)[-1][:80]
-        self._bus.emit_long(
-            "jarvis_insight",
-            message=(
+        self._emit_insight({
+            "message": (
                 f"Boss, new file landed: {name}. "
                 f"Want a quick summary or should I file it away?"
             ),
-            category="context_download",
-            priority=4,
-            source="proactive_fs",
-        )
+            "category": "context_download",
+            "priority": 4,
+            "source": "proactive_fs",
+        })
 
     # ── Scan All Triggers ─────────────────────────────────────────────
 

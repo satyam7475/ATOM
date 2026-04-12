@@ -363,6 +363,7 @@ class NativeATOMWindow:
     def set_text_input_callback(self, callback: Callable) -> None: pass
     def set_unstick_callback(self, callback: Callable) -> None: pass
     def set_v7_health_provider(self, provider: Callable) -> None: pass
+    def set_execution_state_provider(self, provider: Callable | None) -> None: pass
     def broadcast_perf_mode(self, mode: str, **_kw: Any) -> None: pass
     def broadcast_runtime_settings(self, *args: Any, **kwargs: Any) -> None: pass
     def broadcast_habits(self, habits: list) -> None: pass

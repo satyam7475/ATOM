@@ -1,3 +1,11 @@
+"""
+Legacy goal queue used by older brain subgraphs.
+
+Deprecated for new features: use :mod:`core.cognitive.goal_engine` (wired from
+``main.py``). This file remains for backward compatibility.
+
+See ``docs/ARCHITECTURE_CANONICAL.md``.
+"""
 import hashlib
 import uuid
 import logging

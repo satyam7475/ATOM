@@ -40,6 +40,8 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, TYPE_CHECKING
 
+from core.memory.timeline_memory import TimelineMemory
+
 if TYPE_CHECKING:
     from core.async_event_bus import AsyncEventBus
     from core.conversation_memory import ConversationMemory
@@ -92,7 +94,10 @@ class FusedContext:
     # Conversation
     conversation: ConversationState = field(default_factory=ConversationState)
 
-    # Memory
+    # Memory tiers (see docs/MEMORY_CONTEXT_LAYERS.md)
+    short_term_summary: str = ""       # ConversationMemory — session turns / topics
+    timeline_summary: str = ""          # TimelineMemory — episodic rolling window
+    longterm_store_hint: str = ""     # MemoryEngine stats (async top-k runs in agent path)
     relevant_memories: list[str] = field(default_factory=list)
     relevant_facts: list[str] = field(default_factory=list)
     l1_cache_summary: str = ""
@@ -130,6 +135,8 @@ class FusedContext:
             (min(1.0, len(self.conversation.topic_thread) / 3), 1.0),
             # Memory retrieval (relevant memories = grounded response)
             (min(1.0, len(self.relevant_memories) / 2), 1.5),
+            (min(1.0, len(self.short_term_summary) / 120), 0.6),
+            (min(1.0, len(self.timeline_summary) / 120), 0.6),
             # Facts available
             (min(1.0, len(self.relevant_facts) / 2), 1.0),
             # Active project awareness
@@ -153,6 +160,7 @@ class ContextFusionEngine:
 
     __slots__ = (
         "_bus", "_owner", "_scanner", "_memory", "_conv_memory",
+        "_timeline",
         "_jarvis", "_session_start", "_last_fused_context",
         "_action_log", "_config",
     )
@@ -168,6 +176,7 @@ class ContextFusionEngine:
         self._scanner: SystemScanner | None = None
         self._memory: MemoryEngine | None = None
         self._conv_memory: ConversationMemory | None = None
+        self._timeline: TimelineMemory | None = None
         self._jarvis: JarvisCore | None = None
         self._session_start = time.time()
         self._last_fused_context: FusedContext | None = None
@@ -179,6 +188,7 @@ class ContextFusionEngine:
         scanner: SystemScanner | None = None,
         memory: MemoryEngine | None = None,
         conv_memory: ConversationMemory | None = None,
+        timeline: TimelineMemory | None = None,
         jarvis: JarvisCore | None = None,
     ) -> None:
         """Wire intelligence sources after initialization."""
@@ -186,6 +196,7 @@ class ContextFusionEngine:
         self._scanner = scanner
         self._memory = memory
         self._conv_memory = conv_memory
+        self._timeline = timeline
         self._jarvis = jarvis
 
     def log_action(self, action: str, detail: str = "") -> None:
@@ -275,7 +286,31 @@ class ContextFusionEngine:
         if self._owner:
             conv.sentiment_arc = self._owner.emotion.trajectory
 
-        # ── Memory layer ──
+        # ── Memory layer (tiers: ST session, timeline, LT store hint, L1 fast cache) ──
+        if self._conv_memory:
+            try:
+                ctx.short_term_summary = self._conv_memory.recent_summary(5)
+            except Exception:
+                ctx.short_term_summary = ""
+
+        if self._timeline is not None:
+            try:
+                tw = float((self._config.get("memory") or {}).get("timeline_window_sec", 600.0))
+                ctx.timeline_summary = self._timeline.summary_for_prompt(
+                    window_sec=tw, max_lines=4,
+                )
+            except Exception:
+                ctx.timeline_summary = ""
+
+        if self._memory is not None:
+            try:
+                mode = "semantic+keyword" if self._memory.vectors_ready else "keyword"
+                ctx.longterm_store_hint = (
+                    f"{self._memory.entry_count} Q&A entries · {mode} top-k retrieval"
+                )
+            except Exception:
+                ctx.longterm_store_hint = ""
+
         try:
             from core.l1_cache import l1_cache
             ctx.l1_cache_summary = l1_cache.get_summary_for_llm()
@@ -341,6 +376,15 @@ class ContextFusionEngine:
                 f"[CONVERSATION] Depth: {ctx.conversation.depth} "
                 f"({ctx.conversation.turn_count} turns)"
             )
+
+        if ctx.short_term_summary:
+            lines.append(f"[SHORT_TERM / SESSION]\n{ctx.short_term_summary}")
+
+        if ctx.timeline_summary:
+            lines.append(f"[EPISODIC_TIMELINE]\n{ctx.timeline_summary}")
+
+        if ctx.longterm_store_hint:
+            lines.append(f"[LONG_TERM_STORE] {ctx.longterm_store_hint}")
 
         if ctx.should_be_brief:
             lines.append(

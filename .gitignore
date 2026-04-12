@@ -1,9 +1,11 @@
-# Runtime data (SQLite, caches, security vault, voice profiles)
+# Runtime data (SQLite, caches, security vault, voice profiles, vector DB)
 data/
+atom_vector_db/
 
-# Logs
+# Logs and test output
 logs/
 *.log
+.test_results/
 
 # Environment
 .env
@@ -35,3 +37,34 @@ models/*-mlx/
 # OS
 Thumbs.db
 desktop.ini
+
+# ═════════════════════════════════════════════════════════════
+# ATOM API Credentials - NEVER COMMIT
+# ═════════════════════════════════════════════════════════════
+
+# User credentials and secrets
+~/.atom/
+.atom/
+credentials/
+secrets/
+*.enc
+*.key
+.mk
+
+# API keys (if accidentally created in repo)
+api_keys.json
+gemini_keys.json
+credentials.json
+
+# Environment files with credentials
+.env.local
+.env.credentials
+
+# Master password backup files
+.master_password*
+password_backup*
+
+# OS secrets
+.DS_Store
+*.pem
+*.p12

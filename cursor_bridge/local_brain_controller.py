@@ -413,7 +413,7 @@ class LocalBrainController:
                 importance=0.72,
             )
         except Exception:
-            logger.debug("Failed to remember exported report", exc_info=True)
+            logger.info("Failed to remember exported report", exc_info=True)
 
     def _maybe_export_report(
         self,
@@ -490,12 +490,12 @@ class LocalBrainController:
             try:
                 self._rag_engine.apply_memory_pressure(memory_pct)
             except Exception:
-                logger.debug("Local brain RAG pressure hook failed", exc_info=True)
+                logger.info("Local brain RAG pressure hook failed", exc_info=True)
         if self._memory_graph is not None:
             try:
                 self._memory_graph.apply_memory_pressure(memory_pct)
             except Exception:
-                logger.debug("Local brain MemoryGraph pressure hook failed", exc_info=True)
+                logger.info("Local brain MemoryGraph pressure hook failed", exc_info=True)
 
     def set_action_executor(self, executor: "ActionExecutor") -> None:
         """Inject the ActionExecutor after Router initialization."""
@@ -512,6 +512,13 @@ class LocalBrainController:
 
     def request_preempt(self) -> None:
         self._llm.request_abort_preempt()
+
+    def is_mlx_generating(self) -> bool:
+        """True while the MLX worker is in a generate/stream call."""
+        try:
+            return bool(self._llm.is_generating())
+        except Exception:
+            return False
 
     def unload_llm_for_power(self) -> None:
         """V7: release model memory (next query will reload)."""
@@ -564,7 +571,7 @@ class LocalBrainController:
                 text="Local brain hit an error, Boss. Check the log and try again.",
             )
         except Exception:
-            logger.debug("Local brain fallback response failed", exc_info=True)
+            logger.info("Local brain fallback response failed", exc_info=True)
 
     async def on_query(
         self,
@@ -705,7 +712,7 @@ class LocalBrainController:
                     getattr(query_plan, "reason", ""),
                 )
             except Exception:
-                logger.debug("Local brain query_plan logging failed", exc_info=True)
+                logger.info("Local brain query_plan logging failed", exc_info=True)
 
         gpu_util = 0.0
         if self._gpu_coord is not None:
@@ -968,7 +975,7 @@ class LocalBrainController:
                     rag_document_context = rag_res.document_context
                     rag_enrichment = rag_res.enrichment_block or None
             except Exception:
-                logger.debug("RAG retrieve skipped", exc_info=True)
+                logger.warning("RAG retrieve skipped", exc_info=True)
 
         while react_step <= MAX_REACT_STEPS:
             prompt = self._prompt_builder.build(
@@ -1202,9 +1209,9 @@ class LocalBrainController:
                                     cloud_score, conf_score,
                                 )
                     except Exception:
-                        logger.debug("v22 cloud escalation failed", exc_info=True)
+                        logger.info("v22 cloud escalation failed", exc_info=True)
             except Exception:
-                logger.debug("v22 confidence scoring failed", exc_info=True)
+                logger.info("v22 confidence scoring failed", exc_info=True)
 
         # ── v22: Decision Engine enrichment ───────────────────────────
         if self._decision_engine is not None:
@@ -1213,21 +1220,21 @@ class LocalBrainController:
                 if enriched.enriched:
                     full_text = enriched.enriched
             except Exception:
-                logger.debug("v22 decision engine enrichment failed", exc_info=True)
+                logger.info("v22 decision engine enrichment failed", exc_info=True)
 
         # ── v22: Semantic Cache — store response ─────────────────────
         if self._semantic_cache is not None:
             try:
                 self._semantic_cache.put(policy_query, full_text, source="local")
             except Exception:
-                logger.debug("v22 semantic cache put failed", exc_info=True)
+                logger.info("v22 semantic cache put failed", exc_info=True)
 
         # ── v22: Preference learning ─────────────────────────────────
         if self._preference_store is not None:
             try:
                 self._preference_store.learn_from_query_pattern(policy_query)
             except Exception:
-                logger.debug("v22 preference learning failed", exc_info=True)
+                logger.info("v22 preference learning failed", exc_info=True)
 
         final_text, saved_report_path = self._maybe_export_report(policy_query, full_text)
         if saved_report_path:

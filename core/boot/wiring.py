@@ -87,6 +87,7 @@ def wire_events(
         tts=tts,
         interrupt_manager=None,
         local_brain=local_brain,
+        llm_queue=llm_queue,
         indicator=indicator,
     )
     bus.on(

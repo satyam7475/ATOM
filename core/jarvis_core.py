@@ -56,6 +56,8 @@ from core.identity_engine import IdentityEngine
 
 if TYPE_CHECKING:
     from core.async_event_bus import AsyncEventBus
+    from core.cognitive.goal_engine import GoalEngine
+    from core.proactive_quota import ProactiveInsightQuota
     from core.behavior_tracker import BehaviorTracker
     from core.cognitive.prediction_engine import PredictionEngine
     from core.context_fusion import ContextFusionEngine
@@ -146,6 +148,8 @@ class JarvisCore:
         self._prediction: PredictionEngine | None = None
         self._conv_memory: ConversationMemory | None = None
         self._memory: MemoryEngine | None = None
+        self._goals: GoalEngine | None = None
+        self._quota: ProactiveInsightQuota | None = None
 
         jcfg = self._config.get("jarvis_core", {})
         self._proactive_interval = jcfg.get("proactive_interval_s", 120.0)
@@ -165,6 +169,8 @@ class JarvisCore:
         prediction: PredictionEngine | None = None,
         conv_memory: ConversationMemory | None = None,
         memory: MemoryEngine | None = None,
+        goals: GoalEngine | None = None,
+        quota: ProactiveInsightQuota | None = None,
     ) -> None:
         """Wire additional intelligence sources after construction."""
         self._fusion = fusion
@@ -172,6 +178,8 @@ class JarvisCore:
         self._prediction = prediction
         self._conv_memory = conv_memory
         self._memory = memory
+        self._goals = goals
+        self._quota = quota
 
     # ── Situational Awareness ─────────────────────────────────────
 
@@ -497,6 +505,33 @@ class JarvisCore:
                     expires_at=now + 3600,
                 ))
 
+        # ── Goals (aligned with GoalEngine + ProactiveIntelligenceEngine) ──
+        if self._goals and s.session_duration_min > 25:
+            try:
+                active_goals = self._goals.get_active_goals()
+            except Exception:
+                active_goals = []
+            if active_goals:
+                top = active_goals[0]
+                gtitle = str(top.get("title", "")).strip()
+                if gtitle:
+                    gl = gtitle.lower()
+                    topics = (
+                        self._conv_memory.active_topics if self._conv_memory else []
+                    )
+                    mentioned = any(gl in (t or "").lower() for t in topics)
+                    if not mentioned:
+                        insights.append(ProactiveInsight(
+                            category="goals",
+                            priority=7,
+                            source="goal_engine",
+                            message=(
+                                f"You have '{gtitle}' in progress. "
+                                f"Want a quick next step, or should I stay quiet?"
+                            ),
+                            expires_at=now + 3600,
+                        ))
+
         # ── v21: Frustration loop detection ──
         if self._failed_query_streak >= 3:
             insights.append(ProactiveInsight(
@@ -638,7 +673,7 @@ class JarvisCore:
             )
 
         # Closing tone
-        adjustments = self._identity.get_personality_adjustment({"hour": s.hour})
+        adjustments = self._identity.get_personality_adjustment({"hour": now.hour})
         if adjustments.get("tone") == "supportive":
             parts.append("Take it easy today. I've got your back.")
         else:
@@ -837,9 +872,11 @@ class JarvisCore:
             "milestone", count=self._conversation_count,
         )
         if milestone:
-            self._bus.emit_long("jarvis_insight",
-                                message=milestone, category="milestone",
-                                priority=6)
+            q = self._quota
+            if q is None or q.allow_emit("jarvis_core", "milestone", 6):
+                self._bus.emit_long("jarvis_insight",
+                                    message=milestone, category="milestone",
+                                    priority=6)
 
     async def _on_idle_detected(self, idle_minutes: float = 0, **_kw) -> None:
         self._situation.idle_minutes = idle_minutes
@@ -910,18 +947,29 @@ class JarvisCore:
                     continue
 
                 insights = self.generate_proactive_insights()
-                if insights:
+                if not insights:
+                    continue
+                for _ in range(8):
                     insight = self.get_next_insight()
-                    if insight and insight.priority <= 5:
-                        self._bus.emit_long(
-                            "jarvis_insight",
-                            message=insight.message,
-                            category=insight.category,
-                            priority=insight.priority,
-                            action=insight.action,
-                            action_args=insight.action_args,
-                            source=insight.source,
-                        )
+                    if not insight:
+                        break
+                    if insight.priority > 5:
+                        break
+                    q = self._quota
+                    if q is not None and not q.allow_emit(
+                        "jarvis_core", insight.category, insight.priority,
+                    ):
+                        continue
+                    self._bus.emit_long(
+                        "jarvis_insight",
+                        message=insight.message,
+                        category=insight.category,
+                        priority=insight.priority,
+                        action=insight.action,
+                        action_args=insight.action_args,
+                        source=insight.source,
+                    )
+                    break
             except Exception:
                 logger.debug("JARVIS proactive loop error", exc_info=True)
 

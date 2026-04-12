@@ -98,6 +98,8 @@ class MLXBrain:
         self._load_lock = threading.RLock()
         self._brain_mode_mgr: BrainModeManager | None = None
         self._abort_generation = 0
+        self._gen_lock = threading.Lock()
+        self._streaming_depth = 0
 
     def set_brain_mode_manager(self, mgr: "BrainModeManager | None") -> None:
         self._brain_mode_mgr = mgr
@@ -222,6 +224,11 @@ class MLXBrain:
         """Invalidate the current streaming generation."""
         self._abort_generation += 1
 
+    def is_generating(self) -> bool:
+        """True while MLX inference is active inside the worker thread."""
+        with self._gen_lock:
+            return self._streaming_depth > 0
+
     def save_kv_cache(self, system_prompt_hash: int) -> None:
         """Compatibility no-op: MLX wrapper does not persist KV cache yet."""
         del system_prompt_hash
@@ -339,6 +346,29 @@ class MLXBrain:
         if model is None or tokenizer is None or stream_generate is None:
             return "", False
 
+        with self._gen_lock:
+            self._streaming_depth += 1
+        try:
+            return self._generate_sync_streaming_inner(
+                role, eff, model, tokenizer, prompt, on_token,
+                max_tokens_override=max_tokens_override,
+            )
+        finally:
+            with self._gen_lock:
+                self._streaming_depth -= 1
+
+    def _generate_sync_streaming_inner(
+        self,
+        role: str,
+        eff: dict[str, Any],
+        model: Any,
+        tokenizer: Any,
+        prompt: str,
+        on_token: Callable[[str, bool], None] | None = None,
+        *,
+        max_tokens_override: int | None = None,
+    ) -> tuple[str, bool]:
+        """Core stream loop (wrapped for active-generation accounting)."""
         my_gen = self._abort_generation
         sampler = self._make_sampler(eff["temperature"], eff["top_p"])
         logits_processors = self._make_logits_processors(eff["repeat_penalty"])

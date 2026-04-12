@@ -66,6 +66,17 @@ class LLMInferenceQueue:
         self._worker_task = None
         logger.info("LLM inference queue stopped")
 
+    def has_pending(self) -> bool:
+        """Best-effort: True if a job is waiting for the worker (may race)."""
+        return self._pending is not None
+
+    async def clear_pending(self) -> None:
+        """Drop the coalesced next job (e.g. user interrupted before it runs)."""
+        async with self._lock:
+            self._pending = None
+        if self._metrics is not None:
+            self._metrics.inc("llm_queue_cleared_interrupt")
+
     async def submit(
         self,
         text: str,

@@ -497,7 +497,7 @@ class STTAsync:
                 self._preprocessor.learn_noise(ambient_pcm)
                 logger.info("AudioPreprocessor noise profile learned from ambient audio")
         except Exception:
-            logger.debug("Ambient capture for preprocessor skipped (timeout or error)")
+            logger.info("Ambient capture for preprocessor skipped (timeout or error)")
 
         if threshold < min_thr:
             threshold = min_thr
@@ -902,7 +902,7 @@ class STTAsync:
             try:
                 self._bus.emit("silence_timeout")
             except Exception:
-                logger.debug("STT fallback timeout emit failed", exc_info=True)
+                logger.info("STT fallback timeout emit failed", exc_info=True)
 
     # ── Async wrappers ─────────────────────────────────────────────────
 

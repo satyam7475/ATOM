@@ -4,6 +4,10 @@ ATOM -- End-to-end pipeline latency tracker.
 Tracks timing across the full voice command pipeline:
     speech_final -> intent -> router -> action -> tts_start
 
+Also records **pipeline_llm_first_partial**: time from ``cursor_query`` to the
+first ``partial_response`` (streaming first chunk) — validates the LLM hot path
+without blocking the bus on generation.
+
 Emits a structured one-line summary log per query:
 
     PIPELINE | STT: 110ms | Intent: 2ms | Action: 4ms | TTS: 6ms | Total: 122ms
@@ -31,6 +35,7 @@ class PipelineTimer:
         "_bus", "_metrics",
         "_t_speech_final", "_t_intent_done", "_t_action_done",
         "_t_tts_start", "_t_tts_complete",
+        "_t_cursor_query",
         "_current_query", "_active",
     )
 
@@ -46,6 +51,7 @@ class PipelineTimer:
         self._t_action_done: float = 0.0
         self._t_tts_start: float = 0.0
         self._t_tts_complete: float = 0.0
+        self._t_cursor_query: float = 0.0
         self._current_query: str = ""
         self._active: bool = False
 
@@ -53,6 +59,8 @@ class PipelineTimer:
         """Subscribe to bus events. Call once during startup."""
         self._bus.on("speech_final", self._on_speech_final)
         self._bus.on("intent_classified", self._on_intent_classified)
+        self._bus.on("cursor_query", self._on_cursor_query)
+        self._bus.on("partial_response", self._on_partial_response)
         self._bus.on("response_ready", self._on_response_ready)
         self._bus.on("state_changed", self._on_state_changed)
         self._bus.on("tts_complete", self._on_tts_complete)
@@ -67,6 +75,28 @@ class PipelineTimer:
                                     ms: float = 0.0, **_kw) -> None:
         if self._active:
             self._t_intent_done = time.perf_counter()
+
+    async def _on_cursor_query(self, text: str = "", **_kw) -> None:
+        """LLM path scheduled — anchor for first streamed partial latency."""
+        if self._active:
+            self._t_cursor_query = time.perf_counter()
+
+    async def _on_partial_response(
+        self, text: str = "", is_first: bool = False, source: str = "", **_kw,
+    ) -> None:
+        """First sentence/chunk from local MLX — streaming segment (not TTS partials)."""
+        if source != "local":
+            return
+        if (
+            not self._active
+            or not is_first
+            or self._t_cursor_query <= 0
+            or self._metrics is None
+        ):
+            return
+        dt_ms = (time.perf_counter() - self._t_cursor_query) * 1000
+        self._metrics.record_latency("pipeline_llm_first_partial", dt_ms)
+        self._t_cursor_query = 0.0
 
     async def _on_response_ready(self, text: str = "", **_kw) -> None:
         if self._active:

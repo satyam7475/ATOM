@@ -46,6 +46,11 @@ BLOCKED_SHELL_PATTERNS: frozenset[str] = frozenset({
     "powershell -enc", "powershell -e ",
     "invoke-expression", "iex ",
     "set-executionpolicy",
+    # Unix / macOS — destructive or common abuse patterns
+    "rm -rf", "rm -fr", "sudo ", "su -", "chmod 777", "chmod -r 777",
+    "| sh", "| bash", "| zsh", "mkfs", "dd if=",
+    "/dev/disk", "/dev/sd", ":(){", "launchctl unload /system",
+    "csrutil disable", "spctl --master-disable",
 })
 
 BLOCKED_EXACT: frozenset[str] = frozenset({
@@ -173,6 +178,12 @@ _COMMAND_CHAIN_RE = re.compile(
     re.I,
 )
 
+# Pipe downloaded content into a shell (curl|sh style)
+_PIPE_TO_SHELL_RE = re.compile(
+    r"(?:^|[;&|])\s*(?:curl|wget)\s+[^\n|]*\|\s*(?:ba)?sh\b",
+    re.I,
+)
+
 _DELETION_INTENT_RE = re.compile(
     r"\b(delete|remove|erase|format|wipe|trash|destroy|rmdir)\b",
     re.I,
@@ -211,14 +222,20 @@ class SecurityPolicy:
         self._rate_limit_window = sec.get("rate_limit_window_s", _RATE_LIMIT_WINDOW_S)
         self._rate_limit_max = sec.get("rate_limit_max_actions", _RATE_LIMIT_MAX_ACTIONS)
 
+        from core.security_tiers import max_tier_for_security_mode
+
+        self._max_action_tier: int = max_tier_for_security_mode(self._mode)
+
         from core.execution.behavior_monitor import BehaviorMonitor
 
         self._behavior = BehaviorMonitor(config)
         self._behavior.set_lock_mode(self._lock_mode)
 
-        logger.info("SecurityPolicy init: mode=%s, lock=%s, rate_limit=%d/%ds",
-                     self._mode, self._lock_mode,
-                     self._rate_limit_max, self._rate_limit_window)
+        logger.info(
+            "SecurityPolicy init: mode=%s, max_action_tier=%d, lock=%s, rate_limit=%d/%ds",
+            self._mode, self._max_action_tier, self._lock_mode,
+            self._rate_limit_max, self._rate_limit_window,
+        )
 
     # ── Central action gate ───────────────────────────────────────────
 
@@ -235,24 +252,6 @@ class SecurityPolicy:
         self._action_timestamps.append(now)
         return True
 
-    def _calculate_risk_score(self, action: str, args: dict | None) -> float:
-        """Adaptive risk heuristic f(intent, context, tool_severity)."""
-        base_score = 0.1
-        
-        high_risk_actions = {"run_terminal_command", "click_ui_element", "set_focused_text", "delete_file"}
-        med_risk_actions = {"close_app", "kill_process", "empty_recycle_bin"}
-        
-        if action in high_risk_actions:
-            base_score += 0.6
-        elif action in med_risk_actions:
-            base_score += 0.4
-            
-        # Context modifiers
-        if args and any("password" in str(v).lower() for v in args.values()):
-            base_score += 0.3
-            
-        return min(1.0, base_score)
-
     def allow_action(
         self,
         action: str,
@@ -266,11 +265,6 @@ class SecurityPolicy:
         Includes rate limiting to prevent command flooding.
         ``policy_context='plan_validate'`` skips paranoid HMAC verification (planning dry-run).
         """
-        risk_score = self._calculate_risk_score(action, args)
-        if risk_score >= 0.9:
-            reason = f"Adaptive Security Block: Risk Score {risk_score:.2f} is too high for autonomous execution."
-            self.audit_log(action, reason, success=False)
-            return False, reason
         if action not in _SAFE_ALWAYS_INTENTS and not self._check_rate_limit():
             reason = "Too many actions in a short time. Please slow down, Boss."
             self.audit_log(action, reason, success=False)
@@ -293,6 +287,13 @@ class SecurityPolicy:
             reason = f"Lock mode 'restricted': action '{action}' is not permitted."
             self.audit_log(action, reason, success=False)
             return False, reason
+
+        from core.security_tiers import tier_allowed
+
+        tier_ok, tier_reason = tier_allowed(action, self._max_action_tier)
+        if not tier_ok:
+            self.audit_log(action, tier_reason, success=False)
+            return False, tier_reason
 
         ok, p1_reason = self._phase1_policy_checks(action, args, policy_context=policy_context)
         if not ok:
@@ -343,12 +344,6 @@ class SecurityPolicy:
             if not self.is_safe_close_target(proc):
                 reason = f"Process '{proc}' is not in the safe close list."
                 self.audit_log("close_app", reason, success=False)
-                return False, reason
-
-        if action in ("shutdown_pc", "restart_pc", "logoff", "sleep_pc"):
-            if self._mode == "strict":
-                reason = f"Power action '{action}' blocked in strict mode."
-                self.audit_log(action, reason, success=False)
                 return False, reason
 
         return True, "ok"
@@ -452,6 +447,10 @@ class SecurityPolicy:
                 reason = f"Blocked: '{pattern}' is not allowed on a corporate system."
                 logger.warning("Security block: command '%s' matched '%s'", cmd[:60], pattern)
                 return False, reason
+        if _PIPE_TO_SHELL_RE.search(cmd):
+            reason = "Blocked: piping curl/wget into a shell is not allowed."
+            logger.warning("Security block: pipe-to-shell in '%s'", cmd[:80])
+            return False, reason
         if cmd_lower in BLOCKED_EXACT:
             return False, f"Blocked: '{cmd_lower}' requires manual execution."
         return True, "ok"
@@ -519,7 +518,7 @@ class SecurityPolicy:
             text = _COMMAND_CHAIN_RE.sub("", text)
 
         if _DELETION_INTENT_RE.search(text):
-            logger.warning("SECURITY: Destructive word detected and blocked per Owner Policy")
+            logger.warning("SECURITY: Destructive word detected and blocked as per Boss Satyam")
             text = "SYSTEM_BLOCK: Deletion and destructive actions are strictly prohibited by Owner policy."
 
         text = re.sub(r"[\x01-\x08\x0b\x0c\x0e-\x1f\x7f]", "", text)

@@ -1,3 +1,12 @@
+"""
+Legacy planning graph (rule/skill templates) used by ``brain.plan_evaluator``.
+
+Deprecated for new product work: prefer :mod:`core.reasoning.planner` for
+multi-step reasoning aligned with the live Router / ``LocalBrainController``
+path. Kept unchanged so imports from ``plan_evaluator`` and tests keep working.
+
+See ``docs/ARCHITECTURE_CANONICAL.md``.
+"""
 import logging
 from typing import List, Dict, Any, Optional
 

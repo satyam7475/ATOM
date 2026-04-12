@@ -1,10 +1,12 @@
 """
 ATOM -- Context Engine with privacy filtering.
 
-Gathers environment context (active window, clipboard, CWD, timestamp)
-using Windows API via ctypes. Zero external dependencies.
+Gathers environment context (active window, clipboard, CWD, timestamp).
+On macOS, uses Quartz + AppKit for the foreground window and NSPasteboard
+(or ``pbpaste``) for clipboard. On Windows, uses Win32 via ctypes when
+``sys.platform == \"win32\"``. Other platforms return empty window/clipboard.
 
-All Win32 calls are wrapped in try/except so failures return empty
+All platform calls are wrapped in try/except so failures return empty
 strings rather than crashing. This module is safe to call from any
 thread or async context.
 
@@ -16,15 +18,28 @@ of API keys, passwords, tokens, and other secrets to the external LLM.
 from __future__ import annotations
 
 import os
+import sys
 import time
 from typing import Any
 
 from context.privacy_filter import redact as _redact_sensitive
-import ctypes
 
 
 def _get_foreground_window_title() -> str:
-    """Active window title via user32.GetWindowTextW. Returns '' on failure."""
+    """Active window title. Returns '' on failure or unsupported OS."""
+    if sys.platform == "darwin":
+        try:
+            from context.context_darwin import get_foreground_window_title as _darwin_title
+
+            return _darwin_title()
+        except Exception:
+            return ""
+    if sys.platform != "win32":
+        return ""
+    try:
+        import ctypes
+    except Exception:
+        return ""
     try:
         user32 = ctypes.windll.user32  # type: ignore[attr-defined]
         hwnd = user32.GetForegroundWindow()
@@ -39,10 +54,20 @@ def _get_foreground_window_title() -> str:
 
 
 def _get_clipboard_text(max_chars: int = 500) -> str:
-    """Clipboard text via user32 OpenClipboard/GetClipboardData.
+    """Clipboard text, truncated to *max_chars*. Returns '' on failure."""
+    if sys.platform == "darwin":
+        try:
+            from context.context_darwin import get_clipboard_text as _darwin_clip
 
-    Truncated to max_chars. Returns '' on failure or non-text clipboard.
-    """
+            return _darwin_clip(max_chars)
+        except Exception:
+            return ""
+    if sys.platform != "win32":
+        return ""
+    try:
+        import ctypes
+    except Exception:
+        return ""
     try:
         user32 = ctypes.windll.user32  # type: ignore[attr-defined]
         kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
@@ -73,7 +98,7 @@ def _get_clipboard_text(max_chars: int = 500) -> str:
 def _extract_app_name(window_title: str) -> str:
     """Extract the application name from a window title.
 
-    Heuristic: many Windows apps show 'Document - AppName', so we take
+    Heuristic: many apps show 'Document - AppName', so we take
     the last segment after ' - '. Falls back to the full title.
     """
     if not window_title:
@@ -88,7 +113,7 @@ class ContextEngine:
     Collects environment context for prompt injection.
 
     All data is gathered lazily on each get_bundle() call.
-    Sub-millisecond execution (ctypes calls are fast).
+    Sub-millisecond execution (native calls are fast).
     """
 
     def __init__(self, config: dict[str, Any] | None = None) -> None:

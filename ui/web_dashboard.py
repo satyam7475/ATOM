@@ -96,6 +96,7 @@ class WebDashboard:
         self._activity_log: list[dict] = []
         self._conv_log: list[dict] = []
         self._v7_health_provider: Optional[Callable[[], dict[str, Any]]] = None
+        self._execution_state_provider: Optional[Callable[[], dict[str, Any]]] = None
 
     # ── Security ──────────────────────────────────────────────────────
 
@@ -183,6 +184,12 @@ class WebDashboard:
     def set_v7_health_provider(self, provider: Callable[[], dict[str, Any]]) -> None:
         """Callable returns JSON-serializable dict (health + metrics + warnings + snapshot)."""
         self._v7_health_provider = provider
+
+    def set_execution_state_provider(
+        self, provider: Callable[[], dict[str, Any]] | None,
+    ) -> None:
+        """Optional callable: interrupt / queue / MLX activity for WebSocket ``execution_state``."""
+        self._execution_state_provider = provider
 
     async def _api_auth_session(self, request: web.Request) -> web.StreamResponse:
         """Mint a session after dashboard token validation."""
@@ -471,6 +478,14 @@ class WebDashboard:
                     pass
 
                 await self._broadcast(payload)
+
+                if self._execution_state_provider is not None:
+                    try:
+                        ex = self._execution_state_provider()
+                        if isinstance(ex, dict):
+                            await self._broadcast({"type": "execution_state", **ex})
+                    except Exception:
+                        logger.debug("execution_state provider failed", exc_info=True)
             except Exception as exc:
                 logger.debug("System info push error: %s", exc)
 

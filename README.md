@@ -1,58 +1,54 @@
-# ATOM — Personal Cognitive AI Operating System
+# ATOM -- Personal Cognitive AI Operating System
 
-**Owner:** Satyam (“Boss”)  
-**What it is:** A local-first, JARVIS-style voice OS — not a thin chatbot. It perceives (voice, system state), reasons (intent → cache/memory → optional RAG/graph → local LLM), acts (security-gated tools), and learns (behavior, habits, V7 feedback metrics).
+**Owner:** Satyam ("Boss")
+**Platform:** macOS (Apple Silicon, M-series)
+**What it is:** A local-first, JARVIS-style voice OS that perceives (voice, system state), reasons (intent, cache, memory, RAG, local LLM), acts (security-gated tools), and learns (behavior, habits, feedback metrics). Not a chatbot -- a continuously running AI OS.
 
-**Docs:** Deep architecture → [`ATOM_ARCHITECTURE_BLUEPRINT.md`](ATOM_ARCHITECTURE_BLUEPRINT.md)  
-**Code review & desktop plan:** [`docs/ATOM_CODE_REVIEW_AND_DESKTOP_PLAN.md`](docs/ATOM_CODE_REVIEW_AND_DESKTOP_PLAN.md)
+**Docs:** [`docs/ATOM_M5_EVOLUTION_PLAN.md`](docs/ATOM_M5_EVOLUTION_PLAN.md) -- current active roadmap
+**Architecture:** [`docs/architecture/INDEX.md`](docs/architecture/INDEX.md) -- modular architecture modules
+**Implementation tracking:** [`docs/ATOM_IMPLEMENTATION_PLAN.md`](docs/ATOM_IMPLEMENTATION_PLAN.md) — phased work, **ACT** protocol, and change log. Say **“Next step ACT”** or **“ACT step `runtime-truth`”** (any step ID from that doc) so the assistant implements that work and updates the tracker.
 
 ---
 
-## Features (summary)
+## Features
 
 | Area | Description |
 |------|-------------|
 | **Owner-first** | Configured in `config/settings.json` (`owner.name`, `owner.title`). |
-| **Instant path** | Intent engine + cache for sub-millisecond-class command routing where applicable. |
-| **Offline brain** | Local GGUF via `llama-cpp-python` when `brain.enabled` and model path set. |
-| **V7 intelligence** | Runtime modes (FAST/SMART/DEEP/SECURE), `V7RuntimeContext`, feedback engine, mode stability, bounded prefetch, graph-first RAG with validation, `/v7/health` observability. |
-| **Security** | `SecurityPolicy` + `allow_action` on routed actions; treat policy changes as high-risk. |
-| **UI** | aiohttp web dashboard (default) + WebSocket; optional floating indicator mode. |
+| **Instant path** | Intent engine + cache for sub-millisecond command routing. |
+| **Local brain** | MLX dual-model (Qwen3-4B primary + Qwen3-1.7B fast) on Apple Silicon. |
+| **Cognitive kernel** | Central routing across DIRECT / CACHE / QUICK / FULL / DEEP execution paths. |
+| **Security** | Fernet-encrypted credentials, SecurityPolicy gating on all actions, audit logging. |
+| **UI** | aiohttp web dashboard + WebSocket on localhost with token auth. |
 
 ---
 
 ## Requirements
 
-- **Python 3.11+** (64-bit recommended)
+- **macOS** on Apple Silicon (M1/M2/M3/M4/M5)
+- **Python 3.11+**
 - **Microphone** for voice
-- **No cloud API keys** for core offline operation (optional Edge TTS uses network if selected)
 
 ---
 
-## Install (personal desktop)
-
-Use a dedicated virtual environment.
+## Install
 
 ```bash
 cd ATOM
-python -m venv .venv
-.venv\Scripts\activate
-python -m pip install --upgrade pip
+python3 -m venv .venv
+source .venv/bin/activate
+python3 -m pip install --upgrade pip
 pip install -r requirements-desktop.txt
 ```
-
-- **Canonical pinned set:** [`requirements-desktop.txt`](requirements-desktop.txt) (keep in sync with [`requirements.txt`](requirements.txt) when bumping versions).
-- **Optional dev tools (tests):** [`requirements-dev.txt`](requirements-dev.txt)
 
 ---
 
 ## Configure
 
-1. Copy or edit **`config/settings.json`**.
-2. For a desktop-oriented baseline, see **`config/settings.desktop.example.json`**.
-3. For corporate-style restrictions, see **`config/settings.corporate.example.json`** and [`docs/ATOM_Deployment_Profiles.md`](docs/ATOM_Deployment_Profiles.md).
-4. Set **`brain.model_path`** to your GGUF file when using the local LLM.
-5. **`v7_intelligence`** — thresholds for health, prefetch, mode stability, observability (see schema in `core/config_schema.py`).
+1. Edit `config/settings.json`.
+2. Set `brain.enabled: true` and configure model paths for MLX models.
+3. Run `python scripts/setup_api_keys.py` to set up encrypted API credentials.
+4. See `core/config_schema.py` for the full schema reference.
 
 ---
 
@@ -62,67 +58,43 @@ pip install -r requirements-desktop.txt
 python main.py
 ```
 
-- Dashboard (default): `http://127.0.0.1:<port>/` — port from `ui.web_port` in settings (often **8765**).
-- **V7 health (JSON):** `GET http://127.0.0.1:<port>/v7/health` when the dashboard is running.
-- **Hotkey:** Ctrl+Alt+A toggles listening / resume; use dashboard **UNSTICK** if the state machine hangs.
-
-If the browser does not open automatically, use Cursor Simple Browser or open the URL manually — see [`docs/CURSOR_DASHBOARD.md`](docs/CURSOR_DASHBOARD.md) if present.
+- Dashboard: `http://127.0.0.1:<port>/` (port from `ui.web_port` in settings).
+- Health endpoint: `GET /v7/health` on the same port.
 
 ---
 
-## Project layout (abbreviated)
+## Project layout
 
 ```
 ATOM/
-├── main.py                 # Entry: run_atom() / asyncio main
-├── config/
-│   ├── settings.json       # Active config
-│   └── *.example.json      # Desktop / corporate templates
-├── core/                   # Router, state, cognition, RAG, GPU, observability
-├── brain/                  # Mini LLM, memory graph, pipelines
-├── cursor_bridge/          # Local brain controller, prompts
-├── voice/                  # STT, TTS, mic
-├── ui/                     # Web dashboard (aiohttp)
-├── docs/                   # Reports, deployment, benchmarks
+├── main.py                 # Entry point: async main loop
+├── config/                 # Settings and example configs
+├── core/                   # Runtime: router, state, scheduler, security, cognition, RAG
+├── brain/                  # MLX LLM, memory graph
+├── cursor_bridge/          # Agentic loop: LocalBrainController, prompt builder
+├── context/                # Perception: screen reader, privacy filter
+├── voice/                  # STT, TTS, wake word, mic
+├── ui/                     # Web dashboard (aiohttp + WebSocket)
+├── tests/                  # Test suite
+├── scripts/                # Setup and utility scripts
+├── docs/                   # Architecture docs and evolution plan
+├── models/                 # MLX model weights (gitignored)
 ├── requirements.txt
-├── requirements-desktop.txt
-└── ATOM_ARCHITECTURE_BLUEPRINT.md
+└── requirements-desktop.txt
 ```
 
 ---
 
-## V7 observability (quick reference)
-
-| Signal | Where |
-|--------|--------|
-| Health + metrics + warnings + `latency_board` | `GET /v7/health` |
-| Per-module latency board (offline demo) | `python3 tools/observability_dashboard.py --json` |
-| Periodic snapshot | Log tag `v7_debug_snapshot` |
-| Mode decisions | `v7_mode_selected`, `v7_mode_switch` |
-| RAG / graph | `v7_rag_retrieval`, `v7_graph_*`, `v7_rag_fallback` |
-| Prefetch | `v7_prefetch_*` |
-
----
-
-## Security & privacy (short)
-
-- Clipboard/context redaction: `context/privacy_filter.py`
-- Sensitive actions can be tied to optional vision / owner recognition — see settings and deployment docs
-- **Do not** weaken `SecurityPolicy` or authentication paths without a full review
-
----
-
-## More documentation
+## Documentation
 
 | Document | Content |
 |----------|---------|
-| [`docs/ATOM_CODE_REVIEW_AND_DESKTOP_PLAN.md`](docs/ATOM_CODE_REVIEW_AND_DESKTOP_PLAN.md) | Review summary, V7 map, desktop migration, static validation |
-| [`docs/README.md`](docs/README.md) | Index of benchmarks and reports |
-| [`docs/ATOM_Deployment_Profiles.md`](docs/ATOM_Deployment_Profiles.md) | Corporate vs home hardware |
-| [`ATOM_ARCHITECTURE_BLUEPRINT.md`](ATOM_ARCHITECTURE_BLUEPRINT.md) | Full system blueprint |
+| [`docs/ATOM_M5_EVOLUTION_PLAN.md`](docs/ATOM_M5_EVOLUTION_PLAN.md) | Active roadmap and evolution plan |
+| [`docs/ATOM_M5_AIR_HLD_LLD_WHITEPAPER.md`](docs/ATOM_M5_AIR_HLD_LLD_WHITEPAPER.md) | HLD/LLD technical whitepaper |
+| [`docs/architecture/INDEX.md`](docs/architecture/INDEX.md) | Module index mapping code to architecture |
 
 ---
 
 ## License / ownership
 
-ATOM is Satyam’s personal cognitive OS project; use and deployment are subject to your environment’s policies.
+ATOM is Satyam's personal cognitive OS project.
