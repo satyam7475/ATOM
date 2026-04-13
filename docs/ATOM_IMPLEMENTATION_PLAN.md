@@ -29,8 +29,8 @@ When you want the assistant to **implement** the next planned step (not just dis
 
 | Field | Value |
 |-------|--------|
-| **Active step ID** | — (ACT phases 0–9 **complete**) |
-| **Last completed** | `experience-layer` (Phase 9) |
+| **Active step ID** | `jarvis-state-stabilization` |
+| **Last completed** | `jarvis-state-stabilization` |
 | **Last updated** | 2026-04-13 |
 
 ---
@@ -50,6 +50,7 @@ When you want the assistant to **implement** the next planned step (not just dis
 | `proactive-intelligence` | 7 | done | `ProactiveInsightQuota` + audit; `jarvis_core.wire_intelligence` from main; goals in Jarvis |
 | `security-hardening` | 8 | done | `security_tiers` + `strict` cap; Unix shell blocks + pipe-to-shell; `SECURITY_SETUP.md` |
 | `experience-layer` | 9 | done | Dashboard experience line + title/placeholder; `EXPERIENCE_LAYER.md` |
+| `jarvis-state-stabilization` | 10 | done | Unified `ATOM_STATE`, typed state events, Apple-first/Google fallback parity, shared readiness/self-check publication, state-driven dashboard controls, hardware-aware mode reasoning, focused contract tests |
 
 Statuses: `pending` → `in_progress` → `done`.
 
@@ -71,6 +72,7 @@ Newest first.
 
 | Date | Step ID | Summary |
 |------|---------|---------|
+| 2026-04-13 | `jarvis-state-stabilization` | Added `core/state` as the runtime source of truth, wired `main.py` + `wiring.py` + diagnostics into `state.diff` / `state.snapshot` and typed `voice.*` / `execution.update` / `system.warning` / `mode.change`, made readiness and self-check publish into shared state, normalized Apple/Google STT metadata and errors, converted the dashboard to consume state snapshot/diff with `SELF CHECK` / `STOP TASK`, and added focused contract tests. |
 | 2026-04-13 | `experience-layer` | `execution_state` adds `stt_engine`, `tts_engine`, `tts_voice`, `assistant_mode`; dashboard **Runtime Truth** experience line + page title + input placeholder; `docs/EXPERIENCE_LAYER.md` + architecture link. |
 | 2026-04-13 | `security-hardening` | `core/security_tiers.py`: intent tiers 1–4 + `security.mode` max tier (`strict`→3 blocks power tier-4); `SecurityPolicy` integration + duplicate strict power block removed; `is_safe_command` Unix/macOS patterns + pipe-to-shell regex; `docs/SECURITY_SETUP.md` + architecture index. |
 | 2026-04-13 | `proactive-intelligence` | `ProactiveInsightQuota` (`proactive_coordination` config): hourly cap + `logs/proactive_insights.log` audit; `JarvisCore` + `ProactiveIntelligenceEngine` gated; `main.py` calls `wire_intelligence` (fusion/behavior/prediction/memory/goals); goal momentum insights in `generate_proactive_insights`; fixed `_generate_morning_briefing` `now.hour` bug. |

@@ -81,12 +81,15 @@ class WebDashboard:
         self._shutdown_callback: Any = None
         self._ws_token = secrets.token_urlsafe(32)
         self._unstick_callback: Callable[[], Awaitable[None]] | None = None
+        self._stop_task_callback: Callable[[], Awaitable[None]] | None = None
         self._mode_change_callback: Callable[[str], None] | None = None
         self._personality_mode_callback: Callable[[str], None] | None = None
         self._text_input_callback: Callable[[str], Awaitable[None]] | None = None
+        self._self_check_callback: Callable[[], Awaitable[dict[str, Any] | None]] | None = None
         self._brain_mode_mgr: Any = None
         self._assistant_mode_mgr: Any = None
         self._security_policy: Any = None
+        self._atom_state_bridge: Any = None
         self._init_info: dict[str, str] = {}
         self._owner_detected = False
         self._owner_status = "disabled"
@@ -96,7 +99,6 @@ class WebDashboard:
         self._activity_log: list[dict] = []
         self._conv_log: list[dict] = []
         self._v7_health_provider: Optional[Callable[[], dict[str, Any]]] = None
-        self._execution_state_provider: Optional[Callable[[], dict[str, Any]]] = None
 
     # ── Security ──────────────────────────────────────────────────────
 
@@ -184,12 +186,6 @@ class WebDashboard:
     def set_v7_health_provider(self, provider: Callable[[], dict[str, Any]]) -> None:
         """Callable returns JSON-serializable dict (health + metrics + warnings + snapshot)."""
         self._v7_health_provider = provider
-
-    def set_execution_state_provider(
-        self, provider: Callable[[], dict[str, Any]] | None,
-    ) -> None:
-        """Optional callable: interrupt / queue / MLX activity for WebSocket ``execution_state``."""
-        self._execution_state_provider = provider
 
     async def _api_auth_session(self, request: web.Request) -> web.StreamResponse:
         """Mint a session after dashboard token validation."""
@@ -304,6 +300,11 @@ class WebDashboard:
             "last_latency_ms": self._last_latency_ms,
             **STATE_META.get(self._current_state, {}),
         }
+        if self._atom_state_bridge is not None:
+            try:
+                init_payload["snapshot"] = self._atom_state_bridge.snapshot()
+            except Exception:
+                logger.debug("Dashboard init snapshot failed", exc_info=True)
         if bound_session_id:
             init_payload["session_id"] = bound_session_id
         await self._send_one(ws, init_payload)
@@ -332,6 +333,21 @@ class WebDashboard:
                             await self._unstick_callback()
                         except Exception:
                             logger.exception("Dashboard unstick callback failed")
+                    elif msg_type == "stop_task" and self._stop_task_callback:
+                        try:
+                            await self._stop_task_callback()
+                        except Exception:
+                            logger.exception("Dashboard stop-task callback failed")
+                    elif msg_type == "run_self_check" and self._self_check_callback:
+                        try:
+                            report = await self._self_check_callback()
+                            if report is not None:
+                                await self._send_one(ws, {
+                                    "type": "self_check_result",
+                                    "report": report,
+                                })
+                        except Exception:
+                            logger.exception("Dashboard self-check callback failed")
                     elif msg_type == "change_mode":
                         raw_mode = (data.get("mode") or "").strip().lower().replace("-", "_")
                         aliases = {
@@ -448,6 +464,13 @@ class WebDashboard:
 
         while True:
             try:
+                if self._atom_state_bridge is not None:
+                    await self.on_state_snapshot(
+                        snapshot=self._atom_state_bridge.snapshot(),
+                        source="dashboard.periodic_snapshot",
+                    )
+                    await asyncio.sleep(3.0)
+                    continue
                 cpu = psutil.cpu_percent(interval=0)
                 mem = psutil.virtual_memory()
                 disk = psutil.disk_usage("/")
@@ -478,14 +501,6 @@ class WebDashboard:
                     pass
 
                 await self._broadcast(payload)
-
-                if self._execution_state_provider is not None:
-                    try:
-                        ex = self._execution_state_provider()
-                        if isinstance(ex, dict):
-                            await self._broadcast({"type": "execution_state", **ex})
-                    except Exception:
-                        logger.debug("execution_state provider failed", exc_info=True)
             except Exception as exc:
                 logger.debug("System info push error: %s", exc)
 
@@ -600,6 +615,10 @@ class WebDashboard:
         """Async callback: stop TTS if needed and return to LISTENING (resume / unstick)."""
         self._unstick_callback = callback
 
+    def set_stop_task_callback(self, callback: Callable[[], Awaitable[None]]) -> None:
+        """Async callback to cancel or preempt the active task."""
+        self._stop_task_callback = callback
+
     def set_mode_change_callback(self, callback: Callable[[str], None]) -> None:
         self._mode_change_callback = callback
 
@@ -608,6 +627,34 @@ class WebDashboard:
 
     def set_text_input_callback(self, callback: Callable[[str], Awaitable[None]]) -> None:
         self._text_input_callback = callback
+
+    def set_self_check_callback(
+        self,
+        callback: Callable[[], Awaitable[dict[str, Any] | None]],
+    ) -> None:
+        self._self_check_callback = callback
+
+    def attach_atom_state(self, state_bridge: Any) -> None:
+        self._atom_state_bridge = state_bridge
+
+    async def on_state_diff(self, diff: dict[str, Any], source: str = "", **_kw: Any) -> None:
+        await self._broadcast({
+            "type": "state_diff",
+            "diff": diff,
+            "source": source,
+        })
+
+    async def on_state_snapshot(
+        self,
+        snapshot: dict[str, Any],
+        source: str = "",
+        **_kw: Any,
+    ) -> None:
+        await self._broadcast({
+            "type": "state_snapshot",
+            "snapshot": snapshot,
+            "source": source,
+        })
 
     def attach_runtime_managers(
         self,

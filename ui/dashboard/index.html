@@ -260,6 +260,23 @@ html,body{
   transition:all .2s;letter-spacing:1px;
 }
 .text-send-btn:hover{background:rgba(129,140,248,0.25);}
+.text-mic-btn{
+  min-width:108px;
+}
+.text-mic-btn.listening{
+  background:rgba(52,211,153,0.16);
+  color:var(--green);
+  border-color:rgba(52,211,153,0.32);
+}
+.text-mic-btn.error{
+  background:rgba(248,113,113,0.14);
+  color:var(--red);
+  border-color:rgba(248,113,113,0.28);
+}
+.text-mic-btn.disabled{
+  opacity:0.55;
+  cursor:not-allowed;
+}
 
 /* ── Cockpit panel (bottom center) ───────── */
 .conv-zone{
@@ -338,6 +355,8 @@ html,body{
   <header class="topbar">
     <div class="brand">A<span>.</span>T<span>.</span>O<span>.</span>M<span>.</span></div>
     <div class="topbar-right">
+      <button class="unstick-btn" id="selfCheckBtn">SELF CHECK</button>
+      <button class="unstick-btn" id="stopTaskBtn">STOP TASK</button>
       <button class="unstick-btn" id="unstickBtn">UNSTICK</button>
       <div class="topbar-state">
         <span id="topbarState">IDLE</span>
@@ -468,6 +487,7 @@ html,body{
     <!-- Text input fallback -->
     <div class="text-input-wrap">
       <input class="text-input" id="textInput" type="text" placeholder="Type here or use the mic when listening — same pipeline as speech." autocomplete="off">
+      <button class="text-send-btn text-mic-btn" id="voiceInputBtn" type="button">MIC</button>
       <button class="text-send-btn" id="textSendBtn">SEND</button>
     </div>
   </div>
@@ -567,6 +587,35 @@ window.setOrbModeTheme=mt=>{
 const $=id=>document.getElementById(id);
 const WS='ws://'+location.host+'/ws';
 let ws,startTime=Date.now(),queryCount=0;
+let atomState=null;
+const SpeechRecognitionCtor=window.SpeechRecognition||window.webkitSpeechRecognition||null;
+const browserVoice={
+  supported:!!SpeechRecognitionCtor,
+  active:false,
+  interim:'',
+  lastFinal:'',
+  lastError:'',
+  permission:'unknown',
+  recognition:null,
+};
+
+function deepClone(v){
+  return v==null?v:JSON.parse(JSON.stringify(v));
+}
+
+function deepMerge(target,patch){
+  if(!patch||typeof patch!=='object')return target;
+  Object.keys(patch).forEach(key=>{
+    const value=patch[key];
+    if(value&&typeof value==='object'&&!Array.isArray(value)){
+      const base=(target[key]&&typeof target[key]==='object'&&!Array.isArray(target[key]))?target[key]:{};
+      target[key]=deepMerge(base,value);
+      return;
+    }
+    target[key]=value;
+  });
+  return target;
+}
 
 function clipText(text,maxLen=220){
   const clean=String(text||'').trim();
@@ -672,9 +721,307 @@ function setPerfUI(requestedMode,effectiveMode){
 }
 function updateVoiceRuntime(mode,note){
   const prodVoice = mode === 'app_bundle_production';
-  $('connStt').className = 'mini-dot ' + (prodVoice ? 'on' : 'off');
-  if($('voiceRuntimeNote'))$('voiceRuntimeNote').textContent = note || '';
+  const browserReady = browserVoice.supported && browserVoice.permission !== 'denied';
+  $('connStt').className = 'mini-dot ' + ((prodVoice || browserReady) ? 'on' : 'off');
+  const bits=[];
+  if(note)bits.push(note);
+  if(browserVoice.supported){
+    bits.push(browserVoice.active?'Browser mic listening.':'Browser mic ready.');
+  }else{
+    bits.push('Browser mic unavailable in this browser.');
+  }
+  if(browserVoice.permission==='denied')bits.push('Browser mic permission denied.');
+  if(browserVoice.lastError&&browserVoice.lastError!=='aborted')bits.push('Browser mic '+browserVoice.lastError+'.');
+  if($('voiceRuntimeNote'))$('voiceRuntimeNote').textContent = clipText(bits.filter(Boolean).join(' '),220);
+  syncVoiceButton();
 }
+
+function renderAtomState(){
+  if(!atomState)return;
+  const lifecycle=atomState.lifecycle||{};
+  const system=atomState.system||{};
+  const context=atomState.context||{};
+  const execution=atomState.execution||{};
+  const voice=atomState.voice||{};
+  const mode=atomState.mode||{};
+  const health=atomState.health||{};
+  const reasoning=atomState.reasoning||{};
+  const media=context.media||{};
+
+  if(lifecycle.state){
+    setAppState(
+      String(lifecycle.state||'idle'),
+      String(lifecycle.label||'IDLE'),
+      String(lifecycle.status||'')
+    );
+  }
+
+  updateSystem({
+    cpu: Math.round(Number(system.cpu||0)),
+    ram: Math.round(Number(system.memory_pct||0)),
+    battery: system.battery_pct!=null?Math.round(Number(system.battery_pct||0)):null,
+    charging: !!system.charging,
+    disk_free_gb: system.disk_free_gb!=null?Math.round(Number(system.disk_free_gb||0)):null,
+  });
+
+  const backendSttOnline=!!voice.stt_engine&&String(voice.stt_engine).toLowerCase()!=='disabled';
+  const browserSttOnline=browserVoice.supported&&browserVoice.permission!=='denied';
+  const sttOnline=backendSttOnline||browserSttOnline;
+  const ttsOnline=!!voice.tts_engine;
+  $('connStt').className='mini-dot '+(sttOnline?'on':'off');
+  $('connTts').className='mini-dot '+(ttsOnline?'on':'off');
+  if($('micName'))$('micName').textContent=
+    voice.mic||(browserVoice.supported?'Browser microphone fallback':'Voice input unavailable');
+  if($('connAiVal'))$('connAiVal').textContent=(mode.profile||'AI').toString().slice(0,10).toUpperCase();
+
+  const voiceBits=[];
+  if(voice.stt_engine)voiceBits.push('STT '+voice.stt_engine);
+  if(voice.tts_engine)voiceBits.push('TTS '+voice.tts_engine);
+  if(voice.permissions&&voice.permissions.speech&&voice.permissions.speech!=='unknown'){
+    voiceBits.push('Speech '+voice.permissions.speech);
+  }
+  if(voice.permissions&&voice.permissions.microphone&&voice.permissions.microphone!=='unknown'){
+    voiceBits.push('Mic '+voice.permissions.microphone);
+  }
+  if(voice.error)voiceBits.push('Error: '+voice.error);
+  else if(Array.isArray(voice.fallback_chain)&&voice.fallback_chain.length){
+    voiceBits.push('Fallbacks: '+voice.fallback_chain.join(' | '));
+  }
+  if(browserVoice.supported){
+    voiceBits.push(browserVoice.active?'Browser mic listening':'Browser mic ready');
+  }else{
+    voiceBits.push('Browser mic unavailable');
+  }
+  if(browserVoice.permission==='denied')voiceBits.push('Browser mic denied');
+  if(browserVoice.lastError&&browserVoice.lastError!=='aborted'){
+    voiceBits.push('Browser mic '+browserVoice.lastError);
+  }
+  if($('voiceRuntimeNote'))$('voiceRuntimeNote').textContent=clipText(
+    voiceBits.join(' · ')||'Voice runtime ready.',
+    220
+  );
+
+  setPerfUI(mode.requested||curPerfRequested,mode.effective||curPerfActive);
+  if($('runtimeInfo')){
+    const runtimeBits=[];
+    if(mode.assistant_mode)runtimeBits.push(String(mode.assistant_mode).replace(/_/g,' '));
+    if(mode.profile)runtimeBits.push(modeLabel(mode.profile));
+    $('runtimeInfo').textContent=runtimeBits.join(' · ');
+  }
+  if($('modeInfo'))$('modeInfo').textContent=mode.reason||reasoning.why_this_mode||'';
+
+  const activeTask=execution.active_task||execution.label||execution.last_query||'Waiting for input.';
+  $('taskQueryText').textContent=clipText(activeTask,260);
+  const taskMeta=[];
+  if(execution.last_intent)taskMeta.push('Intent: '+execution.last_intent);
+  if(execution.latency_ms)taskMeta.push('Latency: '+Math.round(Number(execution.latency_ms||0))+'ms');
+  if(execution.queue_depth)taskMeta.push('Queue: '+execution.queue_depth);
+  $('taskMetaText').textContent=taskMeta.join(' · ')||'No active intent yet.';
+
+  const heard=browserVoice.interim||voice.last_partial||voice.last_final||execution.last_query||'No input captured yet.';
+  $('heardPanelText').textContent=clipText(heard,220);
+  const inputBits=[];
+  if(browserVoice.supported){
+    inputBits.push(browserVoice.active?'BROWSER MIC':'MIC READY');
+  }else{
+    inputBits.push('TEXT INPUT');
+  }
+  if(context.activity_type)inputBits.push(String(context.activity_type).toUpperCase());
+  if(context.active_app)inputBits.push(context.active_app);
+  $('inputModeText').textContent=inputBits.join(' · ')||'Browser text input is available.';
+  const hearingPreview=browserVoice.interim||voice.last_partial||'';
+  $('hearingText').textContent=hearingPreview?'"'+clipText(hearingPreview,120)+'"':'';
+
+  const spoken=voice.last_spoken||reasoning.last_report||'No spoken answer yet.';
+  $('spokenPanelText').textContent=clipText(spoken,260);
+
+  const screenBits=[];
+  if(context.active_app)screenBits.push(context.active_app);
+  if(context.window_title&&context.window_title!==context.active_app)screenBits.push(context.window_title);
+  if(context.activity_type)screenBits.push('Activity: '+context.activity_type);
+  if(media.playing)screenBits.push('Media: '+(media.summary||media.title||media.source||'playing'));
+  $('screenPanelText').textContent=clipText(
+    screenBits.join(' · ')||'Long details and overflow will appear here.',
+    260
+  );
+
+  const recoveryBits=[];
+  if(Array.isArray(health.warnings)&&health.warnings.length){
+    recoveryBits.push(health.warnings.slice(-2).join(' | '));
+  }else if(health.status){
+    recoveryBits.push('Health: '+health.status);
+  }else{
+    recoveryBits.push('No recovery events.');
+  }
+  $('recoveryPanelText').textContent=clipText(recoveryBits.join(' · '),220);
+
+  $('memoryRagStatus').textContent=clipText(
+    health.readiness_summary||reasoning.why_this_mode||'Checking runtime...',
+    220
+  );
+  const executionBits=[execution.status||'idle'];
+  if(execution.label&&execution.label!==execution.status)executionBits.push(execution.label);
+  if(execution.queue_depth)executionBits.push('queue '+execution.queue_depth);
+  $('executionStateText').textContent='Execution: '+executionBits.join(' · ');
+
+  const experienceBits=[];
+  if(voice.stt_engine||voice.tts_engine){
+    experienceBits.push('STT '+(voice.stt_engine||'—')+' · TTS '+(voice.tts_engine||'—'));
+  }
+  if(voice.voice_name)experienceBits.push(String(voice.voice_name));
+  if(mode.assistant_mode)experienceBits.push(String(mode.assistant_mode).replace(/_/g,' '));
+  $('experienceLine').textContent=experienceBits.join(' · ')||'Voice & assistant —';
+  $('recentActionText').textContent=clipText(
+    reasoning.last_decision||execution.last_action||'Waiting for activity.',
+    180
+  );
+
+  syncVoiceButton();
+  updateLastQuery(
+    execution.last_query||voice.last_final||'',
+    execution.last_intent||'',
+    execution.latency_ms!=null?Number(execution.latency_ms):null
+  );
+}
+
+function ensureBrowserRecognition(){
+  if(!SpeechRecognitionCtor)return null;
+  if(browserVoice.recognition)return browserVoice.recognition;
+  const recognition=new SpeechRecognitionCtor();
+  recognition.continuous=false;
+  recognition.interimResults=true;
+  recognition.maxAlternatives=1;
+  recognition.lang=navigator.language||'en-US';
+  recognition.onstart=()=>{
+    browserVoice.active=true;
+    browserVoice.interim='';
+    browserVoice.lastError='';
+    browserVoice.permission='granted';
+    $('hearingText').textContent='Listening...';
+    syncVoiceButton();
+  };
+  recognition.onresult=(event)=>{
+    let interim='';
+    let finalText='';
+    for(let i=event.resultIndex;i<event.results.length;i++){
+      const result=event.results[i];
+      const transcript=((result[0]&&result[0].transcript)||'').trim();
+      if(!transcript)continue;
+      if(result.isFinal)finalText+=(finalText?' ':'')+transcript;
+      else interim+=(interim?' ':'')+transcript;
+    }
+    browserVoice.interim=interim.trim();
+    if(browserVoice.interim){
+      $('heardPanelText').textContent=clipText(browserVoice.interim,220);
+      $('hearingText').textContent='"'+clipText(browserVoice.interim,120)+'"';
+    }
+    if(finalText.trim()){
+      browserVoice.lastFinal=finalText.trim();
+      browserVoice.interim='';
+      dispatchTextInput(browserVoice.lastFinal,{fromVoice:true});
+    }
+    if(atomState)renderAtomState();
+    else syncVoiceButton();
+  };
+  recognition.onerror=(event)=>{
+    browserVoice.active=false;
+    browserVoice.interim='';
+    browserVoice.lastError=String((event&&event.error)||'error');
+    if(browserVoice.lastError==='not-allowed'||browserVoice.lastError==='service-not-allowed'){
+      browserVoice.permission='denied';
+    }
+    $('hearingText').textContent='';
+    if(atomState)renderAtomState();
+    else updateVoiceRuntime('', $('voiceRuntimeNote') ? $('voiceRuntimeNote').textContent : '');
+  };
+  recognition.onend=()=>{
+    browserVoice.active=false;
+    browserVoice.interim='';
+    if(!atomState)$('hearingText').textContent='';
+    if(atomState)renderAtomState();
+    else syncVoiceButton();
+  };
+  browserVoice.recognition=recognition;
+  return recognition;
+}
+
+function syncVoiceButton(){
+  const btn=$('voiceInputBtn');
+  if(!btn)return;
+  btn.classList.remove('listening','error','disabled');
+  if(!browserVoice.supported){
+    btn.textContent='MIC N/A';
+    btn.disabled=true;
+    btn.classList.add('disabled');
+    btn.title='Browser speech recognition is unavailable in this browser.';
+    return;
+  }
+  btn.disabled=false;
+  if(browserVoice.active){
+    btn.textContent='STOP MIC';
+    btn.classList.add('listening');
+    btn.title='Stop browser microphone capture';
+    return;
+  }
+  if(browserVoice.permission==='denied'){
+    btn.textContent='MIC DENIED';
+    btn.classList.add('error');
+    btn.title='Allow microphone access in the browser to use voice input.';
+    return;
+  }
+  if(browserVoice.lastError&&browserVoice.lastError!=='aborted'){
+    btn.textContent='MIC RETRY';
+    btn.classList.add('error');
+    btn.title='Browser speech error: '+browserVoice.lastError;
+    return;
+  }
+  btn.textContent='MIC';
+  btn.title='Use browser microphone as a voice input fallback.';
+}
+
+function toggleBrowserVoice(){
+  if(!browserVoice.supported){
+    browserVoice.lastError='unsupported';
+    syncVoiceButton();
+    return;
+  }
+  if(!ws||ws.readyState!==1){
+    browserVoice.lastError='dashboard offline';
+    syncVoiceButton();
+    return;
+  }
+  const recognition=ensureBrowserRecognition();
+  if(!recognition){
+    browserVoice.lastError='unsupported';
+    syncVoiceButton();
+    return;
+  }
+  if(browserVoice.active){
+    recognition.stop();
+    return;
+  }
+  browserVoice.lastError='';
+  browserVoice.interim='';
+  try{
+    recognition.lang=((atomState&&atomState.voice&&atomState.voice.language)||navigator.language||'en-US');
+    recognition.start();
+  }catch(err){
+    browserVoice.lastError=String((err&&err.message)||'could not start');
+    syncVoiceButton();
+  }
+}
+
+function applyStateSnapshot(snapshot){
+  atomState=deepClone(snapshot||{});
+  renderAtomState();
+}
+
+function applyStateDiff(diff){
+  if(!atomState)atomState={};
+  deepMerge(atomState,diff||{});
+  renderAtomState();
+}
+
 document.querySelectorAll('.perf-btn').forEach(b=>b.addEventListener('click',function(){
   const m=this.dataset.mode;if(m===curPerfRequested)return;
   if(!confirm('Switch to '+modeLabel(m)+' mode? ATOM will restart.'))return;
@@ -684,24 +1031,37 @@ document.querySelectorAll('.perf-btn').forEach(b=>b.addEventListener('click',fun
 
 function connect(){
   ws=new WebSocket(WS);
-  ws.onopen=()=>{$('connWs').className='mini-dot on';if($('connWsVal'))$('connWsVal').textContent='LIVE';$('perfRestartMsg').style.display='none';};
+  ws.onopen=()=>{$('connWs').className='mini-dot on';if($('connWsVal'))$('connWsVal').textContent='LIVE';$('perfRestartMsg').style.display='none';syncVoiceButton();};
   ws.onmessage=e=>{try{
     const d=JSON.parse(e.data);
     switch(d.type){
       case 'init':
+        if(d.snapshot)applyStateSnapshot(d.snapshot);
         if(d.mic)$('micName').textContent=d.mic;
         if(d.brain&&$('connAiVal'))$('connAiVal').textContent=d.brain;
-        updateVoiceRuntime(d.voice_mode,d.voice_note);
-        if(d.voice_note)$('inputModeText').textContent=d.voice_note;
-        if(d.memory_rag_status)$('memoryRagStatus').textContent=d.memory_rag_status;
-        if(d.last_query!==undefined)updateLastQuery(d.last_query,d.last_intent,d.last_latency_ms);
-        if(d.state)setAppState(d.state,d.label,d.status);
-        if(d.perf_mode||d.perf_mode_requested)setPerfUI(d.perf_mode_requested||d.perf_mode,d.perf_mode||'optimal');
-        if(d.brain_profile||d.assistant_mode)updateRuntimeUI(d.brain_profile,d.assistant_mode);
+        if(!atomState){
+          updateVoiceRuntime(d.voice_mode,d.voice_note);
+          if(d.voice_note)$('inputModeText').textContent=d.voice_note;
+          if(d.memory_rag_status)$('memoryRagStatus').textContent=d.memory_rag_status;
+          if(d.last_query!==undefined)updateLastQuery(d.last_query,d.last_intent,d.last_latency_ms);
+          if(d.state)setAppState(d.state,d.label,d.status);
+          if(d.perf_mode||d.perf_mode_requested)setPerfUI(d.perf_mode_requested||d.perf_mode,d.perf_mode||'optimal');
+          if(d.brain_profile||d.assistant_mode)updateRuntimeUI(d.brain_profile,d.assistant_mode);
+        }
         startTime=Date.now();break;
-      case 'last_query':updateLastQuery(d.query,d.intent,d.latency_ms);break;
-      case 'state':setAppState(d.state,d.label,d.status);break;
+      case 'state_snapshot':applyStateSnapshot(d.snapshot);break;
+      case 'state_diff':applyStateDiff(d.diff);break;
+      case 'self_check_result':
+        if(d.report&&d.report.summary_text)showAtomBubble(d.report.summary_text);
+        break;
+      case 'last_query':
+        if(!atomState)updateLastQuery(d.query,d.intent,d.latency_ms);
+        break;
+      case 'state':
+        if(!atomState)setAppState(d.state,d.label,d.status);
+        break;
       case 'log':
+        if(atomState)break;
         if(d.tag==='heard'){
           queryCount++;$('queriesVal').textContent=queryCount;showUserBubble(d.message);
         }else if(d.tag==='speaking'){
@@ -722,13 +1082,21 @@ function connect(){
           }
         }
         break;
-      case 'system':updateSystem(d);break;
-      case 'hearing':
-        $('hearingText').textContent=d.text?'"'+d.text+'"':'';
-        if(d.text)$('heardPanelText').textContent=clipText(d.text,220);
+      case 'system':
+        if(!atomState)updateSystem(d);
         break;
-      case 'mic':$('micName').textContent=d.name;break;
-      case 'status_text':$('orbStatusText').textContent=d.text;break;
+      case 'hearing':
+        if(!atomState){
+          $('hearingText').textContent=d.text?'"'+d.text+'"':'';
+          if(d.text)$('heardPanelText').textContent=clipText(d.text,220);
+        }
+        break;
+      case 'mic':
+        if(!atomState)$('micName').textContent=d.name;
+        break;
+      case 'status_text':
+        if(!atomState)$('orbStatusText').textContent=d.text;
+        break;
       case 'thinking_progress':
         {const tp=$('thinkingProgress'),tt=$('thinkingText'),tb=$('thinkingBar');
         tp.classList.add('visible');
@@ -737,33 +1105,39 @@ function connect(){
         const pct=Math.min(100,d.estimate_s>0?(d.elapsed_s/d.estimate_s)*100:0);
         tb.style.width=pct+'%';}
         break;
-      case 'perf_mode':setPerfUI(d.requested_mode||curPerfRequested,d.mode||curPerfActive);break;
+      case 'perf_mode':
+        if(!atomState)setPerfUI(d.requested_mode||curPerfRequested,d.mode||curPerfActive);
+        break;
       case 'governor':govThrottled=!!d.throttled;renderPerfStatus();break;
       case 'restarting':
         $('perfRestartMsg').style.display='block';
         $('recentActionText').textContent='Restarting into '+modeLabel(d.mode)+' mode.';
         showAtomBubble('Switching to '+modeLabel(d.mode)+' mode...');
         break;
-      case 'runtime_settings':updateRuntimeUI(d.brain_profile,d.assistant_mode);break;
+      case 'runtime_settings':
+        if(!atomState)updateRuntimeUI(d.brain_profile,d.assistant_mode);
+        break;
       case 'execution_state':
-        if($('executionStateText')){
-          const lab=d.label!=null?String(d.label):'—';
-          let line='Execution: '+lab;
-          if(d.cache_max!=null&&d.cache_entries!=null){
-            line+=' · cache '+d.cache_entries+'/'+d.cache_max;
+        if(!atomState){
+          if($('executionStateText')){
+            const lab=d.label!=null?String(d.label):'—';
+            let line='Execution: '+lab;
+            if(d.cache_max!=null&&d.cache_entries!=null){
+              line+=' · cache '+d.cache_entries+'/'+d.cache_max;
+            }
+            $('executionStateText').textContent=line;
           }
-          $('executionStateText').textContent=line;
-        }
-        if($('experienceLine')){
-          const am=d.assistant_mode?String(d.assistant_mode).replace(/_/g,' '):'';
-          const se=d.stt_engine&&d.stt_engine!=='—'?d.stt_engine:'';
-          const te=d.tts_engine&&d.tts_engine!=='—'?d.tts_engine:'';
-          const vv=d.tts_voice?String(d.tts_voice):'';
-          const bits=[];
-          if(se||te)bits.push('STT '+ (se||'—')+' · TTS '+ (te||'—'));
-          if(vv)bits.push(vv);
-          if(am)bits.push(am);
-          $('experienceLine').textContent=bits.length?bits.join(' · '):'Voice & assistant —';
+          if($('experienceLine')){
+            const am=d.assistant_mode?String(d.assistant_mode).replace(/_/g,' '):'';
+            const se=d.stt_engine&&d.stt_engine!=='—'?d.stt_engine:'';
+            const te=d.tts_engine&&d.tts_engine!=='—'?d.tts_engine:'';
+            const vv=d.tts_voice?String(d.tts_voice):'';
+            const bits=[];
+            if(se||te)bits.push('STT '+ (se||'—')+' · TTS '+ (te||'—'));
+            if(vv)bits.push(vv);
+            if(am)bits.push(am);
+            $('experienceLine').textContent=bits.length?bits.join(' · '):'Voice & assistant —';
+          }
         }
         break;
       case 'mode_update':
@@ -777,18 +1151,34 @@ function connect(){
 connect();
 
 $('unstickBtn').addEventListener('click',()=>{if(ws&&ws.readyState===1)ws.send(JSON.stringify({type:'unstick'}));});
+$('stopTaskBtn').addEventListener('click',()=>{if(ws&&ws.readyState===1)ws.send(JSON.stringify({type:'stop_task'}));});
+$('selfCheckBtn').addEventListener('click',()=>{if(ws&&ws.readyState===1)ws.send(JSON.stringify({type:'run_self_check'}));});
 
+function dispatchTextInput(txt,{fromVoice=false}={}){
+  const text=String(txt||'').trim();
+  if(!text)return;
+  if(ws&&ws.readyState===1){
+    ws.send(JSON.stringify({type:'text_input',text}));
+    if(fromVoice){
+      browserVoice.interim='';
+      browserVoice.lastFinal=text;
+    }
+    showUserBubble(text);
+    $('heardPanelText').textContent=clipText(text,220);
+    $('hearingText').textContent=fromVoice?'':'';
+    syncVoiceButton();
+  }
+}
 function sendTextInput(){
   const inp=$('textInput'),txt=(inp.value||'').trim();
   if(!txt)return;
-  if(ws&&ws.readyState===1){
-    ws.send(JSON.stringify({type:'text_input',text:txt}));
-    showUserBubble(txt);
-    inp.value='';
-  }
+  dispatchTextInput(txt);
+  inp.value='';
 }
 $('textSendBtn').addEventListener('click',sendTextInput);
 $('textInput').addEventListener('keydown',e=>{if(e.key==='Enter'){e.preventDefault();sendTextInput();}});
+$('voiceInputBtn').addEventListener('click',toggleBrowserVoice);
+syncVoiceButton();
 
 function updateRuntimeUI(brain,asst){
   const ri=$('runtimeInfo');

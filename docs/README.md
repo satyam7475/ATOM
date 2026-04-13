@@ -3,6 +3,7 @@
 | Document | Description |
 |----------|-------------|
 | [ARCHITECTURE_CANONICAL.md](./ARCHITECTURE_CANONICAL.md) | **Canonical vs legacy:** live paths (`core/`, `cursor_bridge/`) vs deprecated `brain/*` duplicates |
+| [ARCHITECTURE_CANONICAL.md#runtime-world-state](./ARCHITECTURE_CANONICAL.md#runtime-world-state) | **Shared runtime truth:** `ATOM_STATE`, typed state events, dashboard snapshot/diff contract |
 | [SECURITY_SETUP.md](./SECURITY_SETUP.md) | **Credentials, permission tiers, audit logs** — complements `settings.json` `security` / `control` |
 | [EXPERIENCE_LAYER.md](./EXPERIENCE_LAYER.md) | **Voice, assistant modes, web dashboard** — operator-facing UX after core stabilization |
 | [MEMORY_CONTEXT_LAYERS.md](./MEMORY_CONTEXT_LAYERS.md) | **ST / timeline / LT / RAG:** roles and where each appears in prompts |

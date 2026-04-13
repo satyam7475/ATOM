@@ -94,6 +94,13 @@ _SYSTEM_ANALYZE = re.compile(
     r"show\s+(?:me\s+)?(?:all\s+)?(?:running|open)\s+(?:apps?|programs?|windows?)|"
     r"what\s+apps?\s+(?:are\s+)?(?:running|open)|"
     r"full\s+(?:system\s+)?report)\b", re.I)
+_DETAILED_STATUS = re.compile(
+    r"\b(?:detailed\s+(?:system|status|report)|"
+    r"(?:give|show|tell)\s+(?:me\s+)?a\s+detailed\s+(?:system|status|report)|"
+    r"(?:12\s+point|full)\s+(?:system|status)\s+report|"
+    r"warnings\s+first)\b",
+    re.I,
+)
 
 _TIMER = re.compile(
     r"\b(set\s+(?:a\s+)?timer|timer\s+(?:for|of)\s+|remind\s+me\s+in\s+|"
@@ -348,6 +355,9 @@ def check(text: str) -> IntentResult | None:
         return IntentResult("behavior_report", action="behavior_report", action_args={})
     if _SELF_DIAGNOSTIC.search(text):
         return IntentResult("self_diagnostic", action="self_diagnostic", action_args={})
+
+    if _DETAILED_STATUS.search(text):
+        return IntentResult("detailed_status", action="detailed_status", action_args={})
 
     if _SYSTEM_ANALYZE.search(text):
         return IntentResult("system_analyze", action="system_analyze", action_args={})

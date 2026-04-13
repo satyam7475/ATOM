@@ -100,6 +100,7 @@ class STTAsync:
         self._is_bt_mic: bool = False
         self._detected_language: str = "en"
         self._language_history: list[str] = []
+        self._last_error: str | None = None
 
         stt_cfg = self._config.get("stt", {})
         self.POST_TTS_COOLDOWN: float = stt_cfg.get("post_tts_cooldown_ms", 600) / 1000
@@ -835,7 +836,16 @@ class STTAsync:
             try:
                 t = text
                 loop.call_soon_threadsafe(
-                    lambda: self._bus.emit("speech_partial", text=t))
+                    lambda: (
+                        self._bus.emit("speech_partial", text=t),
+                        self._bus.emit_fast(
+                            "voice.partial",
+                            text=t,
+                            confidence=float(self._last_confidence),
+                            engine=self.backend_name,
+                            mic=self.mic_name,
+                        ),
+                    ))
             except RuntimeError:
                 pass
 
@@ -882,6 +892,10 @@ class STTAsync:
         return counts.most_common(1)[0][0]
 
     @property
+    def backend_name(self) -> str:
+        return "faster-whisper"
+
+    @property
     def preprocessor(self):
         return self._preprocessor
 
@@ -916,8 +930,17 @@ class STTAsync:
             if text:
                 self._consecutive_errors = 0
                 self._consecutive_noise = 0
+                self._last_error = None
                 lang = self._detected_language
                 logger.info("STT final [%s]: '%s'", lang, text)
+                self._bus.emit_fast(
+                    "voice.final",
+                    text=text,
+                    language=lang,
+                    confidence=float(self._last_confidence),
+                    engine=self.backend_name,
+                    mic=self.mic_name,
+                )
                 self._bus.emit("speech_final", text=text, language=lang)
             elif self._consecutive_errors > 0:
                 backoff = min(2 ** self._consecutive_errors, self._MAX_BACKOFF_S)
@@ -932,6 +955,7 @@ class STTAsync:
         except asyncio.CancelledError:
             raise
         except Exception as exc:
+            self._last_error = str(exc)
             await self._handle_runtime_error("start_listening", exc)
 
     def stop(self) -> None:

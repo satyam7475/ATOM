@@ -33,7 +33,8 @@ def collect_v7_warnings(
 
     pwr = float(feedback_metrics.get("prefetch_waste_rate") or feedback_metrics.get("prefetch_miss_rate") or 0.0)
     pwt = float(wc.get("prefetch_waste_above", 0.72))
-    if pwr >= pwt:
+    pfe = str(health_status.get("prefetch_efficiency") or "")
+    if pwr >= pwt and pfe != "warming_up":
         out.append({
             "code": "prefetch_waste_high",
             "message": f"Prefetch waste rate {pwr:.2f} exceeds threshold {pwt:.2f}.",

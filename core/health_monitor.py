@@ -351,9 +351,12 @@ class HealthMonitor:
         v20: Caches ctypes/psutil references at module level to avoid
         repeated imports on each cycle. Reuses buffer for window title.
         """
+        from context.context_engine import ContextEngine
+
         now = datetime.now()
         hour = now.hour
-        active_app = self._get_active_app()
+        context_engine = ContextEngine({"context": {"enable_clipboard": False}})
+        runtime_ctx = context_engine.get_runtime_snapshot(idle_minutes=self.idle_minutes)
         cpu = self._last_cpu
 
         ram = 0.0
@@ -370,7 +373,11 @@ class HealthMonitor:
             cpu=cpu,
             ram=ram,
             idle_minutes=self.idle_minutes,
-            active_app=active_app,
+            active_app=str(runtime_ctx.get("active_app") or ""),
+            window_title=str(runtime_ctx.get("window_title") or ""),
+            frontmost_pid=int(runtime_ctx.get("frontmost_pid") or 0),
+            activity_type=str(runtime_ctx.get("activity_type") or "idle"),
+            confidence=float(runtime_ctx.get("confidence") or 0.0),
             is_weekday=weekday < 5,
             weekday=weekday,
         )
@@ -382,8 +389,10 @@ class HealthMonitor:
 
         if sys.platform == "darwin":
             try:
-                from context.context_darwin import get_foreground_window_title
-                return get_foreground_window_title()[:80]
+                from context.context_darwin import get_foreground_window_info
+
+                info = get_foreground_window_info()
+                return str(info.get("app_name") or info.get("window_title") or "")[:80]
             except Exception:
                 pass
             return ""

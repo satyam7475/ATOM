@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import socket
+import sys
 from typing import TYPE_CHECKING
 import psutil
 import ctypes
@@ -33,6 +34,15 @@ _NETWORK_CHECK_HOSTS = [
 
 
 def _get_foreground_app() -> str:
+    if sys.platform == "darwin":
+        try:
+            from context.context_darwin import get_foreground_window_info
+
+            info = get_foreground_window_info()
+            return str(info.get("app_name") or info.get("window_title") or "").strip()
+        except Exception:
+            logger.debug("macOS foreground app lookup failed", exc_info=True)
+            return ""
     try:
         user32 = ctypes.windll.user32  # type: ignore[attr-defined]
         hwnd = user32.GetForegroundWindow()

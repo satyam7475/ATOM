@@ -17,44 +17,92 @@ from typing import Any
 logger = logging.getLogger("atom.context.darwin")
 
 
-def get_foreground_window_title() -> str:
-    """Return the frontmost window title for the active app, or ``\"\"``."""
+_CODING_APPS = {
+    "cursor", "visual studio code", "code", "terminal", "iterm2", "xcode", "warp",
+}
+_MEETING_APPS = {
+    "zoom", "microsoft teams", "slack", "google chrome", "arc", "safari", "firefox",
+}
+_MEETING_TITLE_HINTS = {
+    "zoom meeting", "google meet", "meet -", "microsoft teams", "huddle", "webex",
+}
+_BROWSER_APPS = {"google chrome", "safari", "firefox", "arc", "brave browser"}
+_MEDIA_TITLE_HINTS = {"youtube", "spotify", "music", "soundcloud", "netflix", "prime video"}
+
+
+def get_foreground_window_info() -> dict[str, Any]:
+    """Return frontmost macOS app + title using AppKit and Quartz."""
+    info = {"app_name": "", "window_title": "", "pid": 0}
     try:
         from AppKit import NSWorkspace
         import Quartz
     except Exception:
-        logger.debug("AppKit/Quartz unavailable for foreground window", exc_info=True)
-        return ""
+        logger.debug("AppKit/Quartz unavailable for foreground window info", exc_info=True)
+        return info
 
     try:
         ws = NSWorkspace.sharedWorkspace()
         fa = ws.frontmostApplication()
         if fa is None:
-            return ""
+            return info
         pid = int(fa.processIdentifier())
-        fallback = str(fa.localizedName() or "")
+        app_name = str(fa.localizedName() or "")
+        info["app_name"] = app_name
+        info["pid"] = pid
 
         opt = (
             Quartz.kCGWindowListOptionOnScreenOnly
             | Quartz.kCGWindowListExcludeDesktopElements
         )
-        windows: Any = Quartz.CGWindowListCopyWindowInfo(
-            opt,
-            Quartz.kCGNullWindowID,
-        )
+        windows: Any = Quartz.CGWindowListCopyWindowInfo(opt, Quartz.kCGNullWindowID)
         for w in windows:
             d = dict(w)
             if int(d.get("kCGWindowOwnerPID", -1)) != pid:
                 continue
             if int(d.get("kCGWindowLayer", 0)) != 0:
                 continue
-            name = d.get("kCGWindowName") or ""
+            name = str(d.get("kCGWindowName") or "").strip()
             if name:
-                return str(name)
-        return fallback
+                info["window_title"] = name
+                break
+        if not info["window_title"]:
+            info["window_title"] = app_name
+        return info
     except Exception:
-        logger.debug("Foreground window title probe failed", exc_info=True)
-        return ""
+        logger.debug("Foreground window info probe failed", exc_info=True)
+        return info
+
+
+def get_foreground_window_title() -> str:
+    """Return the frontmost window title for the active app, or ``\"\"``."""
+    return str(get_foreground_window_info().get("window_title") or "")
+
+
+def classify_activity(
+    app_name: str,
+    window_title: str,
+    *,
+    media_playing: bool = False,
+    idle_minutes: float = 0.0,
+) -> tuple[str, float]:
+    """Map frontmost context to coding, browsing, meeting, media, or idle."""
+    app = str(app_name or "").strip().lower()
+    title = str(window_title or "").strip().lower()
+    if idle_minutes >= 5.0:
+        return "idle", 0.92
+    if media_playing or any(hint in title for hint in _MEDIA_TITLE_HINTS):
+        return "media", 0.9
+    if app in _CODING_APPS:
+        return "coding", 0.95
+    if app in _BROWSER_APPS and any(hint in title for hint in _MEETING_TITLE_HINTS):
+        return "meeting", 0.88
+    if app in {"zoom", "microsoft teams", "webex"}:
+        return "meeting", 0.95
+    if app in _BROWSER_APPS:
+        return "browsing", 0.8
+    if app:
+        return "browsing", 0.55
+    return "idle", 0.35
 
 
 def get_clipboard_text(max_chars: int = 500) -> str:

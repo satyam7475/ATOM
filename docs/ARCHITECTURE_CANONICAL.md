@@ -13,7 +13,7 @@
 | `VoiceInterruptHandler` | Preempts TTS, moves state to LISTENING, calls `LocalBrainController.request_preempt()`, **`LLMInferenceQueue.clear_pending()`** (drops coalesced next job), emits `user_interrupt`. |
 | `brain/mlx_llm.MLXBrain` | `request_abort_preempt()` bumps a generation token so streaming exits; `is_generating()` reflects active MLX work. |
 | `PriorityScheduler` | Voice jobs ahead of LLM; optional `JobHandle.cancel()`. |
-| Web dashboard | WebSocket `execution_state` (every ~5s with system push): queue / MLX / scheduler depth. |
+| Web dashboard | `stop_task` preempts local brain + clears queue + resumes listening; `self_check` routes through the shared diagnostics/state publisher. |
 
 ---
 
@@ -92,7 +92,21 @@ See [`MEMORY_CONTEXT_LAYERS.md`](./MEMORY_CONTEXT_LAYERS.md): short-term convers
 
 ## Experience layer (voice + HUD)
 
-See [`EXPERIENCE_LAYER.md`](./EXPERIENCE_LAYER.md): STT/TTS settings, assistant/brain modes, and web dashboard wiring (`execution_state` carries live voice + mode hints).
+See [`EXPERIENCE_LAYER.md`](./EXPERIENCE_LAYER.md): STT/TTS settings, assistant/brain modes, and web dashboard wiring.
+
+---
+
+## Runtime world state
+
+| Concern | Canonical location | Notes |
+|--------|---------------------|--------|
+| Shared read model | `core/state/atom_state.py` | `AtomStateStore` is the single authoritative runtime state (`system`, `context`, `execution`, `voice`, `mode`, `health`, `reasoning`, `lifecycle`, `meta`) |
+| Diff/snapshot events | `core/state/event_bus.py` | Emits `state.diff` on writes and `state.snapshot` on explicit broadcasts; typed side-channel events: `voice.partial`, `voice.final`, `execution.update`, `system.warning`, `mode.change` |
+| Legacy UI bridge | `core/state/ui_adapter.py` | Mirrors indicator/UI calls into `AtomRuntimeStateBridge` so legacy emitters still write to shared state |
+| Canonical writers | `main.py`, `core/boot/wiring.py`, `core/router/diagnostics_handler.py` | Boot/runtime sync, readiness/self-check publication, mode reasoning, voice/execution/system state updates |
+| Dashboard contract | `ui/web_dashboard.py`, `ui/dashboard/index.html` | Browser initializes from `snapshot`, applies `state_diff` / `state_snapshot`, and only uses legacy messages as fallback compatibility |
+
+The live dashboard now renders from `ATOM_STATE` rather than mixed ad hoc providers. `main.py` maintains a 3-second world-state sync, readiness writes into `health`, and voice/self-check/mode decisions publish through the same shared state contract.
 
 ---
 

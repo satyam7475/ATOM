@@ -29,6 +29,8 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import shutil
+import sys
 import time
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
@@ -770,39 +772,118 @@ class SystemScanner:
         return result
 
     def _check_stt_engine(self) -> dict[str, Any]:
-        """Check STT engine availability (faster-whisper required)."""
+        """Check the configured STT chain, matching the real runtime order."""
         result: dict[str, Any] = {"status": "fail", "engine": "none", "detail": ""}
-        try:
-            from faster_whisper import WhisperModel
-            result["status"] = "pass"
-            result["engine"] = "faster-whisper"
-            result["detail"] = "faster-whisper available (STT engine ready)"
+        cfg = (self._config.get("stt") or {})
+        requested = str(cfg.get("engine", "auto") or "auto").strip().lower()
+
+        def _native_ready() -> tuple[bool, str]:
+            if sys.platform != "darwin":
+                return False, "macOS native STT is only available on macOS"
+            try:
+                from voice.stt_macos import native_stt_launch_supported
+
+                return native_stt_launch_supported()
+            except Exception as exc:
+                return False, f"Native STT probe failed: {exc}"
+
+        def _whisper_ready() -> tuple[bool, str]:
+            try:
+                import faster_whisper  # noqa: F401
+                import speech_recognition  # noqa: F401
+                import pyaudio  # noqa: F401
+
+                return True, "faster-whisper available"
+            except ImportError as exc:
+                return False, f"Offline STT dependency missing: {exc}"
+
+        def _google_ready() -> tuple[bool, str]:
+            try:
+                import speech_recognition  # noqa: F401
+                import pyaudio  # noqa: F401
+
+                return True, "Google online STT dependencies available"
+            except ImportError as exc:
+                return False, f"Google STT dependency missing: {exc}"
+
+        if requested in {"auto", "macos_native"}:
+            native_ok, native_detail = _native_ready()
+            if native_ok:
+                return {
+                    "status": "pass",
+                    "engine": "macos_native",
+                    "detail": f"macOS native STT ready ({native_detail or 'SFSpeechRecognizer'})",
+                }
+            whisper_ok, whisper_detail = _whisper_ready()
+            if whisper_ok:
+                return {
+                    "status": "pass" if requested == "auto" else "warn",
+                    "engine": "faster_whisper",
+                    "detail": f"Native unavailable; offline fallback ready ({whisper_detail})",
+                }
+            google_ok, google_detail = _google_ready()
+            if google_ok:
+                return {
+                    "status": "warn",
+                    "engine": "google_online",
+                    "detail": f"Native and offline unavailable; online fallback ready ({google_detail})",
+                }
+            result["detail"] = f"Native unavailable ({native_detail}); offline unavailable ({whisper_detail}); online unavailable ({google_detail})"
             return result
-        except ImportError:
-            result["detail"] = "No STT engine available"
+
+        if requested in {"faster_whisper"}:
+            whisper_ok, whisper_detail = _whisper_ready()
+            result["status"] = "pass" if whisper_ok else "fail"
+            result["engine"] = "faster_whisper" if whisper_ok else "none"
+            result["detail"] = whisper_detail
+            return result
+
+        if requested in {"google_online", "google"}:
+            google_ok, google_detail = _google_ready()
+            result["status"] = "pass" if google_ok else "fail"
+            result["engine"] = "google_online" if google_ok else "none"
+            result["detail"] = google_detail
+            return result
+
+        result["detail"] = f"Unknown STT engine setting: {requested}"
         return result
 
     def _check_tts_engine(self) -> dict[str, Any]:
-        """Check TTS engine availability."""
+        """Check configured TTS backend availability."""
         result: dict[str, Any] = {"status": "fail", "engine": "none", "detail": ""}
+        requested = str((self._config.get("tts") or {}).get("engine", "macos_native") or "macos_native").strip().lower()
+
+        if requested == "macos_native":
+            if sys.platform == "darwin" and shutil.which("say"):
+                result["status"] = "pass"
+                result["engine"] = "macos_native"
+                result["detail"] = "macOS native TTS available"
+                return result
+            result["detail"] = "macOS native TTS unavailable on this platform"
+            return result
+
+        if requested == "kokoro":
+            try:
+                from voice.tts_kokoro import KokoroTTSAsync  # noqa: F401
+
+                result["status"] = "pass"
+                result["engine"] = "kokoro"
+                result["detail"] = "Kokoro TTS available"
+                return result
+            except Exception as exc:
+                result["detail"] = f"Kokoro TTS unavailable: {exc}"
+                return result
+
         try:
-            import pyttsx3
+            import edge_tts  # noqa: F401
+
             result["status"] = "pass"
-            result["engine"] = "pyttsx3"
-            result["detail"] = "pyttsx3 TTS available"
+            result["engine"] = "edge"
+            result["detail"] = "Edge TTS available"
             return result
         except ImportError:
-            pass
-        try:
-            import edge_tts
-            result["status"] = "pass"
-            result["engine"] = "edge-tts"
-            result["detail"] = "edge-tts available"
+            result["detail"] = "No TTS engine available"
             return result
-        except ImportError:
-            pass
-        result["detail"] = "No TTS engine available"
-        return result
 
     def _check_llm(self) -> dict[str, Any]:
         """Check LLM model/API availability."""

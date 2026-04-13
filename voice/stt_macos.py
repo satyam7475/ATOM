@@ -56,6 +56,40 @@ _SILENCE_TIMEOUT_S = 2.0
 _MAX_RECORD_S = 15.0
 
 
+def _speech_permission_status() -> str:
+    if not _HAS_SPEECH or _Speech is None:
+        return "unavailable"
+    try:
+        status = int(_Speech.SFSpeechRecognizer.authorizationStatus())
+    except Exception:
+        return "unknown"
+    return {
+        0: "not_determined",
+        1: "denied",
+        2: "restricted",
+        3: "authorized",
+    }.get(status, f"unknown({status})")
+
+
+def _microphone_permission_status() -> str:
+    if _AVFoundation is None:
+        return "unknown"
+    try:
+        device_cls = getattr(_AVFoundation, "AVCaptureDevice", None)
+        media_type = getattr(_AVFoundation, "AVMediaTypeAudio", "soun")
+        if device_cls is not None and hasattr(device_cls, "authorizationStatusForMediaType_"):
+            status = int(device_cls.authorizationStatusForMediaType_(media_type))
+            return {
+                0: "not_determined",
+                1: "restricted",
+                2: "denied",
+                3: "authorized",
+            }.get(status, f"unknown({status})")
+    except Exception:
+        logger.debug("Microphone permission probe failed", exc_info=True)
+    return "unknown"
+
+
 def native_stt_launch_supported() -> tuple[bool, str]:
     """Return whether the current process can safely use SFSpeechRecognizer."""
     if sys.platform != "darwin":
@@ -120,8 +154,12 @@ class NativeSTT:
         self._async_task: asyncio.Task | None = None
         self._last_partial: str = ""
         self._last_final: str = ""
+        self._last_confidence: float = 0.95
+        self._last_error: str | None = None
         self._last_speech_time: float = 0.0
         self._loop: asyncio.AbstractEventLoop | None = None
+        self.speech_permission_status: str = "unknown"
+        self.microphone_permission_status: str = "unknown"
 
         self._on_final: Callable[[str], None] | None = None
         self._on_partial: Callable[[str], None] | None = None
@@ -136,13 +174,16 @@ class NativeSTT:
 
     @property
     def backend_name(self) -> str:
-        return "SFSpeechRecognizer" if self._available else "unavailable"
+        return "macOS Native (SFSpeechRecognizer)" if self._available else "unavailable"
 
     # ── Initialization ─────────────────────────────────────────────
 
     def preload(self) -> bool:
         """Initialize recognizer and check authorization."""
+        self.speech_permission_status = _speech_permission_status()
+        self.microphone_permission_status = _microphone_permission_status()
         if not _HAS_SPEECH:
+            self._last_error = "pyobjc speech frameworks are unavailable"
             logger.info(
                 "SFSpeechRecognizer not available (pyobjc-framework-Speech "
                 "not installed). Install with: pip install pyobjc-framework-Speech"
@@ -150,6 +191,7 @@ class NativeSTT:
             return False
 
         if sys.platform != "darwin":
+            self._last_error = "SFSpeechRecognizer only available on macOS"
             logger.info("SFSpeechRecognizer only available on macOS")
             return False
 
@@ -160,6 +202,7 @@ class NativeSTT:
             locale
         )
         if self._recognizer is None or not self._recognizer.isAvailable():
+            self._last_error = f"SFSpeechRecognizer unavailable for locale {self._locale}"
             logger.warning(
                 "SFSpeechRecognizer not available for locale '%s'", self._locale
             )
@@ -170,9 +213,12 @@ class NativeSTT:
         auth_status = _Speech.SFSpeechRecognizer.authorizationStatus()
         if auth_status == 3:  # authorized
             self._available = True
+            self.speech_permission_status = "authorized"
+            self._last_error = None
             logger.info("Native STT ready (SFSpeechRecognizer, locale=%s, on-device=True)", self._locale)
             return True
         elif auth_status == 0:  # notDetermined
+            self.speech_permission_status = "not_determined"
             logger.info("Requesting Speech Recognition authorization...")
             granted_event = threading.Event()
             granted_result = [False]
@@ -186,15 +232,21 @@ class NativeSTT:
 
             if granted_result[0]:
                 self._available = True
+                self.speech_permission_status = "authorized"
+                self._last_error = None
                 logger.info("Speech Recognition authorized by user")
                 return True
             else:
+                self.speech_permission_status = "denied"
+                self._last_error = "Speech Recognition permission denied"
                 logger.warning(
                     "Speech Recognition denied. Go to System Settings > Privacy & Security > Speech Recognition to enable."
                 )
                 return False
         else:
             status_names = {1: "denied", 2: "restricted", 3: "authorized"}
+            self.speech_permission_status = status_names.get(auth_status, f"unknown({auth_status})")
+            self._last_error = f"Speech Recognition authorization: {self.speech_permission_status}"
             logger.warning(
                 "Speech Recognition authorization: %s",
                 status_names.get(auth_status, f"unknown({auth_status})"),
@@ -216,6 +268,8 @@ class NativeSTT:
           on_partial(text) — called with interim results
         """
         if not self._available or self._listening:
+            if not self._available and self._last_error is None:
+                self._last_error = "Native STT is unavailable"
             return False
 
         self._loop = loop
@@ -223,6 +277,11 @@ class NativeSTT:
         self._on_partial = on_partial
         self._last_partial = ""
         self._last_final = ""
+        self.microphone_permission_status = _microphone_permission_status()
+        if self.microphone_permission_status in {"denied", "restricted"}:
+            self._last_error = f"Microphone permission {self.microphone_permission_status}"
+            logger.warning("Native STT blocked: %s", self._last_error)
+            return False
 
         try:
             self._audio_engine = _AVFoundation.AVAudioEngine.alloc().init()
@@ -250,6 +309,7 @@ class NativeSTT:
             self._audio_engine.prepare()
             success, error = self._audio_engine.startAndReturnError_(None)
             if not success:
+                self._last_error = str(error or "AVAudioEngine start failed")
                 logger.error("AVAudioEngine start failed: %s", error)
                 self._cleanup()
                 return False
@@ -260,10 +320,12 @@ class NativeSTT:
 
             self._listening = True
             self._last_speech_time = time.monotonic()
+            self._last_error = None
             logger.info("Native STT listening started (on-device)")
             return True
 
-        except Exception:
+        except Exception as exc:
+            self._last_error = str(exc)
             logger.exception("Failed to start native STT")
             self._cleanup()
             return False
@@ -277,6 +339,7 @@ class NativeSTT:
         """Called by SFSpeechRecognizer with partial/final results."""
         if error is not None:
             err_desc = str(error)
+            self._last_error = err_desc
             if "kAFAssistantErrorDomain" not in err_desc:
                 logger.debug("Recognition error: %s", err_desc)
             return
@@ -291,6 +354,7 @@ class NativeSTT:
 
         if is_final:
             self._last_final = transcript
+            self._last_error = None
             logger.info("STT final: '%s'", transcript)
             if self._on_final:
                 self._emit_threadsafe(self._on_final, transcript)
@@ -410,14 +474,34 @@ class NativeSTT:
 
         def _on_final(text: str) -> None:
             if text and text.strip():
+                self._last_error = None
                 loop.call_soon_threadsafe(
-                    self._bus.emit, "speech_final", text=text, language="en",
+                    lambda t=text: (
+                        self._bus.emit_fast(
+                            "voice.final",
+                            text=t,
+                            language="en",
+                            confidence=float(self._last_confidence),
+                            engine=self.backend_name,
+                            mic=self.mic_name,
+                        ),
+                        self._bus.emit("speech_final", text=t, language="en"),
+                    ),
                 )
 
         def _on_partial(text: str) -> None:
             if text:
                 loop.call_soon_threadsafe(
-                    lambda t=text: self._bus.emit("speech_partial", text=t),
+                    lambda t=text: (
+                        self._bus.emit_fast(
+                            "voice.partial",
+                            text=t,
+                            confidence=float(self._last_confidence),
+                            engine=self.backend_name,
+                            mic=self.mic_name,
+                        ),
+                        self._bus.emit("speech_partial", text=t),
+                    ),
                 )
 
         max_retries = 5
@@ -429,6 +513,7 @@ class NativeSTT:
                 )
                 if not ok:
                     retries += 1
+                    self._last_error = self._last_error or "Native STT failed to start"
                     if not self._available or retries > max_retries:
                         logger.warning(
                             "Native STT unavailable (retries=%d, available=%s) — "

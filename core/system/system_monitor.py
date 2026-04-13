@@ -17,6 +17,14 @@ logger = logging.getLogger("atom.system_monitor")
 
 
 def _foreground_title() -> str:
+    if sys.platform == "darwin":
+        try:
+            from context.context_darwin import get_foreground_window_info
+
+            return str(get_foreground_window_info().get("window_title") or "")[:240]
+        except Exception:
+            logger.debug("macOS foreground title lookup failed", exc_info=True)
+            return ""
     if sys.platform != "win32":
         return ""
     try:
@@ -64,11 +72,20 @@ def get_system_state() -> dict[str, Any]:
         logger.debug("system_monitor psutil unavailable", exc_info=True)
 
     fg = _foreground_title()
+    active_app = ""
+    if sys.platform == "darwin":
+        try:
+            from context.context_darwin import get_foreground_window_info
+
+            active_app = str(get_foreground_window_info().get("app_name") or "")
+        except Exception:
+            logger.debug("macOS active app lookup failed", exc_info=True)
     state = {
         "cpu_percent": round(cpu_pct, 2),
         "ram_percent": round(ram_pct, 2),
         "active_applications": top_apps,
         "foreground_window_title": fg,
+        "foreground_app": active_app,
         "ts": __import__("time").time(),
     }
     try:

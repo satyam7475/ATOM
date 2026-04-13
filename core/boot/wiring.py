@@ -14,6 +14,7 @@ def wire_events(
     *,
     bus,
     state,
+    state_bridge=None,
     stt,
     tts,
     router,
@@ -333,7 +334,16 @@ def wire_events(
             await asyncio.sleep(0.1)
             if state.current is AtomState.LISTENING:
                 if not (v3 or v4):
-                    asyncio.create_task(stt.start_listening())
+                    start_listener = getattr(stt, "async_start_listening", None)
+                    if not callable(start_listener):
+                        start_listener = getattr(stt, "start_listening", None)
+                    if callable(start_listener):
+                        asyncio.create_task(start_listener())
+                    else:
+                        logger.info(
+                            "Skipping restart_listening because %s has no start hook",
+                            type(stt).__name__,
+                        )
     bus.on(
         "restart_listening",
         _guard_handler(
@@ -380,6 +390,12 @@ def wire_events(
     async def log_response(text: str, **_kw) -> None:
         _stop_thinking_progress()
         indicator.add_log("action", text)
+        if state_bridge is not None:
+            state_bridge.patch_section(
+                "reasoning",
+                {"last_report": str(text or ""), "severity": "info"},
+                source="wiring.log_response",
+            )
 
     async def log_thinking_ack(text: str, **_kw) -> None:
         if text and _perceived["t_speech_final"] > 0 and not _ttfa_gate["sent"]:
@@ -387,11 +403,28 @@ def wire_events(
             metrics.record_latency("ttfa", ttfa_ms)
             _ttfa_gate["sent"] = True
         indicator.add_log("info", text)
+        if state_bridge is not None and text:
+            state_bridge.patch_section(
+                "reasoning",
+                {"last_decision": str(text), "severity": "info"},
+                source="wiring.log_thinking_ack",
+            )
         if text:
             asyncio.create_task(tts.speak_ack(text))
 
     async def log_cursor_query(text: str, **_kw) -> None:
         indicator.add_log("action", "Thinking with local brain...")
+        if state_bridge is not None:
+            payload = {"status": "running", "label": "Thinking with local brain..."}
+            state_bridge.patch_section(
+                "execution",
+                payload,
+                source="wiring.log_cursor_query",
+            )
+            state_bridge.events.emit_execution_update(
+                source="wiring.log_cursor_query",
+                **payload,
+            )
         _start_thinking_progress()
 
     async def log_partial(
@@ -409,14 +442,32 @@ def wire_events(
         if text.strip():
             _stream_buffer["text"] += (" " if _stream_buffer["text"] else "") + text.strip()
             indicator.add_log("speaking", _stream_buffer["text"])
+            if state_bridge is not None:
+                state_bridge.patch_section(
+                    "voice",
+                    {"status": "speaking"},
+                    source="wiring.log_partial",
+                )
         if is_last:
             if _stream_buffer["text"]:
                 indicator.add_log("action", _stream_buffer["text"])
+                if state_bridge is not None:
+                    state_bridge.patch_section(
+                        "voice",
+                        {"last_final": _stream_buffer["text"], "speaking": False},
+                        source="wiring.log_partial",
+                    )
             _stream_buffer["text"] = ""
             _stream_buffer["stream_id"] = ""
 
     async def show_hearing(text: str, **_kw) -> None:
         indicator.show_hearing(text)
+        if state_bridge is not None:
+            state_bridge.patch_section(
+                "voice",
+                {"status": "listening", "last_partial": str(text or "")[:240]},
+                source="wiring.show_hearing",
+            )
 
     def _estimate_llm_seconds() -> float:
         if _llm_latency_history:
@@ -460,6 +511,17 @@ def wire_events(
             _stop_thinking_progress()
             if hasattr(indicator, "set_last_latency_ms"):
                 indicator.set_last_latency_ms(latency_ms)
+            if state_bridge is not None:
+                payload = {"latency_ms": float(latency_ms), "status": "idle"}
+                state_bridge.patch_section(
+                    "execution",
+                    payload,
+                    source="wiring.measure_perceived",
+                )
+                state_bridge.events.emit_execution_update(
+                    source="wiring.measure_perceived",
+                    **payload,
+                )
 
     _active_language = {"lang": "en"}
 
@@ -473,6 +535,16 @@ def wire_events(
         indicator.clear_hearing()
         lang_label = "[HI]" if language == "hi" else "[EN]"
         indicator.add_log("heard", f"{lang_label} {text}")
+        if state_bridge is not None:
+            state_bridge.patch_section(
+                "voice",
+                {
+                    "last_final": str(text or "")[:240],
+                    "language": str(language or "en"),
+                    "status": "processing",
+                },
+                source="wiring.speech_final",
+            )
         metrics.inc("queries_total")
         if hasattr(indicator, "set_last_query"):
             indicator.set_last_query(text)
@@ -482,10 +554,72 @@ def wire_events(
     async def _on_intent_classified(intent: str = "", **_kw) -> None:
         if hasattr(indicator, "set_last_intent"):
             indicator.set_last_intent(intent)
+        if state_bridge is not None:
+            payload = {"last_intent": str(intent or "")}
+            state_bridge.patch_section(
+                "execution",
+                payload,
+                source="wiring.intent_classified",
+            )
+            state_bridge.events.emit_execution_update(
+                source="wiring.intent_classified",
+                **payload,
+            )
+
+    async def _on_voice_partial_event(
+        text: str = "",
+        confidence: float = 0.0,
+        engine: str = "",
+        mic: str = "",
+        **_kw,
+    ) -> None:
+        if state_bridge is None:
+            return
+        state_bridge.patch_section(
+            "voice",
+            {
+                "last_partial": str(text or "")[:240],
+                "confidence": float(confidence or 0.0),
+                "mic": str(mic or ""),
+                "status": "listening",
+                "listening": True,
+                "error": None,
+            },
+            source="wiring.voice_partial",
+        )
+
+    async def _on_voice_final_event(
+        text: str = "",
+        language: str = "en",
+        confidence: float = 0.0,
+        engine: str = "",
+        mic: str = "",
+        **_kw,
+    ) -> None:
+        if state_bridge is None:
+            return
+        patch = {
+            "last_final": str(text or "")[:240],
+            "language": str(language or "en"),
+            "confidence": float(confidence or 0.0),
+            "mic": str(mic or ""),
+            "status": "processing",
+            "listening": False,
+            "error": None,
+        }
+        if engine:
+            patch["stt_engine"] = str(engine)
+        state_bridge.patch_section(
+            "voice",
+            patch,
+            source="wiring.voice_final",
+        )
 
     bus.on("speech_final", _on_speech_final_consolidated)
     bus.on("intent_classified", _on_intent_classified)
     bus.on("partial_response", _measure_perceived)
+    bus.on("voice.partial", _on_voice_partial_event)
+    bus.on("voice.final", _on_voice_final_event)
     bus.on(
         "speech_partial",
         _guard_handler(
@@ -536,6 +670,20 @@ def wire_events(
             return
         if kind == "resource_alert" and message:
             indicator.add_log("warning", message)
+            if state_bridge is not None:
+                warnings = list(state_bridge.store.get_section("health").get("warnings", []))
+                if message not in warnings:
+                    warnings.append(message)
+                state_bridge.patch_section(
+                    "health",
+                    {"warnings": warnings[-10:], "status": "degraded"},
+                    source="wiring.system_event",
+                )
+                state_bridge.events.emit_system_warning(
+                    source="wiring.system_event",
+                    message=message,
+                    kind=kind,
+                )
             bus.emit_long("response_ready", text=message)
             return
         if state.current not in (AtomState.IDLE, AtomState.LISTENING):
@@ -634,6 +782,12 @@ def wire_events(
     async def update_mic_on_listen(old, new, **_kw) -> None:
         if new is AtomState.LISTENING:
             indicator.set_mic_name(stt.mic_name)
+            if state_bridge is not None:
+                state_bridge.patch_section(
+                    "voice",
+                    {"mic": getattr(stt, "mic_name", ""), "status": "listening"},
+                    source="wiring.update_mic_on_listen",
+                )
 
     async def auto_recover_to_listening(old, new, **_kw) -> None:
         if new is AtomState.IDLE and state.always_listen:
@@ -644,6 +798,12 @@ def wire_events(
 
     async def on_mic_changed(name: str = "", **_kw) -> None:
         indicator.set_mic_name(name or stt.mic_name)
+        if state_bridge is not None:
+            state_bridge.patch_section(
+                "voice",
+                {"mic": str(name or getattr(stt, "mic_name", ""))},
+                source="wiring.on_mic_changed",
+            )
     bus.on("state_changed", update_mic_on_listen)
     bus.on("state_changed", auto_recover_to_listening)
     bus.on("mic_changed", on_mic_changed)

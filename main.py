@@ -43,6 +43,7 @@ import json
 import logging
 import sys
 import time
+from datetime import datetime
 import psutil
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -111,6 +112,8 @@ async def main() -> None:
 
     from core.async_event_bus import AsyncEventBus
     bus = AsyncEventBus()
+    from core.state.event_bus import AtomRuntimeStateBridge
+    from core.state.ui_adapter import StateAwareIndicator
 
     from core.state_manager import StateManager, AtomState
     from core.cache_engine import CacheEngine
@@ -139,6 +142,7 @@ async def main() -> None:
 
     if False:
         bus.start()
+    atom_runtime = AtomRuntimeStateBridge(bus)
     state = StateManager(
         bus,
         error_recovery_hold_s=float(
@@ -179,6 +183,7 @@ async def main() -> None:
     from core.runtime.modes import RuntimeModeResolver
     from core.cognition.feedback_engine import FeedbackEngine
     from core.cognition.suggester import SuggestionEngine
+    from core.hardware_profile import get_hardware_profile
     from core.system.system_monitor import SystemMonitor
 
     v7i_cfg = config.get("v7_intelligence") or {}
@@ -218,12 +223,28 @@ async def main() -> None:
 
     stt_cfg = config.get("stt", {})
     stt_runtime_label = "Voice input unavailable"
+    stt_runtime_error = ""
+    stt_runtime_fallbacks: list[str] = []
+    stt_engine_pref = str(stt_cfg.get("engine", "auto") or "auto").strip().lower()
 
     def _build_disabled_stt(reason: str):
         class DisabledSTT:
             def __init__(self, disable_reason: str) -> None:
                 self._reason = disable_reason
+                self._last_error = disable_reason
                 self.mic_name = "Voice input unavailable"
+                self.backend_name = "Disabled"
+                self.fallback_chain = [disable_reason]
+                self.speech_permission_status = (
+                    "bundle_missing_usage_description"
+                    if "NSSpeechRecognitionUsageDescription" in disable_reason
+                    else "unavailable"
+                )
+                self.microphone_permission_status = (
+                    "dependency_missing"
+                    if "PyAudio/PortAudio" in disable_reason
+                    else "unknown"
+                )
 
             async def async_preload(self) -> None:
                 logger.warning("STT disabled: %s", self._reason)
@@ -231,7 +252,13 @@ async def main() -> None:
             async def async_start_listening(self, **_kw) -> None:
                 logger.warning("STT disabled: %s", self._reason)
 
+            async def start_listening(self, **_kw) -> None:
+                await self.async_start_listening(**_kw)
+
             async def on_state_changed(self, old, new, **_kw) -> None:
+                return None
+
+            def stop(self) -> None:
                 return None
 
             def shutdown(self) -> None:
@@ -298,50 +325,95 @@ async def main() -> None:
             intent_engine=intent_engine,
         )
 
-    # STT priority chain (macOS):
-    #   1. macos_native → Apple SFSpeechRecognizer (on-device, zero latency)
-    #   2. google_online → Google Web Speech API (free, fast, bilingual)
-    #   3. faster_whisper → offline Whisper (heavier but no internet)
-    stt_engine_pref = stt_cfg.get("engine", "google_online").lower()
-    logger.info("STT engine preference: %s (platform=%s)", stt_engine_pref, sys.platform)
-
-    if stt_engine_pref == "macos_native" and sys.platform == "darwin":
+    def _build_native_stt():
         from voice.stt_macos import NativeSTT, native_stt_launch_supported
 
         native_ok, native_reason = native_stt_launch_supported()
-        if native_ok:
-            stt = NativeSTT(
-                bus, state, config,
-                mic_manager=mic_manager,
-                intent_engine=intent_engine,
-            )
+        if not native_ok:
+            return None, native_reason
+        return NativeSTT(
+            bus,
+            state,
+            config,
+            mic_manager=mic_manager,
+            intent_engine=intent_engine,
+        ), ""
+
+    # STT priority chain (macOS):
+    #   1. macos_native → Apple SFSpeechRecognizer
+    #   2. faster_whisper → offline fallback
+    #   3. google_online → online fallback
+    logger.info("STT engine preference: %s (platform=%s)", stt_engine_pref, sys.platform)
+
+    if stt_engine_pref in ("auto", "macos_native") and sys.platform == "darwin":
+        native_stt, native_reason = _build_native_stt()
+        if native_stt is not None:
+            stt = native_stt
             stt_runtime_label = "macOS Native (SFSpeechRecognizer)"
             logger.info("STT: macOS Native (SFSpeechRecognizer, on-device)")
         else:
+            stt_runtime_error = native_reason
+            stt_runtime_fallbacks.append(f"native unavailable: {native_reason}")
             logger.warning(
-                "macOS Native STT unavailable (%s) -- falling back to Google Online",
+                "macOS Native STT unavailable (%s) -- falling back to Faster-Whisper",
                 native_reason,
             )
-            google_stt, google_err = _build_google_stt()
-            if google_stt is not None:
-                stt = google_stt
-                stt_runtime_label = "Google Online (native fallback)"
+            whisper_stt = _build_faster_whisper_stt()
+            if type(whisper_stt).__name__ != "DisabledSTT":
+                stt = whisper_stt
+                stt_runtime_label = "Faster-Whisper (native fallback)"
             else:
-                logger.warning("Google STT also unavailable (%s) -- trying Whisper", google_err)
-                stt = _build_faster_whisper_stt()
-                stt_runtime_label = "Faster-Whisper (offline fallback)"
+                whisper_reason = getattr(whisper_stt, "_reason", "offline fallback unavailable")
+                stt_runtime_fallbacks.append(f"offline unavailable: {whisper_reason}")
+                logger.warning("Faster-Whisper unavailable (%s) -- trying Google", whisper_reason)
+                google_stt, google_err = _build_google_stt()
+                if google_stt is not None:
+                    stt = google_stt
+                    stt_runtime_label = "Google Online (third fallback)"
+                else:
+                    stt_runtime_fallbacks.append(f"google unavailable: {google_err}")
+                    stt = _build_disabled_stt(
+                        f"Native unavailable ({native_reason}); offline unavailable ({whisper_reason}); google unavailable ({google_err})"
+                    )
+                    stt_runtime_label = "Disabled"
     elif stt_engine_pref in ("google_online", "google"):
         google_stt, google_err = _build_google_stt()
         if google_stt is not None:
             stt = google_stt
             stt_runtime_label = "Google Online (free)"
         else:
+            stt_runtime_error = google_err or ""
+            stt_runtime_fallbacks.append(f"google unavailable: {google_err}")
             logger.warning("Google STT unavailable (%s) -- trying offline fallback", google_err)
             stt = _build_faster_whisper_stt()
-            stt_runtime_label = "Faster-Whisper (offline fallback)"
+            if type(stt).__name__ == "DisabledSTT":
+                stt_runtime_label = "Disabled"
+            else:
+                stt_runtime_label = "Faster-Whisper (offline fallback)"
+    elif stt_engine_pref == "auto":
+        stt = _build_faster_whisper_stt()
+        if type(stt).__name__ == "DisabledSTT":
+            whisper_reason = getattr(stt, "_reason", "offline fallback unavailable")
+            stt_runtime_fallbacks.append(f"offline unavailable: {whisper_reason}")
+            google_stt, google_err = _build_google_stt()
+            if google_stt is not None:
+                stt = google_stt
+                stt_runtime_label = "Google Online (auto fallback)"
+            else:
+                stt_runtime_fallbacks.append(f"google unavailable: {google_err}")
+                stt = _build_disabled_stt(
+                    f"Offline unavailable ({whisper_reason}); google unavailable ({google_err})"
+                )
+                stt_runtime_label = "Disabled"
+        else:
+            stt_runtime_label = "Faster-Whisper (auto)"
     elif stt_engine_pref == "faster_whisper":
         stt = _build_faster_whisper_stt()
-        stt_runtime_label = "Faster-Whisper (explicit)"
+        stt_runtime_label = (
+            "Disabled"
+            if type(stt).__name__ == "DisabledSTT"
+            else "Faster-Whisper (explicit)"
+        )
     else:
         stt = _build_disabled_stt(f"Unknown STT engine: {stt_engine_pref}")
         stt_runtime_label = "Disabled"
@@ -579,16 +651,66 @@ async def main() -> None:
         "full_performance": {"health": 75, "watcher": 15, "maint": 120},
         "auto": {"health": 120, "watcher": 30, "maint": 180},
     }
+
+    def _describe_perf_mode(mode_name: str) -> str:
+        return str(mode_name or "optimal").replace("_", " ")
+
+    def _initial_auto_mode_decision() -> tuple[str, str]:
+        context_snapshot = context_engine.get_runtime_snapshot(media={"playing": False})
+        activity_type = str(context_snapshot.get("activity_type") or "idle")
+        try:
+            battery = psutil.sensors_battery()
+        except Exception:
+            battery = None
+        on_battery = bool(battery is not None and not getattr(battery, "power_plugged", False))
+        battery_pct = float(getattr(battery, "percent", 100.0) or 100.0) if battery is not None else 100.0
+        try:
+            cpu_now = float(psutil.cpu_percent(interval=0.0) or 0.0)
+            memory_now = float(psutil.virtual_memory().percent or 0.0)
+        except Exception:
+            cpu_now = 0.0
+            memory_now = 0.0
+
+        if on_battery and activity_type == "coding":
+            return (
+                "optimal",
+                "Booted in Optimal due to battery power and an active development session.",
+            )
+        if (
+            not on_battery
+            and cpu_now <= float(perf_cfg.get("auto_threshold_mid", 40))
+            and memory_now <= 70.0
+        ):
+            return (
+                "full_performance",
+                "Booted in Full Performance because power is connected and system load is low.",
+            )
+        if on_battery:
+            return (
+                "optimal",
+                f"Booted in Optimal because the Mac is on battery ({battery_pct:.0f}%).",
+            )
+        return (
+            "optimal",
+            "Booted in Optimal while ATOM gathers live thermal and workload telemetry.",
+        )
+
     perf_mode = _canonical_perf_mode(perf_cfg.get("mode", "auto"))
     perf_requested_mode = perf_mode
     perf_effective_mode = "optimal"
+    initial_mode_reason = ""
     logger.info("Performance mode request: %s", perf_requested_mode)
 
     if perf_requested_mode == "auto":
-        brain_mode_mgr.set_profile("optimal")
+        initial_auto_mode, initial_mode_reason = _initial_auto_mode_decision()
+        brain_mode_mgr.set_profile(initial_auto_mode)
+        perf_effective_mode = brain_mode_mgr.active_profile
     else:
         brain_mode_mgr.set_profile(perf_requested_mode)
         perf_effective_mode = brain_mode_mgr.active_profile
+        initial_mode_reason = (
+            f"Using {_describe_perf_mode(perf_effective_mode)} because it was explicitly requested."
+        )
 
     perf_d = _PERF_DEFAULTS.get(perf_requested_mode, _PERF_DEFAULTS["optimal"])
 
@@ -813,6 +935,97 @@ async def main() -> None:
         platform_adapter.os_type.name,
     )
 
+    def _media_snapshot() -> dict[str, object]:
+        info = getattr(media_watcher, "current_media", None)
+        if info is None:
+            return {
+                "playing": False,
+                "type": "",
+                "source": "",
+                "title": "",
+                "artist": "",
+                "album": "",
+                "position": 0.0,
+                "duration": 0.0,
+                "summary": "No media playing",
+            }
+        source = str(getattr(info, "app_name", "") or "")
+        title = str(getattr(info, "title", "") or "")
+        media_type = ""
+        if title:
+            media_type = "video" if "youtube" in source.lower() else "audio"
+        summary = (
+            info.summary()
+            if hasattr(info, "summary")
+            else ("No media playing" if not bool(getattr(info, "is_playing", False)) else title)
+        )
+        return {
+            "playing": bool(getattr(info, "is_playing", False)),
+            "type": media_type,
+            "source": source,
+            "title": title,
+            "artist": str(getattr(info, "artist", "") or ""),
+            "album": str(getattr(info, "album", "") or ""),
+            "position": float(getattr(info, "position", 0.0) or 0.0),
+            "duration": float(getattr(info, "duration", 0.0) or 0.0),
+            "summary": str(summary or "No media playing"),
+        }
+
+    def _current_silicon_stats():
+        if silicon_governor is None or not silicon_governor.is_available:
+            return None
+        try:
+            return silicon_governor.get_stats()
+        except Exception:
+            logger.debug("Silicon stats snapshot failed", exc_info=True)
+            return None
+
+    def _runtime_system_snapshot() -> dict[str, object]:
+        system_state: dict[str, object] = {}
+        try:
+            system_state = system_monitor.get_system_state() if system_monitor is not None else {}
+        except Exception:
+            logger.debug("System monitor snapshot failed", exc_info=True)
+            system_state = {}
+
+        mem = psutil.virtual_memory()
+        disk = psutil.disk_usage("/")
+        battery = psutil.sensors_battery()
+        battery_pct = float(getattr(battery, "percent", 100.0) or 100.0) if battery is not None else 100.0
+        charging = bool(getattr(battery, "power_plugged", False)) if battery is not None else False
+        network = "unknown"
+        try:
+            stats = psutil.net_if_stats()
+            network = "online" if any(v.isup for v in stats.values()) else "offline"
+        except Exception:
+            logger.debug("Network state probe failed", exc_info=True)
+
+        silicon_stats = _current_silicon_stats()
+        thermal_pressure = (
+            str(getattr(silicon_stats, "thermal_pressure", "unknown") or "unknown")
+            if silicon_stats is not None
+            else "unknown"
+        )
+
+        hardware = get_hardware_profile(silicon_stats=silicon_stats)
+        return {
+            "cpu": round(float(system_state.get("cpu_percent", 0.0) or 0.0), 1),
+            "memory_pct": round(float(system_state.get("ram_percent", 0.0) or 0.0), 1),
+            "battery_pct": round(battery_pct, 1),
+            "thermal_pressure": thermal_pressure,
+            "disk_free_gb": round(disk.free / (1024 ** 3), 1),
+            "network": network,
+            "charging": charging,
+            "ram_used_gb": round((mem.total - mem.available) / (1024 ** 3), 1),
+            "ram_total_gb": round(mem.total / (1024 ** 3), 1),
+            "ram_gb": round(float(hardware.get("ram_total_gb", 0.0) or 0.0), 1),
+            "disk_total_gb": round(disk.total / (1024 ** 3), 1),
+            "chip": str(hardware.get("chip") or ""),
+            "power_source": str(hardware.get("battery_state") or ""),
+            "top_processes": list(system_state.get("active_applications") or [])[:6],
+            "hardware": hardware,
+        }
+
     # ── Cognitive Layer ───────────────────────────────────────────
     cognitive_enabled = config.get("cognitive", {}).get("enabled", True)
     second_brain = None
@@ -982,11 +1195,17 @@ async def main() -> None:
             if semantic_rag_ready
             else "Keyword-only fallback. Semantic RAG is unavailable in this runtime."
         )
-        voice_mode = "browser_text_first"
-        voice_note = "Browser dashboard is text-first. Launch ATOM.app for production voice input."
+        voice_mode = "browser_voice_fallback"
+        voice_note = (
+            "Browser dashboard supports text plus browser-mic fallback. "
+            "Launch ATOM.app for the full native macOS voice path."
+        )
         if "Faster-Whisper" in stt_runtime_label:
             voice_mode = "browser_voice_dev"
-            voice_note = "Browser voice is in development fallback mode. The bundled ATOM.app remains the production voice path."
+            voice_note = (
+                "Browser voice fallback is available. The bundled ATOM.app remains "
+                "the production native voice path."
+            )
         indicator.set_init_info(
             version="ATOM",
             owner_name=owner_name,
@@ -1013,6 +1232,64 @@ async def main() -> None:
         indicator.attach_runtime_managers(
             brain_mode_mgr, assistant_mode_mgr, router._security,
         )
+    indicator = StateAwareIndicator(indicator, atom_runtime)
+    atom_runtime.patch_section(
+        "voice",
+        {
+            "stt_engine": stt_runtime_label,
+            "tts_engine": tts_runtime_label,
+            "mic": getattr(stt, "mic_name", ""),
+            "status": "idle",
+            "error": stt_runtime_error or None,
+            "fallback_chain": stt_runtime_fallbacks,
+            "voice_name": str(
+                (config.get("tts") or {}).get("macos_voice")
+                or (config.get("tts") or {}).get("edge_voice")
+                or (config.get("tts") or {}).get("kokoro_voice")
+                or ""
+            ),
+        },
+        source="main.voice_bootstrap",
+    )
+    atom_runtime.patch_section(
+        "mode",
+        {
+            "requested": perf_requested_mode,
+            "effective": perf_effective_mode,
+            "reason": initial_mode_reason,
+            "profile": brain_mode_mgr.active_profile,
+            "assistant_mode": assistant_mode_mgr.active,
+        },
+        source="main.mode_bootstrap",
+    )
+    atom_runtime.patch_section(
+        "reasoning",
+        {
+            "why_this_mode": initial_mode_reason,
+            "last_decision": f"Boot mode -> {perf_effective_mode}",
+        },
+        source="main.mode_bootstrap",
+    )
+    atom_runtime.patch_section(
+        "execution",
+        {
+            "status": "idle",
+            "label": "idle",
+            "last_intent": "",
+            "last_action": "",
+        },
+        source="main.execution_bootstrap",
+    )
+    atom_runtime.patch_section(
+        "lifecycle",
+        {
+            "state": state.current.value,
+            "label": state.current.value.upper(),
+            "status": "Booting",
+            "always_listen": bool(state.always_listen),
+        },
+        source="main.lifecycle_bootstrap",
+    )
 
     def _ui_shutdown_callback():
         """Called from UI thread when X is clicked -- triggers full shutdown."""
@@ -1042,6 +1319,8 @@ async def main() -> None:
             requested_mode=perf_requested_mode,
             reason=reason,
         )
+
+    _broadcast_perf_state(initial_mode_reason)
 
     async def _sync_effective_mode(
         target_mode: str,
@@ -1277,7 +1556,7 @@ async def main() -> None:
 
     # ── Wire all event handlers (extracted for testability) ────────
     _wiring_ctx = wire_events(
-        bus=bus, state=state, shutdown_event=shutdown_event, stt=stt, tts=tts, router=router,
+        bus=bus, state=state, state_bridge=atom_runtime, shutdown_event=shutdown_event, stt=stt, tts=tts, router=router,
         indicator=indicator, cache=cache, memory=memory, metrics=metrics,
         config=config, local_brain=local_brain, llm_queue=llm_queue,
         assistant_mode_mgr=assistant_mode_mgr,
@@ -1311,24 +1590,315 @@ async def main() -> None:
                 brain_profile=brain_profile or brain_mode_mgr.active_profile,
                 assistant_mode=assistant_mode or assistant_mode_mgr.active,
             )
+        atom_runtime.patch_section(
+            "mode",
+            {
+                "profile": brain_profile or brain_mode_mgr.active_profile,
+                "assistant_mode": assistant_mode or assistant_mode_mgr.active,
+                "effective": perf_effective_mode,
+                "requested": perf_requested_mode,
+            },
+            source="main.runtime_settings_changed",
+        )
 
     bus.on("runtime_settings_changed", _on_runtime_settings_changed)
 
+    _latest_readiness_report: dict[str, object] = {}
+
+    def _format_readiness_summary(readiness: dict[str, object]) -> str:
+        if not readiness:
+            return ""
+        summary = readiness.get("summary", {})
+        summary_info = summary if isinstance(summary, dict) else {}
+        subsystems = readiness.get("subsystems", {})
+        subsystem_info = subsystems if isinstance(subsystems, dict) else {}
+        lines: list[str] = []
+        if bool(readiness.get("overall_ready")):
+            lines.append("All systems operational, Boss.")
+        else:
+            failures = int(summary_info.get("failures", 0) or 0)
+            lines.append(
+                f"{failures} system{'s' if failures != 1 else ''} need attention."
+            )
+        for name, info in subsystem_info.items():
+            if not isinstance(info, dict):
+                continue
+            if info.get("status") == "pass":
+                continue
+            icon = {"warn": "WARNING", "fail": "ISSUE"}.get(str(info.get("status")), "?")
+            lines.append(f"  {name}: [{icon}] {str(info.get('detail', ''))}")
+        passed = int(summary_info.get("passed", 0) or 0)
+        warnings_count = int(summary_info.get("warnings", 0) or 0)
+        failures = int(summary_info.get("failures", 0) or 0)
+        total = len(subsystem_info)
+        if total and passed == total:
+            lines.append(f"All {passed} subsystems passed diagnostics.")
+        else:
+            lines.append(
+                f"{passed} passed, {warnings_count} warnings, {failures} failures."
+            )
+        return "\n".join(lines)
+
+    def _voice_permissions_snapshot() -> dict[str, str]:
+        return {
+            "speech": str(getattr(stt, "speech_permission_status", "unknown") or "unknown"),
+            "microphone": str(
+                getattr(stt, "microphone_permission_status", "unknown") or "unknown"
+            ),
+        }
+
+    def _publish_self_check_report(
+        report: dict[str, object] | None,
+        *,
+        source: str = "main.self_check",
+    ) -> dict[str, object]:
+        payload = dict(report or {})
+        if not payload:
+            return {}
+
+        warnings = [str(w) for w in payload.get("warnings", [])]
+        health_status = "ok" if not warnings else "degraded"
+        atom_runtime.replace_health_report(
+            self_check=payload,
+            score=float(payload.get("health_score", 0.0) or 0.0),
+            warnings=warnings,
+            status=health_status,
+            source=source,
+        )
+
+        context_payload = payload.get("context", {})
+        if isinstance(context_payload, dict) and context_payload:
+            atom_runtime.patch_section("context", context_payload, source=source)
+
+        voice_payload = payload.get("voice", {})
+        if isinstance(voice_payload, dict) and voice_payload:
+            atom_runtime.patch_section(
+                "voice",
+                {
+                    "stt_engine": str(voice_payload.get("stt_engine") or ""),
+                    "tts_engine": str(voice_payload.get("tts_engine") or ""),
+                    "mic": str(voice_payload.get("mic") or ""),
+                    "error": voice_payload.get("error"),
+                },
+                source=source,
+            )
+
+        mode_payload = payload.get("mode", {})
+        if isinstance(mode_payload, dict) and mode_payload:
+            atom_runtime.patch_section("mode", mode_payload, source=source)
+
+        atom_runtime.patch_section(
+            "reasoning",
+            {
+                "why_this_mode": str(mode_payload.get("reason") or ""),
+                "last_report": str(payload.get("summary_text") or ""),
+                "last_decision": str(payload.get("recommendation") or ""),
+                "severity": "warning" if warnings else "info",
+            },
+            source=source,
+        )
+        atom_runtime.emit_snapshot(source=source)
+        return payload
+
     router.configure_diagnostics(
-        stt=stt, tts=tts,
+        stt=stt,
+        tts=tts,
         metrics=metrics,
         local_brain=local_brain,
         health_monitor=health_monitor,
+        state_snapshot_provider=atom_runtime.snapshot,
+        report_publisher=_publish_self_check_report,
     )
 
+    async def _on_atom_readiness(report: dict[str, object] | None = None, **_kw) -> None:
+        nonlocal _latest_readiness_report
+        readiness = dict(report or {})
+        if readiness:
+            _latest_readiness_report = readiness
+        summary = _format_readiness_summary(readiness)
+        summary_info = readiness.get("summary", {}) if isinstance(readiness, dict) else {}
+        warnings = []
+        if isinstance(readiness, dict):
+            subsystems = readiness.get("subsystems", {})
+            if isinstance(subsystems, dict):
+                warnings = [
+                    f"{name}: {str(info.get('detail', ''))}"
+                    for name, info in subsystems.items()
+                    if isinstance(info, dict) and info.get("status") in {"warn", "fail"}
+                ][:10]
+        failures = int(summary_info.get("failures", 0) or 0) if isinstance(summary_info, dict) else 0
+        atom_runtime.replace_health_report(
+            readiness=readiness,
+            score=10.0 if failures == 0 else max(2.0, 10.0 - (failures * 2.0)),
+            warnings=warnings,
+            status="ok" if failures == 0 else "degraded",
+            readiness_summary=summary,
+            scan_summary=system_scanner.get_scan_summary(),
+            source="main.atom_readiness",
+        )
+
+    async def _on_context_snapshot(**kw) -> None:
+        media = _media_snapshot()
+        context_patch = {
+            "active_app": str(kw.get("active_app") or ""),
+            "window_title": str(kw.get("window_title") or ""),
+            "activity_type": str(kw.get("activity_type") or "idle"),
+            "confidence": float(kw.get("confidence") or 0.0),
+            "time_of_day": str(kw.get("time_of_day") or ""),
+            "idle_minutes": float(kw.get("idle_minutes") or 0.0),
+            "is_weekday": bool(kw.get("is_weekday", True)),
+            "weekday": int(kw.get("weekday") or 0),
+            "frontmost_pid": int(kw.get("frontmost_pid") or 0),
+            "media": media,
+        }
+        atom_runtime.patch_section("context", context_patch, source="main.context_snapshot")
+
+    bus.on("atom_readiness", _on_atom_readiness)
+    bus.on("context_snapshot", _on_context_snapshot)
+
+    async def _sync_atom_world_state() -> None:
+        while not shutdown_event.is_set():
+            try:
+                media = _media_snapshot()
+                now = datetime.now()
+                runtime_ctx = context_engine.get_runtime_snapshot(
+                    idle_minutes=health_monitor.idle_minutes,
+                    media=media,
+                )
+                system_snapshot = _runtime_system_snapshot()
+                llm_queue_pending = bool(llm_queue is not None and llm_queue.has_pending())
+                scheduler_depth = int(getattr(priority_sched, "queue_depth", 0) or 0)
+                voice_error = getattr(stt, "_last_error", None) or stt_runtime_error or None
+                atom_runtime.patch_section(
+                    "system",
+                    system_snapshot,
+                    source="main.world_sync.system",
+                )
+                atom_runtime.patch_section(
+                    "context",
+                    {
+                        **runtime_ctx,
+                        "time_of_day": (
+                            "morning"
+                            if 5 <= now.hour < 12
+                            else "afternoon"
+                            if 12 <= now.hour < 17
+                            else "evening"
+                            if 17 <= now.hour < 21
+                            else "night"
+                        ),
+                        "idle_minutes": float(health_monitor.idle_minutes),
+                        "is_weekday": now.weekday() < 5,
+                        "weekday": now.weekday(),
+                        "media": media,
+                    },
+                    source="main.world_sync.context",
+                )
+                atom_runtime.patch_section(
+                    "voice",
+                    {
+                        "mic": str(getattr(stt, "mic_name", "") or ""),
+                        "error": voice_error,
+                        "fallback_chain": list(
+                            getattr(stt, "fallback_chain", None) or stt_runtime_fallbacks
+                        ),
+                        "permissions": _voice_permissions_snapshot(),
+                        "listening": state.current.value == "listening",
+                        "speaking": state.current.value == "speaking",
+                    },
+                    source="main.world_sync.voice",
+                )
+                atom_runtime.patch_section(
+                    "execution",
+                    {
+                        "status": (
+                            "running"
+                            if state.current.value in {"thinking", "speaking"}
+                            else "idle"
+                        ),
+                        "active_task": str(
+                            atom_runtime.store.get_section("execution").get("label", "") or ""
+                        ),
+                        "queue_depth": int(llm_queue_pending) + scheduler_depth,
+                        "scheduler_queue_depth": scheduler_depth,
+                        "llm_queue_pending": llm_queue_pending,
+                        "cache_entries": int(len(getattr(cache, "_store", {}))),
+                        "cache_max": int(getattr(cache, "_max_size", 0) or 0),
+                    },
+                    source="main.world_sync.execution",
+                )
+                if _latest_readiness_report:
+                    atom_runtime.replace_health_report(
+                        readiness=_latest_readiness_report,
+                        source="main.world_sync.readiness",
+                    )
+            except Exception:
+                logger.debug("World-state sync failed", exc_info=True)
+            try:
+                await asyncio.wait_for(shutdown_event.wait(), timeout=3.0)
+            except asyncio.TimeoutError:
+                continue
+
+    _bg_tasks.append(asyncio.create_task(_sync_atom_world_state()))
+
     if web_dashboard is not None:
+        def _can_restart_stt() -> bool:
+            stt_engine = str(getattr(stt, "backend_name", "") or "").strip().lower()
+            mic_name = str(getattr(stt, "mic_name", "") or "").strip().lower()
+            return (
+                callable(getattr(stt, "async_start_listening", None))
+                or callable(getattr(stt, "start_listening", None))
+            ) and stt_engine not in {"", "disabled", "unavailable"} and mic_name != "voice input unavailable"
+
         async def _dashboard_unstick() -> None:
             """Dashboard UNSTICK: exit THINKING, stop TTS, clear ERROR_RECOVERY."""
             bus.emit("resume_listening")
-            await asyncio.sleep(0.05)
-            bus.emit("restart_listening")
+            if _can_restart_stt():
+                await asyncio.sleep(0.05)
+                bus.emit("restart_listening")
 
         web_dashboard.set_unstick_callback(_dashboard_unstick)
+
+        async def _dashboard_stop_task() -> None:
+            if local_brain is not None and hasattr(local_brain, "request_preempt"):
+                local_brain.request_preempt()
+            if llm_queue is not None:
+                await llm_queue.clear_pending()
+            try:
+                if hasattr(tts, "stop"):
+                    await tts.stop()
+            except Exception:
+                logger.debug("Dashboard stop_task TTS stop failed", exc_info=True)
+            bus.emit_fast(
+                "resume_listening",
+                source="dashboard_stop_task",
+                reason="stop_task",
+                user_interrupt=True,
+            )
+            if _can_restart_stt():
+                await asyncio.sleep(0.05)
+                bus.emit("restart_listening")
+            atom_runtime.patch_section(
+                "execution",
+                {
+                    "active_task": "",
+                    "status": "idle",
+                    "label": "idle",
+                    "llm_queue_pending": False,
+                },
+                source="main.dashboard_stop_task",
+            )
+            atom_runtime.patch_section(
+                "reasoning",
+                {
+                    "last_decision": "Stopped the active task from the dashboard.",
+                    "severity": "attention",
+                },
+                source="main.dashboard_stop_task",
+            )
+
+        if hasattr(web_dashboard, "set_stop_task_callback"):
+            web_dashboard.set_stop_task_callback(_dashboard_stop_task)
 
         async def _on_text_input(text: str) -> None:
             """Handle typed input from dashboard — same as speech_final."""
@@ -1336,51 +1906,18 @@ async def main() -> None:
             bus.emit("speech_final", text=text)
 
         web_dashboard.set_text_input_callback(_on_text_input)
+        if hasattr(web_dashboard, "attach_atom_state"):
+            web_dashboard.attach_atom_state(atom_runtime)
+        if hasattr(web_dashboard, "on_state_diff"):
+            bus.on("state.diff", web_dashboard.on_state_diff)
+        if hasattr(web_dashboard, "on_state_snapshot"):
+            bus.on("state.snapshot", web_dashboard.on_state_snapshot)
 
-        def _execution_state_payload() -> dict:
-            """Interrupt-control surface: queue + MLX + priority scheduler (best-effort)."""
-            sch_q = 0
-            if priority_sched is not None:
-                try:
-                    sch_q = int(priority_sched.get_diagnostics().get("queue_depth", 0))
-                except Exception:
-                    sch_q = 0
-            parts: list[str] = []
-            if llm_queue is not None and llm_queue.has_pending():
-                parts.append("LLM queued")
-            if local_brain is not None and local_brain.is_mlx_generating():
-                parts.append("MLX active")
-            if sch_q > 0:
-                parts.append(f"prio q={sch_q}")
-            try:
-                cs = cache.stats()
-            except Exception:
-                cs = {"entries": 0, "max_size": 0, "ttl_seconds": 0.0, "jaccard_scan_limit": 0}
+        async def _run_self_check_from_dashboard() -> dict[str, object]:
+            return router._diagnostics.self_check_report()
 
-            tts_voice = str(
-                (config.get("tts") or {}).get("edge_voice")
-                or (config.get("tts") or {}).get("voice")
-                or "",
-            ).strip()
-            try:
-                assistant_mode_live = str(assistant_mode_mgr.active or "").strip()
-            except Exception:
-                assistant_mode_live = ""
-
-            return {
-                "label": " · ".join(parts) if parts else "idle",
-                "llm_queue_pending": bool(llm_queue is not None and llm_queue.has_pending()),
-                "mlx_generating": bool(local_brain is not None and local_brain.is_mlx_generating()),
-                "scheduler_queue_depth": sch_q,
-                "cache_entries": int(cs.get("entries", 0)),
-                "cache_max": int(cs.get("max_size", 0)),
-                "stt_engine": stt_runtime_label,
-                "tts_engine": tts_runtime_label,
-                "tts_voice": tts_voice[:48],
-                "assistant_mode": assistant_mode_live,
-            }
-
-        web_dashboard.set_execution_state_provider(_execution_state_payload)
+        if hasattr(web_dashboard, "set_self_check_callback"):
+            web_dashboard.set_self_check_callback(_run_self_check_from_dashboard)
 
         def _v7_health_payload() -> dict:
             from core.cognition.preemption import get_last_preemption_score
@@ -1597,6 +2134,11 @@ async def main() -> None:
 
     await cold_start.emit_restored_context()
     state.always_listen = True
+    atom_runtime.patch_section(
+        "lifecycle",
+        {"always_listen": True},
+        source="main.always_listen",
+    )
     logger.info(
         "ATOM -- Supernatural Intelligence OS | always listening | requested=%s | active=%s | health=%.0fs watcher=%.0fs maint=%.0fs",
         perf_requested_mode,
@@ -1632,6 +2174,14 @@ async def main() -> None:
             greeting_bits.append(f"Today is {temporal.holiday_name}.")
 
         greeting = f"{time_g} All systems online. {' '.join(greeting_bits)} What do you need?"
+        atom_runtime.patch_section(
+            "reasoning",
+            {
+                "last_report": greeting,
+                "last_decision": "Startup greeting generated",
+            },
+            source="main.startup_greeting",
+        )
 
         try:
             bat = psutil.sensors_battery()
@@ -1698,7 +2248,25 @@ async def main() -> None:
                 "on_battery": on_battery,
             }
 
-        def _mode_reason(telemetry: dict[str, float | bool | str], lat_s: float) -> str:
+        def _mode_reason(
+            telemetry: dict[str, float | bool | str],
+            lat_s: float,
+            *,
+            activity_type: str = "idle",
+            target_mode: str = "optimal",
+        ) -> str:
+            if (
+                target_mode == "optimal"
+                and bool(telemetry["on_battery"])
+                and activity_type == "coding"
+            ):
+                return "Switched to optimal due to battery power and the active development session."
+            if (
+                target_mode == "full_performance"
+                and not bool(telemetry["on_battery"])
+                and activity_type in {"coding", "browsing", "idle"}
+            ):
+                return "Switched to full performance because power is connected, load is low, and thermals are healthy."
             if bool(telemetry["throttled"]):
                 return "Thermal pressure is high, so I'm protecting the Air."
             if float(telemetry["memory_pct"]) >= _memory_pressure_threshold:
@@ -1732,6 +2300,14 @@ async def main() -> None:
                 lat_ms = _last_perceived_ms.get("ms")
                 lat_s = (lat_ms / 1000.0) if lat_ms is not None else 0.0
                 telemetry = _telemetry()
+                runtime_context = atom_runtime.store.get_section("context")
+                activity_type = str(runtime_context.get("activity_type") or "idle")
+                plugged_low_load = (
+                    not bool(telemetry["on_battery"])
+                    and float(telemetry["cpu"]) <= float(perf_cfg.get("auto_threshold_mid", 40))
+                    and float(telemetry["memory_pct"]) <= max(72.0, _memory_pressure_relief)
+                    and lat_s <= 6.0
+                )
 
                 promote_ready = (
                     not bool(telemetry["throttled"])
@@ -1739,6 +2315,7 @@ async def main() -> None:
                     and float(telemetry["memory_pct"]) <= max(72.0, _memory_pressure_relief)
                     and float(telemetry["cpu"]) <= float(perf_cfg.get("auto_threshold_mid", 40))
                     and lat_s <= 6.0
+                    and activity_type in {"coding", "browsing", "idle"}
                     and (
                         not bool(telemetry["on_battery"])
                         or float(telemetry["battery_pct"]) >= 35.0
@@ -1766,16 +2343,25 @@ async def main() -> None:
                 else:
                     if must_demote:
                         target = "optimal"
+                    elif bool(telemetry["on_battery"]) and activity_type == "coding":
+                        target = "optimal"
                     elif perf_effective_mode == "optimal" and promote_ready:
                         target = "full_performance"
 
+                reason = _mode_reason(
+                    telemetry,
+                    lat_s,
+                    activity_type=activity_type,
+                    target_mode=target,
+                )
                 if target == perf_effective_mode:
-                    _broadcast_perf_state()
+                    if perf_requested_mode == "auto" and plugged_low_load:
+                        _broadcast_perf_state(reason)
+                    else:
+                        _broadcast_perf_state(reason)
                     continue
-
-                reason = _mode_reason(telemetry, lat_s)
                 logger.info(
-                    "M5 auto perf: requested=%s current=%s target=%s latency=%.1fs cpu=%.0f%% mem=%.0f%% thermal=%s battery=%.0f%% on_battery=%s",
+                    "M5 auto perf: requested=%s current=%s target=%s latency=%.1fs cpu=%.0f%% mem=%.0f%% thermal=%s battery=%.0f%% on_battery=%s activity=%s",
                     perf_requested_mode,
                     perf_effective_mode,
                     target,
@@ -1785,6 +2371,7 @@ async def main() -> None:
                     telemetry["thermal_pressure"],
                     float(telemetry["battery_pct"]),
                     telemetry["on_battery"],
+                    activity_type,
                 )
                 switched = await _sync_effective_mode(
                     target,

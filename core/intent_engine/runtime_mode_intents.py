@@ -24,6 +24,12 @@ _MODE_SWITCH_VERB = re.compile(
     r"\b(switch|set|change|use|enable|go(?:\s+to|\s+into)?|turn\s+on)\b",
     re.I,
 )
+_MODE_STATUS = re.compile(
+    r"\b(?:what\s+mode\s+are\s+you\s+in|which\s+mode\s+are\s+you\s+in|"
+    r"what('?s|\s+is)\s+(?:the\s+)?(?:current\s+)?(?:mode|brain\s+profile)|"
+    r"mode\s+status|mode\s+reason|why\s+this\s+mode|why\s+are\s+you\s+in\s+.+\s+mode)\b",
+    re.I,
+)
 _PROFILE_EXACT_MAP = {
     "atom mode": "optimal",
     "fast brain": "optimal",
@@ -64,6 +70,12 @@ def check(text: str) -> IntentResult | None:
     norm = re.sub(r"\s+", " ", t.lower()).strip()
     is_switch_command = bool(_MODE_SWITCH_VERB.search(t))
 
+    if _MODE_STATUS.search(t):
+        return IntentResult(
+            intent="mode_status",
+            action="mode_status",
+            action_args={},
+        )
     if norm in _PROFILE_EXACT_MAP:
         return IntentResult(
             intent="set_brain_profile",

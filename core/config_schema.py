@@ -41,8 +41,8 @@ CONFIG_SCHEMA: dict[str, Any] = {
             "properties": {
                 "engine": {
                     "type": "string",
-                    "enum": ["auto", "macos_native", "faster_whisper"],
-                    "description": "STT engine: auto (prefer native on macOS), macos_native, faster_whisper",
+                    "enum": ["auto", "macos_native", "faster_whisper", "google_online", "google"],
+                    "description": "STT engine: auto (native -> whisper -> google on macOS), macos_native, faster_whisper, google_online",
                 },
                 "whisper_model_size": {
                     "type": "string",

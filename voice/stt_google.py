@@ -104,9 +104,12 @@ class STTGoogle:
         self._threshold_elevated: bool = False
         self._too_noisy_emitted: bool = False
         self._last_confidence: float = 0.85
+        self._last_error: str | None = None
         self._is_bt_mic: bool = False
         self._detected_language: str = "en"
         self._language_history: list[str] = []
+        self.speech_permission_status: str = "unknown"
+        self.microphone_permission_status: str = "unknown"
 
         stt_cfg = self._config.get("stt", {})
         self.POST_TTS_COOLDOWN: float = stt_cfg.get("post_tts_cooldown_ms", 600) / 1000
@@ -153,6 +156,11 @@ class STTGoogle:
             "STT ready -- engine=google_online, mic='%s', lang=%s",
             self.mic_name, lang_str,
         )
+        self._last_error = None
+
+    @property
+    def backend_name(self) -> str:
+        return "Google Online"
 
     # Alias expected by main.py wiring
     async def async_preload(self) -> None:
@@ -503,12 +511,15 @@ class STTGoogle:
 
         except sr.UnknownValueError:
             logger.debug("Google STT: unintelligible audio -- skipped")
+            self._last_error = None
             return ""
         except sr.RequestError as e:
             logger.warning("Google STT network error: %s", e)
             self._consecutive_errors += 1
+            self._last_error = str(e)
             return ""
-        except Exception:
+        except Exception as exc:
+            self._last_error = str(exc)
             logger.exception("Google STT unexpected error")
             return ""
 
@@ -647,7 +658,16 @@ class STTGoogle:
             try:
                 t = text
                 loop.call_soon_threadsafe(
-                    lambda: self._bus.emit("speech_partial", text=t))
+                    lambda: (
+                        self._bus.emit_fast(
+                            "voice.partial",
+                            text=t,
+                            confidence=float(self._last_confidence),
+                            engine=self.backend_name,
+                            mic=self.mic_name,
+                        ),
+                        self._bus.emit("speech_partial", text=t),
+                    ))
             except RuntimeError:
                 pass
 
@@ -703,8 +723,17 @@ class STTGoogle:
             if text:
                 self._consecutive_errors = 0
                 self._consecutive_noise = 0
+                self._last_error = None
                 lang = self._detected_language
                 logger.info("STT final [%s]: '%s'", lang, text)
+                self._bus.emit_fast(
+                    "voice.final",
+                    text=text,
+                    language=lang,
+                    confidence=float(self._last_confidence),
+                    engine=self.backend_name,
+                    mic=self.mic_name,
+                )
                 self._bus.emit("speech_final", text=text, language=lang)
             elif self._consecutive_errors > 0:
                 backoff = min(2 ** self._consecutive_errors, self._MAX_BACKOFF_S)
@@ -721,6 +750,7 @@ class STTGoogle:
         except Exception as exc:
             logger.exception("STT start_listening failed: %s", exc)
             self._consecutive_errors += 1
+            self._last_error = str(exc)
             try:
                 self._bus.emit("silence_timeout")
             except Exception:

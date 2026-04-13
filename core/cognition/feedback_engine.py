@@ -249,6 +249,14 @@ class FeedbackEngine:
         m = self.compute_accuracy_metrics()
         cpu = float((system_state or {}).get("cpu_percent") or 0)
         ram = float((system_state or {}).get("memory_percent") or (system_state or {}).get("ram_percent") or 0)
+        with self._lock:
+            prediction_total = int(self._prediction_total or 0)
+            prefetch_total = int(self._prefetch_total or 0)
+            graph_events = int(self._graph_hits or 0) + int(self._rag_fallbacks or 0)
+
+        min_prediction_samples = int(hc.get("prediction_min_samples", 5))
+        min_prefetch_samples = int(hc.get("prefetch_min_samples", 5))
+        min_memory_samples = int(hc.get("memory_relevance_min_samples", 3))
 
         pa = float(m.get("prediction_accuracy", 0.5))
         good_a = float(hc.get("prediction_good_above", 0.55))
@@ -256,7 +264,9 @@ class FeedbackEngine:
         unstable_lo = float(hc.get("prediction_unstable_low", 0.4))
         unstable_hi = float(hc.get("prediction_unstable_high", 0.52))
 
-        if pa >= good_a:
+        if prediction_total < min_prediction_samples:
+            pq = "warming_up"
+        elif pa >= good_a:
             pq = "good"
         elif pa <= poor_a:
             pq = "poor"
@@ -268,7 +278,9 @@ class FeedbackEngine:
         pr = float(m.get("prefetch_hit_rate", 0.0))
         pf_good = float(hc.get("prefetch_good_above", 0.35))
         pf_poor = float(hc.get("prefetch_poor_below", 0.15))
-        if pr >= pf_good:
+        if prefetch_total < min_prefetch_samples:
+            pfe = "warming_up"
+        elif pr >= pf_good:
             pfe = "good"
         elif pr <= pf_poor:
             pfe = "poor"
@@ -278,7 +290,9 @@ class FeedbackEngine:
         gvr = float(m.get("graph_vs_rag_ratio", 0.5))
         mr_good = float(hc.get("memory_relevance_good_above", 0.35))
         mr_poor = float(hc.get("memory_relevance_poor_below", 0.15))
-        if gvr >= mr_good:
+        if graph_events < min_memory_samples:
+            memrel = "warming_up"
+        elif gvr >= mr_good:
             memrel = "good"
         elif gvr <= mr_poor:
             memrel = "poor"

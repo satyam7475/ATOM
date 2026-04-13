@@ -82,7 +82,7 @@ class Router:
         "system_info", "ip", "wifi", "uptime", "top_processes",
         "resource_report", "resource_trend", "app_history",
         "show_reminders", "self_diagnostic", "system_analyze",
-        "self_check", "behavior_report",
+        "self_check", "behavior_report", "mode_status", "detailed_status",
     })
 
     def __init__(
@@ -312,19 +312,6 @@ class Router:
         if self._conv_memory is not None:
             self._conv_memory.on_new_user_query(raw_text)
 
-        _skill_chain: list[str] = []
-        if self._skills is not None:
-            match = self._skills.try_expand_full(clean_text)
-            if match is not None:
-                logger.info(
-                    "Skill '%s': '%s' -> '%s'%s",
-                    match.skill_id, clean_text[:80], match.primary[:80],
-                    f" +{len(match.chain)} chain" if match.chain else "",
-                )
-                clean_text = match.primary
-                raw_text = match.primary
-                _skill_chain = list(match.chain)
-
         # ── 1. Pronoun resolution (conversational continuity) ────────
         resolved = self._conv_mgr.resolve_pronouns(clean_text)
         if resolved != clean_text:
@@ -387,6 +374,47 @@ class Router:
             if classify_ms > 0 and not used_intent_cache:
                 logger.info("Router: '%s' -> %s (%.1fms)",
                              clean_text[:60], result.intent, classify_ms)
+
+        _skill_chain: list[str] = []
+        if result.intent == "fallback" and self._skills is not None:
+            match = self._skills.try_expand_full(clean_text)
+            if match is not None:
+                logger.info(
+                    "Skill '%s': '%s' -> '%s'%s",
+                    match.skill_id, clean_text[:80], match.primary[:80],
+                    f" +{len(match.chain)} chain" if match.chain else "",
+                )
+                clean_text = match.primary
+                raw_text = match.primary
+                _skill_chain = list(match.chain)
+                cached = cmd_cache.get(clean_text)
+                if cached is not None:
+                    result = cached
+                    classify_ms = 0.0
+                    logger.info("Router: '%s' -> %s (CACHED, 0ms)",
+                                clean_text[:60], result.intent)
+                else:
+                    if self._runtime_watchdog is not None:
+                        from core.intent_engine import IntentResult
+
+                        classify_result = await self._runtime_watchdog.run_sync(
+                            "intent_engine",
+                            self._intent.classify,
+                            clean_text,
+                            default=IntentResult("fallback"),
+                            metadata={"query": clean_text[:80], "source": "skill_expand"},
+                        )
+                        result = classify_result.value
+                        classify_ms = classify_result.elapsed_ms
+                        intent_timed_out = classify_result.timed_out
+                    else:
+                        result = self._intent.classify(clean_text)
+                        classify_ms = (time.perf_counter() - t0) * 1000
+                        intent_timed_out = False
+                    if not intent_timed_out:
+                        cmd_cache.put(clean_text, result)
+                    logger.info("Router: '%s' -> %s (skill expanded, %.1fms)",
+                                clean_text[:60], result.intent, classify_ms)
 
         self._bus.emit_fast("intent_classified",
                             intent=result.intent, ms=classify_ms,
@@ -905,19 +933,34 @@ class Router:
 
     # ── ATOM self-check diagnostics (delegated) ─────────────────────
 
-    def configure_diagnostics(self, *, stt=None, tts=None,
-                               metrics=None,
-                               local_brain=None,
-                               health_monitor=None) -> None:
+    def configure_diagnostics(
+        self,
+        *,
+        stt=None,
+        tts=None,
+        metrics=None,
+        local_brain=None,
+        health_monitor=None,
+        state_snapshot_provider=None,
+        report_publisher=None,
+    ) -> None:
         self._diagnostics.configure(
             stt=stt, tts=tts, metrics=metrics,
             local_brain=local_brain, health_monitor=health_monitor,
             evolution=self._evolution,
             behavior_tracker=self._behavior_tracker,
+            state_snapshot_provider=state_snapshot_provider,
+            report_publisher=report_publisher,
         )
 
     def _do_self_check(self, _action: str, _args: dict) -> str:
         return self._diagnostics.self_check()
+
+    def _do_mode_status(self, _action: str, _args: dict) -> str:
+        return self._diagnostics.mode_status()
+
+    def _do_detailed_status(self, _action: str, _args: dict) -> str:
+        return self._diagnostics.detailed_status()
 
     def _do_set_performance_mode(self, _action: str, args: dict) -> str:
         mode = (args.get("mode") or "optimal").strip().lower().replace("-", "_")
@@ -1139,6 +1182,8 @@ class Router:
         "type_text": _do_type_text,
         "system_analyze": _do_system_analyze,
         "self_check": _do_self_check,
+        "mode_status": _do_mode_status,
+        "detailed_status": _do_detailed_status,
         "set_performance_mode": _do_set_performance_mode,
         "set_brain_profile": _do_set_brain_profile,
         "set_assistant_mode": _do_set_assistant_mode,
