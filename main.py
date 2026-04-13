@@ -298,12 +298,39 @@ async def main() -> None:
             intent_engine=intent_engine,
         )
 
-    # Primary: Google Online STT (fast, free, accurate, no TCC issues)
-    # Fallback: faster-whisper (offline, heavier but no internet needed)
+    # STT priority chain (macOS):
+    #   1. macos_native → Apple SFSpeechRecognizer (on-device, zero latency)
+    #   2. google_online → Google Web Speech API (free, fast, bilingual)
+    #   3. faster_whisper → offline Whisper (heavier but no internet)
     stt_engine_pref = stt_cfg.get("engine", "google_online").lower()
     logger.info("STT engine preference: %s (platform=%s)", stt_engine_pref, sys.platform)
 
-    if stt_engine_pref in ("google_online", "google", "macos_native"):
+    if stt_engine_pref == "macos_native" and sys.platform == "darwin":
+        from voice.stt_macos import NativeSTT, native_stt_launch_supported
+
+        native_ok, native_reason = native_stt_launch_supported()
+        if native_ok:
+            stt = NativeSTT(
+                bus, state, config,
+                mic_manager=mic_manager,
+                intent_engine=intent_engine,
+            )
+            stt_runtime_label = "macOS Native (SFSpeechRecognizer)"
+            logger.info("STT: macOS Native (SFSpeechRecognizer, on-device)")
+        else:
+            logger.warning(
+                "macOS Native STT unavailable (%s) -- falling back to Google Online",
+                native_reason,
+            )
+            google_stt, google_err = _build_google_stt()
+            if google_stt is not None:
+                stt = google_stt
+                stt_runtime_label = "Google Online (native fallback)"
+            else:
+                logger.warning("Google STT also unavailable (%s) -- trying Whisper", google_err)
+                stt = _build_faster_whisper_stt()
+                stt_runtime_label = "Faster-Whisper (offline fallback)"
+    elif stt_engine_pref in ("google_online", "google"):
         google_stt, google_err = _build_google_stt()
         if google_stt is not None:
             stt = google_stt
@@ -1330,12 +1357,10 @@ async def main() -> None:
             except Exception:
                 cs = {"entries": 0, "max_size": 0, "ttl_seconds": 0.0, "jaccard_scan_limit": 0}
 
-            stt_cfg = config.get("stt") or {}
-            tts_cfg = config.get("tts") or {}
-            stt_engine = str(stt_cfg.get("engine", "")).strip() or "—"
-            tts_engine = str(tts_cfg.get("engine", "")).strip() or "—"
             tts_voice = str(
-                tts_cfg.get("edge_voice") or tts_cfg.get("voice") or "",
+                (config.get("tts") or {}).get("edge_voice")
+                or (config.get("tts") or {}).get("voice")
+                or "",
             ).strip()
             try:
                 assistant_mode_live = str(assistant_mode_mgr.active or "").strip()
@@ -1349,8 +1374,8 @@ async def main() -> None:
                 "scheduler_queue_depth": sch_q,
                 "cache_entries": int(cs.get("entries", 0)),
                 "cache_max": int(cs.get("max_size", 0)),
-                "stt_engine": stt_engine,
-                "tts_engine": tts_engine,
+                "stt_engine": stt_runtime_label,
+                "tts_engine": tts_runtime_label,
                 "tts_voice": tts_voice[:48],
                 "assistant_mode": assistant_mode_live,
             }

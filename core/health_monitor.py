@@ -377,11 +377,20 @@ class HealthMonitor:
 
     @staticmethod
     def _get_active_app() -> str:
-        """Get the foreground window title (Windows). Uses cached ctypes ref."""
+        """Foreground window title (macOS + Windows)."""
+        import sys
+
+        if sys.platform == "darwin":
+            try:
+                from context.context_darwin import get_foreground_window_title
+                return get_foreground_window_title()[:80]
+            except Exception:
+                pass
+            return ""
+
+        if sys.platform != "win32":
+            return ""
         try:
-            import sys
-            if sys.platform != "win32":
-                return ""
             _user32 = ctypes.windll.user32
             hwnd = _user32.GetForegroundWindow()
             length = _user32.GetWindowTextLengthW(hwnd)
