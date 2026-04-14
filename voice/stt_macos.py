@@ -201,6 +201,8 @@ class NativeSTT:
 
         self._on_final: Callable[[str], None] | None = None
         self._on_partial: Callable[[str], None] | None = None
+        # After TTS, wait before reopening mic (avoids AVAudioEngine vs output conflict).
+        self._need_post_tts_cooldown: bool = False
 
     @property
     def is_available(self) -> bool:
@@ -555,8 +557,28 @@ class NativeSTT:
 
         max_retries = 5
         retries = 0
+        from core.state_manager import AtomState
+
+        post_cd_s = float(self._config.get("post_tts_cooldown_ms", 800) or 0) / 1000.0
+
         while getattr(self, "_running_async", False):
             if not self._listening:
+                cur = self._state.current
+                # Do not open the mic during TTS/thinking — wait until LISTENING.
+                if cur is AtomState.SPEAKING or cur is AtomState.THINKING:
+                    await asyncio.sleep(0.12)
+                    continue
+                if cur is not AtomState.LISTENING:
+                    await asyncio.sleep(0.12)
+                    continue
+                if self._need_post_tts_cooldown:
+                    self._need_post_tts_cooldown = False
+                    if post_cd_s > 0:
+                        logger.info(
+                            "Native STT: post-TTS cooldown %.2fs before mic (config stt.post_tts_cooldown_ms)",
+                            post_cd_s,
+                        )
+                        await asyncio.sleep(post_cd_s)
                 ok = self.start_listening(
                     loop=loop, on_final=_on_final, on_partial=_on_partial,
                 )
@@ -589,6 +611,9 @@ class NativeSTT:
         try:
             if self._permanently_disabled:
                 return
+
+            if old is AtomState.SPEAKING and new is AtomState.LISTENING:
+                self._need_post_tts_cooldown = True
 
             if new in (AtomState.LISTENING, AtomState.SPEAKING):
                 already_running = (

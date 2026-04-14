@@ -2211,16 +2211,13 @@ async def main() -> None:
 
         await stt_preload_done.wait()
         logger.info("STT ready -- ATOM fully operational")
-        # Mic (re)start before blocking in async_start_listening; handler only acts in LISTENING.
+        # Do NOT await async_start_listening() here: on_state_changed already create_task()s
+        # exactly one listen loop when state is LISTENING/SPEAKING. Awaiting it duplicated the
+        # loop and raced the mic with startup TTS (LISTENING→THINKING→SPEAKING→LISTENING).
         try:
             bus.emit("restart_listening")
         except Exception:
-            logger.debug("pre-listen restart_listening emit failed", exc_info=True)
-
-        if hasattr(stt, "async_start_listening"):
-            await stt.async_start_listening()
-        else:
-            await stt.start_listening()
+            logger.debug("post-preload restart_listening emit failed", exc_info=True)
 
     _bg_tasks.append(asyncio.create_task(_startup_greeting()))
 

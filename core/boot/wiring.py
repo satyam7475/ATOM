@@ -338,6 +338,14 @@ def wire_events(
                     if not callable(start_listener):
                         start_listener = getattr(stt, "start_listening", None)
                     if callable(start_listener):
+                        # Stop any in-flight listen loop so we do not stack two mic pipelines.
+                        stop_fn = getattr(stt, "stop", None)
+                        if callable(stop_fn):
+                            try:
+                                stop_fn()
+                            except Exception:
+                                logger.debug("restart_listening: stt.stop failed", exc_info=True)
+                        await asyncio.sleep(0.08)
                         asyncio.create_task(start_listener())
                     else:
                         logger.info(
