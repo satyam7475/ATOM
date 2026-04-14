@@ -63,6 +63,17 @@ Legitimate call sites for `async_start_listening` / `start_listening`:
 
 A `core/voice/voice_session.py` facade (`request_listen_start` / `request_listen_stop`) could centralize `stop` + `create_task` rules; `wiring` and `NativeSTT` would delegate. Not required for v1 if this document + audit stay current.
 
+## Apple-class stack (same public APIs as Siri / Dictation on Mac)
+
+ATOM does **not** embed Apple’s private Siri hotword binary. It **does** use the same **supported** surfaces:
+
+| Capability | API | Config |
+|------------|-----|--------|
+| On-device speech recognition | `SFSpeechRecognizer` + `AVAudioEngine` | `stt.engine`: `macos_native`, `stt.locale`: `auto` (follows Mac primary locale) |
+| On-device neural TTS | `NSSpeechSynthesizer` | `tts.macos_voice`: `system` (uses `NSSpeechSynthesizer.defaultVoice()` — Spoken Content default, Siri-class quality tier) |
+
+**Better than cloud assistants for your Mac:** ATOM adds your **local agentic brain** (tools, ReAct, privacy). Siri/Alexa/Google optimize for their clouds and devices; ATOM optimizes for **your** machine and **your** model.
+
 ## See also
 
 - [`09_STATE_MACHINE.md`](09_STATE_MACHINE.md) — `AtomState` transitions  

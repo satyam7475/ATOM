@@ -29,20 +29,30 @@
     },
     "stt": {
         "engine": "macos_native",
+        "locale": "auto",
         "whisper_model_size": "small",
         "bilingual": true,
         "sample_rate": 16000,
         "chunk_size": 2048,
-        "post_tts_cooldown_ms": 800,
+        "post_tts_cooldown_ms": 550,
         "preload": true,
         "calibration_delay_s": 2.0,
-        "min_energy_threshold": 400
+        "min_energy_threshold": 400,
+        "whisper_vad": {
+            "speech_pad_ms": 400,
+            "min_silence_duration_ms": 220,
+            "threshold": 0.32
+        },
+        "min_audio_duration_s": 0.42,
+        "audio_buffer_frames": 2048,
+        "native_stop_audio_delay_ms": 120
     },
     "tts": {
         "engine": "macos_native",
         "max_lines": 4,
-        "rate": 2,
-        "edge_voice": "en-GB-RyanNeural",
+        "macos_voice": "system",
+        "macos_rate": 200,
+        "edge_voice": "en-GB-SoniaNeural",
         "edge_rate": "+0%",
         "edge_postprocess": true,
         "edge_ack_cache": true

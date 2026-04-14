@@ -430,11 +430,11 @@ async def main() -> None:
         tts = MacOSTTSAsync(
             bus, state,
             max_lines=tts_cfg.get("max_lines", 4),
-            voice=tts_cfg.get("macos_voice", "Daniel"),
+            voice=tts_cfg.get("macos_voice", "system"),
             rate=tts_cfg.get("macos_rate", 200),
         )
-        logger.info("TTS: macOS Native (voice=%s)", tts_cfg.get("macos_voice", "Daniel"))
-        tts_runtime_label = f"macOS Native ({tts_cfg.get('macos_voice', 'Daniel')})"
+        logger.info("TTS: macOS Native (voice=%s)", tts_cfg.get("macos_voice", "system"))
+        tts_runtime_label = f"macOS Native ({tts_cfg.get('macos_voice', 'system')})"
     elif tts_engine == "kokoro":
         from voice.tts_kokoro import KokoroTTSAsync
         tts = KokoroTTSAsync(

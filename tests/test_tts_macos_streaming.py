@@ -116,10 +116,32 @@ async def test_stale_stream_id_is_ignored() -> None:
     print("  PASS: macOS TTS ignores stale chunks from an older stream")
 
 
+async def test_coalesces_single_word_stream_chunks() -> None:
+    """Tiny per-token fragments must batch into one utterance, not one word each."""
+    tts, bus, spoken = await _make_tts()
+    words = ["one", "two", "three", "four", "five", "six", "seven", "eight"]
+    for i, w in enumerate(words):
+        await tts.on_partial_response(
+            w,
+            is_first=(i == 0),
+            is_last=(i == len(words) - 1),
+            source="local",
+            stream_id="stream-words",
+        )
+        await asyncio.sleep(0)
+
+    await asyncio.sleep(0.08)
+    assert len(spoken) == 1
+    assert "one" in spoken[0] and "eight" in spoken[0]
+    assert any(event == "tts_complete" for event, _ in bus.events)
+    print("  PASS: macOS TTS coalesces single-word stream chunks")
+
+
 async def run_all() -> None:
     print("\n=== macOS TTS Streaming Tests ===\n")
     await test_streaming_starts_before_last_chunk()
     await test_stale_stream_id_is_ignored()
+    await test_coalesces_single_word_stream_chunks()
     print("\n=== ALL TESTS PASSED ===\n")
 
 

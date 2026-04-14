@@ -57,6 +57,22 @@ _SILENCE_TIMEOUT_S = 2.0
 _MAX_RECORD_S = 15.0
 
 
+def _resolve_stt_locale(raw: str | None) -> str:
+    """Match Siri/Dictation: use the Mac’s primary locale when ``locale`` is ``auto``."""
+    s = (raw or "auto").strip()
+    if s.lower() != "auto":
+        return s
+    if _Foundation is None:
+        return "en-US"
+    try:
+        loc = _Foundation.NSLocale.currentLocale()
+        ident = str(loc.localeIdentifier())
+        return ident.replace("_", "-")
+    except Exception:
+        logger.debug("NSLocale.currentLocale failed", exc_info=True)
+        return "en-US"
+
+
 def _main_bundle_info() -> dict[str, Any] | None:
     if _Foundation is None:
         return None
@@ -178,7 +194,11 @@ class NativeSTT:
         self._mic_manager = mic_manager
         self._intent_engine = intent_engine
 
-        self._locale: str = self._config.get("locale", "en-US")
+        self._locale: str = _resolve_stt_locale(self._config.get("locale", "auto"))
+        self._audio_buffer_frames: int = int(self._config.get("audio_buffer_frames", 2048))
+        self._native_stop_audio_delay_s: float = (
+            float(self._config.get("native_stop_audio_delay_ms", 120) or 0) / 1000.0
+        )
         self.mic_name: str = "macOS AVAudioEngine"
         self._recognizer: Any = None
         self._audio_engine: Any = None
@@ -349,7 +369,7 @@ class NativeSTT:
             recording_format = input_node.outputFormatForBus_(0)
 
             input_node.installTapOnBus_bufferSize_format_block_(
-                0, 1024, recording_format, self._audio_buffer_callback,
+                0, self._audio_buffer_frames, recording_format, self._audio_buffer_callback,
             )
 
             self._audio_engine.prepare()
@@ -367,7 +387,11 @@ class NativeSTT:
             self._listening = True
             self._last_speech_time = time.monotonic()
             self._last_error = None
-            logger.info("Native STT listening started (on-device)")
+            logger.info(
+                "Native STT listening started (on-device, buffer_frames=%d, locale=%s)",
+                self._audio_buffer_frames,
+                self._locale,
+            )
             return True
 
         except Exception as exc:
@@ -449,6 +473,9 @@ class NativeSTT:
             return self._last_final
 
         self._listening = False
+
+        if self._native_stop_audio_delay_s > 0:
+            time.sleep(self._native_stop_audio_delay_s)
 
         if self._audio_engine is not None:
             try:

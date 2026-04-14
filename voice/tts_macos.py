@@ -1,6 +1,11 @@
 """
 ATOM -- Native macOS TTS (NSSpeechSynthesizer + say fallback).
 
+Uses the same **Apple on-device speech synthesis** APIs: ``NSSpeechSynthesizer`` with
+resolution order ``defaultVoice`` → **Accessibility Spoken Content prefs**
+(``com.apple.speech.voice.prefs``) so **Siri (Voice 2)** and similar picks match System Settings.
+Recognition uses **SFSpeechRecognizer** (see ``voice/stt_macos.py``).
+
 Two backends in priority order:
   1. NSSpeechSynthesizer (pyobjc) — no subprocess, direct AppKit API,
      premium/neural voice support, instant barge-in. ~0ms spawn overhead.
@@ -17,10 +22,12 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import plistlib
 import re
 import subprocess
 import sys
 import threading
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 logger = logging.getLogger("atom.tts_macos")
@@ -54,18 +61,20 @@ _RE_TRANSCRIPT_LABEL = re.compile(r"\b(?:User|Boss|ATOM|Assistant):\s*", re.I)
 _RE_TRANSCRIPT_ONLY = re.compile(r"^(?:(?:User|Boss|ATOM|Assistant)\s*:?\s*)+$", re.I)
 
 _RE_SENTENCE_SPLIT = re.compile(r'(?<=[.!?])\s+')
+# First grammatically complete sentence at buffer start (non-greedy up to first . ! ?)
+_RE_FIRST_SENTENCE = re.compile(r"^(.+?[.!?])\s*", re.DOTALL)
 
 ACK_PHRASES = [
-    "Yes, Boss?", "I'm here.", "Go ahead.", "I'm listening.", "Tell me.",
-    "What do you need?", "Right here.", "Present.",
-    "Hmm, let me think...", "One sec, Boss.", "Working on it.",
-    "Give me a moment.", "Let me check.", "On it, Boss.",
-    "One second.", "Let me pull that up.", "Checking now.", "Hang on, Boss.",
-    "I didn't catch that, Boss. Try again?",
-    "That didn't work. Want me to try again?",
-    "Done.", "Handled.", "All done.",
-    "Searching now.", "Pulling up results.",
-    "On it.", "Working on it now.",
+    "Yes, Boss?", "I'm here.", "Go ahead.", "I'm listening.", "How can I help?",
+    "What do you need?", "Standing by.", "Ready when you are.",
+    "One moment.", "Certainly.", "Working on that.",
+    "Give me a moment.", "Let me check.", "Right away, Boss.",
+    "One second.", "Pulling that up now.", "Checking now.", "Just a moment.",
+    "I didn't quite catch that — could you repeat?",
+    "That didn't go through. Shall I try again?",
+    "Done.", "Complete.", "All set.",
+    "Searching now.", "Here are the results.",
+    "On it.", "Processing now.",
 ]
 
 
@@ -98,8 +107,22 @@ def _split_sentences(text: str) -> list:
 
 # ── Voice discovery ──────────────────────────────────────────────────
 
-# Preferred voices in order (premium British male → premium US → any)
+# Aliases: use the same default voice as System Settings → Accessibility → Spoken Content
+# (NSSpeechSynthesizer defaultVoice — Apple’s on-device neural TTS family as Siri uses).
+_SYSTEM_VOICE_ALIASES = frozenset({
+    "system", "default", "siri", "apple", "apple_siri", "match_system", "",
+})
+
+# When no explicit voice matches: premium neural first (Siri-class quality on Apple Silicon).
 _PREFERRED_VOICES = [
+    "com.apple.voice.premium.en-GB.Martha",
+    "com.apple.voice.enhanced.en-GB.Martha",
+    "com.apple.eloquence.en-GB.Flo",
+    "com.apple.eloquence.en-GB.Shelley",
+    "com.apple.eloquence.en-GB.Sandy",
+    "com.apple.voice.premium.en-US.Samantha",
+    "com.apple.voice.enhanced.en-US.Samantha",
+    "com.apple.voice.compact.en-US.Samantha",
     "com.apple.voice.premium.en-GB.Malcolm",
     "com.apple.voice.premium.en-GB.Daniel",
     "com.apple.voice.enhanced.en-GB.Daniel",
@@ -158,21 +181,144 @@ def list_voices() -> list:
         return []
 
 
+def _match_voice_by_display_name(available: set[str], display: str) -> str:
+    """Match Accessibility label (e.g. 'Siri (Voice 2)') to an NSSpeechSynthesizer voice id."""
+    dlow = (display or "").strip().lower()
+    if not dlow:
+        return ""
+    for vid in available:
+        attrs = _AppKit.NSSpeechSynthesizer.attributesForVoice_(vid)
+        name = str(attrs.get(_AppKit.NSVoiceName, "") or "")
+        if not name:
+            continue
+        nl = name.lower()
+        if dlow == nl or dlow in nl or nl in dlow:
+            return str(vid)
+    return ""
+
+
+def _spoken_content_voice_from_prefs(available: set[str]) -> str:
+    """Read System Settings → Accessibility → Spoken Content voice from Apple prefs.
+
+    ``NSSpeechSynthesizer.defaultVoice()`` is often empty in CLI/headless processes; the
+    user-selected voice is still stored under ``com.apple.speech.voice.prefs`` (see
+    ``~/Library/Preferences/com.apple.speech.voice.prefs``).
+    """
+    id_keys = (
+        "SelectedVoiceID",
+        "SelectedSystemVoiceID",
+        "SystemVoiceID",
+        "TTSSelectedVoiceIdentifier",
+        "NSSpeechSelectedVoice",
+    )
+
+    def try_dict(d: Any) -> str:
+        if not isinstance(d, dict):
+            return ""
+        for key in id_keys:
+            val = d.get(key)
+            if val is None:
+                continue
+            s = str(val).strip()
+            if s and s in available:
+                return s
+        for val in d.values():
+            if isinstance(val, str) and "com.apple." in val and val in available:
+                return val
+        name = d.get("SelectedVoiceName")
+        if name:
+            hit = _match_voice_by_display_name(available, str(name))
+            if hit:
+                return hit
+        return ""
+
+    if _Foundation is None:
+        return ""
+
+    try:
+        ud = _Foundation.NSUserDefaults.standardUserDefaults()
+        dom = ud.persistentDomainForName_("com.apple.speech.voice.prefs")
+        if dom:
+            hit = try_dict(dict(dom))
+            if hit:
+                logger.info(
+                    "TTS: using Spoken Content voice from UserDefaults (Accessibility): %s",
+                    hit,
+                )
+                return hit
+    except Exception:
+        logger.debug("speech.voice.prefs UserDefaults failed", exc_info=True)
+
+    plist_path = Path.home() / "Library/Preferences/com.apple.speech.voice.prefs.plist"
+    try:
+        if plist_path.is_file():
+            with plist_path.open("rb") as fp:
+                data = plistlib.load(fp)
+            hit = try_dict(data)
+            if hit:
+                logger.info(
+                    "TTS: using Spoken Content voice from prefs plist: %s",
+                    hit,
+                )
+                return hit
+    except Exception:
+        logger.debug("speech.voice.prefs plist read failed", exc_info=True)
+
+    return ""
+
+
 def _pick_best_voice(requested: str) -> str:
-    """Find the best available voice. Returns voice identifier string."""
+    """Find the best available voice. Returns voice identifier string.
+
+    For ``system`` / ``siri`` / ``default``: try ``NSSpeechSynthesizer.defaultVoice()``,
+    then ``com.apple.speech.voice.prefs`` (Accessibility → Spoken Content), then a
+    neural fallback list.
+    """
     if not _HAS_NATIVE:
         return requested
 
     available = {str(v) for v in _AppKit.NSSpeechSynthesizer.availableVoices()}
+    req_raw = (requested or "").strip()
+    req_lower = req_raw.lower()
+
+    if req_lower in _SYSTEM_VOICE_ALIASES:
+        try:
+            dv = _AppKit.NSSpeechSynthesizer.defaultVoice()
+            ds = str(dv) if dv is not None else ""
+            if ds and ds in available:
+                logger.info(
+                    "TTS: using NSSpeechSynthesizer.defaultVoice (system neural): %s",
+                    ds,
+                )
+                return ds
+            if not ds:
+                logger.debug("NSSpeechSynthesizer.defaultVoice empty; trying Spoken Content prefs")
+            else:
+                logger.warning(
+                    "TTS: defaultVoice %s not in availableVoices — trying Spoken Content prefs",
+                    ds,
+                )
+        except Exception:
+            logger.debug("NSSpeechSynthesizer.defaultVoice failed", exc_info=True)
+
+        spoken = _spoken_content_voice_from_prefs(available)
+        if spoken:
+            return spoken
+
+        logger.info(
+            "TTS: no Accessibility/Spoken Content voice resolved — using preferred on-device neural voice",
+        )
+
+    if req_raw and req_lower not in _SYSTEM_VOICE_ALIASES:
+        for vid in available:
+            if req_lower in vid.lower():
+                logger.info("TTS: matched requested voice substring '%s' -> %s", req_raw, vid)
+                return vid
 
     for vid in _PREFERRED_VOICES:
         if vid in available:
+            logger.info("TTS: using preferred bundled voice: %s", vid)
             return vid
-
-    if requested:
-        for vid in available:
-            if requested.lower() in vid.lower():
-                return vid
 
     return ""
 
@@ -231,13 +377,16 @@ class MacOSTTSAsync:
     """
 
     _SPEAK_WORD_LIMIT: int = 18
+    # Coalesce tiny stream fragments so NSSpeechSynthesizer does not speak word-by-word.
+    _STREAM_UNPUNCT_MIN_WORDS: int = 8
+    _STREAM_UNPUNCT_BATCH: int = 14
 
     def __init__(
         self,
         bus: AsyncEventBus,
         state: StateManager,
         max_lines: int = 4,
-        voice: str = "Daniel",
+        voice: str = "system",
         rate: int = 200,
     ) -> None:
         self._bus = bus
@@ -265,6 +414,7 @@ class MacOSTTSAsync:
         self._stream_queue: asyncio.Queue[tuple[str, bool]] | None = None
         self._stream_task: asyncio.Task | None = None
         self._stream_generation: int = 0
+        self._stream_speak_buffer: str = ""
 
     # ── Initialization ─────────────────────────────────────────────
 
@@ -395,15 +545,74 @@ class MacOSTTSAsync:
         return re.sub(r"\s+", " ", lowered).strip()
 
     def _is_duplicate_chunk(self, text: str) -> bool:
+        """Skip only immediate repeats of the same spoken chunk (streaming overlap).
+
+        A short ring buffer used to catch duplicates caused the model to repeat
+        a phrase later in the stream to be mistaken for a duplicate — skipping
+        speech and sounding like dropped words.
+        """
         key = self._chunk_key(text)
         if not key:
             return True
-        if key in self._recent_spoken_chunks:
+        if self._recent_spoken_chunks and key == self._recent_spoken_chunks[-1]:
             return True
         self._recent_spoken_chunks.append(key)
-        if len(self._recent_spoken_chunks) > 4:
-            self._recent_spoken_chunks = self._recent_spoken_chunks[-4:]
+        if len(self._recent_spoken_chunks) > 2:
+            self._recent_spoken_chunks = self._recent_spoken_chunks[-2:]
         return False
+
+    def _pop_next_stream_segment(self, force: bool) -> str:
+        """Take the next speakable slice from _stream_speak_buffer.
+
+        Complete sentences (ending in . ! ?) flush immediately so latency stays
+        low. Unpunctuated fragments wait until we have enough words to avoid
+        NSSpeechSynthesizer speaking one token at a time.
+        """
+        buf = self._stream_speak_buffer.strip()
+        if not buf:
+            return ""
+        if force:
+            self._stream_speak_buffer = ""
+            return buf
+
+        m = _RE_FIRST_SENTENCE.match(buf)
+        if m:
+            sentence = m.group(1).strip()
+            self._stream_speak_buffer = buf[m.end() :].strip()
+            return sentence
+
+        words = buf.split()
+        n = len(words)
+        if n >= self._STREAM_UNPUNCT_BATCH:
+            seg = " ".join(words[: self._STREAM_UNPUNCT_BATCH])
+            self._stream_speak_buffer = " ".join(words[self._STREAM_UNPUNCT_BATCH :])
+            return seg
+        if n >= self._STREAM_UNPUNCT_MIN_WORDS:
+            take = min(n, self._STREAM_UNPUNCT_BATCH)
+            seg = " ".join(words[:take])
+            self._stream_speak_buffer = " ".join(words[take:])
+            return seg
+        return ""
+
+    async def _speak_stream_slice(self, raw_segment: str) -> None:
+        """Apply word-cap + duplicate filtering, then speak one slice."""
+        speak_text, overflow_text = self._split_stream_chunk(raw_segment)
+        if speak_text and not self._cancel_requested:
+            if self._is_duplicate_chunk(speak_text):
+                logger.info("TTS stream duplicate chunk skipped: '%s'", speak_text[:100])
+                if overflow_text:
+                    self._screen_buffer.append(overflow_text)
+                return
+            self._spoken_word_count += len(speak_text.split())
+            logger.info(
+                "TTS stream slice (%d/%d words): '%s'",
+                self._spoken_word_count,
+                self._SPEAK_WORD_LIMIT,
+                speak_text[:100],
+            )
+            await self._speak_internal(speak_text)
+        if overflow_text:
+            self._screen_buffer.append(overflow_text)
 
     async def _play_stream_chunks(self, generation: int) -> None:
         queue = self._stream_queue
@@ -418,25 +627,23 @@ class MacOSTTSAsync:
 
                 if text:
                     self._chunk_buffer.append(text)
-                    speak_text, overflow_text = self._split_stream_chunk(text)
-                    if speak_text and not self._cancel_requested:
-                        if self._is_duplicate_chunk(speak_text):
-                            logger.info("TTS stream duplicate chunk skipped: '%s'", speak_text[:100])
-                            if overflow_text:
-                                self._screen_buffer.append(overflow_text)
-                            continue
-                        self._spoken_word_count += len(speak_text.split())
-                        logger.info(
-                            "TTS stream chunk (%d/%d words): '%s'",
-                            self._spoken_word_count,
-                            self._SPEAK_WORD_LIMIT,
-                            speak_text[:100],
-                        )
-                        await self._speak_internal(speak_text)
-                    if overflow_text:
-                        self._screen_buffer.append(overflow_text)
+                    merged = (
+                        f"{self._stream_speak_buffer} {text}".strip()
+                        if self._stream_speak_buffer
+                        else text.strip()
+                    )
+                    self._stream_speak_buffer = re.sub(r"\s+", " ", merged).strip()
+
+                while True:
+                    seg = self._pop_next_stream_segment(force=False)
+                    if not seg:
+                        break
+                    await self._speak_stream_slice(seg)
 
                 if is_last:
+                    tail = self._pop_next_stream_segment(force=True)
+                    if tail:
+                        await self._speak_stream_slice(tail)
                     break
         except asyncio.CancelledError:
             raise
@@ -451,6 +658,7 @@ class MacOSTTSAsync:
             overflow_text = " ".join(self._screen_buffer).strip()
             self._chunk_buffer.clear()
             self._screen_buffer.clear()
+            self._stream_speak_buffer = ""
             self._stream_queue = None
             self._active_source = None
             self._active_stream_id = None
@@ -544,6 +752,7 @@ class MacOSTTSAsync:
         self._active_stream_id = None
         self._chunk_buffer.clear()
         self._screen_buffer.clear()
+        self._stream_speak_buffer = ""
         queue = self._stream_queue
         self._stream_queue = None
         if queue is not None:
@@ -616,6 +825,7 @@ class MacOSTTSAsync:
             self._active_source = source or "unknown"
             self._chunk_buffer.clear()
             self._screen_buffer.clear()
+            self._stream_speak_buffer = ""
             self._spoken_word_count = 0
             self._recent_spoken_chunks.clear()
             self._active_stream_id = stream_id or None

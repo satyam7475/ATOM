@@ -85,6 +85,43 @@ CONFIG_SCHEMA: dict[str, Any] = {
                     "maximum": 2000,
                     "description": "Minimum speech energy (default 100; lower = more sensitive).",
                 },
+                "locale": {
+                    "type": "string",
+                    "description": "BCP-47 locale for native macOS STT (e.g. en-US, en-GB). Use \"auto\" to follow the Mac primary locale (same idea as Siri language).",
+                },
+                "whisper_vad": {
+                    "type": "object",
+                    "description": "faster-whisper VAD tuning (reduces clipped first/last words).",
+                    "properties": {
+                        "min_silence_duration_ms": {"type": "integer", "minimum": 50, "maximum": 2000},
+                        "speech_pad_ms": {"type": "integer", "minimum": 0, "maximum": 1000},
+                        "threshold": {"type": "number", "minimum": 0.0, "maximum": 1.0},
+                    },
+                    "additionalProperties": False,
+                },
+                "whisper_no_speech_threshold": {
+                    "type": "number",
+                    "minimum": 0.0,
+                    "maximum": 1.0,
+                },
+                "min_audio_duration_s": {
+                    "type": "number",
+                    "minimum": 0.1,
+                    "maximum": 3.0,
+                    "description": "Reject shorter captures as noise (Whisper path).",
+                },
+                "audio_buffer_frames": {
+                    "type": "integer",
+                    "minimum": 256,
+                    "maximum": 8192,
+                    "description": "AVAudioEngine tap buffer size (native STT).",
+                },
+                "native_stop_audio_delay_ms": {
+                    "type": "number",
+                    "minimum": 0,
+                    "maximum": 500,
+                    "description": "Brief delay before endAudio so the last word can finalize.",
+                },
             },
             "additionalProperties": False,
         },
@@ -120,6 +157,16 @@ CONFIG_SCHEMA: dict[str, Any] = {
                 },
                 "edge_ack_cache": {
                     "type": "boolean",
+                },
+                "macos_voice": {
+                    "type": "string",
+                    "description": "NSSpeechSynthesizer voice: \"system\" (default, same family as macOS Spoken Content / Siri on-device TTS), or a name substring (e.g. Flo, Martha).",
+                },
+                "macos_rate": {
+                    "type": "integer",
+                    "minimum": 50,
+                    "maximum": 500,
+                    "description": "Words per minute for native macOS TTS.",
                 },
             },
             "additionalProperties": False,

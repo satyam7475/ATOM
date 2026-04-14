@@ -45,7 +45,7 @@ if TYPE_CHECKING:
     from voice.mic_manager import MicManager
 
 MAX_RECORD_S = 10.0
-MIN_AUDIO_DURATION_S = 0.5
+_DEFAULT_MIN_AUDIO_DURATION_S = 0.45
 _BT_MIN_THRESHOLD = 1800.0
 _RECALIBRATE_AFTER_S = 90.0
 _MIN_AUDIO_QUALITY_SCORE = 0.15
@@ -113,6 +113,19 @@ class STTAsync:
         self._whisper_available: bool = False
         self._whisper_model_size: str = stt_cfg.get("whisper_model_size", "small")
         self._whisper_bilingual: bool = stt_cfg.get("bilingual", True)
+
+        _wvad = stt_cfg.get("whisper_vad") if isinstance(stt_cfg.get("whisper_vad"), dict) else {}
+        self._whisper_vad_params: dict[str, Any] = {
+            "min_silence_duration_ms": int(_wvad.get("min_silence_duration_ms", 220)),
+            "speech_pad_ms": int(_wvad.get("speech_pad_ms", 400)),
+            "threshold": float(_wvad.get("threshold", 0.32)),
+        }
+        self._whisper_no_speech_threshold: float = float(
+            stt_cfg.get("whisper_no_speech_threshold", 0.5)
+        )
+        self._min_audio_duration_s: float = float(
+            stt_cfg.get("min_audio_duration_s", _DEFAULT_MIN_AUDIO_DURATION_S)
+        )
 
         from voice.audio_preprocessor import AudioPreprocessor
         self._preprocessor = AudioPreprocessor(self._config)
@@ -601,13 +614,9 @@ class STTAsync:
                 beam_size=3 if self._whisper_bilingual else 1,
                 language=whisper_lang,
                 vad_filter=True,
-                vad_parameters={
-                    "min_silence_duration_ms": 250,
-                    "speech_pad_ms": 200,
-                    "threshold": 0.35,
-                },
+                vad_parameters=dict(self._whisper_vad_params),
                 condition_on_previous_text=False,
-                no_speech_threshold=0.5,
+                no_speech_threshold=self._whisper_no_speech_threshold,
             )
 
             parts = []
@@ -789,9 +798,9 @@ class STTAsync:
             audio_duration_s = len(audio.get_raw_data()) / (
                 audio.sample_rate * audio.sample_width)
 
-            if audio_duration_s < MIN_AUDIO_DURATION_S:
+            if audio_duration_s < self._min_audio_duration_s:
                 logger.debug("Audio too short (%.1fs < %.1fs) -- noise click, skipping",
-                             audio_duration_s, MIN_AUDIO_DURATION_S)
+                             audio_duration_s, self._min_audio_duration_s)
                 return None
 
             logger.info("Captured %.1fs of audio, transcribing...", audio_duration_s)
