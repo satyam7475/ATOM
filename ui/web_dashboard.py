@@ -307,6 +307,9 @@ class WebDashboard:
                 logger.debug("Dashboard init snapshot failed", exc_info=True)
         if bound_session_id:
             init_payload["session_id"] = bound_session_id
+        ui_cfg = self._config.get("ui") or {}
+        init_payload["jarvis_boot_splash"] = bool(ui_cfg.get("jarvis_boot_splash", True))
+        init_payload["voice_only_input"] = bool(ui_cfg.get("voice_only_input", False))
         await self._send_one(ws, init_payload)
 
         for entry in self._activity_log[-50:]:

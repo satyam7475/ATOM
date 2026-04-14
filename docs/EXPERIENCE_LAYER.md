@@ -10,7 +10,7 @@
 | TTS engine | `tts.engine` | e.g. `macos_native`; Edge voices use `edge_voice`, `edge_rate`. |
 | Mic | `mic.device_name`, `mic.prefer_bluetooth` | Resolved at startup; shown on dashboard **Connections** pod. |
 
-The web dashboard init payload includes **`voice_mode`** / **`voice_note`** (browser is text-first unless dev fallback). Production voice path is the bundled app path described in-dashboard.
+The web dashboard init payload includes **`voice_mode`** / **`voice_note`** (browser SpeechRecognition is the reliable path when **`ATOM_LAUNCH_MODE=venv`**). **Native** `SFSpeechRecognizer` needs the process to be **`ATOM.app`**’s executable (`atom_python`) with usage strings in **`Info.plist`** — use **`Run ATOM.command`** when the bundle launcher self-test passes, or rebuild/sign with **`scripts/build_atom_app_launcher.sh`**.
 
 ## Personality & assistant stance
 
@@ -28,3 +28,13 @@ Runtime pod buttons send WebSocket commands; **`execution_state`** pushes live *
 - **`ui/web_dashboard.py`** — WebSocket feed, `set_execution_state_provider` from `main.py`.
 
 Polish for Phase 9: page title, input placeholder, and experience line fed from `main._execution_state_payload()`.
+
+## Operator checklist (launch & reliability)
+
+| Step | Action |
+|------|--------|
+| 1 | Create/use **`.venv`** and install deps: `pip install -r requirements-desktop.txt` (see repo `README.md`). |
+| 2 | **Recommended:** double-click **`Run ATOM.command`** or run it from Terminal — uses venv if the bundle launcher fails; logs to **`logs/atom_run_command.log`**. |
+| 3 | **Background agent (optional):** `bash scripts/install_atom_launchagent.sh` — uses **`scripts/atom_run.sh`** + venv (stable); stdout/stderr under **`logs/launchagent.*.log`**. |
+| 4 | **Double-click `ATOM.app`:** runs **`Contents/MacOS/atom_python`** only. If it misbehaves, use **`Run ATOM.command`** or rebuild: `bash scripts/build_atom_app_launcher.sh` (prefer a repo copy **outside iCloud Desktop** if **codesign** complains about metadata). |
+| 5 | **Native macOS STT:** requires bundle process + plist usage keys; **venv** launch sets **`ATOM_LAUNCH_MODE=venv`** and falls back messaging in **`voice/stt_macos.py`**. |

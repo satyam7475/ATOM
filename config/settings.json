@@ -139,7 +139,9 @@
         "mode": "web",
         "web_port": 8765,
         "auto_open_browser": true,
-        "password_auth_enabled": false
+        "password_auth_enabled": false,
+        "voice_only_input": false,
+        "jarvis_boot_splash": true
     },
     "executor": {
         "max_workers": 2
@@ -170,7 +172,7 @@
     },
     "control": {
         "lock_mode": "off",
-        "assistant_mode": "hybrid",
+        "assistant_mode": "conversational",
         "allow_runtime_mode_switch": true,
         "persist_assistant_mode": true,
         "restore_persisted_assistant_mode": true,
@@ -466,7 +468,7 @@
         "simulation_mode": "hybrid"
     },
     "cloud": {
-        "enabled": true,
+        "enabled": false,
         "provider": "gemini",
         "use_secure_credentials": true,
         "buddy_model": "gemini-2.0-flash",
@@ -499,7 +501,7 @@
         "timeout_seconds": 8
     },
     "semantic_cache": {
-        "enabled": true,
+        "enabled": false,
         "max_size": 256,
         "ttl_seconds": 600,
         "threshold": 0.85

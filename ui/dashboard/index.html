@@ -3,13 +3,13 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>ATOM — Dashboard</title>
+<title>ATOM // Neural Interface</title>
 <style>
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
 @import url('https://fonts.googleapis.com/css2?family=Sora:wght@300;400;500;600;700&family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap');
 
 :root{
-  --bg:#06060a;
+  --bg:#04040a;
   --accent:#818cf8;
   --accent-glow:rgba(129,140,248,0.35);
   --green:#34d399;
@@ -17,11 +17,8 @@
   --red:#f87171;
   --purple:#a78bfa;
   --text:#f0f0f4;
-  --text-dim:#9898aa;
-  --text-muted:#55556a;
-  --pod-bg:rgba(16,16,28,0.7);
-  --pod-border:rgba(129,140,248,0.12);
-  --pod-glow:rgba(129,140,248,0.06);
+  --text-dim:#8888a0;
+  --text-muted:#44445a;
   --font-display:'Sora',sans-serif;
   --font-body:'Inter',sans-serif;
   --font-mono:'JetBrains Mono',monospace;
@@ -33,317 +30,210 @@ html,body{
   font-family:var(--font-body);font-size:13px;
 }
 
-/* ── Ambient background ─────────────────── */
 .ambient{
   position:fixed;inset:0;z-index:0;pointer-events:none;
   background:
-    radial-gradient(ellipse 60% 50% at 50% 50%, rgba(129,140,248,0.06) 0%, transparent 70%),
-    radial-gradient(ellipse 40% 40% at 20% 80%, rgba(52,211,153,0.03) 0%, transparent 60%),
-    radial-gradient(ellipse 40% 40% at 80% 20%, rgba(167,139,250,0.03) 0%, transparent 60%);
+    radial-gradient(ellipse 55% 45% at 50% 45%, rgba(129,140,248,0.05) 0%, transparent 70%),
+    radial-gradient(ellipse 35% 35% at 25% 80%, rgba(52,211,153,0.02) 0%, transparent 60%),
+    radial-gradient(ellipse 35% 35% at 75% 20%, rgba(167,139,250,0.02) 0%, transparent 60%);
 }
 
-/* ── Full-page HUD ──────────────────────── */
+/* ── Layout ────────────────────────────── */
 .hud{
   position:relative;z-index:1;
   width:100vw;height:100vh;height:100dvh;
-  display:grid;
-  grid-template-rows:48px 1fr;
-  perspective:1200px;
+  display:flex;flex-direction:column;
+  align-items:center;
 }
 
-/* ── Top bar ─────────────────────────────── */
+/* ── Top bar ───────────────────────────── */
 .topbar{
+  width:100%;height:44px;
   display:flex;align-items:center;
-  padding:0 28px;
-  background:rgba(6,6,10,0.85);
-  border-bottom:1px solid rgba(255,255,255,0.04);
-  backdrop-filter:blur(16px);z-index:30;
+  padding:0 24px;
+  background:rgba(4,4,10,0.9);
+  border-bottom:1px solid rgba(255,255,255,0.03);
+  backdrop-filter:blur(20px);z-index:30;
+  flex-shrink:0;
 }
 .brand{
-  font-family:var(--font-display);font-size:22px;font-weight:700;
-  letter-spacing:6px;color:var(--text);
+  font-family:var(--font-display);font-size:16px;font-weight:700;
+  letter-spacing:5px;color:var(--text-dim);
 }
 .brand span{color:var(--accent);}
 .topbar-right{
-  margin-left:auto;display:flex;align-items:center;gap:16px;
+  margin-left:auto;display:flex;align-items:center;gap:14px;
 }
-.topbar-state{
-  font-family:var(--font-mono);font-size:14px;font-weight:500;
-  letter-spacing:1.5px;color:var(--text-dim);
-  display:flex;align-items:center;gap:8px;
-}
-.state-dot{
-  width:8px;height:8px;border-radius:50%;
-  background:var(--green);
-  box-shadow:0 0 8px rgba(52,211,153,0.6);
-  transition:all .4s;
-}
-.unstick-btn{
+.sys-pill{
   font-family:var(--font-mono);font-size:10px;
-  padding:5px 12px;border-radius:5px;cursor:pointer;
-  border:1px solid rgba(255,255,255,0.08);
-  background:transparent;color:var(--text-dim);transition:all .2s;
+  color:var(--text-muted);letter-spacing:0.5px;
+  display:flex;align-items:center;gap:5px;
 }
-.unstick-btn:hover{background:rgba(255,255,255,0.05);color:var(--text);}
-
-/* ── HUD Field: orb + pods ──────────────── */
-.hud-field{
-  position:relative;overflow:hidden;
+.sys-pill .dot{
+  width:5px;height:5px;border-radius:50%;
+  transition:background .4s;
+}
+.sys-pill .dot.on{background:var(--green);box-shadow:0 0 6px rgba(52,211,153,0.5);}
+.sys-pill .dot.off{background:var(--red);box-shadow:0 0 6px rgba(248,113,113,0.4);}
+.sys-pill .dot.warn{background:var(--orange);box-shadow:0 0 6px rgba(251,191,36,0.4);}
+/* ── Jarvis boot (Iron Man HUD) ─────────── */
+.jarvis-boot{
+  position:fixed;inset:0;z-index:100;
   display:flex;align-items:center;justify-content:center;
+  background:radial-gradient(ellipse 80% 60% at 50% 40%,rgba(129,140,248,0.12),var(--bg));
+  transition:opacity .85s ease,visibility .85s;
 }
+.jarvis-boot.done{opacity:0;visibility:hidden;pointer-events:none;}
+.jarvis-boot-inner{text-align:center;max-width:90vw;}
+.jarvis-boot-line{
+  font-family:var(--font-display);font-size:clamp(28px,8vw,44px);font-weight:700;
+  letter-spacing:0.35em;color:var(--accent);
+  text-shadow:0 0 40px var(--accent-glow);
+  animation:bootPulse 2s ease-in-out infinite;
+}
+.jarvis-boot-sub{
+  font-family:var(--font-mono);font-size:11px;letter-spacing:0.4em;color:var(--text-dim);
+  margin-top:16px;
+}
+.jarvis-boot-bar{width:min(280px,70vw);height:2px;background:rgba(255,255,255,0.08);
+  border-radius:1px;margin:24px auto 0;overflow:hidden;}
+.jarvis-boot-fill{height:100%;width:0;background:linear-gradient(90deg,var(--accent),var(--green));
+  animation:bootLoad 2.2s ease-out forwards;}
+@keyframes bootPulse{0%,100%{opacity:0.85}50%{opacity:1}}
+@keyframes bootLoad{0%{width:0}100%{width:100%}}
 
-/* ── Central Orb ────────────────────────── */
-.orb-center{
-  position:absolute;
-  top:18%;
-  display:flex;flex-direction:column;align-items:center;
-  z-index:10;
+/* ── Brain zone ────────────────────────── */
+.brain-zone{
+  flex:1;display:flex;flex-direction:column;
+  align-items:center;justify-content:center;
+  position:relative;width:100%;
+  margin-top:-20px;
 }
 .orb-wrap{
-  width:220px;height:220px;
+  width:260px;height:260px;
   display:flex;align-items:center;justify-content:center;
   position:relative;
 }
 #orbCanvas{
   display:block;
-  filter:drop-shadow(0 0 30px var(--accent-glow));
-  animation:orbIn 1s cubic-bezier(0.34,1.56,0.64,1) forwards;
+  filter:drop-shadow(0 0 50px var(--accent-glow));
+  animation:brainIn 1.4s cubic-bezier(0.34,1.56,0.64,1) forwards;
 }
-@keyframes orbIn{0%{opacity:0;transform:scale(0.5);}100%{opacity:1;transform:scale(1);}}
-.orb-wrap[data-state="listening"] #orbCanvas{animation:orbPulse 2s ease-in-out infinite;}
-@keyframes orbPulse{0%,100%{transform:scale(1);}50%{transform:scale(1.04);}}
-.orb-wrap[data-state="thinking"] #orbCanvas{animation:orbThink 0.8s ease-in-out infinite;}
-@keyframes orbThink{0%,100%{transform:scale(1);filter:drop-shadow(0 0 30px rgba(251,191,36,0.5));}50%{transform:scale(1.05);filter:drop-shadow(0 0 50px rgba(251,191,36,0.7));}}
-.orb-wrap[data-state="speaking"] #orbCanvas{animation:orbSpeak 1.5s ease-in-out infinite;}
-@keyframes orbSpeak{0%,100%{filter:drop-shadow(0 0 25px rgba(167,139,250,0.5));}50%{filter:drop-shadow(0 0 45px rgba(167,139,250,0.7));}}
+@keyframes brainIn{0%{opacity:0;transform:scale(0.2);}100%{opacity:1;transform:scale(1);}}
+.orb-wrap[data-state="listening"] #orbCanvas{animation:brainPulse 2s ease-in-out infinite;}
+@keyframes brainPulse{0%,100%{transform:scale(1);filter:drop-shadow(0 0 40px var(--accent-glow));}50%{transform:scale(1.05);filter:drop-shadow(0 0 65px var(--accent-glow));}}
+.orb-wrap[data-state="thinking"] #orbCanvas{animation:brainThink 0.9s ease-in-out infinite;}
+@keyframes brainThink{0%,100%{transform:scale(1);filter:drop-shadow(0 0 40px rgba(251,191,36,0.5));}50%{transform:scale(1.06);filter:drop-shadow(0 0 60px rgba(251,191,36,0.7));}}
+.orb-wrap[data-state="speaking"] #orbCanvas{animation:brainSpeak 1.6s ease-in-out infinite;}
+@keyframes brainSpeak{0%,100%{filter:drop-shadow(0 0 35px rgba(167,139,250,0.5));}50%{filter:drop-shadow(0 0 55px rgba(167,139,250,0.7));}}
 
-.orb-label{text-align:center;margin-top:6px;}
-.orb-state-text{
-  font-family:var(--font-display);font-size:18px;font-weight:600;
-  letter-spacing:5px;color:var(--accent);transition:color .4s;
+/* ── State + transcript ────────────────── */
+.state-label{
+  font-family:var(--font-display);font-size:14px;font-weight:600;
+  letter-spacing:6px;color:var(--accent);
+  margin-top:12px;transition:color .4s;
 }
-.orb-status-text{
-  font-family:var(--font-mono);font-size:13px;color:var(--text-muted);
-  margin-top:2px;
+.state-sub{
+  font-family:var(--font-mono);font-size:11px;
+  color:var(--text-muted);margin-top:4px;
+  min-height:14px;
 }
-.hearing-text{
-  font-family:var(--font-mono);font-size:13px;
-  color:var(--accent);opacity:0.7;margin-top:4px;min-height:16px;
+
+.transcript-zone{
+  width:min(85vw,580px);margin-top:16px;
+  text-align:center;min-height:80px;
 }
-.thinking-progress{
-  font-family:var(--font-mono);font-size:12px;
-  color:var(--orange);margin-top:4px;min-height:16px;
+.heard-line{
+  font-family:var(--font-body);font-size:15px;
+  color:var(--accent);opacity:0.8;
+  min-height:22px;line-height:1.5;
+  transition:opacity .3s;
+}
+.heard-line:empty{opacity:0;}
+.response-line{
+  font-family:var(--font-body);font-size:15px;
+  color:var(--text);line-height:1.6;
+  margin-top:8px;min-height:22px;
+  max-height:120px;overflow-y:auto;
+  scrollbar-width:none;
+}
+.response-line::-webkit-scrollbar{display:none;}
+
+.thinking-bar-wrap{
+  width:140px;height:2px;background:rgba(255,255,255,0.06);
+  border-radius:1px;margin:8px auto 0;overflow:hidden;
   opacity:0;transition:opacity .3s;
 }
-.thinking-progress.visible{opacity:1;}
-.progress-bar-wrap{
-  width:160px;height:3px;background:rgba(255,255,255,0.08);
-  border-radius:2px;margin:6px auto 0;overflow:hidden;
-}
-.progress-bar-fill{
-  height:100%;background:var(--orange);border-radius:2px;
+.thinking-bar-wrap.visible{opacity:1;}
+.thinking-bar-fill{
+  height:100%;background:var(--orange);border-radius:1px;
   transition:width .5s linear;
 }
 
-/* ── Circular Pods ──────────────────────── */
-.pod{
-  position:absolute;
-  width:220px;height:220px;
-  border-radius:50%;
-  background:var(--pod-bg);
-  border:1px solid var(--pod-border);
-  backdrop-filter:blur(20px);
-  box-shadow:
-    0 0 40px var(--pod-glow),
-    inset 0 1px 0 rgba(255,255,255,0.04),
-    0 20px 40px rgba(0,0,0,0.4);
-  display:flex;flex-direction:column;
-  align-items:center;justify-content:center;
-  padding:24px;
-  transition:transform .4s,box-shadow .4s;
-  z-index:5;
-  text-align:center;
-}
-.pod:hover{
-  transform:scale(1.05);
-  box-shadow:0 0 60px rgba(129,140,248,0.12),0 25px 50px rgba(0,0,0,0.5);
-}
-.pod-title{
-  font-family:var(--font-mono);font-size:12px;font-weight:500;
-  letter-spacing:2.5px;color:var(--text-muted);
-  margin-bottom:10px;text-transform:uppercase;
-}
-
-/* Pod positions (4 corners) */
-.pod-system{top:6%;left:3%;}
-.pod-conn{top:6%;right:3%;}
-.pod-perf{bottom:18%;left:3%;}
-.pod-runtime{bottom:18%;right:3%;}
-
-/* Pod content styles */
-.pod-row{
-  display:flex;justify-content:space-between;width:100%;
-  padding:1px 0;
-}
-.pod-label{font-size:13px;color:var(--text-dim);}
-.pod-value{font-family:var(--font-mono);font-size:13px;font-weight:500;color:var(--text);}
-
-.pod-bar{
-  width:100%;height:2px;background:rgba(255,255,255,0.06);
-  border-radius:1px;margin-top:1px;overflow:hidden;
-}
-.pod-bar-fill{height:100%;border-radius:1px;transition:width .6s,background .4s;}
-
-.mini-pills{display:flex;gap:4px;flex-wrap:wrap;justify-content:center;}
-.mini-pill{
-  font-family:var(--font-mono);font-size:12px;
-  padding:4px 8px;border-radius:4px;
-  background:rgba(255,255,255,0.04);color:var(--text-dim);
-  display:flex;align-items:center;gap:4px;
-}
-.mini-dot{width:4px;height:4px;border-radius:50%;}
-.mini-dot.on{background:var(--green);}
-.mini-dot.off{background:var(--red);}
-
-.pod-btn{
-  font-family:var(--font-mono);font-size:12px;font-weight:500;
-  padding:5px 10px;border-radius:5px;cursor:pointer;
-  border:1px solid rgba(255,255,255,0.06);
-  background:transparent;color:var(--text-dim);transition:all .2s;
-}
-.pod-btn:hover{border-color:rgba(255,255,255,0.15);color:var(--text);}
-.pod-btn.active{
-  background:rgba(129,140,248,0.12);color:var(--accent);
-  border-color:rgba(129,140,248,0.25);
-}
-
-.perf-restart-msg{display:none;font-family:var(--font-mono);font-size:11px;color:var(--orange);}
-
-/* ── Clock (below orb) ──────────────────── */
-.clock-area{
-  text-align:center;z-index:8;margin-top:8px;
-}
-.clock-time{
-  font-family:var(--font-mono);font-size:40px;font-weight:600;
-  color:var(--text);letter-spacing:4px;
-}
-.clock-sec{font-size:18px;color:var(--text-muted);}
-.clock-date{
-  font-family:var(--font-mono);font-size:13px;
+/* ── Clock ─────────────────────────────── */
+.clock-strip{
+  font-family:var(--font-mono);
   color:var(--text-muted);letter-spacing:2px;
-  margin-top:3px;text-transform:uppercase;
+  margin-top:12px;font-size:11px;
 }
 
-/* ── Text input ────────────────────────────── */
-.text-input-wrap{
-  position:absolute;bottom:16px;left:50%;transform:translateX(-50%);
-  width:min(90vw,680px);z-index:20;
-  display:flex;gap:8px;
+/* ── Mic button ────────────────────────── */
+.mic-zone{
+  flex-shrink:0;
+  padding-bottom:max(28px, env(safe-area-inset-bottom, 28px));
+  display:flex;flex-direction:column;align-items:center;gap:8px;
 }
-.text-input{
-  flex:1;
-  font-family:var(--font-body);font-size:14px;
-  padding:12px 18px;border-radius:24px;
-  background:rgba(16,16,28,0.8);color:var(--text);
-  border:1px solid rgba(129,140,248,0.15);
+.mic-btn{
+  width:64px;height:64px;border-radius:50%;
+  background:rgba(129,140,248,0.08);
+  border:2px solid rgba(129,140,248,0.2);
+  cursor:pointer;display:flex;align-items:center;justify-content:center;
+  transition:all .3s;position:relative;
   outline:none;
-  backdrop-filter:blur(16px);
-  transition:border-color .2s;
 }
-.text-input::placeholder{color:var(--text-muted);}
-.text-input:focus{border-color:rgba(129,140,248,0.4);}
-.text-send-btn{
-  font-family:var(--font-display);font-size:13px;font-weight:600;
-  padding:12px 20px;border-radius:24px;cursor:pointer;
-  background:rgba(129,140,248,0.12);color:var(--accent);
-  border:1px solid rgba(129,140,248,0.2);
-  transition:all .2s;letter-spacing:1px;
+.mic-btn:hover{
+  background:rgba(129,140,248,0.14);
+  border-color:rgba(129,140,248,0.35);
 }
-.text-send-btn:hover{background:rgba(129,140,248,0.25);}
-.text-mic-btn{
-  min-width:108px;
+.mic-btn.active{
+  background:rgba(52,211,153,0.12);
+  border-color:rgba(52,211,153,0.4);
+  animation:micPulse 1.5s ease-in-out infinite;
 }
-.text-mic-btn.listening{
-  background:rgba(52,211,153,0.16);
-  color:var(--green);
-  border-color:rgba(52,211,153,0.32);
+@keyframes micPulse{
+  0%,100%{box-shadow:0 0 0 0 rgba(52,211,153,0.3);}
+  50%{box-shadow:0 0 0 14px rgba(52,211,153,0);}
 }
-.text-mic-btn.error{
-  background:rgba(248,113,113,0.14);
-  color:var(--red);
-  border-color:rgba(248,113,113,0.28);
+.mic-btn.error{
+  background:rgba(248,113,113,0.1);
+  border-color:rgba(248,113,113,0.3);
 }
-.text-mic-btn.disabled{
-  opacity:0.55;
-  cursor:not-allowed;
+.mic-btn.disabled{opacity:0.35;cursor:not-allowed;}
+.mic-btn svg{width:24px;height:24px;fill:none;stroke:var(--accent);stroke-width:2;stroke-linecap:round;stroke-linejoin:round;transition:stroke .3s;}
+.mic-btn.active svg{stroke:var(--green);}
+.mic-btn.error svg{stroke:var(--red);}
+
+.mic-hint{
+  font-family:var(--font-mono);font-size:10px;
+  color:var(--text-muted);letter-spacing:1px;
+  min-height:14px;
 }
 
-/* ── Cockpit panel (bottom center) ───────── */
-.conv-zone{
-  position:absolute;bottom:72px;left:50%;transform:translateX(-50%);
-  width:min(90vw,760px);z-index:15;
+/* ── Floating system strip ─────────────── */
+.sys-strip{
+  position:fixed;bottom:max(28px, env(safe-area-inset-bottom, 28px));
+  right:16px;z-index:20;
+  display:flex;gap:16px;
+  font-family:var(--font-mono);font-size:10px;
+  color:var(--text-muted);letter-spacing:0.5px;
 }
-.cockpit-grid{
-  display:grid;
-  grid-template-columns:repeat(2,minmax(0,1fr));
-  gap:10px;
-}
-.cockpit-card{
-  min-height:88px;
-  padding:14px 16px;
-  border-radius:16px;
-  background:rgba(10,12,24,0.68);
-  border:1px solid rgba(129,140,248,0.12);
-  backdrop-filter:blur(16px);
-  box-shadow:0 14px 40px rgba(0,0,0,0.22);
-}
-.cockpit-label{
-  font-family:var(--font-mono);
-  font-size:11px;
-  letter-spacing:1.4px;
-  color:var(--text-muted);
-  margin-bottom:8px;
-  text-transform:uppercase;
-}
-.cockpit-value{
-  font-size:14px;
-  line-height:1.55;
-  color:var(--text);
-  word-break:break-word;
-}
-.cockpit-sub{
-  margin-top:8px;
-  font-family:var(--font-mono);
-  font-size:11px;
-  color:var(--text-dim);
-}
-.cockpit-card.recovery{border-color:rgba(248,113,113,0.24);}
-.cockpit-card.screen{border-color:rgba(251,146,60,0.18);}
-.cockpit-card.spoken{border-color:rgba(52,211,153,0.18);}
-.cockpit-card.task{border-color:rgba(129,140,248,0.18);}
-@keyframes blink{0%,100%{opacity:1;}50%{opacity:0;}}
 
-/* ── Responsive ─────────────────────────── */
-@media(max-width:900px){
-  .pod{width:170px;height:170px;padding:16px;}
-  .pod-title{font-size:10px;}
-  .pod-label,.pod-value,.mini-pill,.pod-btn{font-size:10px;}
-  .orb-wrap{width:180px;height:180px;}
-  .conv-zone{width:min(94vw,560px);}
-  .text-input-wrap{width:min(94vw,500px);}
-  .text-input{font-size:13px;padding:10px 14px;}
-}
+/* ── Responsive ────────────────────────── */
 @media(max-width:600px){
-  .pod{width:130px;height:130px;padding:12px;}
-  .pod-system{top:4%;left:2%;}
-  .pod-conn{top:4%;right:2%;}
-  .pod-perf{bottom:14%;left:2%;}
-  .pod-runtime{bottom:14%;right:2%;}
-  .orb-center{top:12%;}
-  .orb-wrap{width:140px;height:140px;}
-  .clock-time{font-size:26px;}
-  .cockpit-grid{grid-template-columns:1fr;}
-  .cockpit-card{min-height:72px;padding:12px 14px;}
+  .orb-wrap{width:180px;height:180px;}
+  .state-label{font-size:12px;letter-spacing:4px;}
+  .heard-line,.response-line{font-size:13px;}
+  .sys-strip{display:none;}
 }
 </style>
 </head>
@@ -353,147 +243,53 @@ html,body{
 
 <div class="hud">
   <header class="topbar">
-    <div class="brand">A<span>.</span>T<span>.</span>O<span>.</span>M<span>.</span></div>
+    <div class="brand">ATOM <span style="opacity:0.5;font-weight:400">//</span> <span style="font-size:11px;letter-spacing:0.25em;font-weight:500">NEURAL</span></div>
     <div class="topbar-right">
-      <button class="unstick-btn" id="selfCheckBtn">SELF CHECK</button>
-      <button class="unstick-btn" id="stopTaskBtn">STOP TASK</button>
-      <button class="unstick-btn" id="unstickBtn">UNSTICK</button>
-      <div class="topbar-state">
-        <span id="topbarState">IDLE</span>
-        <div class="state-dot" id="topbarDot"></div>
-      </div>
+      <div class="sys-pill"><span class="dot on" id="connWs"></span><span id="connWsLabel">LINK</span></div>
+      <div class="sys-pill"><span class="dot on" id="connStt"></span>VOICE</div>
+      <div class="sys-pill"><span class="dot on" id="connTts"></span>TTS</div>
     </div>
   </header>
 
-  <div class="hud-field">
-    <!-- Central Orb -->
-    <div class="orb-center">
-      <div class="orb-wrap" id="orbWrap" data-state="idle">
-        <canvas id="orbCanvas" width="440" height="440"></canvas>
-      </div>
-      <div class="orb-label">
-        <div class="orb-state-text" id="orbStateText">IDLE</div>
-        <div class="orb-status-text" id="orbStatusText">Waiting...</div>
-      </div>
-      <div class="hearing-text" id="hearingText"></div>
-      <div class="thinking-progress" id="thinkingProgress">
-        <span id="thinkingText"></span>
-        <div class="progress-bar-wrap"><div class="progress-bar-fill" id="thinkingBar" style="width:0%"></div></div>
-      </div>
-      <!-- Clock (flows below orb label) -->
-      <div class="clock-area">
-        <div><span class="clock-time" id="bubbleClock">00:00</span><span class="clock-sec" id="bubbleSec"> :00 PM</span></div>
-        <div class="clock-date" id="bubbleDate">---</div>
+  <div class="brain-zone">
+    <div class="orb-wrap" id="orbWrap" data-state="idle">
+      <canvas id="orbCanvas" width="520" height="520"></canvas>
+    </div>
+
+    <div class="state-label" id="stateLabel">IDLE</div>
+    <div class="state-sub" id="stateSub">Waiting...</div>
+
+    <div class="transcript-zone">
+      <div class="heard-line" id="heardLine"></div>
+      <div class="response-line" id="responseLine"></div>
+      <div class="thinking-bar-wrap" id="thinkingWrap">
+        <div class="thinking-bar-fill" id="thinkingBar" style="width:0%"></div>
       </div>
     </div>
 
-    <!-- Pod: System (top-left) -->
-    <div class="pod pod-system">
-      <div class="pod-title">System</div>
-      <div class="pod-row"><span class="pod-label">CPU</span><span class="pod-value" id="cpuVal">0%</span></div>
-      <div class="pod-bar"><div class="pod-bar-fill" id="cpuBar" style="width:0%;background:var(--accent)"></div></div>
-      <div class="pod-row"><span class="pod-label">RAM</span><span class="pod-value" id="ramVal">0%</span></div>
-      <div class="pod-bar"><div class="pod-bar-fill" id="ramBar" style="width:0%;background:var(--accent)"></div></div>
-      <div class="pod-row"><span class="pod-label">BAT</span><span class="pod-value" id="batteryVal">--</span></div>
-      <div class="pod-bar"><div class="pod-bar-fill" id="batteryBar" style="width:0%;background:var(--green)"></div></div>
-      <div class="pod-row"><span class="pod-label">DSK</span><span class="pod-value" id="diskVal">--</span></div>
-    </div>
+    <div class="clock-strip" id="clockStrip">--:-- --</div>
+  </div>
 
-    <!-- Pod: Connections (top-right) -->
-    <div class="pod pod-conn">
-      <div class="pod-title">Connections</div>
-      <div class="mini-pills">
-        <span class="mini-pill"><span class="mini-dot on" id="connStt"></span>STT</span>
-        <span class="mini-pill"><span class="mini-dot on" id="connTts"></span>TTS</span>
-        <span class="mini-pill"><span class="mini-dot on" id="connAi"></span><span id="connAiVal">AI</span></span>
-        <span class="mini-pill"><span class="mini-dot on" id="connWs"></span><span id="connWsVal">LINK</span></span>
-      </div>
-      <div style="margin-top:8px;font-size:11px;color:var(--text-dim);max-width:160px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" id="micName">Detecting...</div>
-      <div style="margin-top:6px;font-size:10px;color:var(--orange);line-height:1.3" id="voiceRuntimeNote">Browser mode contract loading...</div>
-    </div>
-
-    <!-- Pod: Performance (bottom-left) -->
-    <div class="pod pod-perf">
-      <div class="pod-title">Performance</div>
-      <div style="display:flex;gap:3px;flex-wrap:wrap;justify-content:center">
-        <button class="pod-btn perf-btn" data-mode="optimal">OPTIMAL</button>
-        <button class="pod-btn perf-btn" data-mode="full_performance">FULL</button>
-        <button class="pod-btn perf-btn active" data-mode="auto">AUTO</button>
-      </div>
-      <div style="font-family:var(--font-mono);font-size:11px;color:var(--text-muted);margin-top:5px" id="govStatus">ACTIVE: OPTIMAL</div>
-      <div class="perf-restart-msg" id="perfRestartMsg">RESTARTING...</div>
-    </div>
-
-    <!-- Hidden: Session data elements (JS compatibility) -->
-    <span class="hidden" id="uptimeVal" style="display:none">0m</span>
-    <span class="hidden" id="queriesVal" style="display:none">0</span>
-    <span class="hidden" id="lastIntentSpan" style="display:none">—</span>
-    <span class="hidden" id="lastLatencySpan" style="display:none"></span>
-
-    <!-- Pod: Runtime (left-center) -->
-    <div class="pod pod-runtime">
-      <div class="pod-title">Runtime</div>
-      <div style="display:flex;gap:3px;flex-wrap:wrap;justify-content:center">
-        <button class="pod-btn" data-brain="optimal" onclick="setBrainProfile('optimal')">OPT</button>
-        <button class="pod-btn" data-brain="full_performance" onclick="setBrainProfile('full_performance')">FULL</button>
-      </div>
-      <div style="display:flex;gap:3px;flex-wrap:wrap;justify-content:center;margin-top:4px">
-        <button class="pod-btn" data-asst="command_only" onclick="setAssistantMode('command_only')">CMD</button>
-        <button class="pod-btn" data-asst="hybrid" onclick="setAssistantMode('hybrid')">HYB</button>
-        <button class="pod-btn" data-asst="conversational" onclick="setAssistantMode('conversational')">CHT</button>
-      </div>
-      <div id="runtimeInfo" style="font-family:var(--font-mono);font-size:11px;color:var(--text-muted);margin-top:4px"></div>
-    </div>
-
-    <!-- Hidden: Last Query data elements (JS compatibility) -->
-    <span class="hidden" id="lastQueryText" style="display:none">—</span>
-    <span class="hidden" id="modeInfo" style="display:none"></span>
-
-    <!-- Cockpit (bottom center) -->
-    <div class="conv-zone" id="convZone">
-      <div class="cockpit-grid">
-        <div class="cockpit-card task">
-          <div class="cockpit-label">Active Task</div>
-          <div class="cockpit-value" id="taskQueryText">Waiting for input.</div>
-          <div class="cockpit-sub" id="taskMetaText">No active intent yet.</div>
-        </div>
-        <div class="cockpit-card">
-          <div class="cockpit-label">Heard / Input</div>
-          <div class="cockpit-value" id="heardPanelText">No input captured yet.</div>
-          <div class="cockpit-sub" id="inputModeText">Browser text input is available.</div>
-        </div>
-        <div class="cockpit-card spoken">
-          <div class="cockpit-label">Spoken Answer</div>
-          <div class="cockpit-value" id="spokenPanelText">No spoken answer yet.</div>
-        </div>
-        <div class="cockpit-card screen">
-          <div class="cockpit-label">Screen Details</div>
-          <div class="cockpit-value" id="screenPanelText">Long details and overflow will appear here.</div>
-        </div>
-        <div class="cockpit-card recovery">
-          <div class="cockpit-label">Recovery</div>
-          <div class="cockpit-value" id="recoveryPanelText">No recovery events.</div>
-        </div>
-        <div class="cockpit-card">
-          <div class="cockpit-label">Runtime Truth</div>
-          <div class="cockpit-value" id="memoryRagStatus">Checking runtime...</div>
-          <div class="cockpit-sub" id="executionStateText">Execution: —</div>
-          <div class="cockpit-sub" id="experienceLine">Voice & assistant —</div>
-          <div class="cockpit-sub" id="recentActionText">Waiting for activity.</div>
-        </div>
-      </div>
-    </div>
-
-    <!-- Text input fallback -->
-    <div class="text-input-wrap">
-      <input class="text-input" id="textInput" type="text" placeholder="Type here or use the mic when listening — same pipeline as speech." autocomplete="off">
-      <button class="text-send-btn text-mic-btn" id="voiceInputBtn" type="button">MIC</button>
-      <button class="text-send-btn" id="textSendBtn">SEND</button>
-    </div>
+  <div class="mic-zone" aria-live="polite">
+    <div class="mic-hint" id="micHint">ALWAYS-ON MIC — SPEAK NATURALLY</div>
   </div>
 </div>
 
-<!-- ── Three.js Orb ─────────────────────── -->
+<div class="jarvis-boot" id="jarvisBoot" aria-hidden="true">
+  <div class="jarvis-boot-inner">
+    <div class="jarvis-boot-line">ATOM</div>
+    <div class="jarvis-boot-sub">NEURAL INTERFACE · INITIALIZING</div>
+    <div class="jarvis-boot-bar"><div class="jarvis-boot-fill"></div></div>
+  </div>
+</div>
+
+<div class="sys-strip">
+  <span>CPU <span id="cpuVal">0</span>%</span>
+  <span>RAM <span id="ramVal">0</span>%</span>
+  <span>BAT <span id="batteryVal">--</span></span>
+</div>
+
+<!-- ── Three.js Brain ──────────────────── -->
 <script type="importmap">{"imports":{"three":"https://esm.sh/three@0.160.0"}}</script>
 <script type="module">
 import * as THREE from 'three';
@@ -504,7 +300,7 @@ function layout(){
   const w=document.getElementById('orbWrap');
   if(!w)return;
   const d=Math.min(w.clientWidth,w.clientHeight);
-  const s=Math.max(120,Math.min(d||220,220));
+  const s=Math.max(140,Math.min(d||260,260));
   renderer.setPixelRatio(Math.min(devicePixelRatio||1,2));
   renderer.setSize(s,s);
 }
@@ -514,70 +310,126 @@ const scene=new THREE.Scene();
 const cam=new THREE.PerspectiveCamera(45,1,0.1,100);cam.position.z=4;
 
 const SC={
-  sleep:{c:0x52525b,g:0x3f3f46,r:0x52525b,p:0x52525b},
-  idle:{c:0x818cf8,g:0x4338ca,r:0x818cf8,p:0xa5b4fc},
-  listening:{c:0x818cf8,g:0x4f46e5,r:0xa5b4fc,p:0x818cf8},
-  thinking:{c:0xfbbf24,g:0x92400e,r:0xfbbf24,p:0xfde68a},
-  speaking:{c:0xa78bfa,g:0x6d28d9,r:0xc4b5fd,p:0xa78bfa},
-  error_recovery:{c:0xf87171,g:0x991b1b,r:0xfca5a5,p:0xf87171},
+  sleep:     {c:0x52525b,g:0x3f3f46,w:0x52525b,p:0x52525b,s:0x3f3f46},
+  idle:      {c:0x818cf8,g:0x4338ca,w:0x6366f1,p:0xa5b4fc,s:0x4f46e5},
+  listening: {c:0x34d399,g:0x065f46,w:0x6ee7b7,p:0x34d399,s:0x059669},
+  thinking:  {c:0xfbbf24,g:0x92400e,w:0xf59e0b,p:0xfde68a,s:0xd97706},
+  speaking:  {c:0xa78bfa,g:0x6d28d9,w:0xc4b5fd,p:0xa78bfa,s:0x7c3aed},
+  error_recovery:{c:0xf87171,g:0x991b1b,w:0xfca5a5,p:0xf87171,s:0xdc2626},
 };
 const SS={
-  sleep:{o:0.1,p:0.3,rb:0.005},idle:{o:0.3,p:0.6,rb:0.015},
-  listening:{o:0.8,p:1.2,rb:0.04},thinking:{o:2.0,p:2.5,rb:0.08},
-  speaking:{o:1.0,p:1.5,rb:0.03},error_recovery:{o:1.5,p:3.0,rb:0.06},
+  sleep:{rot:0.1,pulse:0.3,synapse:0.005},
+  idle:{rot:0.3,pulse:0.6,synapse:0.015},
+  listening:{rot:0.6,pulse:1.0,synapse:0.03},
+  thinking:{rot:2.0,pulse:2.5,synapse:0.08},
+  speaking:{rot:1.0,pulse:1.5,synapse:0.03},
+  error_recovery:{rot:1.5,pulse:3.0,synapse:0.06},
 };
 let cs='idle',tc=SC.idle,ts=SS.idle;
 
-const cm=new THREE.ShaderMaterial({
-  uniforms:{uTime:{value:0},uColor:{value:new THREE.Color(0x818cf8)},uGlow:{value:new THREE.Color(0x4338ca)},uPulseSpeed:{value:0.6},uDistortion:{value:0}},
-  vertexShader:`uniform float uTime;uniform float uDistortion;varying vec3 vN;varying vec3 vP;
-    void main(){vN=normalize(normalMatrix*normal);vP=position;
-    float d=sin(position.x*5.0+uTime*2.0)*sin(position.y*5.0+uTime*1.5)*sin(position.z*5.0+uTime)*0.04*(1.0+uDistortion*2.0);
-    gl_Position=projectionMatrix*modelViewMatrix*vec4(position+normal*d,1.0);}`,
-  fragmentShader:`uniform float uTime;uniform vec3 uColor;uniform vec3 uGlow;uniform float uPulseSpeed;varying vec3 vN;
-    void main(){float f=pow(1.0-abs(dot(vN,vec3(0,0,1))),2.5);float p=0.85+0.15*sin(uTime*uPulseSpeed);
-    vec3 b=mix(uGlow,uColor,0.5+0.5*f)*p+uColor*f*0.6;gl_FragColor=vec4(b,0.92+f*0.08);}`,
-  transparent:true
+const brainGeo=new THREE.SphereGeometry(0.75,80,60);
+const posAttr=brainGeo.attributes.position;
+const norAttr=brainGeo.attributes.normal;
+function fbm(x,y,z){
+  let v=0,a=0.5,f=1.0;
+  for(let i=0;i<5;i++){
+    v+=a*Math.sin(x*f+y*f*0.7)*Math.cos(y*f+z*f*0.9)*Math.sin(z*f+x*f*0.6);
+    f*=2.1;a*=0.45;
+  }
+  return v;
+}
+for(let i=0;i<posAttr.count;i++){
+  let x=posAttr.getX(i),y=posAttr.getY(i),z=posAttr.getZ(i);
+  const len=Math.sqrt(x*x+y*y+z*z);
+  const nx=x/len,ny=y/len,nz=z/len;
+  const hemisphereGap=Math.exp(-Math.pow(nz*8,2))*0.06;
+  const sulci=fbm(nx*4.5,ny*4.5,nz*4.5)*0.09;
+  const frontalBulge=(nx>0.3?0.04:0)*(1-Math.abs(nz));
+  const d=sulci-hemisphereGap+frontalBulge;
+  posAttr.setXYZ(i,x+norAttr.getX(i)*d,y+norAttr.getY(i)*d,z+norAttr.getZ(i)*d);
+}
+brainGeo.computeVertexNormals();
+
+const brainMat=new THREE.ShaderMaterial({
+  uniforms:{
+    uTime:{value:0},uColor:{value:new THREE.Color(0x818cf8)},
+    uGlow:{value:new THREE.Color(0x4338ca)},uPulse:{value:0.6},uActivity:{value:0},
+  },
+  vertexShader:`
+    uniform float uTime;uniform float uActivity;
+    varying vec3 vN;varying vec3 vPos;varying float vFresnel;
+    void main(){
+      vN=normalize(normalMatrix*normal);vPos=position;
+      vec3 vd=normalize(cameraPosition-(modelMatrix*vec4(position,1.0)).xyz);
+      vec3 wn=normalize((modelMatrix*vec4(normal,0.0)).xyz);
+      vFresnel=pow(1.0-abs(dot(wn,vd)),3.0);
+      float b=sin(position.x*3.0+uTime*1.5)*sin(position.y*4.0+uTime)*0.015*(1.0+uActivity*3.0);
+      gl_Position=projectionMatrix*modelViewMatrix*vec4(position+normal*b,1.0);
+    }`,
+  fragmentShader:`
+    uniform float uTime;uniform vec3 uColor;uniform vec3 uGlow;uniform float uPulse;
+    varying vec3 vN;varying vec3 vPos;varying float vFresnel;
+    void main(){
+      float p=0.7+0.3*sin(uTime*uPulse);
+      float cx=sin(vPos.x*12.0+uTime*0.8)*sin(vPos.y*10.0+uTime*0.5)*0.15;
+      vec3 base=mix(uGlow*0.6,uColor,0.3+vFresnel*0.7+cx)*p;
+      vec3 rim=uColor*vFresnel*1.2;
+      float a=0.1+vFresnel*0.6+cx*0.08;
+      gl_FragColor=vec4(base+rim,clamp(a,0.0,0.85));
+    }`,
+  transparent:true,side:THREE.DoubleSide,depthWrite:false,
 });
-const core=new THREE.Mesh(new THREE.SphereGeometry(0.6,64,64),cm);scene.add(core);
+const brain=new THREE.Mesh(brainGeo,brainMat);
+brain.rotation.x=-0.2;scene.add(brain);
 
-const rm=new THREE.MeshBasicMaterial({color:0x818cf8,transparent:true,opacity:0.4});
-const ring=new THREE.Mesh(new THREE.TorusGeometry(1.1,0.015,16,100),rm);
-ring.rotation.x=Math.PI/2.3;scene.add(ring);
+const wireMat=new THREE.MeshBasicMaterial({color:0x6366f1,transparent:true,opacity:0.07,wireframe:true});
+const wireframe=new THREE.Mesh(brainGeo.clone(),wireMat);
+wireframe.rotation.copy(brain.rotation);scene.add(wireframe);
 
-const ring2=new THREE.Mesh(new THREE.TorusGeometry(1.3,0.008,16,80),
-  new THREE.MeshBasicMaterial({color:0x818cf8,transparent:true,opacity:0.15}));
-ring2.rotation.x=Math.PI/3;ring2.rotation.y=Math.PI/4;scene.add(ring2);
+const sCount=140,sPos=new Float32Array(sCount*3);
+for(let i=0;i<sCount;i++){
+  const th=Math.random()*Math.PI*2,ph=Math.acos(2*Math.random()-1),r=0.78+Math.random()*0.4;
+  sPos[i*3]=r*Math.sin(ph)*Math.cos(th);sPos[i*3+1]=r*Math.sin(ph)*Math.sin(th);sPos[i*3+2]=r*Math.cos(ph);
+}
+const sGeo=new THREE.BufferGeometry();sGeo.setAttribute('position',new THREE.BufferAttribute(sPos,3));
+const sMat=new THREE.PointsMaterial({color:0xa5b4fc,size:0.025,transparent:true,opacity:0.6});
+const synapses=new THREE.Points(sGeo,sMat);scene.add(synapses);
 
-const pc=50,pp=new Float32Array(pc*3);
-for(let i=0;i<pc;i++){const a=Math.random()*Math.PI*2,r=1.2+Math.random()*0.6;
-pp[i*3]=Math.cos(a)*r;pp[i*3+1]=(Math.random()-0.5)*1.4;pp[i*3+2]=Math.sin(a)*r;}
-const pg=new THREE.BufferGeometry();pg.setAttribute('position',new THREE.BufferAttribute(pp,3));
-const pm=new THREE.PointsMaterial({color:0x818cf8,size:0.035,transparent:true,opacity:0.5});
-const pts=new THREE.Points(pg,pm);scene.add(pts);
+const rMat=new THREE.MeshBasicMaterial({color:0x818cf8,transparent:true,opacity:0.15});
+const ring1=new THREE.Mesh(new THREE.TorusGeometry(1.2,0.005,16,120),rMat);
+ring1.rotation.x=Math.PI/2.2;scene.add(ring1);
+const ring2=new THREE.Mesh(new THREE.TorusGeometry(1.35,0.003,16,80),
+  new THREE.MeshBasicMaterial({color:0x818cf8,transparent:true,opacity:0.08}));
+ring2.rotation.x=Math.PI/3.5;ring2.rotation.y=Math.PI/5;scene.add(ring2);
 
 const clk=new THREE.Clock();
 function anim(){
   requestAnimationFrame(anim);const t=clk.getElapsedTime();
-  cm.uniforms.uTime.value=t;
-  cm.uniforms.uColor.value.lerp(new THREE.Color(tc.c),0.03);
-  cm.uniforms.uGlow.value.lerp(new THREE.Color(tc.g),0.03);
-  cm.uniforms.uPulseSpeed.value+=(ts.p-cm.uniforms.uPulseSpeed.value)*0.05;
-  const dt=cs==='thinking'?1:cs==='speaking'?0.3:0;
-  cm.uniforms.uDistortion.value+=(dt-cm.uniforms.uDistortion.value)*0.05;
-  core.rotation.y+=ts.o*0.01;core.rotation.x=Math.sin(t*0.3)*0.1;
-  ring.rotation.z+=0.003;ring.scale.setScalar(1+Math.sin(t*ts.rb*10)*0.06);
-  rm.color.lerp(new THREE.Color(tc.r),0.03);
-  ring2.rotation.z-=0.002;ring2.rotation.x+=0.001;
-  pts.rotation.y+=ts.o*0.005;pm.color.lerp(new THREE.Color(tc.p),0.03);
+  brainMat.uniforms.uTime.value=t;
+  brainMat.uniforms.uColor.value.lerp(new THREE.Color(tc.c),0.03);
+  brainMat.uniforms.uGlow.value.lerp(new THREE.Color(tc.g),0.03);
+  brainMat.uniforms.uPulse.value+=(ts.pulse-brainMat.uniforms.uPulse.value)*0.05;
+  const act=cs==='thinking'?1:cs==='speaking'?0.4:cs==='listening'?0.25:0;
+  brainMat.uniforms.uActivity.value+=(act-brainMat.uniforms.uActivity.value)*0.05;
+  brain.rotation.y+=ts.rot*0.008;brain.rotation.x=-0.2+Math.sin(t*0.25)*0.08;
+  wireframe.rotation.copy(brain.rotation);
+  wireMat.color.lerp(new THREE.Color(tc.w),0.03);
+  wireMat.opacity+=(0.05+act*0.07-wireMat.opacity)*0.05;
+  synapses.rotation.y+=ts.rot*0.004;synapses.rotation.x=Math.sin(t*0.15)*0.1;
+  sMat.color.lerp(new THREE.Color(tc.p),0.03);
+  sMat.opacity=0.4+Math.sin(t*ts.synapse*12)*0.2;
+  sMat.size=0.02+act*0.015+Math.sin(t*2)*0.005;
+  ring1.rotation.z+=0.002;ring1.scale.setScalar(1+Math.sin(t*ts.synapse*8)*0.04);
+  rMat.color.lerp(new THREE.Color(tc.s),0.03);
+  ring2.rotation.z-=0.0015;ring2.rotation.x+=0.0008;
   renderer.render(scene,cam);
 }
 anim();
 
 window.setOrbState=s=>{cs=s;tc=SC[s]||SC.idle;ts=SS[s]||SS.idle;};
 window.setOrbModeTheme=mt=>{
-  SC.idle.c=mt.orbCore;SC.idle.g=mt.orbGlow;SC.idle.r=mt.orbRing;SC.idle.p=mt.orbParticle;
-  SC.listening.c=mt.orbCore;SC.listening.g=mt.orbGlow;SC.listening.r=mt.orbRing;SC.listening.p=mt.orbParticle;
+  SC.idle.c=mt.orbCore;SC.idle.g=mt.orbGlow;SC.idle.w=mt.orbCore;SC.idle.p=mt.orbParticle;SC.idle.s=mt.orbGlow;
+  SC.listening.c=mt.orbCore;SC.listening.g=mt.orbGlow;SC.listening.w=mt.orbCore;SC.listening.p=mt.orbParticle;SC.listening.s=mt.orbGlow;
   if(cs==='idle'||cs==='listening')tc=SC[cs];
 };
 </script>
@@ -586,609 +438,218 @@ window.setOrbModeTheme=mt=>{
 (function(){
 const $=id=>document.getElementById(id);
 const WS='ws://'+location.host+'/ws';
-let ws,startTime=Date.now(),queryCount=0;
+let ws;
 let atomState=null;
-const SpeechRecognitionCtor=window.SpeechRecognition||window.webkitSpeechRecognition||null;
-const browserVoice={
-  supported:!!SpeechRecognitionCtor,
-  active:false,
-  interim:'',
-  lastFinal:'',
-  lastError:'',
-  permission:'unknown',
-  recognition:null,
-};
+let bootSplashEnabled=true;
 
-function deepClone(v){
-  return v==null?v:JSON.parse(JSON.stringify(v));
+function dismissJarvisBoot(){
+  const el=$('jarvisBoot');
+  if(!el||el.classList.contains('done'))return;
+  el.classList.add('done');
+  setTimeout(()=>{try{el.remove();}catch(_){}},900);
 }
 
-function deepMerge(target,patch){
-  if(!patch||typeof patch!=='object')return target;
-  Object.keys(patch).forEach(key=>{
-    const value=patch[key];
-    if(value&&typeof value==='object'&&!Array.isArray(value)){
-      const base=(target[key]&&typeof target[key]==='object'&&!Array.isArray(target[key]))?target[key]:{};
-      target[key]=deepMerge(base,value);
-      return;
+function deepClone(v){return v==null?v:JSON.parse(JSON.stringify(v));}
+function deepMerge(t,p){
+  if(!p||typeof p!=='object')return t;
+  Object.keys(p).forEach(k=>{
+    const v=p[k];
+    if(v&&typeof v==='object'&&!Array.isArray(v)){
+      const b=(t[k]&&typeof t[k]==='object'&&!Array.isArray(t[k]))?t[k]:{};
+      t[k]=deepMerge(b,v);return;
     }
-    target[key]=value;
+    t[k]=v;
   });
-  return target;
+  return t;
 }
+function clip(t,n=200){const c=String(t||'').trim();if(c.length<=n)return c||'';return c.slice(0,n-1).trimEnd()+'…';}
 
-function clipText(text,maxLen=220){
-  const clean=String(text||'').trim();
-  if(clean.length<=maxLen)return clean||'—';
-  return clean.slice(0,maxLen-1).trimEnd()+'…';
-}
-
+/* ── Clock ─────────────────────────────── */
 function tickClock(){
   const n=new Date();
-  let h=n.getHours(),m=n.getMinutes(),s=n.getSeconds();
+  let h=n.getHours(),m=n.getMinutes();
   const ap=h>=12?'PM':'AM';h=h%12||12;
-  $('bubbleClock').textContent=String(h).padStart(2,'0')+':'+String(m).padStart(2,'0');
-  $('bubbleSec').textContent=' :'+String(s).padStart(2,'0')+' '+ap;
   const d=['Sun','Mon','Tue','Wed','Thu','Fri','Sat'];
   const mo=['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
-  $('bubbleDate').textContent=d[n.getDay()]+' · '+mo[n.getMonth()]+' '+n.getDate()+', '+n.getFullYear();
-  const up=Math.floor((Date.now()-startTime)/60000);
-  $('uptimeVal').textContent=up<60?up+'m':Math.floor(up/60)+'h '+up%60+'m';
+  $('clockStrip').textContent=
+    String(h).padStart(2,'0')+':'+String(m).padStart(2,'0')+' '+ap+
+    '  ·  '+d[n.getDay()]+' '+mo[n.getMonth()]+' '+n.getDate();
 }
-tickClock();setInterval(tickClock,1000);
+tickClock();setInterval(tickClock,30000);
 
-const stColors={idle:'var(--accent)',listening:'var(--accent)',thinking:'var(--orange)',speaking:'var(--purple)',error_recovery:'var(--red)',sleep:'var(--text-muted)'};
-const dotColors={idle:'var(--green)',listening:'var(--green)',thinking:'var(--orange)',speaking:'var(--purple)',error_recovery:'var(--red)',sleep:'var(--text-muted)'};
+/* ── State colors ──────────────────────── */
+const stColors={idle:'var(--accent)',listening:'var(--green)',thinking:'var(--orange)',speaking:'var(--purple)',error_recovery:'var(--red)',sleep:'var(--text-muted)'};
 
 function setAppState(state,label,status){
-  $('topbarState').textContent=label||state.toUpperCase();
-  $('orbStateText').textContent=label||state.toUpperCase();
-  $('orbStateText').style.color=stColors[state]||'var(--accent)';
-  $('orbStatusText').textContent=status||'';
-  const d=$('topbarDot');d.style.background=dotColors[state]||'var(--green)';
-  d.style.boxShadow='0 0 8px '+(dotColors[state]||'var(--green)');
+  $('stateLabel').textContent=label||state.toUpperCase();
+  $('stateLabel').style.color=stColors[state]||'var(--accent)';
+  $('stateSub').textContent=status||'';
   $('orbWrap').setAttribute('data-state',state);
   if(window.setOrbState)window.setOrbState(state);
   if(state!=='thinking'){
-    const tp=$('thinkingProgress');if(tp)tp.classList.remove('visible');
-    const tb=$('thinkingBar');if(tb)tb.style.width='0%';
-  }
-  if(state==='thinking')$('recentActionText').textContent='Reasoning on the active task.';
-  if(state==='error_recovery')$('recoveryPanelText').textContent=clipText(status||'Recovery active.',220);
-}
-
-function showUserBubble(text){
-  $('taskQueryText').textContent=clipText(text,260);
-  $('heardPanelText').textContent=clipText(text,220);
-  $('spokenPanelText').textContent='Waiting for answer...';
-}
-
-function showAtomBubble(text){
-  $('spokenPanelText').textContent=clipText(text,260);
-}
-
-function updateLastQuery(q,intent,ms){
-  if($('lastQueryText'))$('lastQueryText').textContent=q||'—';
-  if($('lastIntentSpan'))$('lastIntentSpan').textContent=intent?'→ '+intent:'—';
-  if($('lastLatencySpan'))$('lastLatencySpan').textContent=ms!=null?' '+Math.round(ms)+'ms':'';
-  if($('taskMetaText')){
-    const parts=[];
-    if(intent)parts.push('Intent: '+intent);
-    if(ms!=null)parts.push('Latency: '+Math.round(ms)+'ms');
-    $('taskMetaText').textContent=parts.join(' · ')||'No active intent yet.';
+    $('thinkingWrap').classList.remove('visible');
+    $('thinkingBar').style.width='0%';
   }
 }
 
+function showHeard(text){
+  $('heardLine').textContent=text?'"'+clip(text,160)+'"':'';
+}
+function showResponse(text){
+  const el=$('responseLine');
+  el.textContent=clip(text,400);
+  el.scrollTop=el.scrollHeight;
+}
+
+/* ── System ────────────────────────────── */
 function updateSystem(d){
-  $('cpuVal').textContent=d.cpu+'%';$('cpuBar').style.width=d.cpu+'%';
-  $('cpuBar').style.background=d.cpu>80?'var(--red)':d.cpu>60?'var(--orange)':'var(--accent)';
-  $('ramVal').textContent=d.ram+'%';$('ramBar').style.width=d.ram+'%';
-  $('ramBar').style.background=d.ram>85?'var(--red)':d.ram>70?'var(--orange)':'var(--accent)';
-  if(d.battery!=null){
-    $('batteryVal').textContent=d.battery+'%'+(d.charging?' ⚡':'');
-    $('batteryBar').style.width=d.battery+'%';
-    $('batteryBar').style.background=d.battery<20?'var(--red)':d.battery<40?'var(--orange)':'var(--green)';
-  }
-  if(d.disk_free_gb!=null)$('diskVal').textContent=d.disk_free_gb+'GB';
+  $('cpuVal').textContent=Math.round(d.cpu||0);
+  $('ramVal').textContent=Math.round(d.ram||0);
+  if(d.battery!=null)$('batteryVal').textContent=d.battery+'%'+(d.charging?' ⚡':'');
 }
 
-let curPerfRequested='auto',curPerfActive='optimal',govThrottled=false;
+/* ── Performance mode ──────────────────── */
+let curPerfActive='optimal';
 const MT={
-  optimal:{accent:'#34d399',glow:'rgba(52,211,153,0.5)',dim:'rgba(52,211,153,0.12)',orbCore:0x34d399,orbGlow:0x065f46,orbRing:0x34d399,orbParticle:0x6ee7b7},
-  full_performance:{accent:'#818cf8',glow:'rgba(129,140,248,0.5)',dim:'rgba(129,140,248,0.12)',orbCore:0x818cf8,orbGlow:0x4338ca,orbRing:0x818cf8,orbParticle:0xa5b4fc},
-  auto:{accent:'#fb923c',glow:'rgba(251,146,60,0.5)',dim:'rgba(251,146,60,0.12)',orbCore:0xfb923c,orbGlow:0x9a3412,orbRing:0xfb923c,orbParticle:0xfdba74},
+  optimal:{orbCore:0x34d399,orbGlow:0x065f46,orbRing:0x34d399,orbParticle:0x6ee7b7},
+  full_performance:{orbCore:0x818cf8,orbGlow:0x4338ca,orbRing:0x818cf8,orbParticle:0xa5b4fc},
+  auto:{orbCore:0xfb923c,orbGlow:0x9a3412,orbRing:0xfb923c,orbParticle:0xfdba74},
 };
-const MODE_LABELS={optimal:'Optimal',full_performance:'Full Performance',auto:'Auto'};
-function modeLabel(mode){
-  return MODE_LABELS[mode]||String(mode||'').replace(/_/g,' ').replace(/\b\w/g,c=>c.toUpperCase());
-}
-function renderPerfStatus(){
-  let text='ACTIVE: '+modeLabel(curPerfActive).toUpperCase();
-  if(curPerfRequested==='auto')text+=' · AUTO';
-  else if(curPerfRequested!==curPerfActive)text+=' · REQUESTED '+modeLabel(curPerfRequested).toUpperCase();
-  if(govThrottled)text+=' · THROTTLED';
-  $('govStatus').textContent=text;
-}
-function setPerfUI(requestedMode,effectiveMode){
-  if(requestedMode)curPerfRequested=requestedMode;
-  if(effectiveMode)curPerfActive=effectiveMode;
-  document.querySelectorAll('.perf-btn').forEach(b=>b.classList.toggle('active',b.dataset.mode===curPerfRequested));
+function setPerfUI(eff){
+  if(eff)curPerfActive=eff;
   const t=MT[curPerfActive]||MT.optimal;
-  document.documentElement.style.setProperty('--accent',t.accent);
-  document.documentElement.style.setProperty('--accent-glow',t.glow);
   if(window.setOrbModeTheme)window.setOrbModeTheme(t);
-  renderPerfStatus();
 }
-function updateVoiceRuntime(mode,note){
-  const prodVoice = mode === 'app_bundle_production';
-  const browserReady = browserVoice.supported && browserVoice.permission !== 'denied';
-  $('connStt').className = 'mini-dot ' + ((prodVoice || browserReady) ? 'on' : 'off');
-  const bits=[];
-  if(note)bits.push(note);
-  if(browserVoice.supported){
-    bits.push(browserVoice.active?'Browser mic listening.':'Browser mic ready.');
-  }else{
-    bits.push('Browser mic unavailable in this browser.');
-  }
-  if(browserVoice.permission==='denied')bits.push('Browser mic permission denied.');
-  if(browserVoice.lastError&&browserVoice.lastError!=='aborted')bits.push('Browser mic '+browserVoice.lastError+'.');
-  if($('voiceRuntimeNote'))$('voiceRuntimeNote').textContent = clipText(bits.filter(Boolean).join(' '),220);
-  syncVoiceButton();
+
+/* ── Render full state (native STT only; no dashboard text/mic button) ─ */
+function syncVoiceRibbon(lc,v){
+  const hint=$('micHint');
+  if(!hint)return;
+  const st=String(lc.state||'idle');
+  if(st==='listening')hint.textContent='ALWAYS-ON MIC — LISTENING';
+  else if(st==='thinking')hint.textContent='PROCESSING';
+  else if(st==='speaking')hint.textContent='ATOM SPEAKING';
+  else if(st==='error_recovery')hint.textContent='RECOVERING — STANDBY';
+  else hint.textContent='ALWAYS-ON MIC — SPEAK NATURALLY';
+  const sttOn=!!v.stt_engine&&String(v.stt_engine).toLowerCase()!=='disabled';
+  $('connStt').className='dot '+(sttOn?'on':'off');
 }
 
 function renderAtomState(){
   if(!atomState)return;
-  const lifecycle=atomState.lifecycle||{};
-  const system=atomState.system||{};
-  const context=atomState.context||{};
-  const execution=atomState.execution||{};
-  const voice=atomState.voice||{};
+  const lc=atomState.lifecycle||{};
+  const sys=atomState.system||{};
+  const exec=atomState.execution||{};
+  const v=atomState.voice||{};
   const mode=atomState.mode||{};
-  const health=atomState.health||{};
-  const reasoning=atomState.reasoning||{};
-  const media=context.media||{};
+  const reason=atomState.reasoning||{};
 
-  if(lifecycle.state){
-    setAppState(
-      String(lifecycle.state||'idle'),
-      String(lifecycle.label||'IDLE'),
-      String(lifecycle.status||'')
-    );
-  }
+  if(lc.state)setAppState(String(lc.state||'idle'),String(lc.label||'IDLE'),String(lc.status||''));
 
   updateSystem({
-    cpu: Math.round(Number(system.cpu||0)),
-    ram: Math.round(Number(system.memory_pct||0)),
-    battery: system.battery_pct!=null?Math.round(Number(system.battery_pct||0)):null,
-    charging: !!system.charging,
-    disk_free_gb: system.disk_free_gb!=null?Math.round(Number(system.disk_free_gb||0)):null,
+    cpu:Math.round(Number(sys.cpu||0)),
+    ram:Math.round(Number(sys.memory_pct||0)),
+    battery:sys.battery_pct!=null?Math.round(Number(sys.battery_pct||0)):null,
+    charging:!!sys.charging,
   });
 
-  const backendSttOnline=!!voice.stt_engine&&String(voice.stt_engine).toLowerCase()!=='disabled';
-  const browserSttOnline=browserVoice.supported&&browserVoice.permission!=='denied';
-  const sttOnline=backendSttOnline||browserSttOnline;
-  const ttsOnline=!!voice.tts_engine;
-  $('connStt').className='mini-dot '+(sttOnline?'on':'off');
-  $('connTts').className='mini-dot '+(ttsOnline?'on':'off');
-  if($('micName'))$('micName').textContent=
-    voice.mic||(browserVoice.supported?'Browser microphone fallback':'Voice input unavailable');
-  if($('connAiVal'))$('connAiVal').textContent=(mode.profile||'AI').toString().slice(0,10).toUpperCase();
+  const sttOn=!!v.stt_engine&&String(v.stt_engine).toLowerCase()!=='disabled';
+  $('connStt').className='dot '+(sttOn?'on':'off');
+  $('connTts').className='dot '+(!!v.tts_engine?'on':'off');
 
-  const voiceBits=[];
-  if(voice.stt_engine)voiceBits.push('STT '+voice.stt_engine);
-  if(voice.tts_engine)voiceBits.push('TTS '+voice.tts_engine);
-  if(voice.permissions&&voice.permissions.speech&&voice.permissions.speech!=='unknown'){
-    voiceBits.push('Speech '+voice.permissions.speech);
-  }
-  if(voice.permissions&&voice.permissions.microphone&&voice.permissions.microphone!=='unknown'){
-    voiceBits.push('Mic '+voice.permissions.microphone);
-  }
-  if(voice.error)voiceBits.push('Error: '+voice.error);
-  else if(Array.isArray(voice.fallback_chain)&&voice.fallback_chain.length){
-    voiceBits.push('Fallbacks: '+voice.fallback_chain.join(' | '));
-  }
-  if(browserVoice.supported){
-    voiceBits.push(browserVoice.active?'Browser mic listening':'Browser mic ready');
-  }else{
-    voiceBits.push('Browser mic unavailable');
-  }
-  if(browserVoice.permission==='denied')voiceBits.push('Browser mic denied');
-  if(browserVoice.lastError&&browserVoice.lastError!=='aborted'){
-    voiceBits.push('Browser mic '+browserVoice.lastError);
-  }
-  if($('voiceRuntimeNote'))$('voiceRuntimeNote').textContent=clipText(
-    voiceBits.join(' · ')||'Voice runtime ready.',
-    220
-  );
+  setPerfUI(mode.effective||curPerfActive);
+  syncVoiceRibbon(lc,v);
 
-  setPerfUI(mode.requested||curPerfRequested,mode.effective||curPerfActive);
-  if($('runtimeInfo')){
-    const runtimeBits=[];
-    if(mode.assistant_mode)runtimeBits.push(String(mode.assistant_mode).replace(/_/g,' '));
-    if(mode.profile)runtimeBits.push(modeLabel(mode.profile));
-    $('runtimeInfo').textContent=runtimeBits.join(' · ');
-  }
-  if($('modeInfo'))$('modeInfo').textContent=mode.reason||reasoning.why_this_mode||'';
+  const activeTask=exec.active_task||exec.label||exec.last_query||'';
+  if(activeTask&&lc.state==='thinking')showHeard(activeTask);
 
-  const activeTask=execution.active_task||execution.label||execution.last_query||'Waiting for input.';
-  $('taskQueryText').textContent=clipText(activeTask,260);
-  const taskMeta=[];
-  if(execution.last_intent)taskMeta.push('Intent: '+execution.last_intent);
-  if(execution.latency_ms)taskMeta.push('Latency: '+Math.round(Number(execution.latency_ms||0))+'ms');
-  if(execution.queue_depth)taskMeta.push('Queue: '+execution.queue_depth);
-  $('taskMetaText').textContent=taskMeta.join(' · ')||'No active intent yet.';
+  const spoken=v.last_spoken||reason.last_report||'';
+  if(spoken)showResponse(spoken);
 
-  const heard=browserVoice.interim||voice.last_partial||voice.last_final||execution.last_query||'No input captured yet.';
-  $('heardPanelText').textContent=clipText(heard,220);
-  const inputBits=[];
-  if(browserVoice.supported){
-    inputBits.push(browserVoice.active?'BROWSER MIC':'MIC READY');
-  }else{
-    inputBits.push('TEXT INPUT');
-  }
-  if(context.activity_type)inputBits.push(String(context.activity_type).toUpperCase());
-  if(context.active_app)inputBits.push(context.active_app);
-  $('inputModeText').textContent=inputBits.join(' · ')||'Browser text input is available.';
-  const hearingPreview=browserVoice.interim||voice.last_partial||'';
-  $('hearingText').textContent=hearingPreview?'"'+clipText(hearingPreview,120)+'"':'';
-
-  const spoken=voice.last_spoken||reasoning.last_report||'No spoken answer yet.';
-  $('spokenPanelText').textContent=clipText(spoken,260);
-
-  const screenBits=[];
-  if(context.active_app)screenBits.push(context.active_app);
-  if(context.window_title&&context.window_title!==context.active_app)screenBits.push(context.window_title);
-  if(context.activity_type)screenBits.push('Activity: '+context.activity_type);
-  if(media.playing)screenBits.push('Media: '+(media.summary||media.title||media.source||'playing'));
-  $('screenPanelText').textContent=clipText(
-    screenBits.join(' · ')||'Long details and overflow will appear here.',
-    260
-  );
-
-  const recoveryBits=[];
-  if(Array.isArray(health.warnings)&&health.warnings.length){
-    recoveryBits.push(health.warnings.slice(-2).join(' | '));
-  }else if(health.status){
-    recoveryBits.push('Health: '+health.status);
-  }else{
-    recoveryBits.push('No recovery events.');
-  }
-  $('recoveryPanelText').textContent=clipText(recoveryBits.join(' · '),220);
-
-  $('memoryRagStatus').textContent=clipText(
-    health.readiness_summary||reasoning.why_this_mode||'Checking runtime...',
-    220
-  );
-  const executionBits=[execution.status||'idle'];
-  if(execution.label&&execution.label!==execution.status)executionBits.push(execution.label);
-  if(execution.queue_depth)executionBits.push('queue '+execution.queue_depth);
-  $('executionStateText').textContent='Execution: '+executionBits.join(' · ');
-
-  const experienceBits=[];
-  if(voice.stt_engine||voice.tts_engine){
-    experienceBits.push('STT '+(voice.stt_engine||'—')+' · TTS '+(voice.tts_engine||'—'));
-  }
-  if(voice.voice_name)experienceBits.push(String(voice.voice_name));
-  if(mode.assistant_mode)experienceBits.push(String(mode.assistant_mode).replace(/_/g,' '));
-  $('experienceLine').textContent=experienceBits.join(' · ')||'Voice & assistant —';
-  $('recentActionText').textContent=clipText(
-    reasoning.last_decision||execution.last_action||'Waiting for activity.',
-    180
-  );
-
-  syncVoiceButton();
-  updateLastQuery(
-    execution.last_query||voice.last_final||'',
-    execution.last_intent||'',
-    execution.latency_ms!=null?Number(execution.latency_ms):null
-  );
+  const hearPrev=v.last_partial||'';
+  if(hearPrev)showHeard(hearPrev);
 }
 
-function ensureBrowserRecognition(){
-  if(!SpeechRecognitionCtor)return null;
-  if(browserVoice.recognition)return browserVoice.recognition;
-  const recognition=new SpeechRecognitionCtor();
-  recognition.continuous=false;
-  recognition.interimResults=true;
-  recognition.maxAlternatives=1;
-  recognition.lang=navigator.language||'en-US';
-  recognition.onstart=()=>{
-    browserVoice.active=true;
-    browserVoice.interim='';
-    browserVoice.lastError='';
-    browserVoice.permission='granted';
-    $('hearingText').textContent='Listening...';
-    syncVoiceButton();
-  };
-  recognition.onresult=(event)=>{
-    let interim='';
-    let finalText='';
-    for(let i=event.resultIndex;i<event.results.length;i++){
-      const result=event.results[i];
-      const transcript=((result[0]&&result[0].transcript)||'').trim();
-      if(!transcript)continue;
-      if(result.isFinal)finalText+=(finalText?' ':'')+transcript;
-      else interim+=(interim?' ':'')+transcript;
-    }
-    browserVoice.interim=interim.trim();
-    if(browserVoice.interim){
-      $('heardPanelText').textContent=clipText(browserVoice.interim,220);
-      $('hearingText').textContent='"'+clipText(browserVoice.interim,120)+'"';
-    }
-    if(finalText.trim()){
-      browserVoice.lastFinal=finalText.trim();
-      browserVoice.interim='';
-      dispatchTextInput(browserVoice.lastFinal,{fromVoice:true});
-    }
-    if(atomState)renderAtomState();
-    else syncVoiceButton();
-  };
-  recognition.onerror=(event)=>{
-    browserVoice.active=false;
-    browserVoice.interim='';
-    browserVoice.lastError=String((event&&event.error)||'error');
-    if(browserVoice.lastError==='not-allowed'||browserVoice.lastError==='service-not-allowed'){
-      browserVoice.permission='denied';
-    }
-    $('hearingText').textContent='';
-    if(atomState)renderAtomState();
-    else updateVoiceRuntime('', $('voiceRuntimeNote') ? $('voiceRuntimeNote').textContent : '');
-  };
-  recognition.onend=()=>{
-    browserVoice.active=false;
-    browserVoice.interim='';
-    if(!atomState)$('hearingText').textContent='';
-    if(atomState)renderAtomState();
-    else syncVoiceButton();
-  };
-  browserVoice.recognition=recognition;
-  return recognition;
-}
+/* ── State management ──────────────────── */
+function applySnapshot(s){atomState=deepClone(s||{});renderAtomState();}
+function applyDiff(d){if(!atomState)atomState={};deepMerge(atomState,d||{});renderAtomState();}
 
-function syncVoiceButton(){
-  const btn=$('voiceInputBtn');
-  if(!btn)return;
-  btn.classList.remove('listening','error','disabled');
-  if(!browserVoice.supported){
-    btn.textContent='MIC N/A';
-    btn.disabled=true;
-    btn.classList.add('disabled');
-    btn.title='Browser speech recognition is unavailable in this browser.';
-    return;
-  }
-  btn.disabled=false;
-  if(browserVoice.active){
-    btn.textContent='STOP MIC';
-    btn.classList.add('listening');
-    btn.title='Stop browser microphone capture';
-    return;
-  }
-  if(browserVoice.permission==='denied'){
-    btn.textContent='MIC DENIED';
-    btn.classList.add('error');
-    btn.title='Allow microphone access in the browser to use voice input.';
-    return;
-  }
-  if(browserVoice.lastError&&browserVoice.lastError!=='aborted'){
-    btn.textContent='MIC RETRY';
-    btn.classList.add('error');
-    btn.title='Browser speech error: '+browserVoice.lastError;
-    return;
-  }
-  btn.textContent='MIC';
-  btn.title='Use browser microphone as a voice input fallback.';
-}
-
-function toggleBrowserVoice(){
-  if(!browserVoice.supported){
-    browserVoice.lastError='unsupported';
-    syncVoiceButton();
-    return;
-  }
-  if(!ws||ws.readyState!==1){
-    browserVoice.lastError='dashboard offline';
-    syncVoiceButton();
-    return;
-  }
-  const recognition=ensureBrowserRecognition();
-  if(!recognition){
-    browserVoice.lastError='unsupported';
-    syncVoiceButton();
-    return;
-  }
-  if(browserVoice.active){
-    recognition.stop();
-    return;
-  }
-  browserVoice.lastError='';
-  browserVoice.interim='';
-  try{
-    recognition.lang=((atomState&&atomState.voice&&atomState.voice.language)||navigator.language||'en-US');
-    recognition.start();
-  }catch(err){
-    browserVoice.lastError=String((err&&err.message)||'could not start');
-    syncVoiceButton();
-  }
-}
-
-function applyStateSnapshot(snapshot){
-  atomState=deepClone(snapshot||{});
-  renderAtomState();
-}
-
-function applyStateDiff(diff){
-  if(!atomState)atomState={};
-  deepMerge(atomState,diff||{});
-  renderAtomState();
-}
-
-document.querySelectorAll('.perf-btn').forEach(b=>b.addEventListener('click',function(){
-  const m=this.dataset.mode;if(m===curPerfRequested)return;
-  if(!confirm('Switch to '+modeLabel(m)+' mode? ATOM will restart.'))return;
-  setPerfUI(m,curPerfActive);$('perfRestartMsg').style.display='block';
-  if(ws&&ws.readyState===1)ws.send(JSON.stringify({action:'change_mode',mode:m}));
-}));
-
+/* ── WebSocket ─────────────────────────── */
 function connect(){
   ws=new WebSocket(WS);
-  ws.onopen=()=>{$('connWs').className='mini-dot on';if($('connWsVal'))$('connWsVal').textContent='LIVE';$('perfRestartMsg').style.display='none';syncVoiceButton();};
+  ws.onopen=()=>{
+    $('connWs').className='dot on';$('connWsLabel').textContent='LIVE';
+  };
   ws.onmessage=e=>{try{
     const d=JSON.parse(e.data);
     switch(d.type){
       case 'init':
-        if(d.snapshot)applyStateSnapshot(d.snapshot);
-        if(d.mic)$('micName').textContent=d.mic;
-        if(d.brain&&$('connAiVal'))$('connAiVal').textContent=d.brain;
+        if(typeof d.jarvis_boot_splash==='boolean')bootSplashEnabled=d.jarvis_boot_splash;
+        if(!bootSplashEnabled)dismissJarvisBoot();
+        if(d.snapshot)applySnapshot(d.snapshot);
         if(!atomState){
-          updateVoiceRuntime(d.voice_mode,d.voice_note);
-          if(d.voice_note)$('inputModeText').textContent=d.voice_note;
-          if(d.memory_rag_status)$('memoryRagStatus').textContent=d.memory_rag_status;
-          if(d.last_query!==undefined)updateLastQuery(d.last_query,d.last_intent,d.last_latency_ms);
           if(d.state)setAppState(d.state,d.label,d.status);
-          if(d.perf_mode||d.perf_mode_requested)setPerfUI(d.perf_mode_requested||d.perf_mode,d.perf_mode||'optimal');
-          if(d.brain_profile||d.assistant_mode)updateRuntimeUI(d.brain_profile,d.assistant_mode);
+          if(d.perf_mode)setPerfUI(d.perf_mode);
         }
-        startTime=Date.now();break;
-      case 'state_snapshot':applyStateSnapshot(d.snapshot);break;
-      case 'state_diff':applyStateDiff(d.diff);break;
-      case 'self_check_result':
-        if(d.report&&d.report.summary_text)showAtomBubble(d.report.summary_text);
         break;
-      case 'last_query':
-        if(!atomState)updateLastQuery(d.query,d.intent,d.latency_ms);
+      case 'state_snapshot':applySnapshot(d.snapshot);dismissJarvisBoot();break;
+      case 'state_diff':applyDiff(d.diff);dismissJarvisBoot();break;
+      case 'self_check_result':
+        if(d.report&&d.report.summary_text)showResponse(d.report.summary_text);
         break;
       case 'state':
-        if(!atomState)setAppState(d.state,d.label,d.status);
+        /* Always merge: after init, atomState exists but legacy `state` events must still refresh the orb. */
+        if(d.state){
+          if(!atomState){
+            setAppState(d.state,d.label,d.status);
+          } else {
+            atomState.lifecycle=atomState.lifecycle||{};
+            atomState.lifecycle.state=d.state;
+            if(d.label!==undefined&&d.label!==null)atomState.lifecycle.label=d.label;
+            if(d.status!==undefined&&d.status!==null)atomState.lifecycle.status=d.status;
+            renderAtomState();
+          }
+        }
         break;
       case 'log':
         if(atomState)break;
-        if(d.tag==='heard'){
-          queryCount++;$('queriesVal').textContent=queryCount;showUserBubble(d.message);
-        }else if(d.tag==='speaking'){
-          showAtomBubble(d.message);
-        }else if(d.tag==='action'){
-          $('recentActionText').textContent=clipText(d.message,180);
-          if(d.message && d.message !== 'Thinking with local brain...'){
-            $('screenPanelText').textContent=clipText(d.message,260);
-          }
-        }else if(d.tag==='info'){
-          const msg=String(d.message||'');
-          $('recentActionText').textContent=clipText(msg,180);
-          if(msg.startsWith('[screen]')){
-            $('screenPanelText').textContent=clipText(msg.replace(/^\[screen\]\s*/,''),
-              260);
-          }else{
-            $('recoveryPanelText').textContent=clipText(msg,220);
-          }
-        }
+        if(d.tag==='heard')showHeard(d.message);
+        else if(d.tag==='speaking')showResponse(d.message);
+        else if(d.tag==='action'&&d.message&&d.message!=='Thinking with local brain...')showResponse(d.message);
         break;
       case 'system':
         if(!atomState)updateSystem(d);
         break;
       case 'hearing':
-        if(!atomState){
-          $('hearingText').textContent=d.text?'"'+d.text+'"':'';
-          if(d.text)$('heardPanelText').textContent=clipText(d.text,220);
-        }
-        break;
-      case 'mic':
-        if(!atomState)$('micName').textContent=d.name;
-        break;
-      case 'status_text':
-        if(!atomState)$('orbStatusText').textContent=d.text;
+        if(!atomState&&d.text)showHeard(d.text);
         break;
       case 'thinking_progress':
-        {const tp=$('thinkingProgress'),tt=$('thinkingText'),tb=$('thinkingBar');
-        tp.classList.add('visible');
-        const rem=Math.ceil(d.remaining_s);
-        tt.textContent='Thinking... ~'+rem+'s remaining';
+        $('thinkingWrap').classList.add('visible');
         const pct=Math.min(100,d.estimate_s>0?(d.elapsed_s/d.estimate_s)*100:0);
-        tb.style.width=pct+'%';}
+        $('thinkingBar').style.width=pct+'%';
         break;
       case 'perf_mode':
-        if(!atomState)setPerfUI(d.requested_mode||curPerfRequested,d.mode||curPerfActive);
+        if(!atomState)setPerfUI(d.mode||curPerfActive);
         break;
-      case 'governor':govThrottled=!!d.throttled;renderPerfStatus();break;
       case 'restarting':
-        $('perfRestartMsg').style.display='block';
-        $('recentActionText').textContent='Restarting into '+modeLabel(d.mode)+' mode.';
-        showAtomBubble('Switching to '+modeLabel(d.mode)+' mode...');
-        break;
-      case 'runtime_settings':
-        if(!atomState)updateRuntimeUI(d.brain_profile,d.assistant_mode);
-        break;
-      case 'execution_state':
-        if(!atomState){
-          if($('executionStateText')){
-            const lab=d.label!=null?String(d.label):'—';
-            let line='Execution: '+lab;
-            if(d.cache_max!=null&&d.cache_entries!=null){
-              line+=' · cache '+d.cache_entries+'/'+d.cache_max;
-            }
-            $('executionStateText').textContent=line;
-          }
-          if($('experienceLine')){
-            const am=d.assistant_mode?String(d.assistant_mode).replace(/_/g,' '):'';
-            const se=d.stt_engine&&d.stt_engine!=='—'?d.stt_engine:'';
-            const te=d.tts_engine&&d.tts_engine!=='—'?d.tts_engine:'';
-            const vv=d.tts_voice?String(d.tts_voice):'';
-            const bits=[];
-            if(se||te)bits.push('STT '+ (se||'—')+' · TTS '+ (te||'—'));
-            if(vv)bits.push(vv);
-            if(am)bits.push(am);
-            $('experienceLine').textContent=bits.length?bits.join(' · '):'Voice & assistant —';
-          }
-        }
-        break;
-      case 'mode_update':
-        document.querySelectorAll('.pod-btn[data-mode]').forEach(b=>{if(!b.classList.contains('perf-btn'))b.classList.toggle('active',b.dataset.mode===d.current);});
+        showResponse('Switching to '+String(d.mode||'').replace(/_/g,' ')+' mode...');
         break;
     }
-  }catch(ex){}};
-  ws.onclose=()=>{$('connWs').className='mini-dot off';if($('connWsVal'))$('connWsVal').textContent='LOST';setTimeout(connect,2000);};
+  }catch(ex){console.debug('ws:',ex);}};
+  ws.onclose=()=>{
+    $('connWs').className='dot off';$('connWsLabel').textContent='LOST';
+    setTimeout(connect,2000);
+  };
   ws.onerror=()=>ws.close();
 }
 connect();
+setTimeout(()=>{if($('jarvisBoot')&&!$('jarvisBoot').classList.contains('done'))dismissJarvisBoot();},3200);
 
-$('unstickBtn').addEventListener('click',()=>{if(ws&&ws.readyState===1)ws.send(JSON.stringify({type:'unstick'}));});
-$('stopTaskBtn').addEventListener('click',()=>{if(ws&&ws.readyState===1)ws.send(JSON.stringify({type:'stop_task'}));});
-$('selfCheckBtn').addEventListener('click',()=>{if(ws&&ws.readyState===1)ws.send(JSON.stringify({type:'run_self_check'}));});
+tickClock();
 
-function dispatchTextInput(txt,{fromVoice=false}={}){
-  const text=String(txt||'').trim();
-  if(!text)return;
-  if(ws&&ws.readyState===1){
-    ws.send(JSON.stringify({type:'text_input',text}));
-    if(fromVoice){
-      browserVoice.interim='';
-      browserVoice.lastFinal=text;
-    }
-    showUserBubble(text);
-    $('heardPanelText').textContent=clipText(text,220);
-    $('hearingText').textContent=fromVoice?'':'';
-    syncVoiceButton();
-  }
-}
-function sendTextInput(){
-  const inp=$('textInput'),txt=(inp.value||'').trim();
-  if(!txt)return;
-  dispatchTextInput(txt);
-  inp.value='';
-}
-$('textSendBtn').addEventListener('click',sendTextInput);
-$('textInput').addEventListener('keydown',e=>{if(e.key==='Enter'){e.preventDefault();sendTextInput();}});
-$('voiceInputBtn').addEventListener('click',toggleBrowserVoice);
-syncVoiceButton();
-
-function updateRuntimeUI(brain,asst){
-  const ri=$('runtimeInfo');
-  if(brain||asst){const p=[];if(asst)p.push(asst.replace(/_/g,' '));if(brain)p.push(modeLabel(brain));if(ri)ri.textContent=p.join(' · ');}
-  document.querySelectorAll('.pod-btn[data-asst]').forEach(b=>b.classList.toggle('active',b.dataset.asst===asst));
-  document.querySelectorAll('.pod-btn[data-brain]').forEach(b=>b.classList.toggle('active',b.dataset.brain===brain));
-}
+/* ── Expose for backend perf mode ──────── */
 window.setAssistantMode=m=>{if(ws&&ws.readyState===1)ws.send(JSON.stringify({type:'set_assistant_mode',mode:m}));};
 window.setBrainProfile=p=>{if(ws&&ws.readyState===1)ws.send(JSON.stringify({type:'set_brain_profile',profile:p}));};
-window.switchMode=m=>{if(ws&&ws.readyState===1)ws.send(JSON.stringify({type:'switch_mode',mode:m}));};
 })();
 </script>
 </body>

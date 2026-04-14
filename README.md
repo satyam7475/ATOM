@@ -55,8 +55,13 @@ pip install -r requirements-desktop.txt
 ## Run
 
 ```bash
+source .venv/bin/activate   # if not already active
 python main.py
 ```
+
+- **Finder / double-click:** use **`Run ATOM.command`** in the repo root (venv-first; optional bundle launcher when `ATOM.app/Contents/MacOS/atom_python` passes self-test). Logs: `logs/atom_run_command.log`.
+- **Always-on (optional):** `bash scripts/install_atom_launchagent.sh` installs a **launchd** agent that runs **`scripts/atom_run.sh`** (venv + `main.py`).
+- **Double-click `ATOM.app`:** launches the embedded **`atom_python`** binary only; if that fails, prefer **`Run ATOM.command`** or rebuild with `bash scripts/build_atom_app_launcher.sh`.
 
 - Dashboard: `http://127.0.0.1:<port>/` (port from `ui.web_port` in settings).
 - Health endpoint: `GET /v7/health` on the same port.

@@ -19,17 +19,14 @@ def test_plist_template_substitutes_and_loads() -> None:
     root = Path(__file__).resolve().parent.parent
     template = root / "scripts" / "com.atom.agent.plist"
     assert template.is_file(), f"missing {template}"
+    repo = "/tmp/atom_test_repo"
     text = template.read_text(encoding="utf-8")
-    filled = text.replace("@@@ATOM_REPO@@@", "/tmp/atom_test_repo").replace(
-        "@@@PYTHON3@@@",
-        "/usr/bin/python3",
-    )
+    filled = text.replace("@@@ATOM_REPO@@@", repo)
     data = plistlib.load(io.BytesIO(filled.encode("utf-8")))
     assert data["Label"] == "com.atom.agent"
     args = data["ProgramArguments"]
-    assert args[0] == "/usr/bin/python3"
-    assert args[1] == "/tmp/atom_test_repo/main.py"
-    assert data["WorkingDirectory"] == "/tmp/atom_test_repo"
+    assert args == ["/bin/bash", f"{repo}/scripts/atom_run.sh"]
+    assert data["WorkingDirectory"] == repo
     assert data["RunAtLoad"] is True
     assert data["KeepAlive"] is True
     assert data["ThrottleInterval"] == 15

@@ -29,9 +29,9 @@ When you want the assistant to **implement** the next planned step (not just dis
 
 | Field | Value |
 |-------|--------|
-| **Active step ID** | `jarvis-state-stabilization` |
-| **Last completed** | `jarvis-state-stabilization` |
-| **Last updated** | 2026-04-13 |
+| **Active step ID** | `launch-experience-docs` |
+| **Last completed** | `launch-experience-docs` |
+| **Last updated** | 2026-04-14 |
 
 ---
 
@@ -39,6 +39,7 @@ When you want the assistant to **implement** the next planned step (not just dis
 
 | Step ID | Phase | Status | Notes |
 |---------|-------|--------|-------|
+| `launch-experience-docs` | 10b | done | README + `EXPERIENCE_LAYER` operator checklist (venv, Run ATOM.command, launchd, logs); removed legacy `ATOM.app/Contents/MacOS/applet` stub; aligns docs with venv-first launch |
 | `cleanup-inventory` | 0 | done | Deletion inventory defined |
 | `cleanup-batch-one` | 0 | done | Safe artifacts removed; README/docs/.gitignore updated |
 | `runtime-truth` | 1 | done | CognitiveKernel before LocalBrain/RAG; InferenceGuard attach deferred; boot logging |
@@ -72,6 +73,7 @@ Newest first.
 
 | Date | Step ID | Summary |
 |------|---------|---------|
+| 2026-04-14 | `launch-experience-docs` | Documented venv-first launch paths in `README.md` and `docs/EXPERIENCE_LAYER.md` (operator checklist: Run ATOM.command, `install_atom_launchagent.sh`, bundle vs native STT); removed obsolete `ATOM.app/Contents/MacOS/applet` binary left over from legacy AppleScript layout (`CFBundleExecutable` remains `atom_python`). |
 | 2026-04-13 | `jarvis-state-stabilization` | Added `core/state` as the runtime source of truth, wired `main.py` + `wiring.py` + diagnostics into `state.diff` / `state.snapshot` and typed `voice.*` / `execution.update` / `system.warning` / `mode.change`, made readiness and self-check publish into shared state, normalized Apple/Google STT metadata and errors, converted the dashboard to consume state snapshot/diff with `SELF CHECK` / `STOP TASK`, and added focused contract tests. |
 | 2026-04-13 | `experience-layer` | `execution_state` adds `stt_engine`, `tts_engine`, `tts_voice`, `assistant_mode`; dashboard **Runtime Truth** experience line + page title + input placeholder; `docs/EXPERIENCE_LAYER.md` + architecture link. |
 | 2026-04-13 | `security-hardening` | `core/security_tiers.py`: intent tiers 1–4 + `security.mode` max tier (`strict`→3 blocks power tier-4); `SecurityPolicy` integration + duplicate strict power block removed; `is_safe_command` Unix/macOS patterns + pipe-to-shell regex; `docs/SECURITY_SETUP.md` + architecture index. |

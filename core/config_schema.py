@@ -327,6 +327,14 @@ CONFIG_SCHEMA: dict[str, Any] = {
                     "type": "string",
                     "description": "If set, WebSocket /ws requires ?token= or X-ATOM-Token header.",
                 },
+                "voice_only_input": {
+                    "type": "boolean",
+                    "description": "If true, dashboard WebSocket text_input is ignored; speech comes from STT only.",
+                },
+                "jarvis_boot_splash": {
+                    "type": "boolean",
+                    "description": "If true, dashboard shows a brief boot splash until the first state sync.",
+                },
             },
             "additionalProperties": False,
         },

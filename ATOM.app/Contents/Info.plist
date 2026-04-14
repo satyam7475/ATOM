@@ -6,8 +6,10 @@
 	<true/>
 	<key>CFBundleDevelopmentRegion</key>
 	<string>en</string>
+	<key>CFBundleIdentifier</key>
+	<string>com.satyamyadav.atom</string>
 	<key>CFBundleExecutable</key>
-	<string>applet</string>
+	<string>atom_python</string>
 	<key>CFBundleIconFile</key>
 	<string>applet</string>
 	<key>CFBundleIconName</key>
@@ -19,14 +21,12 @@
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleSignature</key>
-	<string>aplt</string>
+	<string>????</string>
 	<key>LSMinimumSystemVersionByArchitecture</key>
 	<dict>
 		<key>x86_64</key>
 		<string>10.6</string>
 	</dict>
-	<key>LSRequiresCarbon</key>
-	<true/>
 	<key>NSAppleEventsUsageDescription</key>
 	<string>This script needs to control other applications to run.</string>
 	<key>NSAppleMusicUsageDescription</key>

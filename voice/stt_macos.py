@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import sys
 import threading
 import time
@@ -56,9 +57,48 @@ _SILENCE_TIMEOUT_S = 2.0
 _MAX_RECORD_S = 15.0
 
 
+def _main_bundle_info() -> dict[str, Any] | None:
+    if _Foundation is None:
+        return None
+    try:
+        bundle = _Foundation.NSBundle.mainBundle()
+        info = bundle.infoDictionary()
+        if info is None:
+            return None
+        return dict(info)
+    except Exception:
+        logger.debug("Main bundle probe failed", exc_info=True)
+        return None
+
+
+def _bundle_has_usage_description(key: str) -> bool:
+    info = _main_bundle_info()
+    return bool(info and info.get(key))
+
+
+def _native_stt_bundle_supported() -> tuple[bool, str]:
+    if sys.platform != "darwin":
+        return False, "SFSpeechRecognizer only available on macOS"
+    if os.environ.get("ATOM_LAUNCH_MODE") == "venv":
+        return (
+            False,
+            "Native macOS STT expects the ATOM.app bundle process; running under venv "
+            "(browser/dashboard SpeechRecognition remains available).",
+        )
+    if not _HAS_SPEECH or _Speech is None or _Foundation is None:
+        return False, "pyobjc speech frameworks are unavailable"
+    if not _bundle_has_usage_description("NSSpeechRecognitionUsageDescription"):
+        return False, "current process bundle lacks NSSpeechRecognitionUsageDescription"
+    if not _bundle_has_usage_description("NSMicrophoneUsageDescription"):
+        return False, "current process bundle lacks NSMicrophoneUsageDescription"
+    return True, ""
+
+
 def _speech_permission_status() -> str:
     if not _HAS_SPEECH or _Speech is None:
         return "unavailable"
+    if not _bundle_has_usage_description("NSSpeechRecognitionUsageDescription"):
+        return "bundle_missing_usage_description"
     try:
         status = int(_Speech.SFSpeechRecognizer.authorizationStatus())
     except Exception:
@@ -74,6 +114,8 @@ def _speech_permission_status() -> str:
 def _microphone_permission_status() -> str:
     if _AVFoundation is None:
         return "unknown"
+    if not _bundle_has_usage_description("NSMicrophoneUsageDescription"):
+        return "bundle_missing_usage_description"
     try:
         device_cls = getattr(_AVFoundation, "AVCaptureDevice", None)
         media_type = getattr(_AVFoundation, "AVMediaTypeAudio", "soun")
@@ -92,10 +134,9 @@ def _microphone_permission_status() -> str:
 
 def native_stt_launch_supported() -> tuple[bool, str]:
     """Return whether the current process can safely use SFSpeechRecognizer."""
-    if sys.platform != "darwin":
-        return False, "SFSpeechRecognizer only available on macOS"
-    if not _HAS_SPEECH or _Speech is None or _Foundation is None:
-        return False, "pyobjc speech frameworks are unavailable"
+    launch_ok, launch_reason = _native_stt_bundle_supported()
+    if not launch_ok:
+        return False, launch_reason
 
     try:
         locale = _Foundation.NSLocale.alloc().initWithLocaleIdentifier_("en-US")
@@ -107,9 +148,6 @@ def native_stt_launch_supported() -> tuple[bool, str]:
         if auth_status == 3:
             return True, ""
         if auth_status == 0:
-            info = _Foundation.NSBundle.mainBundle().infoDictionary()
-            if info is None or "NSSpeechRecognitionUsageDescription" not in info:
-                return False, "current process bundle lacks NSSpeechRecognitionUsageDescription"
             return True, ""
         return False, f"speech recognition authorization status={auth_status}"
     except Exception as exc:
@@ -180,20 +218,18 @@ class NativeSTT:
 
     def preload(self) -> bool:
         """Initialize recognizer and check authorization."""
+        launch_ok, launch_reason = _native_stt_bundle_supported()
+        if not launch_ok:
+            self._available = False
+            self._last_error = launch_reason
+            if "NSSpeechRecognitionUsageDescription" in launch_reason:
+                self.speech_permission_status = "bundle_missing_usage_description"
+            if "NSMicrophoneUsageDescription" in launch_reason:
+                self.microphone_permission_status = "bundle_missing_usage_description"
+            logger.warning("Native STT unavailable: %s", launch_reason)
+            return False
         self.speech_permission_status = _speech_permission_status()
         self.microphone_permission_status = _microphone_permission_status()
-        if not _HAS_SPEECH:
-            self._last_error = "pyobjc speech frameworks are unavailable"
-            logger.info(
-                "SFSpeechRecognizer not available (pyobjc-framework-Speech "
-                "not installed). Install with: pip install pyobjc-framework-Speech"
-            )
-            return False
-
-        if sys.platform != "darwin":
-            self._last_error = "SFSpeechRecognizer only available on macOS"
-            logger.info("SFSpeechRecognizer only available on macOS")
-            return False
 
         locale = _Foundation.NSLocale.alloc().initWithLocaleIdentifier_(
             self._locale
@@ -218,6 +254,10 @@ class NativeSTT:
             logger.info("Native STT ready (SFSpeechRecognizer, locale=%s, on-device=True)", self._locale)
             return True
         elif auth_status == 0:  # notDetermined
+            if threading.current_thread() is not threading.main_thread():
+                self._last_error = "Speech Recognition authorization request must run on the main thread"
+                logger.warning("Native STT authorization skipped: %s", self._last_error)
+                return False
             self.speech_permission_status = "not_determined"
             logger.info("Requesting Speech Recognition authorization...")
             granted_event = threading.Event()
@@ -229,6 +269,10 @@ class NativeSTT:
 
             _Speech.SFSpeechRecognizer.requestAuthorization_(_auth_callback)
             granted_event.wait(timeout=30.0)
+            if not granted_event.is_set():
+                self._last_error = "Speech Recognition authorization request timed out"
+                logger.warning("Speech Recognition authorization timed out")
+                return False
 
             if granted_result[0]:
                 self._available = True
@@ -453,9 +497,14 @@ class NativeSTT:
     # ── Async-compatible wrappers (match STTAsync interface for main.py) ──
 
     async def async_preload(self) -> None:
-        """Async wrapper around sync preload for main.py compatibility."""
-        loop = asyncio.get_running_loop()
-        await loop.run_in_executor(None, self.preload)
+        """Run preload on the process main thread.
+
+        macOS speech authorization is tied to the current app bundle and can
+        hard-abort the process if requested from an invalid or worker-thread
+        context. Keep preload on the main thread and let `preload()` fail safe
+        when the bundle is not speech-capable.
+        """
+        self.preload()
 
     async def async_start_listening(self, **_kw) -> None:
         """Continuous listen loop matching STTAsync.start_listening() contract.

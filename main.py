@@ -806,19 +806,22 @@ async def main() -> None:
     semantic_cache = SemanticCache(config)
     preference_store = PreferenceStore(config)
 
-    # Gemini client: load API key from secure credentials
-    from core.secrets_manager import get_gemini_fast_key
-    
-    gemini_client = GeminiClient(config, security_gateway=security_gateway)
-    _gemini_key = get_gemini_fast_key()
-    
-    if _gemini_key:
-        gemini_client.configure_api_key(_gemini_key)
-        logger.info("Gemini API key loaded from secure storage")
+    cloud_enabled_cfg = bool(config.get("cloud", {}).get("enabled", True))
+    gemini_client: GeminiClient | None = None
+    if cloud_enabled_cfg:
+        gemini_client = GeminiClient(config, security_gateway=security_gateway)
+        from core.secrets_manager import get_gemini_fast_key
+
+        _gemini_key = get_gemini_fast_key()
+        if _gemini_key:
+            gemini_client.configure_api_key(_gemini_key)
+            logger.info("Gemini API key loaded from secure storage")
+        else:
+            logger.warning(
+                "Gemini API key not found. Run: python scripts/setup_api_keys.py"
+            )
     else:
-        logger.warning(
-            "Gemini API key not found. Run: python scripts/setup_api_keys.py"
-        )
+        logger.info("Cloud/Gemini disabled in config (cloud.enabled=false) — local MLX only for LLM routing")
 
     search_tool = SearchTool(
         config, security_gateway=security_gateway, gemini_client=gemini_client,
@@ -858,7 +861,7 @@ async def main() -> None:
         "v22 Hybrid Intelligence: SecurityGateway + GeminiClient(%s) + "
         "ConfidenceEngine + DecisionEngine + SearchTool + PreferenceStore + "
         "SemanticCache(semantic=%s, threshold=%.2f)",
-        "available" if gemini_client.is_available else "no key",
+        "available" if (gemini_client and gemini_client.is_available) else "disabled",
         semantic_cache.is_semantic,
         float((config.get("semantic_cache", {}).get("threshold", 0.85))),
     )
@@ -1195,12 +1198,19 @@ async def main() -> None:
             if semantic_rag_ready
             else "Keyword-only fallback. Semantic RAG is unavailable in this runtime."
         )
-        voice_mode = "browser_voice_fallback"
-        voice_note = (
-            "Browser dashboard supports text plus browser-mic fallback. "
-            "Launch ATOM.app for the full native macOS voice path."
-        )
-        if "Faster-Whisper" in stt_runtime_label:
+        _ui = config.get("ui") or {}
+        if _ui.get("voice_only_input"):
+            voice_mode = "voice_only_display"
+            voice_note = (
+                "Dashboard is display-only; speak to ATOM — native STT listens continuously when running."
+            )
+        else:
+            voice_mode = "browser_voice_fallback"
+            voice_note = (
+                "Browser dashboard supports text plus browser-mic fallback. "
+                "Launch ATOM.app for the full native macOS voice path."
+            )
+        if "Faster-Whisper" in stt_runtime_label and not _ui.get("voice_only_input"):
             voice_mode = "browser_voice_dev"
             voice_note = (
                 "Browser voice fallback is available. The bundled ATOM.app remains "
@@ -1900,8 +1910,13 @@ async def main() -> None:
         if hasattr(web_dashboard, "set_stop_task_callback"):
             web_dashboard.set_stop_task_callback(_dashboard_stop_task)
 
+        _voice_only_ui = bool((config.get("ui") or {}).get("voice_only_input"))
+
         async def _on_text_input(text: str) -> None:
-            """Handle typed input from dashboard — same as speech_final."""
+            """Handle typed input from dashboard — same as speech_final (optional; voice-only disables)."""
+            if _voice_only_ui:
+                logger.debug("Ignoring dashboard text_input (ui.voice_only_input=true): %s", (text or "")[:48])
+                return
             logger.info("Text input from dashboard: '%s'", text[:60])
             bus.emit("speech_final", text=text)
 
@@ -2196,7 +2211,11 @@ async def main() -> None:
 
         await stt_preload_done.wait()
         logger.info("STT ready -- ATOM fully operational")
-        
+        # Mic (re)start before blocking in async_start_listening; handler only acts in LISTENING.
+        try:
+            bus.emit("restart_listening")
+        except Exception:
+            logger.debug("pre-listen restart_listening emit failed", exc_info=True)
 
         if hasattr(stt, "async_start_listening"):
             await stt.async_start_listening()

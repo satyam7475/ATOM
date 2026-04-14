@@ -286,6 +286,8 @@ class StructuredPromptBuilder:
             f"13. If Boss writes in Hindi or Hinglish, reply in Hindi or Hinglish naturally unless he asks for English.\n"
             f"14. Quietly understand obvious typos, mistypes, and mixed Hindi-English phrasing instead of acting confused.\n"
             f"15. Never output transcript labels or role tags like \"User:\", \"Boss:\", \"Assistant:\", or \"ATOM:\" in your final answer.\n"
+            f"16. The CURRENT CONTEXT / SESSION / WORLD lines are background only — never read them aloud or "
+            f"answer a casual question by repeating time, city, season, or weather unless Boss asked for those.\n"
         )
         self._system_prompt_cache = prompt
         raw = hashlib.md5(prompt.encode()).hexdigest()
@@ -315,10 +317,28 @@ class StructuredPromptBuilder:
         """
         parts: list[str] = []
         hint = self._query_type_hint_cached(query)
-        
-        # 1. Always include time and mood
+        q_lower = (query or "").lower()
+
+        # 1. Time — only inject full clock when the query is time-related (avoids "always time in Delhi" replies)
         now = datetime.now()
-        parts.append(f"Current time: {now.strftime('%A, %B %d, %Y at %I:%M %p')}")
+        needs_clock = bool(
+            re.search(
+                r"(what|tell me)\s+(is\s+)?(the\s+)?time|what\s+time|current\s+time|"
+                r"what\s+date|what'?s\s+today|today'?s\s+date|which\s+day|what\s+day\b|"
+                r"\btimezone\b|\bcalendar\b|kitna\s+baj",
+                q_lower,
+            )
+        )
+        if needs_clock:
+            parts.append(
+                f"Current time (for time/date questions only): "
+                f"{now.strftime('%A, %B %d, %Y at %I:%M %p')}"
+            )
+        else:
+            parts.append(
+                f"[SESSION] Local time is {now.strftime('%I:%M %p')} — do not mention time, date, "
+                f"weather, or location unless Boss explicitly asks for them; answer the actual question."
+            )
         
         mood = _personality_modifier(context, emotion)
         if mood:
@@ -339,7 +359,6 @@ class StructuredPromptBuilder:
                 )
 
         # 2. Context Router: Only inject what's needed
-        q_lower = query.lower()
         needs_system = any(w in q_lower for w in ("system", "cpu", "ram", "open", "close", "app", "window", "process"))
         needs_clipboard = any(w in q_lower for w in ("clipboard", "paste", "copy", "read this", "summarize this"))
         needs_media = any(w in q_lower for w in ("song", "music", "playing", "spotify", "youtube", "media"))
@@ -383,7 +402,20 @@ class StructuredPromptBuilder:
             except Exception:
                 pass
 
-        if self._real_world_intel is not None:
+        # Real-world block only when query needs weather/place/news/world awareness (prevents parroting Delhi/season)
+        needs_real_world = any(
+            w in q_lower
+            for w in (
+                "weather", "temperature", "rain", "snow", "hot", "cold", "humid",
+                "forecast", "outside", "umbrella",
+                "where am i", "which city", "which country", "location", "timezone",
+                "news", "headline", "breaking",
+                "season", "spring", "summer", "winter", "autumn", "fall",
+                "sunrise", "sunset", "holiday",
+                "delhi", "mumbai", "india", "london", "new york",
+            )
+        )
+        if self._real_world_intel is not None and needs_real_world:
             try:
                 world_block = self._real_world_intel.get_llm_context_block()
                 if world_block:

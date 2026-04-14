@@ -6,8 +6,8 @@
 	<string>com.atom.agent</string>
 	<key>ProgramArguments</key>
 	<array>
-		<string>@@@PYTHON3@@@</string>
-		<string>@@@ATOM_REPO@@@/main.py</string>
+		<string>/bin/bash</string>
+		<string>@@@ATOM_REPO@@@/scripts/atom_run.sh</string>
 	</array>
 	<key>WorkingDirectory</key>
 	<string>@@@ATOM_REPO@@@</string>
