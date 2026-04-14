@@ -84,3 +84,9 @@ Cache TTL auto-adjusts every 10 minutes:
 - Hit rate > 65% → TTL × 1.2 (keep hits longer)
 - Hit rate < 15% → TTL × 0.8 (reduce stale entries)
 - Cooldown: 3 cycles between adjustments
+
+## Cognitive kernel and cloud routing
+
+The **CognitiveKernel** (`core/cognitive_kernel.py`) chooses DIRECT / CACHE / QUICK / FULL / DEEP / cloud paths. The **authoritative** switch for Gemini and semantic cache escalation is **`cloud.enabled`** in `config/settings.json` — not `deployment.product_tier` alone.
+
+**`deployment.product_tier`** (`local_only` | `balanced` | `cloud_augmented`) is an **operator label** shown on the dashboard and documented in the README; align it manually with `cloud.enabled` and `semantic_cache.enabled` when you change deployment posture. See [README](../../README.md) (Product tiers) and [`14_VOICE_PIPELINE.md`](14_VOICE_PIPELINE.md) for voice vs decision ordering.

@@ -774,6 +774,11 @@ CONFIG_SCHEMA: dict[str, Any] = {
                     "type": "boolean",
                     "description": "Show profile pill on web dashboard top bar.",
                 },
+                "product_tier": {
+                    "type": "string",
+                    "enum": ["local_only", "balanced", "cloud_augmented"],
+                    "description": "Operator label: privacy-first vs cloud help. Maps to cloud.enabled / semantic_cache in docs; single source of truth remains cloud.enabled.",
+                },
             },
             "additionalProperties": False,
         },

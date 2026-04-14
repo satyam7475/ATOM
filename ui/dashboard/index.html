@@ -76,6 +76,17 @@ html,body{
 .sys-pill .dot.on{background:var(--green);box-shadow:0 0 6px rgba(52,211,153,0.5);}
 .sys-pill .dot.off{background:var(--red);box-shadow:0 0 6px rgba(248,113,113,0.4);}
 .sys-pill .dot.warn{background:var(--orange);box-shadow:0 0 6px rgba(251,191,36,0.4);}
+/* Voice health — one glance */
+.voice-health-strip{
+  width:100%;padding:6px 20px 8px;
+  font-family:var(--font-mono);font-size:10px;color:var(--text-muted);
+  letter-spacing:0.02em;line-height:1.45;
+  border-bottom:1px solid rgba(255,255,255,0.04);
+  background:rgba(4,4,10,0.65);backdrop-filter:blur(12px);
+  display:flex;flex-wrap:wrap;gap:10px 18px;z-index:25;
+}
+.voice-health-strip span{white-space:nowrap;max-width:100%;}
+.voice-health-strip .vh-err{color:var(--orange);max-width:min(90vw,720px);white-space:normal;}
 /* ── Jarvis boot (Iron Man HUD) ─────────── */
 .jarvis-boot{
   position:fixed;inset:0;z-index:100;
@@ -250,6 +261,14 @@ html,body{
       <div class="sys-pill"><span class="dot on" id="connTts"></span>TTS</div>
     </div>
   </header>
+
+  <div class="voice-health-strip" id="voiceHealthStrip" aria-label="Voice and mode health">
+    <span id="vhStt">STT —</span>
+    <span id="vhPerm">Speech: — · Mic: —</span>
+    <span id="vhLc">Lifecycle: —</span>
+    <span id="vhTier">Tier: —</span>
+    <span class="vh-err" id="vhErr"></span>
+  </div>
 
   <div class="brain-zone">
     <div class="orb-wrap" id="orbWrap" data-state="idle">
@@ -521,6 +540,12 @@ function setPerfUI(eff){
   if(window.setOrbModeTheme)window.setOrbModeTheme(t);
 }
 
+function clipStr(s,n){
+  if(s==null||s==='')return '';
+  const t=String(s);
+  return t.length<=n?t:t.slice(0,Math.max(0,n-1))+'…';
+}
+
 /* ── Render full state (native STT only; no dashboard text/mic button) ─ */
 function syncVoiceRibbon(lc,v){
   const hint=$('micHint');
@@ -531,8 +556,30 @@ function syncVoiceRibbon(lc,v){
   else if(st==='speaking')hint.textContent='ATOM SPEAKING';
   else if(st==='error_recovery')hint.textContent='RECOVERING — STANDBY';
   else hint.textContent='ALWAYS-ON MIC — SPEAK NATURALLY';
-  const sttOn=!!v.stt_engine&&String(v.stt_engine).toLowerCase()!=='disabled';
-  $('connStt').className='dot '+(sttOn?'on':'off');
+}
+
+function syncVoiceHealthStrip(lc,v,mode){
+  const eng=String(v.stt_engine||'');
+  const elow=eng.toLowerCase();
+  const sttReady=!!eng&&!elow.includes('disabled')&&elow!=='unavailable'&&!elow.includes('voice input unavailable');
+  const sp=String((v.permissions&&v.permissions.speech)||'?');
+  const mic=String((v.permissions&&v.permissions.microphone)||'?');
+  const permBad=/denied|restricted|bundle_missing/i.test(sp+mic);
+  const hasErr=!!(v.error&&String(v.error).trim());
+  let dot='off';
+  if(sttReady)dot=(permBad||hasErr)?'warn':'on';
+  $('connStt').className='dot '+dot;
+
+  const st=String(lc.state||'—');
+  const lm=v.launch_mode?(' ['+v.launch_mode+']'):'';
+  $('vhStt').textContent='STT: '+clipStr(eng,42)+lm;
+  $('vhPerm').textContent='Speech: '+sp+' · Mic: '+mic;
+  $('vhLc').textContent='Lifecycle: '+st+(v.listening===true?' · capturing':'' );
+  const tier=String(mode.product_tier||'—');
+  const cloud=mode.cloud_enabled===false?'local-only':'cloud OK';
+  $('vhTier').textContent='Tier: '+tier+' · '+cloud;
+  const errLine=v.error?('Err: '+clipStr(v.error,120)):'';
+  $('vhErr').textContent=errLine;
 }
 
 function renderAtomState(){
@@ -553,12 +600,11 @@ function renderAtomState(){
     charging:!!sys.charging,
   });
 
-  const sttOn=!!v.stt_engine&&String(v.stt_engine).toLowerCase()!=='disabled';
-  $('connStt').className='dot '+(sttOn?'on':'off');
   $('connTts').className='dot '+(!!v.tts_engine?'on':'off');
 
   setPerfUI(mode.effective||curPerfActive);
   syncVoiceRibbon(lc,v);
+  syncVoiceHealthStrip(lc,v,mode);
 
   const activeTask=exec.active_task||exec.label||exec.last_query||'';
   if(activeTask&&lc.state==='thinking')showHeard(activeTask);

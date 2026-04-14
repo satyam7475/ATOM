@@ -1,7 +1,8 @@
 {
     "deployment": {
         "profile": "personal_desktop",
-        "dashboard_badge": true
+        "dashboard_badge": true,
+        "product_tier": "balanced"
     },
     "session": {
         "enabled": true,

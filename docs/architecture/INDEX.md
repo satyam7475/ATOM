@@ -20,13 +20,14 @@
 | 11 | [Performance](11_PERFORMANCE.md) | `11_PERFORMANCE.md` | Changing performance, metrics, scheduler |
 | 12 | [Evolution Roadmap](12_EVOLUTION_ROADMAP.md) | `12_EVOLUTION_ROADMAP.md` | Planning new features |
 | 13 | [Upgrade Playbook](13_UPGRADE_PLAYBOOK.md) | `13_UPGRADE_PLAYBOOK.md` | Replacing or adding modules |
+| 14 | [Voice pipeline](14_VOICE_PIPELINE.md) | `14_VOICE_PIPELINE.md` | STT start/stop ownership, restart_listening, no duplicate loops |
 
 ## File → Module Mapping
 
 | Code Path | Read Module(s) |
 |-----------|---------------|
-| `main.py` | 00, 08, 09 |
-| `voice/*` | 01 (Perception) |
+| `main.py` | 00, 08, 09, 14 |
+| `voice/*` | 01 (Perception), 14 |
 | `core/intent_engine/*` | 02 (Understanding) |
 | `core/router/router.py` | 03 (Decision) |
 | `core/router/*_actions.py` | 04 (Execution) |

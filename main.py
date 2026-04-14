@@ -41,6 +41,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import sys
 import time
 from datetime import datetime
@@ -1269,6 +1270,10 @@ async def main() -> None:
             "reason": initial_mode_reason,
             "profile": brain_mode_mgr.active_profile,
             "assistant_mode": assistant_mode_mgr.active,
+            "product_tier": str(
+                (config.get("deployment") or {}).get("product_tier", "") or "balanced"
+            ),
+            "cloud_enabled": bool(config.get("cloud", {}).get("enabled", True)),
         },
         source="main.mode_bootstrap",
     )
@@ -1808,6 +1813,9 @@ async def main() -> None:
                     "voice",
                     {
                         "mic": str(getattr(stt, "mic_name", "") or ""),
+                        "stt_engine": str(
+                            getattr(stt, "backend_name", None) or stt_runtime_label
+                        ),
                         "error": voice_error,
                         "fallback_chain": list(
                             getattr(stt, "fallback_chain", None) or stt_runtime_fallbacks
@@ -1815,8 +1823,22 @@ async def main() -> None:
                         "permissions": _voice_permissions_snapshot(),
                         "listening": state.current.value == "listening",
                         "speaking": state.current.value == "speaking",
+                        "launch_mode": str(os.environ.get("ATOM_LAUNCH_MODE", "")),
                     },
                     source="main.world_sync.voice",
+                )
+                atom_runtime.patch_section(
+                    "mode",
+                    {
+                        "product_tier": str(
+                            (config.get("deployment") or {}).get("product_tier", "")
+                            or "balanced"
+                        ),
+                        "cloud_enabled": bool(
+                            config.get("cloud", {}).get("enabled", True)
+                        ),
+                    },
+                    source="main.world_sync.mode",
                 )
                 atom_runtime.patch_section(
                     "execution",

@@ -103,6 +103,7 @@ ATOM_STATE_DEFAULTS: dict[str, Any] = {
         "last_partial": "",
         "last_final": "",
         "last_spoken": "",
+        "launch_mode": "",
         "updated_at": 0.0,
     },
     "mode": {
@@ -111,6 +112,8 @@ ATOM_STATE_DEFAULTS: dict[str, Any] = {
         "reason": "",
         "profile": "",
         "assistant_mode": "",
+        "product_tier": "",
+        "cloud_enabled": True,
         "updated_at": 0.0,
     },
     "health": {

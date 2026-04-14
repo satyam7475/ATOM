@@ -4,7 +4,7 @@
 **Platform:** macOS (Apple Silicon, M-series)
 **What it is:** A local-first, JARVIS-style voice OS that perceives (voice, system state), reasons (intent, cache, memory, RAG, local LLM), acts (security-gated tools), and learns (behavior, habits, feedback metrics). Not a chatbot -- a continuously running AI OS.
 
-**Docs:** [`docs/ATOM_M5_EVOLUTION_PLAN.md`](docs/ATOM_M5_EVOLUTION_PLAN.md) -- current active roadmap
+**Docs:** [`docs/ATOM_M5_EVOLUTION_PLAN.md`](docs/ATOM_M5_EVOLUTION_PLAN.md) -- current active roadmap · [`docs/ATOM_VS_JARVIS_SCORECARD.md`](docs/ATOM_VS_JARVIS_SCORECARD.md) — module rating vs “Jarvis” reference
 **Architecture:** [`docs/architecture/INDEX.md`](docs/architecture/INDEX.md) -- modular architecture modules
 **Implementation tracking:** [`docs/ATOM_IMPLEMENTATION_PLAN.md`](docs/ATOM_IMPLEMENTATION_PLAN.md) — phased work, **ACT** protocol, and change log. Say **“Next step ACT”** or **“ACT step `runtime-truth`”** (any step ID from that doc) so the assistant implements that work and updates the tracker.
 
@@ -50,6 +50,16 @@ pip install -r requirements-desktop.txt
 3. Run `python scripts/setup_api_keys.py` to set up encrypted API credentials.
 4. See `core/config_schema.py` for the full schema reference.
 
+### Product tiers (local vs cloud)
+
+| `deployment.product_tier` | Intent | Typical settings |
+|---------------------------|--------|------------------|
+| `local_only` | Privacy-first; no cloud calls | `cloud.enabled: false`, `semantic_cache.enabled: false` optional |
+| `balanced` | Default; local brain, cloud off until you opt in | `cloud.enabled: false` or true with low quotas |
+| `cloud_augmented` | Hard questions / buddy tone via Gemini when needed | `cloud.enabled: true` |
+
+**Source of truth:** `cloud.enabled` (and related keys under `cloud` in settings) actually gates Gemini and cognitive escalation. `product_tier` is a **label** for you and the dashboard—keep it aligned when you change posture.
+
 ---
 
 ## Run
@@ -71,6 +81,15 @@ python main.py
 - **Prefer `Run ATOM.command` when the bundle self-test passes** — `ATOM.app`’s `atom_python` is the process that carries **Speech Recognition + Microphone** usage strings for Apple’s on-device STT. Plain `venv` Python often falls back to **Faster-Whisper** (still works; different stack).
 - **Permissions:** System Settings → Privacy & Security → **Microphone** and **Speech Recognition** — enable for the app you use to launch ATOM (Terminal, Cursor, or the embedded `atom_python`).
 - **After startup speech:** the engine waits until state is **LISTENING** (not during TTS) and applies **`stt.post_tts_cooldown_ms`** (default 800 ms) before reopening the mic so the greeting does not fight the capture path.
+- **Voice health strip** under the top bar shows STT engine, permissions, lifecycle state, tier, and last error (WebSocket `state_diff`).
+
+### Testing (golden path)
+
+```bash
+python3 tests/golden_path_e2e.py
+```
+
+Optional macOS live-mic smoke (may **SKIP** under venv): `python3 tests/golden_path_e2e.py --live-mic`
 
 ---
 
