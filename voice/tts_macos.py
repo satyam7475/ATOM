@@ -777,8 +777,22 @@ class MacOSTTSAsync:
     # ── Event handlers ─────────────────────────────────────────────
 
     async def on_speech_partial(self, text: str, **_kw) -> None:
-        if self._playing and text in ("Listening...", "Processing..."):
-            logger.info("Barge-in detected, stopping TTS")
+        from core.state_manager import AtomState
+
+        t = (text or "").strip()
+        if not t:
+            return
+        has_audio = bool(
+            self._playing or self._stream_task is not None or self._stream_queue is not None
+        )
+        if not has_audio:
+            return
+        if t in ("Listening...", "Processing..."):
+            logger.info("Barge-in detected (status placeholder), stopping TTS")
+            await self.stop()
+            return
+        if self._state.current is AtomState.SPEAKING and len(t) >= 2:
+            logger.info("Barge-in: user speech during TTS, stopping (%s)", t[:56])
             await self.stop()
 
     async def on_response(self, text: str, is_exit: bool = False,

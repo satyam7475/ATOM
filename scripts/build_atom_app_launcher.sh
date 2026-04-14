@@ -3,10 +3,8 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 APP="${ROOT}/ATOM.app"
-SRC="${ROOT}/scripts/atom_app_launcher.c"
 OUT="${APP}/Contents/MacOS/atom_python"
-FRAMEWORK_DIR="/Library/Developer/CommandLineTools/Library/Frameworks"
-PY_HEADERS="${FRAMEWORK_DIR}/Python3.framework/Headers"
+SHELL_LAUNCHER="${ROOT}/scripts/atom_app_bundle_launcher.sh"
 
 if [[ "$(uname -s)" != "Darwin" ]]; then
     echo "This builder is for macOS only." >&2
@@ -16,30 +14,15 @@ if [[ ! -d "${APP}/Contents/MacOS" ]]; then
     echo "Missing app bundle at ${APP}" >&2
     exit 1
 fi
-if [[ ! -f "${SRC}" ]]; then
-    echo "Missing launcher source: ${SRC}" >&2
-    exit 1
-fi
-if [[ ! -f "${PY_HEADERS}/Python.h" ]]; then
-    echo "Python framework headers not found at ${PY_HEADERS}" >&2
+if [[ ! -f "${SHELL_LAUNCHER}" ]]; then
+    echo "Missing shell launcher: ${SHELL_LAUNCHER}" >&2
     exit 1
 fi
 
-clang \
-    -O2 \
-    -Wall \
-    -Wextra \
-    -F "${FRAMEWORK_DIR}" \
-    -I "${PY_HEADERS}" \
-    -framework Python3 \
-    -Wl,-rpath,"${FRAMEWORK_DIR}" \
-    "${SRC}" \
-    -o "${OUT}"
-
+cp "${SHELL_LAUNCHER}" "${OUT}"
 chmod +x "${OUT}"
 
 rm -rf "${APP}/Contents/_CodeSignature"
-# Strip extended attributes (iCloud Desktop provenance breaks codesign).
 xattr -cr "${OUT}"
 xattr -cr "${APP}"
 
@@ -56,4 +39,4 @@ else
 fi
 rm -f /tmp/atom_codesign.err
 
-echo "Built ${OUT}"
+echo "Installed shell launcher at ${OUT}"

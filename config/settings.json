@@ -45,7 +45,13 @@
         },
         "min_audio_duration_s": 0.42,
         "audio_buffer_frames": 2048,
-        "native_stop_audio_delay_ms": 120
+        "native_stop_audio_delay_ms": 120,
+        "voice_debug": true,
+        "voice_debug_interval_s": 20,
+        "barge_in_during_speak": false,
+        "native_requires_on_device": false,
+        "native_voice_processing": false,
+        "native_tap_sample_rate": 48000
     },
     "tts": {
         "engine": "macos_native",

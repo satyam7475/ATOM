@@ -104,6 +104,8 @@ ATOM_STATE_DEFAULTS: dict[str, Any] = {
         "last_final": "",
         "last_spoken": "",
         "launch_mode": "",
+        "app_bundle": "",
+        "perceived_latency_ms": None,
         "updated_at": 0.0,
     },
     "mode": {

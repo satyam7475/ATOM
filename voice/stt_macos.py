@@ -27,9 +27,11 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import plistlib
 import sys
 import threading
 import time
+import weakref
 from typing import TYPE_CHECKING, Any, Callable
 
 logger = logging.getLogger("atom.stt_macos")
@@ -55,6 +57,43 @@ except ImportError:
 _WAKE_PHRASES = {"hey atom", "atom", "hey computer"}
 _SILENCE_TIMEOUT_S = 2.0
 _MAX_RECORD_S = 15.0
+
+
+def _format_ns_error(error: Any) -> str:
+    """Best-effort NSError / PyObjc exception string for STT diagnostics."""
+    if error is None:
+        return ""
+    try:
+        domain = error.domain() if hasattr(error, "domain") else ""
+        code = int(error.code()) if hasattr(error, "code") else -1
+        return f"{domain} code={code} | {error}"
+    except Exception:
+        return str(error)
+
+
+def _probe_default_input_mic_label() -> str:
+    """Best-effort name for the default input device (menu bar / Sound Input)."""
+    if _AVFoundation is None:
+        return "unknown (AVFoundation unavailable)"
+    try:
+        mt = getattr(_AVFoundation, "AVMediaTypeAudio", None)
+        if mt is None:
+            mt = "soun"
+        dev = _AVFoundation.AVCaptureDevice.defaultDeviceWithMediaType_(mt)
+        if dev is None:
+            return "no default AVCaptureDevice — grant Microphone in Privacy, or pick input in Sound"
+        return str(dev.localizedName())
+    except Exception as exc:
+        return f"mic probe error: {exc}"
+
+
+def _format_av_audio_format(fmt: Any) -> str:
+    try:
+        sr = float(fmt.sampleRate())
+        ch = int(fmt.channelCount())
+        return f"{sr:.0f} Hz, {ch} ch"
+    except Exception:
+        return str(fmt)
 
 
 def _resolve_stt_locale(raw: str | None) -> str:
@@ -87,8 +126,41 @@ def _main_bundle_info() -> dict[str, Any] | None:
         return None
 
 
+def _atom_app_bundle_info_plist() -> dict[str, Any] | None:
+    """When the real process image is ``.venv/bin/python`` (shell launcher exec), ``NSBundle.mainBundle`` is Python.framework, not ATOM.app. Read the launched app's Info.plist from ATOM_APP_BUNDLE."""
+    if os.environ.get("ATOM_LAUNCH_MODE") != "bundle":
+        return None
+    root = (os.environ.get("ATOM_APP_BUNDLE") or "").strip()
+    if not root:
+        return None
+    plist_path = os.path.join(root, "Contents", "Info.plist")
+    try:
+        with open(plist_path, "rb") as f:
+            raw = plistlib.load(f)
+        return raw if isinstance(raw, dict) else None
+    except OSError:
+        logger.debug("ATOM_APP_BUNDLE Info.plist missing or unreadable: %s", plist_path)
+        return None
+    except Exception:
+        logger.debug("ATOM_APP_BUNDLE Info.plist parse failed", exc_info=True)
+        return None
+
+
+def _effective_bundle_info() -> dict[str, Any] | None:
+    """Merge main bundle dict with ATOM.app plist so usage strings resolve after ``exec`` to venv Python."""
+    main = _main_bundle_info()
+    extra = _atom_app_bundle_info_plist()
+    if not extra:
+        return main
+    if not main:
+        return extra
+    merged = dict(main)
+    merged.update(extra)
+    return merged
+
+
 def _bundle_has_usage_description(key: str) -> bool:
-    info = _main_bundle_info()
+    info = _effective_bundle_info()
     return bool(info and info.get(key))
 
 
@@ -204,6 +276,7 @@ class NativeSTT:
         self._audio_engine: Any = None
         self._recognition_request: Any = None
         self._recognition_task: Any = None
+        self._recognition_lock = threading.Lock()
 
         self._available = False
         self._permanently_disabled = False
@@ -223,6 +296,29 @@ class NativeSTT:
         self._on_partial: Callable[[str], None] | None = None
         # After TTS, wait before reopening mic (avoids AVAudioEngine vs output conflict).
         self._need_post_tts_cooldown: bool = False
+
+        self._voice_debug: bool = bool(self._config.get("voice_debug", False))
+        self._voice_debug_interval_s: float = max(
+            8.0, float(self._config.get("voice_debug_interval_s", 25) or 25),
+        )
+        self._dbg_next_status_log: float = 0.0
+        # When True, keep mic open during SPEAKING so partials can trigger TTS barge-in (test with headphones first; echo risk).
+        self._barge_in_during_speak: bool = bool(
+            self._config.get("barge_in_during_speak", False),
+        )
+        # On-device-only often yields zero partials on Bluetooth + some locales (e.g. en-IN).
+        # When False, Apple may use server-assisted recognition (requires network; not fully private).
+        self._native_requires_on_device: bool = bool(
+            self._config.get("native_requires_on_device", True),
+        )
+        # Voice Processing I/O can break or silence some Bluetooth headsets — disable to test.
+        self._native_voice_processing: bool = bool(
+            self._config.get("native_voice_processing", True),
+        )
+        self._tap_buffer_count: int = 0
+        self._recognizer_supports_on_device: bool = False
+        # Plain function passed to recognitionTaskWithRequest — bound methods can fail to bridge as ObjC blocks.
+        self._speech_pyobjc_block: Callable[..., None] | None = None
 
     @property
     def is_available(self) -> bool:
@@ -248,7 +344,11 @@ class NativeSTT:
                 self.speech_permission_status = "bundle_missing_usage_description"
             if "NSMicrophoneUsageDescription" in launch_reason:
                 self.microphone_permission_status = "bundle_missing_usage_description"
-            logger.warning("Native STT unavailable: %s", launch_reason)
+            logger.warning(
+                "Native STT unavailable: %s — VOICE_INPUT: use ATOM.app (not raw venv) for "
+                "SFSpeechRecognizer + microphone TCC when bundle usage strings are required.",
+                launch_reason,
+            )
             return False
         self.speech_permission_status = _speech_permission_status()
         self.microphone_permission_status = _microphone_permission_status()
@@ -268,12 +368,27 @@ class NativeSTT:
 
         self._recognizer.setSupportsOnDeviceRecognition_(True)
 
+        try:
+            _sod = bool(self._recognizer.supportsOnDeviceRecognition())
+        except Exception:
+            _sod = False
+        self._recognizer_supports_on_device: bool = _sod
+
         auth_status = _Speech.SFSpeechRecognizer.authorizationStatus()
         if auth_status == 3:  # authorized
             self._available = True
             self.speech_permission_status = "authorized"
             self._last_error = None
-            logger.info("Native STT ready (SFSpeechRecognizer, locale=%s, on-device=True)", self._locale)
+            logger.info(
+                "Native STT ready (SFSpeechRecognizer, locale=%s, recognizer.supportsOnDeviceRecognition=%s)",
+                self._locale,
+                _sod,
+            )
+            logger.info(
+                "VOICE_INPUT: probe default mic=%s | launch_mode=%s",
+                _probe_default_input_mic_label(),
+                os.environ.get("ATOM_LAUNCH_MODE", ""),
+            )
             return True
         elif auth_status == 0:  # notDetermined
             if threading.current_thread() is not threading.main_thread():
@@ -301,6 +416,11 @@ class NativeSTT:
                 self.speech_permission_status = "authorized"
                 self._last_error = None
                 logger.info("Speech Recognition authorized by user")
+                logger.info(
+                    "VOICE_INPUT: probe default mic=%s | launch_mode=%s",
+                    _probe_default_input_mic_label(),
+                    os.environ.get("ATOM_LAUNCH_MODE", ""),
+                )
                 return True
             else:
                 self.speech_permission_status = "denied"
@@ -318,6 +438,41 @@ class NativeSTT:
                 status_names.get(auth_status, f"unknown({auth_status})"),
             )
             return False
+
+    def _apply_speech_request_policy(self, req: Any) -> None:
+        """Partial results + on-device vs server-assisted (Bluetooth/locale dependent)."""
+        req.setShouldReportPartialResults_(True)
+        want_on_device = self._native_requires_on_device
+        if want_on_device:
+            try:
+                if not getattr(self, "_recognizer_supports_on_device", True):
+                    logger.warning(
+                        "Native STT: on-device recognition not supported for locale %s — using "
+                        "server-assisted streaming (set stt.locale=en-US for on-device, or "
+                        "stt.native_requires_on_device=false to allow network by choice)",
+                        self._locale,
+                    )
+                    want_on_device = False
+            except Exception:
+                pass
+        req.setRequiresOnDeviceRecognition_(bool(want_on_device))
+        if not want_on_device:
+            logger.info(
+                "Native STT: requiresOnDeviceRecognition=False (locale=%s) — network speech may be used",
+                self._locale,
+            )
+
+    def _apply_speech_request_hints(self, req: Any) -> None:
+        """Prefer dictation-style streaming (helps some macOS Speech code paths)."""
+        if not _HAS_SPEECH or _Speech is None:
+            return
+        hint = getattr(_Speech, "SFSpeechRecognitionTaskHintDictation", None)
+        if hint is None or not hasattr(req, "setTaskHint_"):
+            return
+        try:
+            req.setTaskHint_(hint)
+        except Exception as exc:
+            logger.debug("Native STT: setTaskHint(Dictation) skipped: %s", exc)
 
     # ── Listening ──────────────────────────────────────────────────
 
@@ -350,27 +505,86 @@ class NativeSTT:
             return False
 
         try:
+            self._tap_buffer_count = 0
+            self._logged_stt_handler_shape = False
             self._audio_engine = _AVFoundation.AVAudioEngine.alloc().init()
 
             input_node = self._audio_engine.inputNode()
 
-            try:
-                input_node.setVoiceProcessingEnabled_error_(True, None)
-                logger.debug("Voice Processing I/O enabled (HW noise suppression)")
-            except Exception:
-                logger.debug("Voice Processing I/O not available")
+            if self._native_voice_processing:
+                try:
+                    input_node.setVoiceProcessingEnabled_error_(True, None)
+                    logger.debug("Voice Processing I/O enabled (HW noise suppression)")
+                except Exception:
+                    logger.debug("Voice Processing I/O not available")
+            else:
+                try:
+                    input_node.setVoiceProcessingEnabled_error_(False, None)
+                    logger.info(
+                        "Native STT: Voice Processing I/O disabled (stt.native_voice_processing=false) — "
+                        "often better for Bluetooth",
+                    )
+                except Exception:
+                    logger.debug("Voice Processing I/O toggle skipped", exc_info=True)
 
             self._recognition_request = (
                 _Speech.SFSpeechAudioBufferRecognitionRequest.alloc().init()
             )
-            self._recognition_request.setShouldReportPartialResults_(True)
-            self._recognition_request.setRequiresOnDeviceRecognition_(True)
+            self._apply_speech_request_policy(self._recognition_request)
+            self._apply_speech_request_hints(self._recognition_request)
 
             recording_format = input_node.outputFormatForBus_(0)
+            n_channels = int(recording_format.channelCount())
+            sample_rate = float(recording_format.sampleRate())
+            tap_sr_override = float(self._config.get("native_tap_sample_rate") or 0)
+            # Multi-channel Bluetooth formats can crash AVAudioConverter in CoreAudio; let the
+            # input node convert in the tap instead (same sample rate, mono Float32 for Speech).
+            # Optional native_tap_sample_rate (e.g. 48000): macOS Speech often behaves better at 44.1/48 kHz.
+            tap_format: Any = recording_format
+            if tap_sr_override > 0:
+                mono_fmt = _AVFoundation.AVAudioFormat.alloc().initStandardFormatWithSampleRate_channels_(
+                    tap_sr_override, 1,
+                )
+                if mono_fmt is not None:
+                    tap_format = mono_fmt
+                    logger.info(
+                        "Native STT: tap forced to %.0f Hz mono (stt.native_tap_sample_rate) — was %.0f Hz, %d ch",
+                        tap_sr_override,
+                        sample_rate,
+                        n_channels,
+                    )
+                else:
+                    logger.warning("Native STT: tap sample-rate format alloc failed; using device format")
+            elif n_channels > 1:
+                mono_fmt = _AVFoundation.AVAudioFormat.alloc().initStandardFormatWithSampleRate_channels_(
+                    sample_rate, 1,
+                )
+                if mono_fmt is not None:
+                    tap_format = mono_fmt
+                    logger.info(
+                        "Native STT: %d ch @ %.0f Hz device — tap delivers mono for SFSpeech (no AVAudioConverter)",
+                        n_channels,
+                        sample_rate,
+                    )
+                else:
+                    logger.warning("Native STT: mono tap format alloc failed; using device format")
 
-            input_node.installTapOnBus_bufferSize_format_block_(
-                0, self._audio_buffer_frames, recording_format, self._audio_buffer_callback,
-            )
+            try:
+                input_node.installTapOnBus_bufferSize_format_block_(
+                    0, self._audio_buffer_frames, tap_format, self._audio_buffer_callback,
+                )
+            except Exception as exc:
+                if tap_format is not recording_format:
+                    logger.warning(
+                        "Native STT: mono tap install failed (%s); retrying with raw device format",
+                        exc,
+                    )
+                    tap_format = recording_format
+                    input_node.installTapOnBus_bufferSize_format_block_(
+                        0, self._audio_buffer_frames, tap_format, self._audio_buffer_callback,
+                    )
+                else:
+                    raise
 
             self._audio_engine.prepare()
             success, error = self._audio_engine.startAndReturnError_(None)
@@ -380,17 +594,46 @@ class NativeSTT:
                 self._cleanup()
                 return False
 
+            _wr = weakref.ref(self)
+
+            def _pyobjc_speech_block(*args: Any) -> None:
+                inst = _wr()
+                if inst is not None:
+                    inst._recognition_result_handler(*args)
+
+            self._speech_pyobjc_block = _pyobjc_speech_block
             self._recognition_task = self._recognizer.recognitionTaskWithRequest_resultHandler_(
-                self._recognition_request, self._recognition_result_handler,
+                self._recognition_request, self._speech_pyobjc_block,
             )
+            if self._recognition_task is None:
+                self._last_error = "SFSpeechRecognizer returned nil recognition task"
+                logger.error("Native STT: recognitionTaskWithRequest returned nil — Speech unavailable")
+                self._cleanup()
+                return False
 
             self._listening = True
             self._last_speech_time = time.monotonic()
             self._last_error = None
+            mic_label = _probe_default_input_mic_label()
+            self.mic_name = f"{mic_label} (AVAudioEngine)"
             logger.info(
-                "Native STT listening started (on-device, buffer_frames=%d, locale=%s)",
+                "Native STT listening started (buffer_frames=%d, locale=%s, requires_on_device=%s, "
+                "voice_processing=%s)",
                 self._audio_buffer_frames,
                 self._locale,
+                self._native_requires_on_device,
+                self._native_voice_processing,
+            )
+            logger.info(
+                "VOICE_INPUT: mic=%s | device=%s | tap=%s | engine_running=%s | speech=%s | mic_perm=%s | "
+                "launch_mode=%s",
+                mic_label,
+                _format_av_audio_format(recording_format),
+                _format_av_audio_format(tap_format),
+                bool(self._audio_engine and self._audio_engine.isRunning()),
+                self.speech_permission_status,
+                self.microphone_permission_status,
+                os.environ.get("ATOM_LAUNCH_MODE", ""),
             )
             return True
 
@@ -402,16 +645,51 @@ class NativeSTT:
 
     def _audio_buffer_callback(self, buffer: Any, when: Any) -> None:
         """Tap callback: forward audio buffers to the recognition request."""
-        if self._recognition_request is not None:
-            self._recognition_request.appendAudioPCMBuffer_(buffer)
+        if self._voice_debug:
+            self._tap_buffer_count += 1
+            if self._tap_buffer_count == 1 or self._tap_buffer_count % 200 == 0:
+                logger.info(
+                    "VOICE_INPUT: tap feeding Speech (buffers=%d) — no STT partial lines? try "
+                    "stt.native_requires_on_device=false and stt.native_voice_processing=false",
+                    self._tap_buffer_count,
+                )
+        with self._recognition_lock:
+            req = self._recognition_request
+        if req is not None:
+            req.appendAudioPCMBuffer_(buffer)
 
-    def _recognition_result_handler(self, result: Any, error: Any) -> None:
-        """Called by SFSpeechRecognizer with partial/final results."""
+    def _recognition_result_handler(self, *args: Any) -> None:
+        """Called by SFSpeechRecognizer with partial/final results.
+
+        PyObjC may invoke the block as ``(result, error)`` or ``(context, result, error)``.
+        A wrong arity mis-binds arguments and yields no transcripts (often silently).
+        """
+        if len(args) == 2:
+            result, error = args[0], args[1]
+        elif len(args) == 3:
+            _, result, error = args[0], args[1], args[2]
+        else:
+            logger.warning(
+                "Native STT: unexpected resultHandler arity=%d (args=%r) — check PyObjC/Speech",
+                len(args),
+                args,
+            )
+            return
+
+        if not getattr(self, "_logged_stt_handler_shape", False):
+            self._logged_stt_handler_shape = True
+            logger.info(
+                "Native STT: recognition resultHandler invoked (arity=%d) — callbacks are wired",
+                len(args),
+            )
+
         if error is not None:
-            err_desc = str(error)
+            err_desc = _format_ns_error(error)
             self._last_error = err_desc
-            if "kAFAssistantErrorDomain" not in err_desc:
-                logger.debug("Recognition error: %s", err_desc)
+            if "kAFAssistantErrorDomain" in err_desc or "216" in err_desc:
+                logger.debug("Recognition (cancel/expected): %s", err_desc)
+            else:
+                logger.warning("STT recognition error: %s", err_desc)
             return
 
         if result is None:
@@ -428,10 +706,16 @@ class NativeSTT:
             logger.info("STT final: '%s'", transcript)
             if self._on_final:
                 self._emit_threadsafe(self._on_final, transcript)
+            # One SFSpeechAudioBufferRecognitionRequest completes after each final; start a new
+            # recognition task while keeping AVAudioEngine + tap (continuous listen).
+            self._restart_recognition_chain()
         else:
             if transcript != self._last_partial:
                 self._last_partial = transcript
-                logger.debug("STT partial: '%s'", transcript)
+                if self._voice_debug:
+                    logger.info("STT partial: '%s'", transcript[:200])
+                else:
+                    logger.debug("STT partial: '%s'", transcript)
 
                 lower = transcript.lower().strip()
                 for phrase in _WAKE_PHRASES:
@@ -447,6 +731,46 @@ class NativeSTT:
 
                 if self._on_partial:
                     self._emit_threadsafe(self._on_partial, transcript)
+
+    def _restart_recognition_chain(self) -> None:
+        """After each isFinal, start a new request+task; the engine tap keeps running.
+
+        SFSpeechRecognizer completes one streaming request per final; without a new
+        request, buffers keep appending to a finished session and no further results fire.
+        """
+        if not self._listening or self._audio_engine is None or self._recognizer is None:
+            return
+        try:
+            with self._recognition_lock:
+                old_task = self._recognition_task
+                self._recognition_request = None
+                self._recognition_task = None
+            if old_task is not None:
+                try:
+                    old_task.cancel()
+                except Exception:
+                    pass
+
+            new_req = _Speech.SFSpeechAudioBufferRecognitionRequest.alloc().init()
+            self._apply_speech_request_policy(new_req)
+            self._apply_speech_request_hints(new_req)
+
+            block = self._speech_pyobjc_block or self._recognition_result_handler
+            new_task = self._recognizer.recognitionTaskWithRequest_resultHandler_(
+                new_req, block,
+            )
+            if new_task is None:
+                logger.warning("Native STT: recognition restart returned nil task — may need to stop/start listening")
+                self._last_error = "Speech recognition task nil on restart"
+                return
+            with self._recognition_lock:
+                self._recognition_request = new_req
+                self._recognition_task = new_task
+            self._last_partial = ""
+            logger.debug("Native STT: recognition chain restarted for next utterance")
+        except Exception as exc:
+            self._last_error = str(exc)
+            logger.warning("STT: failed to restart recognition chain: %s", exc)
 
     def _emit_threadsafe(self, callback: Callable, arg: Any) -> None:
         """Safely call a callback from the recognition thread."""
@@ -496,6 +820,8 @@ class NativeSTT:
             except Exception:
                 pass
 
+        self._speech_pyobjc_block = None
+
         logger.info("Native STT listening stopped")
         return self._last_final or self._last_partial
 
@@ -514,6 +840,7 @@ class NativeSTT:
         self._audio_engine = None
         self._recognition_request = None
         self._recognition_task = None
+        self._speech_pyobjc_block = None
 
     def shutdown(self) -> None:
         """Full shutdown."""
@@ -589,13 +916,46 @@ class NativeSTT:
         post_cd_s = float(self._config.get("post_tts_cooldown_ms", 800) or 0) / 1000.0
 
         while getattr(self, "_running_async", False):
+            now = time.monotonic()
+            if self._voice_debug and now >= self._dbg_next_status_log:
+                self._dbg_next_status_log = now + self._voice_debug_interval_s
+                cur = self._state.current
+                hint = ""
+                if cur is not AtomState.LISTENING and not (
+                    self._barge_in_during_speak and cur is AtomState.SPEAKING
+                ):
+                    hint = (
+                        " | NOTE: mic only opens when AtomState=LISTENING "
+                        "(blocked during THINKING/SPEAKING/SLEEP/IDLE)"
+                        + (
+                            " [barge_in_during_speak: mic may open during SPEAKING]"
+                            if self._barge_in_during_speak
+                            else ""
+                        )
+                    )
+                logger.info(
+                    "VOICE_DEBUG: atom_state=%s | native_stt_listening=%s | mic_field=%s | "
+                    "stt_available=%s | speech_perm=%s | mic_perm=%s | last_err=%s | launch_mode=%s%s",
+                    getattr(cur, "value", cur),
+                    self._listening,
+                    (self.mic_name or "")[:120],
+                    self._available,
+                    self.speech_permission_status,
+                    self.microphone_permission_status,
+                    self._last_error,
+                    os.environ.get("ATOM_LAUNCH_MODE", ""),
+                    hint,
+                )
+
             if not self._listening:
                 cur = self._state.current
-                # Do not open the mic during TTS/thinking — wait until LISTENING.
-                if cur is AtomState.SPEAKING or cur is AtomState.THINKING:
+                if cur is AtomState.THINKING:
                     await asyncio.sleep(0.12)
                     continue
-                if cur is not AtomState.LISTENING:
+                allow_mic = cur is AtomState.LISTENING or (
+                    self._barge_in_during_speak and cur is AtomState.SPEAKING
+                )
+                if not allow_mic:
                     await asyncio.sleep(0.12)
                     continue
                 if self._need_post_tts_cooldown:

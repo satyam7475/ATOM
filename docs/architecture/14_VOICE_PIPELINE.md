@@ -30,7 +30,9 @@ flowchart LR
   restart --> loop
 ```
 
-**Native macOS (`NativeSTT`):** the long-lived loop is `async_start_listening()` → inner `start_listening()` (mic + `SFSpeechRecognizer`). After startup TTS, reopening the mic waits until `AtomState.LISTENING` and applies `stt.post_tts_cooldown_ms` when transitioning `SPEAKING → LISTENING`.
+**Native macOS (`NativeSTT`):** the long-lived loop is `async_start_listening()` → inner `start_listening()` (mic + `SFSpeechRecognizer`). After startup TTS, reopening the mic waits until `AtomState.LISTENING` and applies `stt.post_tts_cooldown_ms` when transitioning `SPEAKING → LISTENING`. Optional **`stt.barge_in_during_speak`**: when `true`, the mic may also open during `SPEAKING` so user speech can interrupt TTS (see [`VOICE_RELIABILITY_ROADMAP.md`](VOICE_RELIABILITY_ROADMAP.md)).
+
+**Bluetooth / default input:** `AVAudioEngine` uses the **system default input** (macOS Sound settings), not [`MicManager`](../../voice/mic_manager.py)’s PyAudio-picked device. For earbuds, set the BT input as default before testing. See [`docs/operations/BLUETOOTH_VOICE_TEST.md`](../operations/BLUETOOTH_VOICE_TEST.md).
 
 **Do not** `await async_start_listening()` from [`main.py`](../../main.py) startup greeting — that duplicated the loop and raced TTS (fixed). Listening is started only via `on_state_changed` and `restart_listening`.
 

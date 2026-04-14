@@ -228,6 +228,17 @@ async def main() -> None:
     stt_runtime_fallbacks: list[str] = []
     stt_engine_pref = str(stt_cfg.get("engine", "auto") or "auto").strip().lower()
 
+    def _normalize_stt_dev_prefer(raw: object) -> str:
+        s = str(raw or "").strip().lower().replace("-", "_")
+        if s in ("google", "google_online"):
+            return "google_online"
+        if s in ("faster_whisper", "whisper", "offline"):
+            return "faster_whisper"
+        return ""
+
+    dev_prefer = _normalize_stt_dev_prefer(stt_cfg.get("dev_prefer"))
+    venv_launch = os.environ.get("ATOM_LAUNCH_MODE") == "venv"
+
     def _build_disabled_stt(reason: str):
         class DisabledSTT:
             def __init__(self, disable_reason: str) -> None:
@@ -266,6 +277,16 @@ async def main() -> None:
                 return None
 
         logger.error("Voice input unavailable: %s", reason)
+        if sys.platform == "darwin" and "NSSpeechRecognitionUsageDescription" in reason:
+            logger.warning(
+                "VOICE_INPUT: On macOS, speech needs the ATOM.app bundle (usage strings in Info.plist). "
+                "Run via “Run ATOM.command” when it uses the bundle launcher — not raw `python main.py`.",
+            )
+        elif "PyAudio" in reason or "faster-whisper" in reason or "SpeechRecognition" in reason:
+            logger.warning(
+                "VOICE_INPUT: Install offline STT deps (`pip install faster-whisper SpeechRecognition "
+                "pyaudio`) or use ATOM.app for native SFSpeechRecognizer.",
+            )
         return DisabledSTT(reason)
 
     def _build_google_stt():
@@ -347,36 +368,99 @@ async def main() -> None:
     logger.info("STT engine preference: %s (platform=%s)", stt_engine_pref, sys.platform)
 
     if stt_engine_pref in ("auto", "macos_native") and sys.platform == "darwin":
-        native_stt, native_reason = _build_native_stt()
-        if native_stt is not None:
-            stt = native_stt
-            stt_runtime_label = "macOS Native (SFSpeechRecognizer)"
-            logger.info("STT: macOS Native (SFSpeechRecognizer, on-device)")
-        else:
-            stt_runtime_error = native_reason
-            stt_runtime_fallbacks.append(f"native unavailable: {native_reason}")
-            logger.warning(
-                "macOS Native STT unavailable (%s) -- falling back to Faster-Whisper",
-                native_reason,
+        skip_native = venv_launch and dev_prefer in ("faster_whisper", "google_online")
+        if skip_native and dev_prefer == "faster_whisper":
+            stt_runtime_fallbacks.append(
+                "native skipped: stt.dev_prefer=faster_whisper with ATOM_LAUNCH_MODE=venv"
+            )
+            logger.info(
+                "STT: skipping native macOS STT (venv + stt.dev_prefer=faster_whisper); "
+                "trying Faster-Whisper first",
             )
             whisper_stt = _build_faster_whisper_stt()
             if type(whisper_stt).__name__ != "DisabledSTT":
                 stt = whisper_stt
-                stt_runtime_label = "Faster-Whisper (native fallback)"
+                stt_runtime_label = "Faster-Whisper (dev_prefer)"
             else:
                 whisper_reason = getattr(whisper_stt, "_reason", "offline fallback unavailable")
                 stt_runtime_fallbacks.append(f"offline unavailable: {whisper_reason}")
-                logger.warning("Faster-Whisper unavailable (%s) -- trying Google", whisper_reason)
+                stt_runtime_error = whisper_reason
+                logger.warning(
+                    "Faster-Whisper unavailable (%s) -- trying Google",
+                    whisper_reason,
+                )
                 google_stt, google_err = _build_google_stt()
                 if google_stt is not None:
                     stt = google_stt
-                    stt_runtime_label = "Google Online (third fallback)"
+                    stt_runtime_label = "Google Online (dev_prefer fallback)"
                 else:
                     stt_runtime_fallbacks.append(f"google unavailable: {google_err}")
                     stt = _build_disabled_stt(
-                        f"Native unavailable ({native_reason}); offline unavailable ({whisper_reason}); google unavailable ({google_err})"
+                        f"dev_prefer offline unavailable ({whisper_reason}); "
+                        f"google unavailable ({google_err})",
                     )
                     stt_runtime_label = "Disabled"
+        elif skip_native and dev_prefer == "google_online":
+            stt_runtime_fallbacks.append(
+                "native skipped: stt.dev_prefer=google_online with ATOM_LAUNCH_MODE=venv",
+            )
+            logger.info(
+                "STT: skipping native macOS STT (venv + stt.dev_prefer=google_online); "
+                "trying Google first",
+            )
+            google_stt, google_err = _build_google_stt()
+            if google_stt is not None:
+                stt = google_stt
+                stt_runtime_label = "Google Online (dev_prefer)"
+            else:
+                stt_runtime_fallbacks.append(f"google unavailable: {google_err}")
+                stt_runtime_error = google_err or ""
+                whisper_stt = _build_faster_whisper_stt()
+                if type(whisper_stt).__name__ != "DisabledSTT":
+                    stt = whisper_stt
+                    stt_runtime_label = "Faster-Whisper (dev_prefer fallback)"
+                else:
+                    whisper_reason = getattr(whisper_stt, "_reason", "offline fallback unavailable")
+                    stt_runtime_fallbacks.append(f"offline unavailable: {whisper_reason}")
+                    stt = _build_disabled_stt(
+                        f"google unavailable ({google_err}); offline unavailable ({whisper_reason})",
+                    )
+                    stt_runtime_label = "Disabled"
+        else:
+            native_stt, native_reason = _build_native_stt()
+            if native_stt is not None:
+                stt = native_stt
+                stt_runtime_label = "macOS Native (SFSpeechRecognizer)"
+                logger.info("STT: macOS Native (SFSpeechRecognizer, on-device)")
+            else:
+                stt_runtime_error = native_reason
+                stt_runtime_fallbacks.append(f"native unavailable: {native_reason}")
+                logger.warning(
+                    "macOS Native STT unavailable (%s) -- falling back to Faster-Whisper",
+                    native_reason,
+                )
+                whisper_stt = _build_faster_whisper_stt()
+                if type(whisper_stt).__name__ != "DisabledSTT":
+                    stt = whisper_stt
+                    stt_runtime_label = "Faster-Whisper (native fallback)"
+                else:
+                    whisper_reason = getattr(whisper_stt, "_reason", "offline fallback unavailable")
+                    stt_runtime_fallbacks.append(f"offline unavailable: {whisper_reason}")
+                    logger.warning(
+                        "Faster-Whisper unavailable (%s) -- trying Google",
+                        whisper_reason,
+                    )
+                    google_stt, google_err = _build_google_stt()
+                    if google_stt is not None:
+                        stt = google_stt
+                        stt_runtime_label = "Google Online (third fallback)"
+                    else:
+                        stt_runtime_fallbacks.append(f"google unavailable: {google_err}")
+                        stt = _build_disabled_stt(
+                            f"Native unavailable ({native_reason}); offline unavailable "
+                            f"({whisper_reason}); google unavailable ({google_err})",
+                        )
+                        stt_runtime_label = "Disabled"
     elif stt_engine_pref in ("google_online", "google"):
         google_stt, google_err = _build_google_stt()
         if google_stt is not None:
@@ -420,6 +504,12 @@ async def main() -> None:
         stt_runtime_label = "Disabled"
 
     logger.info("STT backend selected: %s", type(stt).__name__)
+    logger.info(
+        "VOICE_LAUNCH_DIAG: ATOM_LAUNCH_MODE=%s ATOM_APP_BUNDLE=%s label=%s",
+        os.environ.get("ATOM_LAUNCH_MODE", ""),
+        os.environ.get("ATOM_APP_BUNDLE", ""),
+        stt_runtime_label,
+    )
 
     tts_cfg = config.get("tts", {})
     tts_engine = (tts_cfg.get("engine") or "macos_native").lower()
@@ -1253,6 +1343,8 @@ async def main() -> None:
             "status": "idle",
             "error": stt_runtime_error or None,
             "fallback_chain": stt_runtime_fallbacks,
+            "launch_mode": str(os.environ.get("ATOM_LAUNCH_MODE", "") or ""),
+            "app_bundle": str(os.environ.get("ATOM_APP_BUNDLE", "") or ""),
             "voice_name": str(
                 (config.get("tts") or {}).get("macos_voice")
                 or (config.get("tts") or {}).get("edge_voice")
@@ -1824,6 +1916,8 @@ async def main() -> None:
                         "listening": state.current.value == "listening",
                         "speaking": state.current.value == "speaking",
                         "launch_mode": str(os.environ.get("ATOM_LAUNCH_MODE", "")),
+                        "app_bundle": str(os.environ.get("ATOM_APP_BUNDLE", "") or ""),
+                        "perceived_latency_ms": _last_perceived_ms.get("ms"),
                     },
                     source="main.world_sync.voice",
                 )

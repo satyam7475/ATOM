@@ -87,6 +87,7 @@ html,body{
 }
 .voice-health-strip span{white-space:nowrap;max-width:100%;}
 .voice-health-strip .vh-err{color:var(--orange);max-width:min(90vw,720px);white-space:normal;}
+.voice-health-strip .vh-fb{width:100%;flex-basis:100%;color:var(--text-dim);font-size:9px;white-space:normal;max-width:min(96vw,900px);opacity:0.92;line-height:1.35;}
 /* ── Jarvis boot (Iron Man HUD) ─────────── */
 .jarvis-boot{
   position:fixed;inset:0;z-index:100;
@@ -268,6 +269,7 @@ html,body{
     <span id="vhLc">Lifecycle: —</span>
     <span id="vhTier">Tier: —</span>
     <span class="vh-err" id="vhErr"></span>
+    <span class="vh-fb" id="vhFb" role="status"></span>
   </div>
 
   <div class="brain-zone">
@@ -577,9 +579,15 @@ function syncVoiceHealthStrip(lc,v,mode){
   $('vhLc').textContent='Lifecycle: '+st+(v.listening===true?' · capturing':'' );
   const tier=String(mode.product_tier||'—');
   const cloud=mode.cloud_enabled===false?'local-only':'cloud OK';
-  $('vhTier').textContent='Tier: '+tier+' · '+cloud;
+  const lat=(v.perceived_latency_ms!=null&&v.perceived_latency_ms!=='')?(' · '+Math.round(Number(v.perceived_latency_ms))+'ms'):'';
+  const intent=exec.last_intent?(' · '+clipStr(String(exec.last_intent),28)):'';
+  $('vhTier').textContent='Tier: '+tier+' · '+cloud+lat+intent;
   const errLine=v.error?('Err: '+clipStr(v.error,120)):'';
   $('vhErr').textContent=errLine;
+  const fc=Array.isArray(v.fallback_chain)?v.fallback_chain:[];
+  const fb=fc.length?('Fallback trace: '+fc.map(x=>clipStr(String(x),200)).join(' · ')):'';
+  const ab=v.app_bundle?(' · bundle: '+clipStr(v.app_bundle,64)):'';
+  $('vhFb').textContent=fb?(fb+ab):ab?('Launch'+ab):'';
 }
 
 function renderAtomState(){

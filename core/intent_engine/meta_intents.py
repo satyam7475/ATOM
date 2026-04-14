@@ -9,12 +9,16 @@ import re
 from core import adaptive_personality as personality
 from .base import IntentResult
 
+# Casual "bye" / "goodbye" are go_silent (see _CASUAL_BYE), not hard exit — otherwise
+# STT noise matching "bye" shuts down the app seconds after launch.
 _EXIT = re.compile(
     r"^(shutdown|quit|exit|stop atom|shut\s*down|"
     r"close atom|turn off|power off|"
-    r"good\s*bye|bye|"
     r"shutdown\s+atom|shut\s*down\s+atom|"
     r"alvida|band\s+karo\s+atom)[\s!.]*$", re.I)
+
+_CASUAL_BYE = re.compile(
+    r"^(bye|good\s*bye|goodbye)(\s+(atom|boss|buddy|bro|sir|madam))?[\s!.]*$", re.I)
 
 _SILENT_MODE = re.compile(
     r"^(go\s+(to\s+)?sleep|sleep\s+mode|go\s+silent|silent\s+mode|"
@@ -56,6 +60,8 @@ _DENY = re.compile(
 def check(text: str) -> IntentResult | None:
     if _SILENT_MODE.search(text):
         return IntentResult("go_silent", response=personality.silent_response())
+    if _CASUAL_BYE.search(text):
+        return IntentResult("go_silent", response=personality.silent_response())
     if _EXIT.search(text):
         return IntentResult("exit", response=personality.exit_response())
     if _CONFIRM.search(text):
@@ -76,6 +82,8 @@ def check(text: str) -> IntentResult | None:
 def quick_match(text: str) -> str | None:
     """Fast check for meta intents used by STT early-exit."""
     if _SILENT_MODE.search(text):
+        return "go_silent"
+    if _CASUAL_BYE.search(text):
         return "go_silent"
     if _EXIT.search(text):
         return "exit"

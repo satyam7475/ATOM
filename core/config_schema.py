@@ -28,6 +28,7 @@ CONFIG_SCHEMA: dict[str, Any] = {
             "properties": {
                 "device_name": {
                     "type": ["string", "null"],
+                    "description": "Reserved for future PyAudio device binding; native macOS STT uses AVAudioEngine and follows the system default input (set in System Settings).",
                 },
                 "prefer_bluetooth": {
                     "type": "boolean",
@@ -121,6 +122,46 @@ CONFIG_SCHEMA: dict[str, Any] = {
                     "minimum": 0,
                     "maximum": 500,
                     "description": "Brief delay before endAudio so the last word can finalize.",
+                },
+                "voice_debug": {
+                    "type": "boolean",
+                    "description": "Log VOICE_DEBUG / VOICE_INPUT lines for mic, permissions, and AtomState.",
+                },
+                "voice_debug_interval_s": {
+                    "type": "number",
+                    "minimum": 5,
+                    "maximum": 120,
+                    "description": "Seconds between VOICE_DEBUG heartbeat lines.",
+                },
+                "dev_prefer": {
+                    "type": "string",
+                    "enum": [
+                        "",
+                        "faster_whisper",
+                        "whisper",
+                        "offline",
+                        "google_online",
+                        "google",
+                    ],
+                    "description": "When ATOM_LAUNCH_MODE=venv, skip native macOS STT and prefer this engine first (explicit dev path; does not fake native APIs).",
+                },
+                "barge_in_during_speak": {
+                    "type": "boolean",
+                    "description": "If true, native STT may open the mic during SPEAKING so user speech can interrupt TTS (test with headphones; echo can false-trigger).",
+                },
+                "native_requires_on_device": {
+                    "type": "boolean",
+                    "description": "If true, SFSpeechAudioBufferRecognitionRequest uses on-device only; if false, Apple may use server-assisted recognition (network).",
+                },
+                "native_voice_processing": {
+                    "type": "boolean",
+                    "description": "If true, enable AVAudioEngine Voice Processing I/O; if false, often better for Bluetooth headsets.",
+                },
+                "native_tap_sample_rate": {
+                    "type": "number",
+                    "minimum": 8000,
+                    "maximum": 48000,
+                    "description": "If set (e.g. 48000), force mono tap at this sample rate for Speech; 0 = match device.",
                 },
             },
             "additionalProperties": False,
