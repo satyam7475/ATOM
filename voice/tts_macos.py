@@ -27,6 +27,7 @@ import re
 import subprocess
 import sys
 import threading
+import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -376,10 +377,11 @@ class MacOSTTSAsync:
     Public API matches EdgeTTSAsync / TTSAsync for drop-in replacement.
     """
 
-    _SPEAK_WORD_LIMIT: int = 40
+    _SPEAK_WORD_LIMIT: int = 80
     # Coalesce tiny stream fragments so NSSpeechSynthesizer does not speak word-by-word.
-    _STREAM_UNPUNCT_MIN_WORDS: int = 8
-    _STREAM_UNPUNCT_BATCH: int = 14
+    # Lowered from 8/14 for faster first-audio on the streaming LLM path.
+    _STREAM_UNPUNCT_MIN_WORDS: int = 5
+    _STREAM_UNPUNCT_BATCH: int = 10
 
     def __init__(
         self,
@@ -415,6 +417,7 @@ class MacOSTTSAsync:
         self._stream_task: asyncio.Task | None = None
         self._stream_generation: int = 0
         self._stream_speak_buffer: str = ""
+        self._stream_start_t: float = 0.0
 
         from voice.speech_enhancer import SpeechEnhancer
         self._enhancer = SpeechEnhancer(base_rate=rate)
@@ -596,6 +599,20 @@ class MacOSTTSAsync:
 
         words = buf.split()
         n = len(words)
+
+        # End-of-speech alignment: when the buffer ends with sentence
+        # punctuation, flush immediately so speech aligns with natural
+        # pauses instead of arbitrary word-count boundaries.
+        if n >= 2 and buf.rstrip()[-1:] in ".!?":
+            self._stream_speak_buffer = ""
+            return buf
+
+        # Fast first-audio: flush with as few as 3 words when nothing has
+        # been spoken yet so the user hears something immediately.
+        if self._spoken_word_count == 0 and n >= 3:
+            self._stream_speak_buffer = ""
+            return buf
+
         if n >= self._STREAM_UNPUNCT_BATCH:
             seg = " ".join(words[: self._STREAM_UNPUNCT_BATCH])
             self._stream_speak_buffer = " ".join(words[self._STREAM_UNPUNCT_BATCH :])
@@ -684,9 +701,20 @@ class MacOSTTSAsync:
                 )
                 self._bus.emit("text_display", text=overflow_text)
 
+            stream_duration_ms = (
+                (time.perf_counter() - self._stream_start_t) * 1000
+                if self._stream_start_t > 0 else 0.0
+            )
             logger.info(
-                "TTS stream done: %d words spoken",
+                "TTS stream done: %d words spoken in %.0fms",
                 self._spoken_word_count,
+                stream_duration_ms,
+            )
+            self._bus.emit(
+                "tts_delivery_metrics",
+                words_spoken=self._spoken_word_count,
+                duration_ms=round(stream_duration_ms, 1),
+                backend=self._backend,
             )
             self._bus.emit("tts_complete")
 
@@ -773,10 +801,55 @@ class MacOSTTSAsync:
             self._current_emotion = emotion
             logger.debug("TTS emotion updated: %s", emotion)
 
+    def apply_perception_style(
+        self,
+        rate_multiplier: float = 1.0,
+        pause_multiplier: float = 1.0,
+    ) -> None:
+        """Adapt speech pacing from PerceptionEngine style decisions.
+
+        Adjusts the SpeechEnhancer base rate so urgency and emotion
+        flow through the existing enhancement pipeline.
+        """
+        new_rate = int(self._rate * max(0.7, min(1.4, rate_multiplier)))
+        self._enhancer._base_rate = new_rate
+        if self._native_synth is not None:
+            self._native_synth._rate = float(new_rate)
+        logger.debug(
+            "TTS perception style: rate_mult=%.2f pause_mult=%.1f -> base_rate=%d",
+            rate_multiplier, pause_multiplier, new_rate,
+        )
+
     def next_ack_phrase(self) -> str:
         phrase = ACK_PHRASES[self._ack_idx % len(ACK_PHRASES)]
         self._ack_idx += 1
         return phrase
+
+    async def force_stop(self) -> None:
+        """Hard stop: immediate silence, cancel stream, kill processes.
+
+        Called by ``VoiceInterruptHandler`` -- the single public API for
+        external interrupt callers so they never touch private fields.
+
+        Order matters: clear state first so no in-flight coroutine can
+        re-queue audio, then kill processes, then run the full ``stop()``
+        for any remaining cleanup.
+        """
+        self._cancel_requested = True
+        self._playing = False
+        self._stream_generation += 1
+        self._stream_speak_buffer = ""
+        self._chunk_buffer.clear()
+        self._screen_buffer.clear()
+        queue = self._stream_queue
+        if queue is not None:
+            try:
+                while not queue.empty():
+                    queue.get_nowait()
+            except Exception:
+                pass
+        await self._kill_procs()
+        await self.stop()
 
     async def stop(self) -> None:
         """Barge-in: immediately stop all speech."""
@@ -878,6 +951,7 @@ class MacOSTTSAsync:
             self._spoken_word_count = 0
             self._recent_spoken_chunks.clear()
             self._active_stream_id = stream_id or None
+            self._stream_start_t = time.perf_counter()
             logger.info(
                 "TTS stream: source='%s' stream_id=%s'",
                 self._active_source,
@@ -909,6 +983,24 @@ class MacOSTTSAsync:
             self._stream_task = asyncio.create_task(
                 self._play_stream_chunks(self._stream_generation)
             )
+
+        # Backpressure: when TTS is falling behind (queue depth > 5),
+        # merge text directly into the speak buffer instead of queueing
+        # to prevent unbounded growth and silent latency creep.
+        _BACKPRESSURE_DEPTH = 5
+        if queue.qsize() > _BACKPRESSURE_DEPTH and normalized_text and not is_last:
+            merged = (
+                f"{self._stream_speak_buffer} {normalized_text}".strip()
+                if self._stream_speak_buffer
+                else normalized_text
+            )
+            self._stream_speak_buffer = re.sub(r"\s+", " ", merged)
+            logger.debug(
+                "TTS backpressure: merged into buffer (queue depth %d)",
+                queue.qsize(),
+            )
+            return
+
         queue.put_nowait((normalized_text, is_last))
 
     # ── Shutdown ───────────────────────────────────────────────────

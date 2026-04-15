@@ -295,7 +295,11 @@ class VoiceInterruptHandler:
         self._interrupted_position = 0
 
     async def _stop_tts(self) -> None:
-        """Immediately kill TTS -- not graceful, instant silence."""
+        """Immediately kill TTS -- not graceful, instant silence.
+
+        Uses ``force_stop()`` (public API) when available so we never
+        mutate private TTS fields from outside the TTS module.
+        """
         tts = self._tts
         if tts is None:
             return
@@ -303,23 +307,19 @@ class VoiceInterruptHandler:
         if self._paused:
             self._paused = False
 
-        stop_fn = getattr(tts, "stop", None)
-        if not callable(stop_fn):
-            return
-
         try:
-            kill_fn = getattr(tts, "_kill_procs", None)
-            if callable(kill_fn):
-                await kill_fn()
+            force_fn = getattr(tts, "force_stop", None)
+            if callable(force_fn):
+                result = force_fn()
+                if inspect.isawaitable(result):
+                    await result
+                return
 
-            tts._cancel_requested = True
-            tts._playing = False
-            if hasattr(tts, "_stream_generation"):
-                tts._stream_generation += 1
-
-            result = stop_fn()
-            if inspect.isawaitable(result):
-                await result
+            stop_fn = getattr(tts, "stop", None)
+            if callable(stop_fn):
+                result = stop_fn()
+                if inspect.isawaitable(result):
+                    await result
         except Exception:
             logger.debug("Voice interrupt TTS stop failed", exc_info=True)
 

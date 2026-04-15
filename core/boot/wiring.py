@@ -93,6 +93,86 @@ def wire_events(
         indicator=indicator,
         command_loop=command_loop,
     )
+
+    # ── Perception Engine (Phase 1) ───────────────────────────────
+    from core.perception.engine import PerceptionEngine
+
+    perception = PerceptionEngine(bus)
+
+    bus.on(
+        "speech_partial",
+        _guard_handler(
+            "speech_partial",
+            perception.on_speech_partial,
+            source="perception.on_speech_partial",
+        ),
+    )
+    bus.on(
+        "speech_final",
+        _guard_handler(
+            "speech_final",
+            perception.on_speech_final,
+            source="perception.on_speech_final",
+        ),
+    )
+
+    async def _perception_tts_start(old=None, new=None, **_kw) -> None:
+        from core.state_manager import AtomState
+        if new is AtomState.SPEAKING:
+            await perception.on_tts_speaking()
+
+    async def _perception_tts_end(**_kw) -> None:
+        await perception.on_tts_done()
+
+    async def _on_tts_delivery_metrics(
+        words_spoken: int = 0, duration_ms: float = 0.0,
+        backend: str = "", **_kw,
+    ) -> None:
+        logger.debug(
+            "TTS delivery: %d words, %.0fms, backend=%s",
+            words_spoken, duration_ms, backend,
+        )
+
+    bus.on("state_changed", _perception_tts_start)
+    bus.on("tts_complete", _perception_tts_end)
+    bus.on("tts_delivery_metrics", _on_tts_delivery_metrics)
+
+    _perception_style_applied = {"locked": False}
+
+    async def _on_perception_result(
+        emotion=None, urgency=None, style=None, **_kw,
+    ) -> None:
+        if _perception_style_applied["locked"]:
+            return
+        if style is not None and hasattr(tts, "apply_perception_style"):
+            tts.apply_perception_style(
+                rate_multiplier=style.rate_multiplier,
+                pause_multiplier=style.pause_multiplier,
+            )
+            _perception_style_applied["locked"] = True
+
+    async def _unlock_perception_style(**_kw) -> None:
+        _perception_style_applied["locked"] = False
+
+    bus.on("perception_result", _on_perception_result)
+    bus.on("tts_complete", _unlock_perception_style)
+
+    async def _on_interrupt_predicted(**_kw) -> None:
+        await voice_interrupt.interrupt_to_listening(
+            trigger="interrupt_predicted",
+            reason="perception_predicted",
+            user_interrupt=True,
+        )
+
+    bus.on(
+        "interrupt_predicted",
+        _guard_handler(
+            "interrupt_predicted",
+            _on_interrupt_predicted,
+            source="perception.interrupt_predicted",
+        ),
+    )
+
     bus.on(
         "state_changed",
         _guard_handler(

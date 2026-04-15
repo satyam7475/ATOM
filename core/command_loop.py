@@ -47,7 +47,7 @@ class CommandLoop:
 
     __slots__ = (
         "_bus", "_state", "_router", "_lock",
-        "_cancelled", "_current_trace_id",
+        "_cancelled", "_current_trace_id", "_current_task",
         "_total_commands", "_total_errors",
         "_system_state_engine", "_session_memory",
         "_ack_engine", "_pipeline_metrics",
@@ -71,6 +71,7 @@ class CommandLoop:
         self._lock = ExecutionLock(default_timeout_s=lock_timeout_s)
         self._cancelled = asyncio.Event()
         self._current_trace_id: str | None = None
+        self._current_task: asyncio.Task[None] | None = None
         self._total_commands: int = 0
         self._total_errors: int = 0
         self._system_state_engine = system_state_engine
@@ -114,13 +115,21 @@ class CommandLoop:
     def is_busy(self) -> bool:
         return self._lock.is_busy
 
-    async def submit(self, text: str = "", **_kw: Any) -> None:
+    async def submit(self, text: str = "", *, priority: str = "voice", **_kw: Any) -> None:
         """Submit a command through the controlled pipeline.
 
         This is the bus handler for ``speech_final``.
+
+        Args:
+            priority: ``"voice"`` for normal serial commands,
+                      ``"background"`` to bypass the execution lock.
         """
         text = (text or "").strip()
         if not text:
+            return
+
+        if priority == "background":
+            asyncio.create_task(self._run_background(text))
             return
 
         trace_id = uuid.uuid4().hex[:12]
@@ -143,6 +152,7 @@ class CommandLoop:
 
         self._cancelled.clear()
         self._current_trace_id = trace_id
+        self._current_task = asyncio.current_task()
         self._total_commands += 1
 
         try:
@@ -238,14 +248,10 @@ class CommandLoop:
                         active_app=active_app,
                     )
                     if suggestion:
-                        async def _emit_suggestion(s: str = suggestion) -> None:
-                            await asyncio.sleep(2.0)
-                            self._bus.emit_fast(
-                                "response_ready",
-                                text=s,
-                                priority="low",
-                            )
-                        asyncio.create_task(_emit_suggestion())
+                        self._bus.emit_fast(
+                            "suggestion_ready",
+                            suggestions=[suggestion],
+                        )
                 except Exception:
                     logger.debug("Suggestion engine failed", exc_info=True)
 
@@ -297,16 +303,54 @@ class CommandLoop:
             except Exception:
                 logger.debug("CommandLoop error recovery failed", exc_info=True)
         finally:
+            self._current_task = None
             self._current_trace_id = None
             self._lock.release()
 
     async def cancel_current(self) -> bool:
-        """Cancel the currently running command (called by interrupt handler)."""
+        """Cancel the currently running command (called by interrupt handler).
+
+        Cancels the asyncio Task running ``submit()``, which raises
+        ``CancelledError`` inside the router and releases the execution lock.
+        Also signals the Gemini executor thread to stop reading if a
+        streaming cloud call is in flight.
+        """
         if not self._lock.is_busy:
             return False
+
         self._cancelled.set()
-        logger.info("CommandLoop: cancel requested for '%s'", self._lock.current_command or "?")
+
+        # Signal the Gemini executor thread to abort the SSE read loop
+        # immediately rather than waiting for asyncio task cancellation
+        # to propagate through the event loop.
+        gemini = getattr(self._router, "_gemini_client", None)
+        if gemini is not None:
+            cancel_fn = getattr(gemini, "cancel_streaming", None)
+            if callable(cancel_fn):
+                cancel_fn()
+
+        task = self._current_task
+        if task is not None and not task.done():
+            task.cancel()
+            logger.info(
+                "CommandLoop: task cancelled for '%s'",
+                self._lock.current_command or "?",
+            )
+        else:
+            logger.info(
+                "CommandLoop: cancel flag set for '%s' (no active task)",
+                self._lock.current_command or "?",
+            )
         return True
+
+    async def _run_background(self, text: str) -> None:
+        """Run a non-voice command without acquiring the execution lock."""
+        try:
+            await self._router.on_speech(text)
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            logger.debug("Background task failed for '%s'", text[:60], exc_info=True)
 
     def get_diagnostics(self) -> dict[str, Any]:
         diag: dict[str, Any] = {

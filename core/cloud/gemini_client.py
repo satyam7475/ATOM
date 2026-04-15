@@ -23,13 +23,15 @@ Owner: Satyam
 from __future__ import annotations
 
 import asyncio
+import functools
 import hashlib
 import json
 import logging
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
-from typing import Any
+from typing import Any, Callable
 
 logger = logging.getLogger("atom.cloud.gemini")
 
@@ -84,6 +86,10 @@ class GeminiClient:
         # Circuit breaker settings
         self._circuit_threshold = 3
         self._circuit_cooldown_s = 60.0
+
+        # Thread-safe cancellation flag for streaming requests.
+        # Set by cancel_streaming(); checked by _call_streaming_sync().
+        self._streaming_cancelled = False
 
         if self._api_key:
             logger.info(
@@ -280,7 +286,6 @@ class GeminiClient:
         effective_timeout = self._timeout_reasoning if is_reasoning else self._timeout
         effective_max_tokens = max_tokens or (self._max_tokens_reasoning if is_reasoning else self._max_tokens)
 
-        import functools
         call_fn = functools.partial(
             self._call_sync,
             query,
@@ -365,6 +370,222 @@ class GeminiClient:
             system_instruction=system_instruction or default_system,
             temperature=0.4,
         )
+
+    # ── Streaming API ─────────────────────────────────────────────────
+
+    def cancel_streaming(self) -> None:
+        """Signal the executor thread to abort the current streaming read.
+
+        Safe to call from any thread or coroutine.  The next iteration of
+        ``_call_streaming_sync``'s read loop will see the flag and exit.
+        """
+        self._streaming_cancelled = True
+
+    def _call_streaming_sync(
+        self,
+        query: str,
+        on_token: Callable[[str, bool], None],
+        *,
+        model_override: str | None = None,
+        max_tokens_override: int | None = None,
+        system_instruction: str | None = None,
+        temperature_override: float | None = None,
+    ) -> tuple[str, bool]:
+        """Synchronous streaming call — reads SSE chunks line by line.
+
+        Calls ``on_token(chunk_text, is_last)`` for every text fragment
+        received from the Gemini ``streamGenerateContent`` endpoint.
+        Runs in an executor; the callback must be thread-safe (e.g. use
+        ``loop.call_soon_threadsafe``).
+        """
+        t0 = time.perf_counter()
+        effective_model = model_override or self._model
+        self._streaming_cancelled = False
+
+        try:
+            _, body, headers = self._build_request(
+                query,
+                model_override=model_override,
+                max_tokens_override=max_tokens_override,
+                system_instruction=system_instruction,
+                temperature_override=temperature_override,
+            )
+            url = (
+                f"{_GEMINI_API_URL}/{effective_model}"
+                f":streamGenerateContent?alt=sse&key={self._api_key}"
+            )
+            req = urllib.request.Request(
+                url, data=body, headers=headers, method="POST",
+            )
+
+            effective_timeout = (
+                self._timeout_reasoning
+                if effective_model == self._reasoning_model
+                else self._timeout
+            )
+            full_text = ""
+            cancelled = False
+
+            with urllib.request.urlopen(req, timeout=effective_timeout) as resp:
+                # Cap per-read blocking to 100ms so the cancel flag is
+                # checked promptly regardless of network buffer state.
+                try:
+                    resp.fp.raw._sock.settimeout(0.1)
+                except Exception:
+                    pass
+                resp_iter = iter(resp)
+                while True:
+                    if self._streaming_cancelled:
+                        cancelled = True
+                        logger.info("Gemini streaming cancelled by caller")
+                        break
+                    try:
+                        raw_line = next(resp_iter)
+                    except TimeoutError:
+                        continue
+                    except StopIteration:
+                        break
+
+                    line = raw_line.decode("utf-8", errors="replace").strip()
+                    if not line.startswith("data:"):
+                        continue
+                    payload_str = line[5:].strip()
+                    if payload_str == "[DONE]":
+                        break
+                    try:
+                        data = json.loads(payload_str)
+                        candidates = data.get("candidates", [])
+                        if not candidates:
+                            continue
+                        parts = candidates[0].get("content", {}).get("parts", [])
+                        for part in parts:
+                            if self._streaming_cancelled:
+                                cancelled = True
+                                break
+                            chunk = part.get("text", "")
+                            if chunk:
+                                full_text += chunk
+                                on_token(chunk, False)
+                        if cancelled:
+                            break
+                    except (json.JSONDecodeError, KeyError, IndexError):
+                        continue
+
+            if not cancelled:
+                on_token("", True)
+
+            latency_ms = (time.perf_counter() - t0) * 1000
+            if full_text:
+                self._record_success(latency_ms, len(query), len(full_text))
+                logger.info(
+                    "Gemini streaming [%s]: %.0fms, %d chars",
+                    effective_model, latency_ms, len(full_text),
+                )
+            return full_text, bool(full_text)
+
+        except urllib.error.HTTPError as e:
+            latency_ms = (time.perf_counter() - t0) * 1000
+            error_body = ""
+            try:
+                error_body = e.read().decode("utf-8", errors="ignore")[:200]
+            except Exception:
+                pass
+            self._record_failure(f"HTTP {e.code}: {error_body}")
+            logger.warning(
+                "Gemini streaming HTTP error %d (%.0fms): %s",
+                e.code, latency_ms, error_body[:100],
+            )
+            return "", False
+
+        except Exception as e:
+            latency_ms = (time.perf_counter() - t0) * 1000
+            self._record_failure(str(e))
+            logger.warning("Gemini streaming failed (%.0fms): %s", latency_ms, e)
+            return "", False
+
+    async def ask_streaming(
+        self,
+        query: str,
+        *,
+        on_token: Callable[[str, bool], None] | None = None,
+        max_tokens: int | None = None,
+        model: str | None = None,
+        system_instruction: str | None = None,
+        temperature: float | None = None,
+    ) -> tuple[str, bool]:
+        """Ask Gemini with streaming response (async, security-gated).
+
+        ``on_token(chunk, is_last)`` is called from the executor thread for
+        each received token chunk.  The caller is responsible for making
+        that callback thread-safe (e.g. ``loop.call_soon_threadsafe``).
+
+        Falls back to the non-streaming ``ask()`` when no ``on_token``
+        callback is provided.
+        """
+        if on_token is None:
+            return await self.ask(
+                query, max_tokens=max_tokens, model=model,
+                system_instruction=system_instruction, temperature=temperature,
+            )
+
+        if not self.is_available:
+            return "", False
+
+        if self._gateway:
+            allowed, reason = self._gateway.allow_cloud(query)
+            if not allowed:
+                logger.info("Gemini streaming blocked by SecurityGateway: %s", reason)
+                return "", False
+            query = self._gateway.sanitize_outbound(query)
+
+        if not query.strip():
+            return "", False
+
+        effective_model = model or self._model
+        is_reasoning = effective_model == self._reasoning_model
+        effective_timeout = self._timeout_reasoning if is_reasoning else self._timeout
+        effective_max_tokens = max_tokens or (
+            self._max_tokens_reasoning if is_reasoning else self._max_tokens
+        )
+
+        call_fn = functools.partial(
+            self._call_streaming_sync,
+            query,
+            on_token,
+            model_override=model,
+            max_tokens_override=effective_max_tokens,
+            system_instruction=system_instruction,
+            temperature_override=temperature,
+        )
+
+        loop = asyncio.get_running_loop()
+        try:
+            text, ok = await asyncio.wait_for(
+                loop.run_in_executor(None, call_fn),
+                timeout=effective_timeout + 5.0,
+            )
+
+            if ok and self._gateway:
+                query_hash = hashlib.sha256(query.encode()).hexdigest()[:16]
+                self._gateway.record_cloud_call(
+                    query_hash=query_hash,
+                    sanitized_length=len(query),
+                    response_length=len(text),
+                    latency_ms=0,
+                    provider="gemini",
+                )
+                tagged = self._gateway.tag_cloud_response(text, provider="gemini")
+                return tagged["text"], True
+
+            return text, ok
+
+        except asyncio.TimeoutError:
+            self._record_failure("streaming_timeout")
+            logger.warning(
+                "Gemini streaming timeout (%.0fs, model=%s)",
+                effective_timeout, effective_model,
+            )
+            return "", False
 
     # ── Circuit breaker ──────────────────────────────────────────────
 

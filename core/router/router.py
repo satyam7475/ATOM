@@ -135,6 +135,10 @@ class Router:
         self._session_memory: Any = None
         self._user_memory: Any = None
 
+        # Stream generation counter — incremented on every new streaming call
+        # so stale tokens from a cancelled stream are discarded.
+        self._cloud_stream_generation: int = 0
+
         # v22: Cloud intelligence components (wired via attach_cloud_intelligence)
         self._gemini_client: Any = None
         self._search_tool: Any = None
@@ -1717,7 +1721,12 @@ class Router:
             return
 
         if not self._brain_enabled:
-            logger.info("No local brain (brain.enabled is false)")
+            if self._gemini_client is not None and self._gemini_client.is_available:
+                await self._handle_cloud_streaming(
+                    original_text, clean_text, ack, query_plan,
+                )
+                return
+            logger.info("No local brain and no cloud — offline fallback")
             self._emit_response(personality.offline_fallback())
             return
 
@@ -1739,6 +1748,106 @@ class Router:
             history=history,
             query_plan=query_plan,
         )
+
+    # ── Cloud streaming (token-by-token → TTS) ─────────────────────
+
+    async def _handle_cloud_streaming(
+        self,
+        original_text: str,
+        clean_text: str,
+        ack: str,
+        query_plan: Any = None,
+    ) -> None:
+        """Stream Gemini response into partial_response events.
+
+        Applies two safeguards:
+        - **Micro-batching**: tokens are accumulated and flushed every 5
+          tokens or 50ms, whichever comes first, to avoid flooding the TTS
+          queue with single-token events.
+        - **Stream generation guard**: each streaming call gets a generation
+          number.  If a new call starts (e.g. after barge-in), the old
+          callback silently discards remaining tokens.
+        """
+        import uuid as _uuid
+
+        if self._should_emit_thinking_ack(clean_text, query_plan):
+            self._emit_thinking_ack(ack)
+
+        # Cancel any in-flight streaming request in the executor thread.
+        if self._gemini_client is not None:
+            self._gemini_client.cancel_streaming()
+
+        self._cloud_stream_generation += 1
+        my_generation = self._cloud_stream_generation
+
+        stream_id = _uuid.uuid4().hex[:8]
+        loop = asyncio.get_running_loop()
+        first_token = [True]
+        batch: list[str] = []
+        last_flush = [time.perf_counter()]
+        _BATCH_SIZE = 5
+        _BATCH_INTERVAL = 0.05
+
+        def _flush_batch(is_last: bool) -> None:
+            if my_generation != self._cloud_stream_generation:
+                return
+            text = "".join(batch)
+            batch.clear()
+            if not text and not is_last:
+                return
+            is_first = first_token[0]
+            first_token[0] = False
+            last_flush[0] = time.perf_counter()
+
+            def _emit() -> None:
+                if my_generation != self._cloud_stream_generation:
+                    return
+                self._bus.emit(
+                    "partial_response",
+                    text=text,
+                    is_first=is_first,
+                    is_last=is_last,
+                    source="gemini_stream",
+                    stream_id=stream_id,
+                )
+
+            loop.call_soon_threadsafe(_emit)
+
+        def _on_token(chunk: str, is_last: bool) -> None:
+            if my_generation != self._cloud_stream_generation:
+                return
+
+            if chunk:
+                batch.append(chunk)
+
+            now = time.perf_counter()
+            elapsed = now - last_flush[0]
+
+            if is_last:
+                _flush_batch(True)
+            elif len(batch) >= _BATCH_SIZE or elapsed >= _BATCH_INTERVAL:
+                _flush_batch(False)
+
+        default_system = (
+            "You are ATOM, a personal AI assistant created by Satyam Yadav. "
+            "You call him 'Boss'. You are friendly, witty, concise, and helpful. "
+            "Keep responses short and conversational unless asked for detail."
+        )
+        try:
+            full_text, ok = await self._gemini_client.ask_streaming(
+                original_text,
+                on_token=_on_token,
+                system_instruction=default_system,
+            )
+            if ok and full_text and my_generation == self._cloud_stream_generation:
+                self.record_turn(clean_text, full_text)
+        except asyncio.CancelledError:
+            self._gemini_client.cancel_streaming()
+            raise
+        except Exception:
+            logger.exception("Cloud streaming failed — emitting error response")
+            if my_generation == self._cloud_stream_generation:
+                self._emit_response("Cloud request failed, Boss. Try again.")
 
     # ── Contextual follow-up ────────────────────────────────────────
 
