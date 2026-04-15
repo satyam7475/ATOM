@@ -83,7 +83,7 @@ class KokoroTTSAsync:
             self._bus.emit("tts_complete")
             return
 
-        self.stop()
+        await self.stop()
         self._running = True
         self._current_task = asyncio.create_task(self._speak_task(text))
 

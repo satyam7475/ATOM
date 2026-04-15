@@ -141,8 +141,6 @@ async def main() -> None:
     from core.cognitive.self_optimizer import SelfOptimizer
     from core.personality_modes import PersonalityModes
 
-    if False:
-        bus.start()
     atom_runtime = AtomRuntimeStateBridge(bus)
     state = StateManager(
         bus,
@@ -235,272 +233,6 @@ async def main() -> None:
     stt_runtime_error = voice_pipeline.stt_runtime_error
     stt_runtime_fallbacks = voice_pipeline.stt_runtime_fallbacks
     tts_runtime_label = voice_pipeline.tts_runtime_label
-
-    if False:  # legacy STT/TTS factory removed -- see voice/voice_pipeline.py
-     def _legacy_placeholder():
-        class DisabledSTT:
-            def __init__(self, disable_reason: str) -> None:
-                self._reason = disable_reason
-                self._last_error = disable_reason
-                self.mic_name = "Voice input unavailable"
-                self.backend_name = "Disabled"
-                self.fallback_chain = [disable_reason]
-                self.speech_permission_status = (
-                    "bundle_missing_usage_description"
-                    if "NSSpeechRecognitionUsageDescription" in disable_reason
-                    else "unavailable"
-                )
-                self.microphone_permission_status = (
-                    "dependency_missing"
-                    if "PyAudio/PortAudio" in disable_reason
-                    else "unknown"
-                )
-
-            async def async_preload(self) -> None:
-                logger.warning("STT disabled: %s", self._reason)
-
-            async def async_start_listening(self, **_kw) -> None:
-                logger.warning("STT disabled: %s", self._reason)
-
-            async def start_listening(self, **_kw) -> None:
-                await self.async_start_listening(**_kw)
-
-            async def on_state_changed(self, old, new, **_kw) -> None:
-                return None
-
-            def stop(self) -> None:
-                return None
-
-            def shutdown(self) -> None:
-                return None
-
-        logger.error("Voice input unavailable: %s", reason)
-        if sys.platform == "darwin" and "NSSpeechRecognitionUsageDescription" in reason:
-            logger.warning(
-                "VOICE_INPUT: On macOS, speech needs the ATOM.app bundle (usage strings in Info.plist). "
-                "Run via “Run ATOM.command” when it uses the bundle launcher — not raw `python main.py`.",
-            )
-        elif sys.platform != "darwin" and (
-            "PyAudio" in reason or "faster-whisper" in reason or "SpeechRecognition" in reason
-        ):
-            logger.warning(
-                "VOICE_INPUT: Install offline STT deps (`pip install faster-whisper SpeechRecognition "
-                "pyaudio`) for Whisper/Google paths on this platform.",
-            )
-        elif sys.platform == "darwin" and (
-            "PyAudio" in reason or "faster-whisper" in reason or "SpeechRecognition" in reason
-        ):
-            logger.warning(
-                "VOICE_INPUT: On macOS only Apple native STT is wired — use ATOM.app / Run ATOM.command "
-                "with stt.engine macos_native or auto.",
-            )
-        return DisabledSTT(reason)
-
-    def _build_google_stt():
-        """Build Google Online STT (primary — fast, free, accurate)."""
-        missing: list[str] = []
-        try:
-            import speech_recognition  # noqa: F401
-        except ImportError:
-            missing.append("SpeechRecognition")
-        try:
-            import pyaudio  # noqa: F401
-        except ImportError:
-            missing.append("PyAudio/PortAudio")
-
-        if missing:
-            return None, "Google STT dependencies missing: " + ", ".join(missing)
-
-        from voice.stt_google import STTGoogle
-
-        logger.info("STT: Google Online (free, fast, bilingual)")
-        return STTGoogle(
-            bus,
-            state,
-            config,
-            mic_manager=mic_manager,
-            intent_engine=intent_engine,
-        ), None
-
-    def _build_faster_whisper_stt():
-        """Build offline faster-whisper STT (fallback if no internet)."""
-        missing: list[str] = []
-        try:
-            import faster_whisper  # noqa: F401
-        except ImportError:
-            missing.append("faster-whisper")
-        try:
-            import speech_recognition  # noqa: F401
-        except ImportError:
-            missing.append("SpeechRecognition")
-        try:
-            import pyaudio  # noqa: F401
-        except ImportError:
-            missing.append("PyAudio/PortAudio")
-
-        if missing:
-            return _build_disabled_stt(
-                "Offline STT dependencies missing: " + ", ".join(missing),
-            )
-
-        from voice.stt_async import STTAsync
-
-        logger.info("STT: faster-whisper (offline fallback)")
-        return STTAsync(
-            bus,
-            state,
-            config,
-            mic_manager=mic_manager,
-            intent_engine=intent_engine,
-        )
-
-    def _build_native_stt():
-        from voice.stt_macos import NativeSTT, native_stt_launch_supported
-
-        native_ok, native_reason = native_stt_launch_supported()
-        if not native_ok:
-            return None, native_reason
-        return NativeSTT(
-            bus,
-            state,
-            config,
-            mic_manager=mic_manager,
-            intent_engine=intent_engine,
-        ), ""
-
-    # macOS: SFSpeechRecognizer + AVAudioEngine only (auto and macos_native are equivalent).
-    # Non-macOS: optional faster-whisper / Google chain (modules remain for tests and Linux).
-    logger.info("STT engine preference: %s (platform=%s)", stt_engine_pref, sys.platform)
-
-    if sys.platform == "darwin":
-        if stt_engine_pref in ("macos_native", "auto"):
-            native_stt, native_reason = _build_native_stt()
-            if native_stt is not None:
-                stt = native_stt
-                stt_runtime_label = "macOS Native (SFSpeechRecognizer)"
-                logger.info("STT: macOS Native — Apple stack only (no Whisper/Google on macOS)")
-            else:
-                stt_runtime_error = native_reason or ""
-                stt_runtime_fallbacks.append(f"native unavailable: {native_reason}")
-                stt = _build_disabled_stt(
-                    native_reason
-                    or "Native STT unavailable — use ATOM.app / Run ATOM.command (bundle launcher)",
-                )
-                stt_runtime_label = "Disabled"
-        elif stt_engine_pref in ("faster_whisper", "google_online", "google"):
-            msg = (
-                f"stt.engine={stt_engine_pref} is not used on macOS — use macos_native or auto "
-                "(SFSpeechRecognizer only in this build)"
-            )
-            stt_runtime_fallbacks.append(msg)
-            stt = _build_disabled_stt(msg)
-            stt_runtime_label = "Disabled"
-        else:
-            stt = _build_disabled_stt(f"Unknown STT engine: {stt_engine_pref}")
-            stt_runtime_label = "Disabled"
-    elif stt_engine_pref in ("google_online", "google"):
-        google_stt, google_err = _build_google_stt()
-        if google_stt is not None:
-            stt = google_stt
-            stt_runtime_label = "Google Online (free)"
-        else:
-            stt_runtime_error = google_err or ""
-            stt_runtime_fallbacks.append(f"google unavailable: {google_err}")
-            logger.warning("Google STT unavailable (%s) -- trying offline fallback", google_err)
-            stt = _build_faster_whisper_stt()
-            if type(stt).__name__ == "DisabledSTT":
-                stt_runtime_label = "Disabled"
-            else:
-                stt_runtime_label = "Faster-Whisper (offline fallback)"
-    elif stt_engine_pref == "auto":
-        stt = _build_faster_whisper_stt()
-        if type(stt).__name__ == "DisabledSTT":
-            whisper_reason = getattr(stt, "_reason", "offline fallback unavailable")
-            stt_runtime_fallbacks.append(f"offline unavailable: {whisper_reason}")
-            google_stt, google_err = _build_google_stt()
-            if google_stt is not None:
-                stt = google_stt
-                stt_runtime_label = "Google Online (auto fallback)"
-            else:
-                stt_runtime_fallbacks.append(f"google unavailable: {google_err}")
-                stt = _build_disabled_stt(
-                    f"Offline unavailable ({whisper_reason}); google unavailable ({google_err})"
-                )
-                stt_runtime_label = "Disabled"
-        else:
-            stt_runtime_label = "Faster-Whisper (auto)"
-    elif stt_engine_pref == "macos_native":
-        stt = _build_disabled_stt(
-            "macOS native STT (SFSpeechRecognizer) is only available on macOS",
-        )
-        stt_runtime_label = "Disabled"
-    elif stt_engine_pref == "faster_whisper":
-        stt = _build_faster_whisper_stt()
-        stt_runtime_label = (
-            "Disabled"
-            if type(stt).__name__ == "DisabledSTT"
-            else "Faster-Whisper (explicit)"
-        )
-    else:
-        stt = _build_disabled_stt(f"Unknown STT engine: {stt_engine_pref}")
-        stt_runtime_label = "Disabled"
-
-    logger.info("STT backend selected: %s", type(stt).__name__)
-    logger.info(
-        "VOICE_LAUNCH_DIAG: ATOM_LAUNCH_MODE=%s ATOM_APP_BUNDLE=%s label=%s",
-        os.environ.get("ATOM_LAUNCH_MODE", ""),
-        os.environ.get("ATOM_APP_BUNDLE", ""),
-        stt_runtime_label,
-    )
-
-    tts_cfg = config.get("tts", {})
-    tts_engine = (tts_cfg.get("engine") or "macos_native").lower()
-    tts_runtime_label = "macOS Native"
-    # Siri-like spoken output on Mac: NSSpeechSynthesizer / system neural voices (tts.engine=macos_native).
-    if sys.platform == "darwin" and tts_engine not in ("macos_native", "kokoro"):
-        logger.warning(
-            "TTS: engine=%r ignored on macOS — using macos_native",
-            tts_cfg.get("engine"),
-        )
-        tts_engine = "macos_native"
-
-    if tts_engine == "macos_native":
-        from voice.tts_macos import MacOSTTSAsync
-        tts = MacOSTTSAsync(
-            bus, state,
-            max_lines=tts_cfg.get("max_lines", 4),
-            voice=tts_cfg.get("macos_voice", "system"),
-            rate=tts_cfg.get("macos_rate", 200),
-        )
-        logger.info("TTS: macOS Native (voice=%s)", tts_cfg.get("macos_voice", "system"))
-        tts_runtime_label = f"macOS Native ({tts_cfg.get('macos_voice', 'system')})"
-    elif tts_engine == "kokoro":
-        from voice.tts_kokoro import KokoroTTSAsync
-        tts = KokoroTTSAsync(
-            bus, state,
-            max_lines=tts_cfg.get("max_lines", 4),
-            voice=tts_cfg.get("kokoro_voice", "af_heart")
-        )
-        logger.info(
-            "TTS: Kokoro Neural fallback (offline, %s)",
-            tts_cfg.get("kokoro_voice", "af_heart"),
-        )
-        tts_runtime_label = f"Kokoro fallback ({tts_cfg.get('kokoro_voice', 'af_heart')})"
-    else:
-        from voice.tts_edge import EdgeTTSAsync
-        tts = EdgeTTSAsync(
-            bus, state,
-            max_lines=tts_cfg.get("max_lines", 4),
-            voice=tts_cfg.get("edge_voice", "en-GB-RyanNeural"),
-            rate=tts_cfg.get("edge_rate", "+15%"),
-            enable_postprocess=tts_cfg.get("edge_postprocess", True),
-            enable_ack_cache=tts_cfg.get("edge_ack_cache", True),
-        )
-        logger.info(
-            "TTS: Edge Neural fallback (%s) -- macOS native remains preferred on Apple Silicon",
-            tts_cfg.get("edge_voice"),
-        )
-        tts_runtime_label = f"Edge fallback ({tts_cfg.get('edge_voice')})"
 
     # ── Boot order (runtime truth) ─────────────────────────────────
     # InferenceGuard + SiliconGovernor before CognitiveKernel so routing sees
@@ -2739,7 +2471,8 @@ def run_atom(config_overrides: dict | None = None) -> None:
             asyncio.run(main())
             if _restart_requested:
                 _restart_requested = False
-                shutdown_event.clear()
+                if shutdown_event is not None:
+                    shutdown_event.clear()
                 logger.info("Graceful restart requested (mode change) -- restarting ATOM...")
                 import time as _time
                 _time.sleep(2.0)
@@ -2766,7 +2499,8 @@ def run_atom(config_overrides: dict | None = None) -> None:
                 break
             import time as _time
             _time.sleep(backoff)
-            shutdown_event.clear()
+            if shutdown_event is not None:
+                shutdown_event.clear()
 
     set_config_overrides({})
 

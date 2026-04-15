@@ -76,6 +76,7 @@ class SpeechEnhancer:
 
     def __init__(self, base_rate: int = 200) -> None:
         self._base_rate = base_rate
+        self._pause_multiplier: float = 1.0
 
     def enhance(
         self,
@@ -138,12 +139,14 @@ class SpeechEnhancer:
     ) -> float:
         """Seconds to pause between sentences for natural rhythm."""
         if emotion in ("tired", "calm"):
-            return 0.12
-        if emotion in ("excited", "happy"):
-            return 0.04
-        if _RE_ELLIPSIS.search(sentence):
-            return 0.15
-        return 0.06
+            base = 0.12
+        elif emotion in ("excited", "happy"):
+            base = 0.04
+        elif _RE_ELLIPSIS.search(sentence):
+            base = 0.15
+        else:
+            base = 0.06
+        return base * self._pause_multiplier
 
 
 __all__ = ["SpeechEnhancer", "EnhancedSpeech"]

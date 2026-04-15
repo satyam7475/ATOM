@@ -28,27 +28,35 @@ class SpeechStyle:
 
 
 class SpeechStyleController:
-    """Decide TTS pacing from emotion + urgency signals."""
+    """Decide TTS pacing from emotion + urgency + adaptive feedback."""
 
     __slots__ = ()
 
-    def decide(self, emotion: EmotionResult, urgency: UrgencyResult) -> SpeechStyle:
+    def decide(
+        self,
+        emotion: EmotionResult,
+        urgency: UrgencyResult,
+        *,
+        rate_boost: float = 0.0,
+    ) -> SpeechStyle:
         if urgency.level == "high":
-            return SpeechStyle(rate_multiplier=1.20, pause_multiplier=0.4)
+            base = SpeechStyle(rate_multiplier=1.20, pause_multiplier=0.4)
+        elif urgency.level == "low" and emotion.label in ("neutral", "calm"):
+            base = SpeechStyle(rate_multiplier=0.92, pause_multiplier=1.5)
+        elif emotion.label in ("frustrated", "angry"):
+            base = SpeechStyle(rate_multiplier=1.10, pause_multiplier=0.6)
+        elif emotion.label == "stressed":
+            base = SpeechStyle(rate_multiplier=1.05, pause_multiplier=0.7)
+        elif emotion.label == "happy":
+            base = SpeechStyle(rate_multiplier=1.05, pause_multiplier=0.9)
+        elif emotion.label == "sad":
+            base = SpeechStyle(rate_multiplier=0.88, pause_multiplier=1.8)
+        else:
+            base = SpeechStyle(rate_multiplier=1.0, pause_multiplier=1.0)
 
-        if urgency.level == "low" and emotion.label in ("neutral", "calm"):
-            return SpeechStyle(rate_multiplier=0.92, pause_multiplier=1.5)
-
-        if emotion.label in ("frustrated", "angry"):
-            return SpeechStyle(rate_multiplier=1.10, pause_multiplier=0.6)
-
-        if emotion.label == "stressed":
-            return SpeechStyle(rate_multiplier=1.05, pause_multiplier=0.7)
-
-        if emotion.label == "happy":
-            return SpeechStyle(rate_multiplier=1.05, pause_multiplier=0.9)
-
-        if emotion.label == "sad":
-            return SpeechStyle(rate_multiplier=0.88, pause_multiplier=1.8)
-
-        return SpeechStyle(rate_multiplier=1.0, pause_multiplier=1.0)
+        if rate_boost:
+            return SpeechStyle(
+                rate_multiplier=round(base.rate_multiplier + rate_boost, 3),
+                pause_multiplier=base.pause_multiplier,
+            )
+        return base

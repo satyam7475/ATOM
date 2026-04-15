@@ -139,6 +139,12 @@ class Router:
         # so stale tokens from a cancelled stream are discarded.
         self._cloud_stream_generation: int = 0
 
+        # Adaptive perception profile — updated by perception_adaptive events.
+        self._perception_concise: bool = False
+
+        # Phase 2 Adaptive Intelligence Engine (wired via attach_adaptive_engine)
+        self._adaptive: Any = None
+
         # v22: Cloud intelligence components (wired via attach_cloud_intelligence)
         self._gemini_client: Any = None
         self._search_tool: Any = None
@@ -183,6 +189,11 @@ class Router:
         """Wire the centralized background task manager."""
         self._task_manager = task_manager
         logger.info("TaskManager attached to Router")
+
+    def attach_adaptive_engine(self, adaptive: Any) -> None:
+        """Wire the Phase 2 Adaptive Intelligence Engine."""
+        self._adaptive = adaptive
+        logger.info("AdaptiveEngine attached to Router")
 
     def attach_context_layer(
         self,
@@ -261,8 +272,11 @@ class Router:
             logger.debug("Router recovery hook failed", exc_info=True)
 
     def _emit_response(self, text: str, **kw) -> None:
-        """Emit response through adaptive output polishing."""
-        polished = personality.polish_response(text or "", source="router")
+        """Emit response through adaptive shaping + output polishing."""
+        out = text or ""
+        if self._adaptive is not None:
+            out, _speech = self._adaptive.process_response(out)
+        polished = personality.polish_response(out, source="router")
         self._bus.emit_long("response_ready", text=polished, **kw)
 
     def _emit_thinking_ack(self, text: str) -> None:
@@ -1833,6 +1847,16 @@ class Router:
             "You call him 'Boss'. You are friendly, witty, concise, and helpful. "
             "Keep responses short and conversational unless asked for detail."
         )
+
+        _adaptive_concise = (
+            self._adaptive is not None and self._adaptive.should_be_concise()
+        )
+        if self._perception_concise or _adaptive_concise:
+            default_system += (
+                " The user has been interrupting or seems impatient—"
+                "keep this response very brief (1-2 sentences max)."
+            )
+
         try:
             full_text, ok = await self._gemini_client.ask_streaming(
                 original_text,
@@ -1848,6 +1872,17 @@ class Router:
             logger.exception("Cloud streaming failed — emitting error response")
             if my_generation == self._cloud_stream_generation:
                 self._emit_response("Cloud request failed, Boss. Try again.")
+
+    # ── Perception adaptive profile ─────────────────────────────────
+
+    def apply_perception_profile(
+        self,
+        concise: bool = False,
+        rate_boost: float = 0.0,
+        **_kw: Any,
+    ) -> None:
+        """Called from the bus when the perception layer updates its profile."""
+        self._perception_concise = concise
 
     # ── Contextual follow-up ────────────────────────────────────────
 

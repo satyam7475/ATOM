@@ -59,6 +59,7 @@ class PriorityEventBus:
         self._queue: asyncio.PriorityQueue | None = None
         self._worker_task: asyncio.Task | None = None
         self._priority_cache: dict[str, int] = {}
+        self._seq: int = 0
 
 class AsyncEventBus(PriorityEventBus):
     """Full event bus implementation with priority dispatch and error isolation.
@@ -132,7 +133,7 @@ class AsyncEventBus(PriorityEventBus):
         while True:
             try:
                 # PriorityQueue returns the lowest integer first
-                priority, _, event, data, emit_type = await self._queue.get()
+                priority, _, _seq, event, data, emit_type = await self._queue.get()
                 self._dispatch(event, data, emit_type)
                 self._queue.task_done()
             except asyncio.CancelledError:
@@ -208,21 +209,24 @@ class AsyncEventBus(PriorityEventBus):
         if not self._queue:
             self.start()
         priority = self._get_priority(event)
-        self._queue.put_nowait((priority, time.monotonic(), event, data, "normal"))
+        self._seq += 1
+        self._queue.put_nowait((priority, time.monotonic(), self._seq, event, data, "normal"))
 
     def emit_fast(self, event: str, **data: Any) -> None:
         """Queue event for fast processing."""
         if not self._queue:
             self.start()
         priority = self._get_priority(event)
-        self._queue.put_nowait((priority, time.monotonic(), event, data, "fast"))
+        self._seq += 1
+        self._queue.put_nowait((priority, time.monotonic(), self._seq, event, data, "fast"))
 
     def emit_long(self, event: str, **data: Any) -> None:
         """Queue event for long processing."""
         if not self._queue:
             self.start()
         priority = self._get_priority(event)
-        self._queue.put_nowait((priority, time.monotonic(), event, data, "long"))
+        self._seq += 1
+        self._queue.put_nowait((priority, time.monotonic(), self._seq, event, data, "long"))
 
     @staticmethod
     async def _long_call(handler: EventHandler, event: str,

@@ -418,6 +418,7 @@ class MacOSTTSAsync:
         self._stream_generation: int = 0
         self._stream_speak_buffer: str = ""
         self._stream_start_t: float = 0.0
+        self._tts_interrupt_count: int = 0
 
         from voice.speech_enhancer import SpeechEnhancer
         self._enhancer = SpeechEnhancer(base_rate=rate)
@@ -484,7 +485,12 @@ class MacOSTTSAsync:
                 stdout=asyncio.subprocess.DEVNULL,
                 stderr=asyncio.subprocess.DEVNULL,
             )
-            await self._say_proc.wait()
+            try:
+                await asyncio.wait_for(self._say_proc.wait(), timeout=10.0)
+            except asyncio.TimeoutError:
+                logger.warning("say process timed out after 10s, killing")
+                self._say_proc.kill()
+                await self._say_proc.wait()
         except asyncio.CancelledError:
             await self._kill_procs()
             raise
@@ -715,7 +721,9 @@ class MacOSTTSAsync:
                 words_spoken=self._spoken_word_count,
                 duration_ms=round(stream_duration_ms, 1),
                 backend=self._backend,
+                interrupt_count=self._tts_interrupt_count,
             )
+            self._tts_interrupt_count = 0
             self._bus.emit("tts_complete")
 
     # ── Internal speak (no tts_complete emission) ──────────────────
@@ -772,7 +780,7 @@ class MacOSTTSAsync:
             finally:
                 self._playing = False
                 if self._native_synth:
-                    self._native_synth._rate = float(self._rate)
+                    self._native_synth._rate = float(self._enhancer._base_rate)
 
     # ── Public API ─────────────────────────────────────────────────
 
@@ -806,13 +814,15 @@ class MacOSTTSAsync:
         rate_multiplier: float = 1.0,
         pause_multiplier: float = 1.0,
     ) -> None:
-        """Adapt speech pacing from PerceptionEngine style decisions.
+        """Adapt speech pacing from merged perception + adaptive params.
 
-        Adjusts the SpeechEnhancer base rate so urgency and emotion
-        flow through the existing enhancement pipeline.
+        Adjusts the SpeechEnhancer base rate and pause multiplier so
+        urgency, emotion, and learned preferences flow through the
+        existing enhancement pipeline.
         """
         new_rate = int(self._rate * max(0.7, min(1.4, rate_multiplier)))
         self._enhancer._base_rate = new_rate
+        self._enhancer._pause_multiplier = max(0.3, min(2.0, pause_multiplier))
         if self._native_synth is not None:
             self._native_synth._rate = float(new_rate)
         logger.debug(
@@ -838,6 +848,7 @@ class MacOSTTSAsync:
         self._cancel_requested = True
         self._playing = False
         self._stream_generation += 1
+        self._tts_interrupt_count += 1
         self._stream_speak_buffer = ""
         self._chunk_buffer.clear()
         self._screen_buffer.clear()

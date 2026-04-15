@@ -279,6 +279,7 @@ class CommandLoop:
                 trace_id=trace_id,
                 stage="cancelled",
             )
+            raise
         except Exception as exc:
             self._total_errors += 1
             elapsed_ms = (time.perf_counter() - t0) * 1000

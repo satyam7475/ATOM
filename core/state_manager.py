@@ -51,6 +51,7 @@ VALID_TRANSITIONS: dict[AtomState, frozenset[AtomState]] = {
     }),
     AtomState.IDLE: frozenset({
         AtomState.LISTENING,
+        AtomState.THINKING,
         AtomState.SLEEP,
     }),
     AtomState.LISTENING: frozenset({

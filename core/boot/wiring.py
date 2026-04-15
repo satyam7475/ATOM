@@ -132,30 +132,82 @@ def wire_events(
             "TTS delivery: %d words, %.0fms, backend=%s",
             words_spoken, duration_ms, backend,
         )
+        await perception.on_tts_delivery_metrics(
+            words_spoken=words_spoken,
+            duration_ms=duration_ms,
+        )
 
-    bus.on("state_changed", _perception_tts_start)
-    bus.on("tts_complete", _perception_tts_end)
-    bus.on("tts_delivery_metrics", _on_tts_delivery_metrics)
+    bus.on("state_changed", _guard_handler(
+        "state_changed", _perception_tts_start,
+        source="perception.tts_start",
+    ))
+    bus.on("tts_complete", _guard_handler(
+        "tts_complete", _perception_tts_end,
+        source="perception.tts_end",
+    ))
+    bus.on("tts_delivery_metrics", _guard_handler(
+        "tts_delivery_metrics", _on_tts_delivery_metrics,
+        source="perception.delivery_metrics",
+    ))
 
+    # ── SpeechController (single merge point for TTS params) ────────
+    from core.speech_controller import SpeechController
+
+    speech_ctrl = SpeechController()
     _perception_style_applied = {"locked": False}
+
+    def _apply_merged_style() -> None:
+        """Push the composed perception+adaptive params to TTS."""
+        if hasattr(tts, "apply_perception_style"):
+            merged = speech_ctrl.merged()
+            tts.apply_perception_style(
+                rate_multiplier=merged["rate_multiplier"],
+                pause_multiplier=merged["pause_multiplier"],
+            )
 
     async def _on_perception_result(
         emotion=None, urgency=None, style=None, **_kw,
     ) -> None:
         if _perception_style_applied["locked"]:
             return
-        if style is not None and hasattr(tts, "apply_perception_style"):
-            tts.apply_perception_style(
+        if style is not None:
+            speech_ctrl.set_perception(
                 rate_multiplier=style.rate_multiplier,
                 pause_multiplier=style.pause_multiplier,
             )
+            _apply_merged_style()
             _perception_style_applied["locked"] = True
 
     async def _unlock_perception_style(**_kw) -> None:
         _perception_style_applied["locked"] = False
+        speech_ctrl.reset()
 
-    bus.on("perception_result", _on_perception_result)
-    bus.on("tts_complete", _unlock_perception_style)
+    bus.on("perception_result", _guard_handler(
+        "perception_result", _on_perception_result,
+        source="speech_ctrl.on_perception_result",
+    ))
+    bus.on("tts_complete", _guard_handler(
+        "tts_complete", _unlock_perception_style,
+        source="speech_ctrl.unlock",
+    ))
+
+    async def _on_perception_adaptive(
+        concise: bool = False, rate_boost: float = 0.0,
+        session_stats: dict | None = None, **_kw,
+    ) -> None:
+        router.apply_perception_profile(concise=concise, rate_boost=rate_boost)
+        if session_stats:
+            logger.debug(
+                "Session stats: int_rate=%.2f frust=%.2f avg_dur=%.0fms",
+                session_stats.get("interrupt_rate", 0),
+                session_stats.get("frustration_score", 0),
+                session_stats.get("avg_duration_ms", 0),
+            )
+
+    bus.on("perception_adaptive", _guard_handler(
+        "perception_adaptive", _on_perception_adaptive,
+        source="speech_ctrl.on_perception_adaptive",
+    ))
 
     async def _on_interrupt_predicted(**_kw) -> None:
         await voice_interrupt.interrupt_to_listening(
@@ -172,6 +224,46 @@ def wire_events(
             source="perception.interrupt_predicted",
         ),
     )
+
+    # ── Adaptive Intelligence Engine (Phase 2) ────────────────────
+    from core.adaptive.engine import AdaptiveEngine
+
+    adaptive = AdaptiveEngine(bus)
+
+    bus.on(
+        "perception_result",
+        _guard_handler(
+            "perception_result",
+            adaptive.on_perception,
+            source="adaptive.on_perception",
+        ),
+    )
+    bus.on(
+        "tts_delivery_metrics",
+        _guard_handler(
+            "tts_delivery_metrics",
+            adaptive.on_tts_delivery_metrics,
+            source="adaptive.on_tts_delivery_metrics",
+        ),
+    )
+
+    async def _on_adaptive_speech_update(
+        rate_multiplier: float = 1.0,
+        pause_multiplier: float = 1.0,
+        **_kw,
+    ) -> None:
+        speech_ctrl.set_adaptive(
+            rate_multiplier=rate_multiplier,
+            pause_multiplier=pause_multiplier,
+        )
+        _apply_merged_style()
+
+    bus.on("adaptive_speech_update", _guard_handler(
+        "adaptive_speech_update", _on_adaptive_speech_update,
+        source="speech_ctrl.on_adaptive_speech_update",
+    ))
+
+    router.attach_adaptive_engine(adaptive)
 
     bus.on(
         "state_changed",

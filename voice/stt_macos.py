@@ -653,8 +653,8 @@ class NativeSTT:
                 )
         with self._recognition_lock:
             req = self._recognition_request
-        if req is not None:
-            req.appendAudioPCMBuffer_(buffer)
+            if req is not None:
+                req.appendAudioPCMBuffer_(buffer)
 
     def _recognition_result_handler(self, *args: Any) -> None:
         """Called by SFSpeechRecognizer with partial/final results.
@@ -687,7 +687,12 @@ class NativeSTT:
             if "kAFAssistantErrorDomain" in err_desc or "216" in err_desc:
                 logger.debug("Recognition (cancel/expected): %s", err_desc)
             else:
-                logger.warning("STT recognition error: %s", err_desc)
+                logger.warning("STT recognition error: %s — attempting auto-restart", err_desc)
+                try:
+                    self._restart_recognition_chain()
+                except Exception:
+                    logger.warning("STT auto-restart after error failed, will retry via async loop")
+                    self._listening = False
             return
 
         if result is None:
@@ -771,8 +776,9 @@ class NativeSTT:
                 new_req, block,
             )
             if new_task is None:
-                logger.warning("Native STT: recognition restart returned nil task — may need to stop/start listening")
+                logger.warning("Native STT: recognition restart returned nil task — forcing full restart")
                 self._last_error = "Speech recognition task nil on restart"
+                self._listening = False
                 return
             with self._recognition_lock:
                 self._recognition_request = new_req
@@ -781,7 +787,8 @@ class NativeSTT:
             logger.debug("Native STT: recognition chain restarted for next utterance")
         except Exception as exc:
             self._last_error = str(exc)
-            logger.warning("STT: failed to restart recognition chain: %s", exc)
+            logger.warning("STT: failed to restart recognition chain: %s — forcing full restart", exc)
+            self._listening = False
 
     def _emit_threadsafe(self, callback: Callable, arg: Any) -> None:
         """Safely call a callback from the recognition thread."""
@@ -998,6 +1005,19 @@ class NativeSTT:
                     await asyncio.sleep(5.0)
                     continue
                 retries = 0
+            elif self._last_speech_time > 0:
+                idle_s = time.monotonic() - self._last_speech_time
+                if idle_s > _MAX_RECORD_S:
+                    logger.info(
+                        "STT: no speech for %.1fs (max=%.1fs) — restarting recognition chain",
+                        idle_s, _MAX_RECORD_S,
+                    )
+                    self._last_speech_time = time.monotonic()
+                    try:
+                        self._restart_recognition_chain()
+                    except Exception:
+                        logger.warning("STT: timeout restart failed, forcing full restart")
+                        self._listening = False
             await asyncio.sleep(0.5)
 
     def stop(self) -> None:

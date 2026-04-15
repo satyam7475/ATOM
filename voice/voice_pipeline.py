@@ -449,7 +449,13 @@ class VoicePipeline:
             stop_fn = getattr(self.tts, "shutdown", getattr(self.tts, "stop", None))
             if callable(stop_fn):
                 try:
-                    stop_fn()
+                    result = stop_fn()
+                    if asyncio.iscoroutine(result):
+                        try:
+                            loop = asyncio.get_running_loop()
+                            loop.create_task(result)
+                        except RuntimeError:
+                            asyncio.get_event_loop().run_until_complete(result)
                 except Exception:
                     logger.debug("TTS shutdown error", exc_info=True)
         logger.info("VoicePipeline shutdown complete")
