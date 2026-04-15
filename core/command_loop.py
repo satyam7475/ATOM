@@ -52,6 +52,7 @@ class CommandLoop:
         "_system_state_engine", "_session_memory",
         "_ack_engine", "_pipeline_metrics",
         "_intent_continuity", "_parallel_pipeline",
+        "_suggestion_engine",
     )
 
     def __init__(
@@ -78,6 +79,7 @@ class CommandLoop:
         self._pipeline_metrics: Any = None
         self._intent_continuity: Any = None
         self._parallel_pipeline: Any = None
+        self._suggestion_engine: Any = None
 
     def attach_system_state(self, engine: Any) -> None:
         self._system_state_engine = engine
@@ -96,6 +98,9 @@ class CommandLoop:
 
     def attach_parallel_pipeline(self, pipeline: Any) -> None:
         self._parallel_pipeline = pipeline
+
+    def attach_suggestion_engine(self, engine: Any) -> None:
+        self._suggestion_engine = engine
 
     @property
     def execution_lock(self) -> ExecutionLock:
@@ -221,6 +226,28 @@ class CommandLoop:
                     self._intent_continuity.on_command_complete(text)
                 except Exception:
                     logger.debug("Intent continuity update failed", exc_info=True)
+
+            # ── Inline suggestion (delayed so it doesn't collide) ────
+            if self._suggestion_engine is not None:
+                try:
+                    active_app = ""
+                    if self._system_state_engine is not None:
+                        active_app = self._system_state_engine.snapshot.active_app
+                    suggestion = self._suggestion_engine.suggest(
+                        text,
+                        active_app=active_app,
+                    )
+                    if suggestion:
+                        async def _emit_suggestion(s: str = suggestion) -> None:
+                            await asyncio.sleep(2.0)
+                            self._bus.emit_fast(
+                                "response_ready",
+                                text=s,
+                                priority="low",
+                            )
+                        asyncio.create_task(_emit_suggestion())
+                except Exception:
+                    logger.debug("Suggestion engine failed", exc_info=True)
 
             elapsed_ms = (time.perf_counter() - t0) * 1000
             self._bus.emit_fast(

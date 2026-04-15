@@ -129,6 +129,7 @@ class Router:
 
         self._cognitive_kernel: CognitiveKernel | None = None
         self._runtime_watchdog: RuntimeWatchdog | None = None
+        self._task_manager: Any = None
 
         self._system_state_engine: Any = None
         self._session_memory: Any = None
@@ -173,6 +174,11 @@ class Router:
         """Wire RuntimeWatchdog so hot router stages use active budgets."""
         self._runtime_watchdog = watchdog
         logger.info("RuntimeWatchdog attached to Router")
+
+    def attach_task_manager(self, task_manager: Any) -> None:
+        """Wire the centralized background task manager."""
+        self._task_manager = task_manager
+        logger.info("TaskManager attached to Router")
 
     def attach_context_layer(
         self,
@@ -1665,6 +1671,34 @@ class Router:
                 context_bundle = self._context.get_bundle()
             except Exception:
                 logger.debug("Context bundle retrieval failed", exc_info=True)
+
+        # Inject real-time context from SystemStateEngine, SessionMemory, UserMemory
+        if self._system_state_engine is not None:
+            try:
+                ctx_str = self._system_state_engine.get_context_string()
+                if ctx_str:
+                    context_bundle = dict(context_bundle or {})
+                    context_bundle["system_state"] = ctx_str
+            except Exception:
+                logger.debug("System state context injection failed", exc_info=True)
+
+        if self._session_memory is not None:
+            try:
+                sess_str = self._session_memory.context_for_prompt()
+                if sess_str:
+                    context_bundle = dict(context_bundle or {})
+                    context_bundle["recent_commands"] = sess_str
+            except Exception:
+                logger.debug("Session memory context injection failed", exc_info=True)
+
+        if self._user_memory is not None:
+            try:
+                user_str = self._user_memory.context_for_prompt()
+                if user_str:
+                    context_bundle = dict(context_bundle or {})
+                    context_bundle["user_profile"] = user_str
+            except Exception:
+                logger.debug("User memory context injection failed", exc_info=True)
 
         if self._conv_memory is not None:
             summ = self._conv_memory.summary_for_prompt()

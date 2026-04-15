@@ -96,6 +96,14 @@ class SpeechEnhancer:
         """Dynamic rate based on content type and emotional context."""
         rate = self._base_rate
         lower = text.lower()
+        word_count = len(lower.split())
+
+        # Short confirmations (≤6 words, e.g. "Done, Boss.") -> speak faster
+        if word_count <= 6:
+            rate += 20
+        # Long explanations (≥40 words) -> slow down for clarity
+        elif word_count >= 40:
+            rate -= 15
 
         if _RE_QUESTION.search(text):
             rate -= 20
@@ -106,7 +114,7 @@ class SpeechEnhancer:
         if words & _ERROR_WORDS:
             rate -= 25
         elif words & _URGENT_WORDS:
-            rate += 20
+            rate += 30
         elif words & _SUCCESS_WORDS:
             rate += 10
 

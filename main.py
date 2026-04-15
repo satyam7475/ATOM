@@ -1647,6 +1647,16 @@ async def main() -> None:
         user_memory=user_memory,
     )
 
+    # ── Suggestion Engine: inline post-command follow-ups ──────────
+    from core.suggestion_engine import SuggestionEngine
+    suggestion_engine = SuggestionEngine()
+    command_loop.attach_suggestion_engine(suggestion_engine)
+
+    # ── Task Manager: centralized background task tracking ─────────
+    from core.task_manager import TaskManager
+    task_manager = TaskManager()
+    router.attach_task_manager(task_manager)
+
     # ── Wire all event handlers (extracted for testability) ────────
     _wiring_ctx = wire_events(
         bus=bus, state=state, state_bridge=atom_runtime, shutdown_event=shutdown_event, stt=stt, tts=tts, router=router,
