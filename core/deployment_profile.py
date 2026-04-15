@@ -10,6 +10,7 @@ Owner: Satyam
 from __future__ import annotations
 
 import logging
+import sys
 from typing import Any
 
 logger = logging.getLogger("atom.deployment")
@@ -50,9 +51,13 @@ def audit_corporate_alignment(config: dict[str, Any]) -> list[str]:
 
     stt = config.get("stt", {}) or {}
     eng = (stt.get("engine") or "auto").lower()
-    if eng not in ("auto", "macos_native", "faster_whisper"):
+    if eng not in ("auto", "macos_native", "faster_whisper", "google_online", "google"):
         warnings.append(
-            f"stt.engine is {eng} — supported: auto, macos_native, faster_whisper.",
+            f"stt.engine is {eng} — supported: auto, macos_native, faster_whisper, google_online, google.",
+        )
+    if sys.platform == "darwin" and eng in ("faster_whisper", "google_online", "google"):
+        warnings.append(
+            f"stt.engine is {eng} — on macOS only Apple native STT runs; use auto or macos_native.",
         )
 
     tts = config.get("tts", {}) or {}

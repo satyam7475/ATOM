@@ -89,16 +89,85 @@ def warm_up_memory(memory_engine: Any) -> None:
         logger.debug("Memory warm-up failed (non-fatal)", exc_info=True)
 
 
+def warm_up_system_state(system_state_engine: Any) -> None:
+    """Take the first snapshot so the first command has context."""
+    try:
+        t0 = time.perf_counter()
+        system_state_engine._capture()
+        ms = (time.perf_counter() - t0) * 1000
+        logger.info("System state warm-up: %.1fms", ms)
+    except Exception:
+        logger.debug("System state warm-up failed (non-fatal)", exc_info=True)
+
+
 def startup_warm_up(
     intent_engine: Any,
     cache: Any,
     memory: Any,
     config: dict[str, Any] | None = None,
+    system_state_engine: Any = None,
 ) -> None:
     """Eagerly warm up hot paths. Call once after all modules are built."""
     t0 = time.perf_counter()
     warm_up_intent_engine(intent_engine)
     warm_up_cache(cache)
     warm_up_memory(memory)
+    if system_state_engine is not None:
+        warm_up_system_state(system_state_engine)
     ms = (time.perf_counter() - t0) * 1000
     logger.info("Fast-path warm-up complete: %.0fms", ms)
+
+
+class ParallelPipeline:
+    """Overlap STT finalization with intent pre-classification.
+
+    When STT emits a partial transcript with high confidence, the pipeline
+    can speculatively start intent classification and cache lookup in
+    parallel, so by the time ``speech_final`` fires, the intent result
+    is already available.
+    """
+
+    def __init__(self, intent_engine: Any, cache: Any) -> None:
+        self._intent = intent_engine
+        self._cache = cache
+        self._prefetched: dict[str, Any] = {}
+        self._prefetch_count = 0
+        self._hit_count = 0
+
+    async def on_speech_partial(self, text: str = "", confidence: float = 0.0, **_kw: Any) -> None:
+        """Called on partial STT results. Pre-classifies if confidence is high."""
+        import asyncio
+
+        text = (text or "").strip()
+        if not text or len(text) < 4 or confidence < 0.7:
+            return
+
+        norm = text.lower().strip()
+        if norm in self._prefetched:
+            return
+
+        loop = asyncio.get_running_loop()
+        try:
+            result = await loop.run_in_executor(None, self._intent.classify, text)
+            self._prefetched[norm] = result
+            self._prefetch_count += 1
+            if len(self._prefetched) > 20:
+                oldest = next(iter(self._prefetched))
+                del self._prefetched[oldest]
+        except Exception:
+            pass
+
+    def get_prefetched(self, text: str) -> Any:
+        """Retrieve a pre-classified intent if available."""
+        norm = text.lower().strip()
+        result = self._prefetched.pop(norm, None)
+        if result is not None:
+            self._hit_count += 1
+        return result
+
+    def get_diagnostics(self) -> dict[str, int]:
+        return {
+            "prefetch_count": self._prefetch_count,
+            "hit_count": self._hit_count,
+            "pending": len(self._prefetched),
+        }

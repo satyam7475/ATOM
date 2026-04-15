@@ -67,3 +67,28 @@ def tier_allowed(action: str, max_tier: int) -> tuple[bool, str]:
         f"Permission tier: '{action}' requires tier {t}, but security.mode allows "
         f"up to tier {max_tier}.",
     )
+
+
+def is_escalatable(action: str, max_tier: int) -> bool:
+    """True if this action can be escalated via user confirmation.
+
+    Tier-4 actions blocked by strict mode are escalatable (e.g. shutdown).
+    This lets the UX prompt the user instead of silently blocking.
+    """
+    t = action_tier(action)
+    return t > max_tier and t <= 4
+
+
+def escalation_prompt(action: str) -> str:
+    """Human-friendly prompt asking the user to confirm a tier escalation."""
+    labels = {
+        "shutdown_pc": "shut down this Mac",
+        "restart_pc": "restart this Mac",
+        "logoff": "log you out",
+        "sleep_pc": "put this Mac to sleep",
+        "kill_process": "force-kill a process",
+        "empty_recycle_bin": "empty the trash",
+        "flush_dns": "flush the DNS cache",
+    }
+    desc = labels.get(action, action.replace("_", " "))
+    return f"That needs elevated permission to {desc}, Boss. Should I go ahead?"

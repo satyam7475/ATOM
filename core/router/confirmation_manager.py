@@ -43,7 +43,8 @@ class ConfirmationManager:
     """Manages pending action and tool confirmations with timeouts."""
 
     __slots__ = (
-        "_pending_action", "_pending_tool", "_security", "_registry",
+        "_pending_action", "_pending_tool", "_pending_escalation",
+        "_security", "_registry",
         "_action_timeout_s", "_tool_timeout_s",
     )
 
@@ -60,12 +61,17 @@ class ConfirmationManager:
         self._registry = registry or get_tool_registry()
         self._pending_action: dict | None = None
         self._pending_tool: dict | None = None
+        self._pending_escalation: dict | None = None
         self._action_timeout_s = action_timeout_s
         self._tool_timeout_s = tool_timeout_s
 
     @property
     def has_pending(self) -> bool:
-        return self._pending_action is not None or self._pending_tool is not None
+        return (
+            self._pending_action is not None
+            or self._pending_tool is not None
+            or self._pending_escalation is not None
+        )
 
     # ── Action confirmations ──────────────────────────────────────────
 
@@ -94,7 +100,9 @@ class ConfirmationManager:
     def handle(self, confirm_intent: str) -> ConfirmationResult:
         """Resolve a pending confirmation with confirm/deny."""
 
-        # Tool confirmations take priority
+        if self._pending_escalation is not None:
+            return self.handle_escalation(confirm_intent)
+
         if self._pending_tool is not None:
             return self._resolve_tool(confirm_intent)
 
@@ -156,10 +164,62 @@ class ConfirmationManager:
             resolved=True, tool_call=tool_call,
         )
 
+    # ── Tier escalation ─────────────────────────────────────────────
+
+    def set_pending_escalation(self, action: str, result: Any) -> str:
+        """Stage a tier-blocked action for user confirmation.
+
+        Returns the voice prompt to speak.
+        """
+        from core.security_tiers import escalation_prompt
+
+        self._pending_escalation = {
+            "action": action,
+            "result": result,
+            "created_at": time.monotonic(),
+        }
+        return escalation_prompt(action)
+
+    def handle_escalation(self, confirm_intent: str) -> ConfirmationResult:
+        """Resolve a pending tier escalation."""
+        if self._pending_escalation is None:
+            return ConfirmationResult(resolved=False)
+
+        age = time.monotonic() - self._pending_escalation.get("created_at", 0)
+        if age > self._action_timeout_s:
+            self._pending_escalation = None
+            return ConfirmationResult(
+                resolved=True, timed_out=True,
+                response="Escalation timed out. Say it again, Boss.",
+            )
+
+        action = self._pending_escalation.get("action", "")
+        result = self._pending_escalation.get("result")
+        self._pending_escalation = None
+
+        if confirm_intent == "deny":
+            self._audit_confirmation(result, "escalation_denied")
+            return ConfirmationResult(
+                resolved=True, denied=True,
+                response="Okay Boss, cancelled.",
+            )
+
+        if self._security is not None:
+            self._security.grant_one_time_escalation(action)
+        self._audit_confirmation(result, "escalation_confirmed")
+        return ConfirmationResult(
+            resolved=True, action_result=result,
+        )
+
+    @property
+    def has_pending_escalation(self) -> bool:
+        return self._pending_escalation is not None
+
     def clear(self) -> None:
         """Clear all pending confirmations."""
         self._pending_action = None
         self._pending_tool = None
+        self._pending_escalation = None
 
     @staticmethod
     def _audit_confirmation(result: Any, outcome: str) -> None:

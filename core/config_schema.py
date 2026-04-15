@@ -43,7 +43,7 @@ CONFIG_SCHEMA: dict[str, Any] = {
                 "engine": {
                     "type": "string",
                     "enum": ["auto", "macos_native", "faster_whisper", "google_online", "google"],
-                    "description": "STT engine: auto (native -> whisper -> google on macOS), macos_native, faster_whisper, google_online",
+                    "description": "STT: on macOS, auto and macos_native use SFSpeechRecognizer only; faster_whisper/google_* are for non-macOS or legacy configs (ignored on macOS).",
                 },
                 "whisper_model_size": {
                     "type": "string",
@@ -143,7 +143,7 @@ CONFIG_SCHEMA: dict[str, Any] = {
                         "google_online",
                         "google",
                     ],
-                    "description": "When ATOM_LAUNCH_MODE=venv, skip native macOS STT and prefer this engine first (explicit dev path; does not fake native APIs).",
+                    "description": "Legacy / no-op on macOS (native-only STT). Reserved for non-macOS tooling.",
                 },
                 "barge_in_during_speak": {
                     "type": "boolean",
@@ -1422,8 +1422,16 @@ def _basic_validation(config: dict) -> list[str]:
         errors.append("stt: must be an object")
     else:
         engine = stt.get("engine")
-        if engine is not None and engine not in ("auto", "macos_native", "faster_whisper"):
-            errors.append(f"stt.engine: must be auto/macos_native/faster_whisper, got {engine}")
+        if engine is not None and engine not in (
+            "auto",
+            "macos_native",
+            "faster_whisper",
+            "google_online",
+            "google",
+        ):
+            errors.append(
+                f"stt.engine: must be auto/macos_native/faster_whisper/google_online/google, got {engine}"
+            )
 
         chunk = stt.get("chunk_size")
         if chunk is not None and (not isinstance(chunk, int)

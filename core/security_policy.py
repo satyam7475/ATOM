@@ -225,6 +225,7 @@ class SecurityPolicy:
         from core.security_tiers import max_tier_for_security_mode
 
         self._max_action_tier: int = max_tier_for_security_mode(self._mode)
+        self._escalation_tokens: set[str] = set()
 
         from core.execution.behavior_monitor import BehaviorMonitor
 
@@ -288,12 +289,19 @@ class SecurityPolicy:
             self.audit_log(action, reason, success=False)
             return False, reason
 
-        from core.security_tiers import tier_allowed
+        from core.security_tiers import tier_allowed, is_escalatable
 
-        tier_ok, tier_reason = tier_allowed(action, self._max_action_tier)
-        if not tier_ok:
-            self.audit_log(action, tier_reason, success=False)
-            return False, tier_reason
+        if action in self._escalation_tokens:
+            self._escalation_tokens.discard(action)
+            self.audit_log(action, "escalation_token_consumed", success=True)
+            logger.info("Escalation token consumed for '%s'", action)
+        else:
+            tier_ok, tier_reason = tier_allowed(action, self._max_action_tier)
+            if not tier_ok:
+                if is_escalatable(action, self._max_action_tier):
+                    tier_reason = f"ESCALATABLE|{tier_reason}"
+                self.audit_log(action, tier_reason, success=False)
+                return False, tier_reason
 
         ok, p1_reason = self._phase1_policy_checks(action, args, policy_context=policy_context)
         if not ok:
@@ -347,6 +355,16 @@ class SecurityPolicy:
                 return False, reason
 
         return True, "ok"
+
+    def grant_one_time_escalation(self, action: str) -> None:
+        """Grant a one-time tier escalation for a specific action.
+
+        The token is consumed on the next allow_action call for this action.
+        Used by ConfirmationManager after the user confirms a tier-blocked command.
+        """
+        self._escalation_tokens.add(action)
+        self.audit_log(action, "escalation_granted", success=True)
+        logger.info("One-time escalation granted for '%s'", action)
 
     def _phase1_policy_checks(
         self,
@@ -551,18 +569,39 @@ class SecurityPolicy:
 
     # ── Audit log ─────────────────────────────────────────────────────
 
-    def audit_log(self, action: str, details: str = "", success: bool = True) -> None:
+    def audit_log(
+        self,
+        action: str,
+        details: str = "",
+        success: bool = True,
+        *,
+        source: str = "",
+        trace_id: str = "",
+        latency_ms: float = 0.0,
+    ) -> None:
         if not self._audit_to_file:
             return
         try:
-            ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            status = "OK" if success else "BLOCKED"
-            entry = f"[{ts}] [{status}] {action}"
+            import json as _json
+
+            ts = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+            record = {
+                "ts": ts,
+                "action": action,
+                "result": "ok" if success else "blocked",
+            }
             if details:
-                entry += f" | {details}"
-            entry += "\n"
+                record["detail"] = details
+            if source:
+                record["source"] = source
+            if trace_id:
+                record["trace_id"] = trace_id
+            if latency_ms > 0:
+                record["latency_ms"] = round(latency_ms, 1)
+
+            line = _json.dumps(record, ensure_ascii=False) + "\n"
             with open(_AUDIT_FILE, "a", encoding="utf-8") as f:
-                f.write(entry)
+                f.write(line)
             try:
                 os.chmod(_AUDIT_FILE, 0o600)
             except OSError:

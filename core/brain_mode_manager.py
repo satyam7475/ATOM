@@ -14,11 +14,13 @@ assistant_brain profiles adjust inference parameters and optional model path.
 
 from __future__ import annotations
 
+import collections
 import json
 import logging
 import os
 import re
 import threading
+import time
 from pathlib import Path
 from typing import Any
 
@@ -80,6 +82,10 @@ class BrainModeManager:
         canonical = BrainModeManager.canonical_profile_name(name) or "optimal"
         return canonical.replace("_", " ").title()
 
+    _COOLDOWN_S = 5.0
+    _MAX_SWITCHES_PER_WINDOW = 6
+    _RATE_WINDOW_S = 60.0
+
     def __init__(self, config: dict | None = None) -> None:
         self._config = config or {}
         self._lock = threading.RLock()
@@ -92,6 +98,8 @@ class BrainModeManager:
             self._active = default
         self._audit = bool(self._config.get("assistant_brain", {}).get("audit_profile_changes", True))
         self._security = None
+        self._last_switch_time: float = 0.0
+        self._switch_timestamps: collections.deque[float] = collections.deque(maxlen=self._MAX_SWITCHES_PER_WINDOW)
 
     def attach_security(self, security: Any) -> None:
         """Optional SecurityPolicy for audit_log on profile changes."""
@@ -118,8 +126,22 @@ class BrainModeManager:
         features = _PROFILE_FEATURES.get(canonical, _PROFILE_FEATURES["optimal"])
         return bool(features.get(feature, True))
 
+    def _rate_limited(self) -> bool:
+        """True if too many switches happened in the rolling window."""
+        now = time.monotonic()
+        cutoff = now - self._RATE_WINDOW_S
+        while self._switch_timestamps and self._switch_timestamps[0] < cutoff:
+            self._switch_timestamps.popleft()
+        return len(self._switch_timestamps) >= self._MAX_SWITCHES_PER_WINDOW
+
     def set_profile(self, name: str) -> tuple[bool, str]:
-        """Validate and switch profile. Returns (ok, message for user)."""
+        """Validate and switch profile. Returns (ok, message for user).
+
+        Guards:
+          - Same-state: no-op if already in the requested profile.
+          - Cooldown: rejects switches within _COOLDOWN_S of the last one.
+          - Rate limit: max _MAX_SWITCHES_PER_WINDOW switches per _RATE_WINDOW_S.
+        """
         if not name or not isinstance(name, str):
             return False, "Invalid profile name."
         key = self.canonical_profile_name(name)
@@ -129,8 +151,26 @@ class BrainModeManager:
                 f"Say optimal mode or full performance mode."
             )
         with self._lock:
+            if key == self._active:
+                logger.debug("Brain profile already %s — no-op", key)
+                return True, f"Already in {self.display_name(key)}, Boss."
+
+            now = time.monotonic()
+            if self._last_switch_time and (now - self._last_switch_time) < self._COOLDOWN_S:
+                remaining = self._COOLDOWN_S - (now - self._last_switch_time)
+                logger.debug("Brain profile cooldown (%.1fs remaining)", remaining)
+                return False, "Profile switch on cooldown, Boss. Try again in a moment."
+
+            if self._rate_limited():
+                logger.warning("Brain profile rate limit hit (%d in %.0fs)",
+                               self._MAX_SWITCHES_PER_WINDOW, self._RATE_WINDOW_S)
+                return False, "Too many profile switches. Try again in a minute, Boss."
+
             old = self._active
             self._active = key
+            self._last_switch_time = now
+            self._switch_timestamps.append(now)
+
         logger.info("Brain profile: %s -> %s", old, key)
         if self._audit and self._security is not None:
             try:

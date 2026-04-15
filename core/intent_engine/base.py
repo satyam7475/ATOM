@@ -9,14 +9,16 @@ import re
 
 
 class IntentResult:
-    __slots__ = ("intent", "response", "action", "action_args")
+    __slots__ = ("intent", "response", "action", "action_args", "confidence")
 
     def __init__(self, intent: str, response: str | None = None,
-                 action: str | None = None, action_args: dict | None = None):
+                 action: str | None = None, action_args: dict | None = None,
+                 confidence: float = 1.0):
         self.intent = intent
         self.response = response
         self.action = action
         self.action_args = action_args
+        self.confidence = confidence
 
 
 def clean_slot(value: str | None) -> str:

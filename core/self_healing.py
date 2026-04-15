@@ -313,7 +313,7 @@ class ModuleHealthChecker:
         ("core.reasoning.tool_registry", None),
         ("core.reasoning.action_executor", "ActionExecutor"),
         ("core.reasoning.code_sandbox", "CodeSandbox"),
-        ("voice.stt_async", "STTAsync"),
+        ("voice.stt_macos", "NativeSTT"),
         ("voice.tts_async", "TTSAsync"),
         ("voice.mic_manager", "MicManager"),
         ("brain.mini_llm", "MiniLLM"),

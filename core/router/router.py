@@ -116,7 +116,7 @@ class Router:
         self._brain_enabled = bool(self._config.get("brain", {}).get("enabled", False))
         self._brain_mode_mgr = brain_mode_manager
         self._assistant_mode_mgr = assistant_mode_manager
-        self._processing_semaphore = asyncio.Semaphore(2)  # Allow 2 concurrent queries (fast-path + LLM)
+        self._processing_lock = asyncio.Lock()
         self._local_queries = 0
         self._llm_queries = 0
         self._scheduler = scheduler
@@ -129,6 +129,10 @@ class Router:
 
         self._cognitive_kernel: CognitiveKernel | None = None
         self._runtime_watchdog: RuntimeWatchdog | None = None
+
+        self._system_state_engine: Any = None
+        self._session_memory: Any = None
+        self._user_memory: Any = None
 
         # v22: Cloud intelligence components (wired via attach_cloud_intelligence)
         self._gemini_client: Any = None
@@ -169,6 +173,22 @@ class Router:
         """Wire RuntimeWatchdog so hot router stages use active budgets."""
         self._runtime_watchdog = watchdog
         logger.info("RuntimeWatchdog attached to Router")
+
+    def attach_context_layer(
+        self,
+        *,
+        system_state_engine: Any = None,
+        session_memory: Any = None,
+        user_memory: Any = None,
+    ) -> None:
+        """Wire the real-time context layer (Phase 5+6)."""
+        self._system_state_engine = system_state_engine
+        self._session_memory = session_memory
+        self._user_memory = user_memory
+        logger.info("Context layer attached to Router (state=%s session=%s user=%s)",
+                     system_state_engine is not None,
+                     session_memory is not None,
+                     user_memory is not None)
 
     def attach_cloud_intelligence(
         self,
@@ -256,10 +276,7 @@ class Router:
         return True
 
     async def on_speech(self, text: str, **_kw) -> None:
-        if self._processing_semaphore._value == 0:
-            logger.warning("Queuing speech '%s' -- at concurrency limit",
-                           text[:40])
-        async with self._processing_semaphore:
+        async with self._processing_lock:
             try:
                 await self._route(text)
             except asyncio.CancelledError:
@@ -318,6 +335,39 @@ class Router:
             logger.info("Pronoun resolved: '%s' -> '%s'", clean_text, resolved)
             clean_text = resolved
             raw_text = resolved
+
+        # ── 2b. System context + reference resolution ─────────────────
+        _system_ctx: dict = {}
+        if self._system_state_engine is not None:
+            try:
+                _system_ctx = self._system_state_engine.get_context()
+                refs = self._system_state_engine.resolve_reference(clean_text)
+                if refs:
+                    _this_app = refs.get("this_app", "")
+                    _prev_app = refs.get("previous_app", "")
+                    _media_app = refs.get("media_app", "")
+                    _lower = clean_text.lower()
+                    if "this" in _lower or "close this" in _lower or "this app" in _lower:
+                        if _this_app:
+                            clean_text = clean_text.replace("this app", _this_app).replace("this", _this_app)
+                            raw_text = clean_text
+                            logger.info("Reference resolved: 'this' -> '%s'", _this_app)
+                    if "switch back" in _lower and _prev_app:
+                        clean_text = f"switch to {_prev_app}"
+                        raw_text = clean_text
+                        logger.info("Reference resolved: 'switch back' -> '%s'", _prev_app)
+                    if ("pause" in _lower or "stop music" in _lower) and _media_app:
+                        if _media_app not in clean_text:
+                            clean_text = f"{clean_text} ({_media_app})"
+                            raw_text = clean_text
+            except Exception:
+                logger.debug("System context injection failed", exc_info=True)
+
+        if self._user_memory is not None:
+            try:
+                self._user_memory.track_app_usage(_system_ctx.get("active_app", ""))
+            except Exception:
+                pass
 
         # ── 3. Clipboard injection (implicit context) ────────────────
         clipboard_injected = False
@@ -488,6 +538,18 @@ class Router:
                     prompt = self._confirmation.set_pending_action(result)
                     self._emit_response(prompt)
                     return
+                confidence = getattr(result, "confidence", 1.0)
+                if confidence < 0.7 and result.action not in self._INFO_INTENTS:
+                    logger.info(
+                        "Low confidence (%.2f) for '%s' — asking confirmation",
+                        confidence, result.action,
+                    )
+                    prompt = self._confirmation.set_pending_action(result)
+                    action_label = result.action.replace("_", " ")
+                    self._emit_response(
+                        f"Did you mean {action_label}, Boss? Say yes to confirm.",
+                    )
+                    return
                 await self._execute_action(result)
                 if _skill_chain:
                     await self._run_skill_chain(_skill_chain)
@@ -533,6 +595,12 @@ class Router:
                 tool_call.name, dict(tool_call.arguments),
             )
             if not allowed:
+                if reason.startswith("ESCALATABLE|"):
+                    human_reason = reason.split("|", 1)[1]
+                    logger.info("Security ESCALATABLE for tool '%s': %s", tool_call.name, human_reason)
+                    prompt = self._confirmation.set_pending_escalation(tool_call.name, tool_call)
+                    self._bus.emit_long("response_ready", text=prompt)
+                    return
                 logger.warning("Security BLOCKED confirmed tool '%s': %s",
                                tool_call.name, reason)
                 self._bus.emit_long(
@@ -566,6 +634,12 @@ class Router:
 
         allowed, reason = self._security.allow_action(result.action, args)
         if not allowed:
+            if reason.startswith("ESCALATABLE|"):
+                human_reason = reason.split("|", 1)[1]
+                logger.info("Security ESCALATABLE for '%s': %s", result.action, human_reason)
+                prompt = self._confirmation.set_pending_escalation(result.action, result)
+                self._emit_response(prompt)
+                return
             logger.warning("Security BLOCKED action '%s': %s", result.action, reason)
             self._emit_response(f"Sorry Boss, that action is blocked. {reason}")
             return

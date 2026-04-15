@@ -159,6 +159,7 @@ class ProactiveIntelligenceEngine:
         self._bus.on("system_light_scan", self._on_system_light_scan)
         self._bus.on("idle_detected", self._on_idle_detected)
         self._bus.on("fs_event", self._on_fs_event)
+        self._bus.on("system_state_update", self._on_system_state_update)
         
         async def _supervisor() -> None:
             while not self._shutdown.is_set():
@@ -249,6 +250,45 @@ class ProactiveIntelligenceEngine:
                 "priority": 8,
                 "source": "proactive_scanner",
             })
+
+    async def _on_system_state_update(
+        self, snapshot: dict | None = None, changed_app: bool = False, **_kw: Any,
+    ) -> None:
+        """React to real-time system state changes from SystemStateEngine."""
+        if not snapshot:
+            return
+
+        battery_pct = int(snapshot.get("battery_pct", 100))
+        battery_plugged = bool(snapshot.get("battery_plugged", True))
+        if battery_pct <= 10 and not battery_plugged:
+            if self._check_cooldown("battery_critical", 600):
+                self._emit_insight({
+                    "message": f"Boss, battery is critically low at {battery_pct}%. You should plug in soon.",
+                    "category": "system",
+                    "priority": 9,
+                    "source": "proactive_system_state",
+                })
+
+        active_app = str(snapshot.get("active_app", "")).lower()
+        coding_apps = {"code", "cursor", "pycharm", "intellij", "xcode", "neovim", "vim"}
+        if active_app and any(ca in active_app for ca in coding_apps):
+            session_hours = (time.time() - self._session_start) / 3600
+            if session_hours >= 2.0 and self._check_cooldown("coding_break", 3600):
+                self._emit_insight({
+                    "message": f"Boss, you've been coding for {session_hours:.1f} hours. Maybe take a short break?",
+                    "category": "wellness",
+                    "priority": 4,
+                    "source": "proactive_system_state",
+                })
+
+    def _check_cooldown(self, trigger_key: str, cooldown_s: float) -> bool:
+        """Return True if the trigger hasn't fired within cooldown_s."""
+        now = time.time()
+        last = self._last_trigger_times.get(trigger_key, 0.0)
+        if now - last < cooldown_s:
+            return False
+        self._last_trigger_times[trigger_key] = now
+        return True
 
     async def _on_idle_detected(self, idle_minutes: float = 0, **_kw: Any) -> None:
         """Track idle streak for goal-aware nudges (M5 Phase 6.1)."""

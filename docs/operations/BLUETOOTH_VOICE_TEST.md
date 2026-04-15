@@ -100,3 +100,24 @@ Many headsets use a **narrowband HFP** profile for the microphone. That is a Blu
 ## Operational vs repo note
 
 Steps in Phase A–D are performed **on your Mac**; this file is the checklist. There is **no substitute** for setting **default input** in System Settings when using **native** macOS STT.
+
+---
+
+## Siri-like stack vs ATOM (what matches)
+
+Siri on macOS (public surface, not Apple’s private internals) is roughly: **system default mic → on-device / Apple speech services → same OS locale & privacy TCC as the host app**. ATOM’s **`stt.engine: "macos_native"`** path uses the same class of APIs (**`SFSpeechRecognizer` + `AVAudioEngine` + `SFSpeechAudioBufferRecognitionRequest`**), with **`tts.engine: "macos_native"`** using **system / NSSpeechSynthesizer-style** output. That is the closest “Siri-class” pairing without shipping Apple’s closed-source Siri binary.
+
+With **`stt.engine: "macos_native"`**, ATOM does **not** chain **faster-whisper** or **Google** STT at startup (lighter imports). Use **`stt.engine: "auto"`** only when you explicitly want native-first fallbacks for development.
+
+---
+
+## If Python / ATOM “stops unexpectedly”
+
+| Symptom | Likely cause |
+|--------|----------------|
+| Exit **137** or **9** in the launcher | **SIGKILL** — often **memory pressure** (MLX + models + browser). Close heavy apps, reduce brain profile, or raise available RAM. |
+| Instant quit with no Python traceback | **Native crash** (e.g. bad audio driver / Speech in a bad state). Check **Console.app** crash reports for `Python` or `ATOM`. |
+| Terminal window closed | **User or shell** ended the session — `Run ATOM.command` must stay open. |
+| `os._exit` from UI | Rare: native UI subprocess path; normal shutdown uses the event bus. |
+
+The runtime **watchdog** in ATOM generally **recovers** stuck THINKING/SPEAKING (it does **not** SIGKILL the whole process by default).
