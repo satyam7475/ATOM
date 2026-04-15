@@ -897,13 +897,6 @@ async def main() -> None:
             preference_store=preference_store,
         )
 
-    # Wire context layer (system state + session + user memory) into Router
-    router.attach_context_layer(
-        system_state_engine=system_state_engine,
-        session_memory=session_memory,
-        user_memory=user_memory,
-    )
-
     logger.info(
         "v22 Hybrid Intelligence: SecurityGateway + GeminiClient(%s) + "
         "ConfidenceEngine + DecisionEngine + SearchTool + PreferenceStore + "
@@ -1646,6 +1639,13 @@ async def main() -> None:
     )
     command_loop.attach_ack_engine(ack_engine)
     command_loop.attach_pipeline_metrics(pipeline_metrics)
+
+    # ── Wire context layer (system state + session + user memory) into Router
+    router.attach_context_layer(
+        system_state_engine=system_state_engine,
+        session_memory=session_memory,
+        user_memory=user_memory,
+    )
 
     # ── Wire all event handlers (extracted for testability) ────────
     _wiring_ctx = wire_events(
