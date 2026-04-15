@@ -82,7 +82,7 @@ class Router:
         "system_info", "ip", "wifi", "uptime", "top_processes",
         "resource_report", "resource_trend", "app_history",
         "show_reminders", "self_diagnostic", "system_analyze",
-        "self_check", "behavior_report", "mode_status", "detailed_status",
+        "self_check", "audio_diagnostics", "behavior_report", "mode_status", "detailed_status",
     })
 
     def __init__(
@@ -1041,6 +1041,7 @@ class Router:
         health_monitor=None,
         state_snapshot_provider=None,
         report_publisher=None,
+        audio_intel=None,
     ) -> None:
         self._diagnostics.configure(
             stt=stt, tts=tts, metrics=metrics,
@@ -1049,10 +1050,14 @@ class Router:
             behavior_tracker=self._behavior_tracker,
             state_snapshot_provider=state_snapshot_provider,
             report_publisher=report_publisher,
+            audio_intel=audio_intel,
         )
 
     def _do_self_check(self, _action: str, _args: dict) -> str:
         return self._diagnostics.self_check()
+
+    def _do_audio_diagnostics(self, _action: str, _args: dict) -> str:
+        return self._diagnostics.audio_diagnostics()
 
     def _do_mode_status(self, _action: str, _args: dict) -> str:
         return self._diagnostics.mode_status()
@@ -1280,6 +1285,7 @@ class Router:
         "type_text": _do_type_text,
         "system_analyze": _do_system_analyze,
         "self_check": _do_self_check,
+        "audio_diagnostics": _do_audio_diagnostics,
         "mode_status": _do_mode_status,
         "detailed_status": _do_detailed_status,
         "set_performance_mode": _do_set_performance_mode,

@@ -60,7 +60,7 @@ class BehaviorMemory:
             p["verbosity"] = min(0.8, p["verbosity"] + 0.05)
 
         if avg_interrupts > 1.0:
-            p["preferred_rate"] = min(1.3, p["preferred_rate"] + 0.05)
+            p["preferred_rate"] = min(1.3, p["preferred_rate"] + 0.08)
         elif avg_interrupts < 0.3:
             p["preferred_rate"] = max(0.85, p["preferred_rate"] - 0.02)
 
@@ -87,6 +87,6 @@ class BehaviorMemory:
         (e.g. frequent interrupts) easily overpower it.
         """
         p = self._user_profile
-        p["preferred_rate"] += (1.0 - p["preferred_rate"]) * 0.03
-        p["preferred_pause"] += (1.0 - p["preferred_pause"]) * 0.03
+        p["preferred_rate"] += (1.0 - p["preferred_rate"]) * 0.02
+        p["preferred_pause"] += (1.0 - p["preferred_pause"]) * 0.02
         p["verbosity"] += (0.5 - p["verbosity"]) * 0.02

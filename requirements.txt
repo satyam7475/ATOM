@@ -1,5 +1,5 @@
 # ATOM v19 — Apple Silicon M5 Dependencies (macOS Native Edition)
-# Python 3.9+ (3.11+ recommended)
+# Python 3.11+
 #
 # Platform: macOS (Apple Silicon / arm64)
 # Strategy: Use native macOS frameworks (pyobjc) wherever possible.
@@ -37,11 +37,14 @@ aiohttp==3.13.3
 # Desktop capture (screenshot for Vision OCR)
 Pillow==12.1.1
 
-# Audio output device
+# Audio output device + device-specific recording
 sounddevice==0.5.1
 
+# Voice Activity Detection for audio intelligence (lightweight C extension, ~50KB)
+webrtcvad>=2.0.10
+
 # ─── Apple Silicon Local Brain (primary path on M-series Macs) ───────────
-mlx==0.29.3
+mlx>=0.30.4
 mlx-lm==0.31.2
 
 # ─── Semantic Memory (embedding + vector store) ──────────────────────────

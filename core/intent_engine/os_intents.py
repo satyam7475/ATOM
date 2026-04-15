@@ -65,6 +65,12 @@ _BEHAVIOR_REPORT = re.compile(
     r"behavior\s+report|behaviour\s+report|what\s+do\s+i\s+usually\s+do|"
     r"my\s+(?:pattern|habit|usage|routine)s?|predict\s+(?:my\s+)?(?:action|behavior))\b", re.I)
 
+_AUDIO_DIAGNOSTICS = re.compile(
+    r"\b(?:audio\s+(?:diagnostics?|status|check|report|info)|"
+    r"(?:mic|microphone)\s+(?:status|check|diagnostics?|info)|"
+    r"(?:check|show|tell)\s+(?:me\s+)?(?:audio|mic|microphone)\s*(?:status|devices?)?|"
+    r"which\s+(?:mic|microphone)\s+(?:am\s+i|are\s+you)\s+using)\b", re.I)
+
 _SELF_CHECK = re.compile(
     r"\b(?:(?:atom\s+)?(?:self|system)\s*check(?:\s+karo)?|"
     r"check\s+(?:all|every)\s*(?:the\s+)?(?:functions?|systems?|things?|modules?)|"
@@ -239,6 +245,9 @@ def check_self_check(text: str) -> IntentResult | None:
 
 
 def check(text: str) -> IntentResult | None:
+    if _AUDIO_DIAGNOSTICS.search(text):
+        return IntentResult("audio_diagnostics", action="audio_diagnostics", action_args={})
+
     if _SELF_CHECK.search(text):
         return IntentResult("self_check", action="self_check", action_args={})
 

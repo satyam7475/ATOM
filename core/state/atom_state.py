@@ -118,6 +118,18 @@ ATOM_STATE_DEFAULTS: dict[str, Any] = {
         "cloud_enabled": True,
         "updated_at": 0.0,
     },
+    "audio": {
+        "selected_input": None,
+        "selected_output": None,
+        "input_score": 0,
+        "input_rms_db": -100,
+        "input_snr_db": 0,
+        "devices": [],
+        "voice_presence": "ambient",
+        "watchdog_status": "off",
+        "switch_history": [],
+        "updated_at": None,
+    },
     "health": {
         "score": 0.0,
         "warnings": [],

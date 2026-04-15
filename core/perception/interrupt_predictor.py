@@ -16,7 +16,7 @@ import time
 
 _MIN_PARTIAL_LEN = 3
 _REQUIRED_PARTIALS = 2
-_CONFIRM_WINDOW_S = 0.8
+_CONFIRM_WINDOW_S = 0.6
 
 
 class InterruptPredictor:

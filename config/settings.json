@@ -25,7 +25,29 @@
     },
     "mic": {
         "device_name": null,
-        "prefer_bluetooth": true
+        "prefer_bluetooth": false
+    },
+    "audio_intelligence": {
+        "enabled": true,
+        "auto_select": true,
+        "active_test_duration_s": 2.0,
+        "allow_bluetooth": true,
+        "bluetooth_penalty": 0.1,
+        "min_rms_threshold_db": -80,
+        "monitoring_interval_s": 10,
+        "degradation_checks_before_switch": 3,
+        "voice_feedback": true,
+        "prefer_device": null,
+        "vad_aggressiveness": 2,
+        "set_system_default": true,
+        "debug_logging": true,
+        "context_aware": true,
+        "device_learning": true,
+        "predictive_switching": true,
+        "predictive_rms_slope_threshold": -0.5,
+        "predictive_snr_slope_threshold": -0.3,
+        "night_suppress_feedback": true,
+        "low_confidence_ask_user": true
     },
     "stt": {
         "engine": "macos_native",
@@ -34,7 +56,7 @@
         "bilingual": true,
         "sample_rate": 16000,
         "chunk_size": 2048,
-        "post_tts_cooldown_ms": 550,
+        "post_tts_cooldown_ms": 1000,
         "preload": true,
         "calibration_delay_s": 2.0,
         "min_energy_threshold": 400,
@@ -49,15 +71,15 @@
         "voice_debug": true,
         "voice_debug_interval_s": 20,
         "barge_in_during_speak": false,
-        "native_requires_on_device": false,
-        "native_voice_processing": false,
-        "native_tap_sample_rate": 48000
+        "native_requires_on_device": true,
+        "native_voice_processing": true,
+        "native_tap_sample_rate": 0
     },
     "tts": {
         "engine": "macos_native",
         "max_lines": 4,
         "macos_voice": "system",
-        "macos_rate": 200,
+        "macos_rate": 165,
         "edge_voice": "en-GB-SoniaNeural",
         "edge_rate": "+0%",
         "edge_postprocess": true,

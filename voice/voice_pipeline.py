@@ -103,6 +103,7 @@ class VoicePipeline:
         self._stt_watchdog: Any = None
         self._listening_mode: Any = None
         self._loop_task: asyncio.Task | None = None
+        self._audio_intel: Any = None
 
     def build(self) -> None:
         """Construct STT and TTS engines based on config + platform."""
@@ -311,7 +312,7 @@ class VoicePipeline:
                 self._bus, self._state,
                 max_lines=tts_cfg.get("max_lines", 4),
                 voice=tts_cfg.get("macos_voice", "system"),
-                rate=tts_cfg.get("macos_rate", 200),
+                rate=tts_cfg.get("macos_rate", 165),
             )
             logger.info("TTS: macOS Native (voice=%s)", tts_cfg.get("macos_voice", "system"))
             self.tts_runtime_label = f"macOS Native ({tts_cfg.get('macos_voice', 'system')})"
@@ -406,6 +407,25 @@ class VoicePipeline:
     def listening_mode(self) -> Any:
         return self._listening_mode
 
+    @property
+    def audio_intelligence(self) -> Any:
+        return self._audio_intel
+
+    def build_audio_intelligence(self) -> Any:
+        """Build the Audio Intelligence Engine for device auto-selection."""
+        from voice.audio_intelligence import AudioIntelligenceEngine
+
+        self._audio_intel = AudioIntelligenceEngine(
+            self._bus, self._state, self._config,
+            mic_manager=self._mic_manager,
+        )
+        return self._audio_intel
+
+    def configure_audio_intelligence(self) -> None:
+        """Wire STT/TTS into the Audio Intelligence Engine after build()."""
+        if self._audio_intel is not None:
+            self._audio_intel.configure(stt=self.stt, tts=self.tts)
+
     async def start_voice_loop(self, loop: asyncio.AbstractEventLoop | None = None) -> None:
         """Start the wake word engine, watchdog, and continuous listening loop."""
         if self._wake_word is not None and self._wake_word.is_available:
@@ -417,6 +437,17 @@ class VoicePipeline:
         if self._stt_watchdog is None:
             self.build_stt_watchdog()
         self._stt_watchdog.start()
+
+        if self._audio_intel is not None:
+            self.configure_audio_intelligence()
+            try:
+                self._audio_intel.wire_context()
+            except Exception:
+                logger.debug("Audio intelligence context wiring failed", exc_info=True)
+            try:
+                await self._audio_intel.start_watchdog()
+            except Exception:
+                logger.debug("Audio watchdog start failed", exc_info=True)
 
         from core.state_manager import AtomState
 
@@ -430,6 +461,11 @@ class VoicePipeline:
 
     def shutdown(self) -> None:
         """Cleanly shut down all voice components."""
+        if self._audio_intel is not None:
+            try:
+                self._audio_intel.shutdown()
+            except Exception:
+                logger.debug("AudioIntelligence shutdown error", exc_info=True)
         if self._stt_watchdog is not None:
             try:
                 self._stt_watchdog.stop()

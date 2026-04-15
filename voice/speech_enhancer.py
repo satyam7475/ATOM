@@ -39,12 +39,14 @@ _SUCCESS_WORDS = frozenset({
 
 _EMOTION_RATE_MAP = {
     "neutral": 0,
-    "happy": 10,
-    "excited": 15,
-    "frustrated": -15,
-    "stressed": -10,
-    "tired": -20,
+    "happy": 8,
+    "excited": 12,
+    "frustrated": -10,
+    "stressed": -8,
+    "tired": -15,
     "calm": -5,
+    "curious": 5,
+    "empathetic": -8,
 }
 
 
@@ -52,7 +54,7 @@ _EMOTION_RATE_MAP = {
 class EnhancedSpeech:
     """Preprocessed speech parameters."""
     text: str
-    rate: int = 200
+    rate: int = 165
     pause_points: list[int] = field(default_factory=list)
     emotion: str = "neutral"
 
@@ -67,14 +69,14 @@ class EnhancedSpeech:
         result = list(self.text)
         for offset in reversed(self.pause_points):
             if 0 <= offset < len(result):
-                result.insert(offset + 1, " [[slnc 80]] ")
+                result.insert(offset + 1, " [[slnc 120]] ")
         return "".join(result)
 
 
 class SpeechEnhancer:
     """Preprocesses text for expressive, JARVIS-quality speech."""
 
-    def __init__(self, base_rate: int = 200) -> None:
+    def __init__(self, base_rate: int = 165) -> None:
         self._base_rate = base_rate
         self._pause_multiplier: float = 1.0
 
@@ -99,29 +101,27 @@ class SpeechEnhancer:
         lower = text.lower()
         word_count = len(lower.split())
 
-        # Short confirmations (≤6 words, e.g. "Done, Boss.") -> speak faster
         if word_count <= 6:
-            rate += 20
-        # Long explanations (≥40 words) -> slow down for clarity
+            rate += 15
         elif word_count >= 40:
-            rate -= 15
+            rate -= 10
 
         if _RE_QUESTION.search(text):
-            rate -= 20
+            rate -= 12
         elif _RE_EXCLAMATION.search(text):
-            rate += 10
+            rate += 8
 
         words = set(lower.split())
         if words & _ERROR_WORDS:
-            rate -= 25
+            rate -= 15
         elif words & _URGENT_WORDS:
-            rate += 30
+            rate += 20
         elif words & _SUCCESS_WORDS:
-            rate += 10
+            rate += 8
 
         rate += _EMOTION_RATE_MAP.get(emotion, 0)
 
-        return max(150, min(250, rate))
+        return max(130, min(210, rate))
 
     def _find_pause_points(self, text: str) -> list[int]:
         """Find positions where micro-pauses improve naturalism."""
@@ -138,14 +138,18 @@ class SpeechEnhancer:
         emotion: str = "neutral",
     ) -> float:
         """Seconds to pause between sentences for natural rhythm."""
-        if emotion in ("tired", "calm"):
-            base = 0.12
+        if _RE_ELLIPSIS.search(sentence):
+            base = 0.22
+        elif emotion in ("tired", "calm", "empathetic"):
+            base = 0.18
         elif emotion in ("excited", "happy"):
-            base = 0.04
-        elif _RE_ELLIPSIS.search(sentence):
-            base = 0.15
+            base = 0.08
+        elif emotion == "curious":
+            base = 0.10
+        elif _RE_QUESTION.search(sentence):
+            base = 0.14
         else:
-            base = 0.06
+            base = 0.12
         return base * self._pause_multiplier
 
 

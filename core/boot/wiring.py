@@ -155,6 +155,7 @@ def wire_events(
 
     speech_ctrl = SpeechController()
     _perception_style_applied = {"locked": False}
+    _adaptive_last_apply_t = {"t": 0.0}
 
     def _apply_merged_style() -> None:
         """Push the composed perception+adaptive params to TTS."""
@@ -164,19 +165,41 @@ def wire_events(
                 rate_multiplier=merged["rate_multiplier"],
                 pause_multiplier=merged["pause_multiplier"],
             )
+            logger.info(
+                "SPEECH_PIPELINE perception=(%.2f, %.2f) adaptive=(%.2f, %.2f) -> merged=(%.3f, %.3f)",
+                speech_ctrl._perception["rate_multiplier"],
+                speech_ctrl._perception["pause_multiplier"],
+                speech_ctrl._adaptive["rate_multiplier"],
+                speech_ctrl._adaptive["pause_multiplier"],
+                merged["rate_multiplier"],
+                merged["pause_multiplier"],
+            )
 
     async def _on_perception_result(
         emotion=None, urgency=None, style=None, **_kw,
     ) -> None:
         if _perception_style_applied["locked"]:
             return
-        if style is not None:
+        if style is None:
+            return
+
+        e_intensity = getattr(emotion, "intensity", 0.0) if emotion else 0.0
+        u_score = getattr(urgency, "score", 0.0) if urgency else 0.0
+        u_level = getattr(urgency, "level", "low") if urgency else "low"
+
+        if e_intensity < 0.25 and u_score < 0.3:
+            _perception_style_applied["locked"] = True
+            return
+
+        if u_level == "high":
+            speech_ctrl.set_perception(rate_multiplier=1.0, pause_multiplier=1.0)
+        else:
             speech_ctrl.set_perception(
                 rate_multiplier=style.rate_multiplier,
                 pause_multiplier=style.pause_multiplier,
             )
-            _apply_merged_style()
-            _perception_style_applied["locked"] = True
+        _apply_merged_style()
+        _perception_style_applied["locked"] = True
 
     async def _unlock_perception_style(**_kw) -> None:
         _perception_style_applied["locked"] = False
@@ -252,6 +275,10 @@ def wire_events(
         pause_multiplier: float = 1.0,
         **_kw,
     ) -> None:
+        now = time.monotonic()
+        if now - _adaptive_last_apply_t["t"] < 2.0:
+            return
+        _adaptive_last_apply_t["t"] = now
         speech_ctrl.set_adaptive(
             rate_multiplier=rate_multiplier,
             pause_multiplier=pause_multiplier,

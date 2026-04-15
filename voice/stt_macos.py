@@ -69,6 +69,12 @@ def _format_ns_error(error: Any) -> str:
         return str(error)
 
 
+_BLUETOOTH_HINTS = frozenset({
+    "airpods", "buds", "bluetooth", "bt ", "wireless", "jbl", "sony",
+    "bose", "beats", "jabra", "galaxy", "oneplus", "nord",
+})
+
+
 def _probe_default_input_mic_label() -> str:
     """Best-effort name for the default input device (menu bar / Sound Input)."""
     if _AVFoundation is None:
@@ -80,7 +86,15 @@ def _probe_default_input_mic_label() -> str:
         dev = _AVFoundation.AVCaptureDevice.defaultDeviceWithMediaType_(mt)
         if dev is None:
             return "no default AVCaptureDevice — grant Microphone in Privacy, or pick input in Sound"
-        return str(dev.localizedName())
+        name = str(dev.localizedName())
+        if any(hint in name.lower() for hint in _BLUETOOTH_HINTS):
+            logger.warning(
+                "VOICE_INPUT: active mic '%s' appears to be Bluetooth — "
+                "for best STT quality, switch macOS Sound Input to MacBook "
+                "built-in mic (System Settings > Sound > Input)",
+                name,
+            )
+        return name
     except Exception as exc:
         return f"mic probe error: {exc}"
 
@@ -315,6 +329,21 @@ class NativeSTT:
         )
         self._tap_buffer_count: int = 0
         self._recognizer_supports_on_device: bool = False
+        self._consecutive_silent_buffers: int = 0
+        self._engine_restart_count: int = 0
+        self._max_engine_restarts: int = 3
+        self._rebind_audio_device: Callable[[], bool] | None = None
+        self._preferred_device_name: str = ""
+        self._signal_verified: bool = False
+        self._sd_stream: Any = None
+        self._sd_audio_format: Any = None
+        self._using_sounddevice: bool = False
+        self._speech_runloop_task: asyncio.Task | None = None
+        self._last_result_callback_time: float = 0.0
+        self._last_listen_start_time: float = 0.0
+        self._last_audio_rms_db: float = -96.0
+        self._last_speech_candidate_time: float = 0.0
+        self._callback_starvation_count: int = 0
         # Plain function passed to recognitionTaskWithRequest — bound methods can fail to bridge as ObjC blocks.
         self._speech_pyobjc_block: Callable[..., None] | None = None
 
@@ -472,6 +501,46 @@ class NativeSTT:
         except Exception as exc:
             logger.debug("Native STT: setTaskHint(Dictation) skipped: %s", exc)
 
+    def set_audio_device_rebinder(
+        self,
+        rebind_fn: Callable[[], bool],
+        device_name: str,
+    ) -> None:
+        """Provide a callable that re-asserts the CoreAudio system default input.
+
+        Called by main.py after AudioIntelligenceEngine selects a device, so
+        that on engine restarts we can re-lock the device before rebuilding
+        AVAudioEngine (prevents macOS from silently switching back to BT).
+        """
+        self._rebind_audio_device = rebind_fn
+        self._preferred_device_name = device_name
+
+    def preflight_mic_check(self, timeout_s: float = 0.5) -> bool:
+        """Quick sounddevice capture to verify the mic is actually live.
+
+        Returns True if RMS > -80 dB (real audio detected), False otherwise.
+        Called before starting AVAudioEngine to catch dead/muted mics early.
+        """
+        try:
+            import sounddevice as sd
+            import numpy as np
+
+            sr = 16000
+            frames = int(sr * timeout_s)
+            audio = sd.rec(frames, samplerate=sr, channels=1, dtype="float32")
+            sd.wait()
+            rms = float(np.sqrt(np.mean(audio ** 2)))
+            rms_db = 20.0 * float(np.log10(max(rms, 1e-10)))
+            ok = rms_db > -80.0
+            logger.info(
+                "VOICE_INPUT: preflight mic check — rms=%.1f dB, signal=%s",
+                rms_db, "OK" if ok else "DEAD",
+            )
+            return ok
+        except Exception as exc:
+            logger.debug("VOICE_INPUT: preflight mic check skipped: %s", exc)
+            return True
+
     # ── Listening ──────────────────────────────────────────────────
 
     def start_listening(
@@ -504,26 +573,13 @@ class NativeSTT:
 
         try:
             self._tap_buffer_count = 0
+            self._consecutive_silent_buffers = 0
+            self._signal_verified = False
             self._logged_stt_handler_shape = False
-            self._audio_engine = _AVFoundation.AVAudioEngine.alloc().init()
-
-            input_node = self._audio_engine.inputNode()
-
-            if self._native_voice_processing:
-                try:
-                    input_node.setVoiceProcessingEnabled_error_(True, None)
-                    logger.debug("Voice Processing I/O enabled (HW noise suppression)")
-                except Exception:
-                    logger.debug("Voice Processing I/O not available")
-            else:
-                try:
-                    input_node.setVoiceProcessingEnabled_error_(False, None)
-                    logger.info(
-                        "Native STT: Voice Processing I/O disabled (stt.native_voice_processing=false) — "
-                        "often better for Bluetooth",
-                    )
-                except Exception:
-                    logger.debug("Voice Processing I/O toggle skipped", exc_info=True)
+            self._logged_buf_fail = False
+            self._last_result_callback_time = 0.0
+            self._last_audio_rms_db = -96.0
+            self._last_speech_candidate_time = 0.0
 
             self._recognition_request = (
                 _Speech.SFSpeechAudioBufferRecognitionRequest.alloc().init()
@@ -531,67 +587,78 @@ class NativeSTT:
             self._apply_speech_request_policy(self._recognition_request)
             self._apply_speech_request_hints(self._recognition_request)
 
-            recording_format = input_node.outputFormatForBus_(0)
-            n_channels = int(recording_format.channelCount())
-            sample_rate = float(recording_format.sampleRate())
-            tap_sr_override = float(self._config.get("native_tap_sample_rate") or 0)
-            # Multi-channel Bluetooth formats can crash AVAudioConverter in CoreAudio; let the
-            # input node convert in the tap instead (same sample rate, mono Float32 for Speech).
-            # Optional native_tap_sample_rate (e.g. 48000): macOS Speech often behaves better at 44.1/48 kHz.
-            tap_format: Any = recording_format
-            if tap_sr_override > 0:
-                mono_fmt = _AVFoundation.AVAudioFormat.alloc().initStandardFormatWithSampleRate_channels_(
-                    tap_sr_override, 1,
-                )
-                if mono_fmt is not None:
-                    tap_format = mono_fmt
-                    logger.info(
-                        "Native STT: tap forced to %.0f Hz mono (stt.native_tap_sample_rate) — was %.0f Hz, %d ch",
-                        tap_sr_override,
-                        sample_rate,
-                        n_channels,
-                    )
-                else:
-                    logger.warning("Native STT: tap sample-rate format alloc failed; using device format")
-            elif n_channels > 1:
-                mono_fmt = _AVFoundation.AVAudioFormat.alloc().initStandardFormatWithSampleRate_channels_(
-                    sample_rate, 1,
-                )
-                if mono_fmt is not None:
-                    tap_format = mono_fmt
-                    logger.info(
-                        "Native STT: %d ch @ %.0f Hz device — tap delivers mono for SFSpeech (no AVAudioConverter)",
-                        n_channels,
-                        sample_rate,
-                    )
-                else:
-                    logger.warning("Native STT: mono tap format alloc failed; using device format")
+            # --- capture path: sounddevice (preferred) or AVAudioEngine (fallback) ---
+            sd_ok = self._start_sounddevice_capture()
 
-            try:
+            if sd_ok:
+                self._using_sounddevice = True
+                mic_label = _probe_default_input_mic_label()
+                device_fmt_label = "16000 Hz, 1 ch"
+                capture_label = "sounddevice (PortAudio/CoreAudio direct)"
+            else:
+                self._using_sounddevice = False
+                self._audio_engine = _AVFoundation.AVAudioEngine.alloc().init()
+                input_node = self._audio_engine.inputNode()
+
+                if self._native_voice_processing:
+                    try:
+                        input_node.setVoiceProcessingEnabled_error_(True, None)
+                        logger.debug("Voice Processing I/O enabled (HW noise suppression)")
+                    except Exception:
+                        logger.debug("Voice Processing I/O not available")
+                else:
+                    try:
+                        input_node.setVoiceProcessingEnabled_error_(False, None)
+                        logger.info(
+                            "Native STT: Voice Processing I/O disabled (stt.native_voice_processing=false) — "
+                            "often better for Bluetooth",
+                        )
+                    except Exception:
+                        logger.debug("Voice Processing I/O toggle skipped", exc_info=True)
+
+                try:
+                    hw_format = input_node.inputFormatForBus_(0)
+                    hw_ch = int(hw_format.channelCount()) if hw_format else 0
+                    hw_sr = float(hw_format.sampleRate()) if hw_format else 0.0
+                    if hw_ch == 0 or hw_sr == 0:
+                        logger.warning(
+                            "VOICE_INPUT: inputNode hardware format is dead "
+                            "(ch=%d, sr=%.0f) — IO graph stale, aborting start",
+                            hw_ch, hw_sr,
+                        )
+                        self._last_error = "Dead IO graph (hardware format ch=0 or sr=0)"
+                        self._cleanup()
+                        return False
+                    else:
+                        logger.info(
+                            "VOICE_INPUT: hardware input format — %.0f Hz, %d ch",
+                            hw_sr, hw_ch,
+                        )
+                except Exception:
+                    logger.debug("VOICE_INPUT: inputFormatForBus_ query failed", exc_info=True)
+
+                recording_format = input_node.outputFormatForBus_(0)
+                n_channels = int(recording_format.channelCount())
+                sample_rate = float(recording_format.sampleRate())
+
                 input_node.installTapOnBus_bufferSize_format_block_(
-                    0, self._audio_buffer_frames, tap_format, self._audio_buffer_callback,
+                    0, self._audio_buffer_frames, recording_format,
+                    self._audio_buffer_callback,
                 )
-            except Exception as exc:
-                if tap_format is not recording_format:
-                    logger.warning(
-                        "Native STT: mono tap install failed (%s); retrying with raw device format",
-                        exc,
-                    )
-                    tap_format = recording_format
-                    input_node.installTapOnBus_bufferSize_format_block_(
-                        0, self._audio_buffer_frames, tap_format, self._audio_buffer_callback,
-                    )
-                else:
-                    raise
 
-            self._audio_engine.prepare()
-            success, error = self._audio_engine.startAndReturnError_(None)
-            if not success:
-                self._last_error = str(error or "AVAudioEngine start failed")
-                logger.error("AVAudioEngine start failed: %s", error)
-                self._cleanup()
-                return False
+                self._audio_engine.prepare()
+                success, error = self._audio_engine.startAndReturnError_(None)
+                if not success:
+                    self._last_error = str(error or "AVAudioEngine start failed")
+                    logger.error("AVAudioEngine start failed: %s", error)
+                    self._cleanup()
+                    return False
 
+                mic_label = _probe_default_input_mic_label()
+                device_fmt_label = _format_av_audio_format(recording_format)
+                capture_label = f"{sample_rate:.0f} Hz, {n_channels} ch (AVAudioEngine tap)"
+
+            # --- recognition task (shared by both capture paths) ---
             _wr = weakref.ref(self)
 
             def _pyobjc_speech_block(*args: Any) -> None:
@@ -611,24 +678,27 @@ class NativeSTT:
 
             self._listening = True
             self._last_speech_time = time.monotonic()
+            self._last_listen_start_time = self._last_speech_time
             self._last_error = None
-            mic_label = _probe_default_input_mic_label()
-            self.mic_name = f"{mic_label} (AVAudioEngine)"
+            self._ensure_speech_runloop_pump()
+            capture_mode = "sounddevice" if self._using_sounddevice else "AVAudioEngine"
+            self.mic_name = f"{mic_label} ({capture_mode})"
             logger.info(
-                "Native STT listening started (buffer_frames=%d, locale=%s, requires_on_device=%s, "
-                "voice_processing=%s)",
+                "Native STT listening started (capture=%s, buffer_frames=%d, locale=%s, "
+                "requires_on_device=%s, voice_processing=%s)",
+                capture_mode,
                 self._audio_buffer_frames,
                 self._locale,
                 self._native_requires_on_device,
                 self._native_voice_processing,
             )
             logger.info(
-                "VOICE_INPUT: mic=%s | device=%s | tap=%s | engine_running=%s | speech=%s | mic_perm=%s | "
+                "VOICE_INPUT: mic=%s | device=%s | capture=%s | running=%s | speech=%s | mic_perm=%s | "
                 "launch_mode=%s",
                 mic_label,
-                _format_av_audio_format(recording_format),
-                _format_av_audio_format(tap_format),
-                bool(self._audio_engine and self._audio_engine.isRunning()),
+                device_fmt_label,
+                capture_label,
+                self._using_sounddevice or bool(self._audio_engine and self._audio_engine.isRunning()),
                 self.speech_permission_status,
                 self.microphone_permission_status,
                 os.environ.get("ATOM_LAUNCH_MODE", ""),
@@ -641,20 +711,363 @@ class NativeSTT:
             self._cleanup()
             return False
 
+    def _note_audio_activity(self, rms_db: float | None) -> None:
+        """Track recent audio energy so watchdog can distinguish speech from ambience."""
+        if rms_db is None:
+            return
+        self._last_audio_rms_db = float(rms_db)
+        # Rough speech-likelihood gate: stronger than quiet-room ambience.
+        if rms_db > -42.0:
+            self._last_speech_candidate_time = time.monotonic()
+
+    def _ensure_speech_runloop_pump(self) -> None:
+        """Pump Cocoa's run loop so Speech framework result handlers actually fire.
+
+        SFSpeechRecognizer callbacks are delivered through the Foundation run loop.
+        ATOM primarily runs on asyncio, so without this pump the recognizer task
+        can stay silent forever even while audio buffers flow correctly.
+        """
+        loop = self._loop
+        if loop is None or _Foundation is None:
+            return
+        task = self._speech_runloop_task
+        if task is not None and not task.done():
+            return
+        self._speech_runloop_task = loop.create_task(self._pump_speech_runloop())
+
+    def _cancel_speech_runloop_pump(self) -> None:
+        task = self._speech_runloop_task
+        self._speech_runloop_task = None
+        if task is not None and not task.done():
+            task.cancel()
+
+    async def _pump_speech_runloop(self) -> None:
+        """Service the main-thread Cocoa run loop alongside asyncio."""
+        if _Foundation is None:
+            return
+        runloop = _Foundation.NSRunLoop.currentRunLoop()
+        try:
+            while self._running_async or self._listening:
+                try:
+                    runloop.runUntilDate_(
+                        _Foundation.NSDate.dateWithTimeIntervalSinceNow_(0.01),
+                    )
+                except Exception:
+                    logger.debug("Native STT: NSRunLoop pump error", exc_info=True)
+                await asyncio.sleep(0.01)
+        except asyncio.CancelledError:
+            pass
+
+    def _on_recognition_starvation(self) -> None:
+        """Progressively relax recognizer constraints when mic is healthy but callbacks never arrive."""
+        self._callback_starvation_count += 1
+        if self._callback_starvation_count == 1 and self._native_requires_on_device:
+            self._native_requires_on_device = False
+            logger.warning(
+                "VOICE_INPUT: healthy mic but no Speech callbacks — disabling "
+                "requiresOnDeviceRecognition for the next recognition task",
+            )
+        elif self._callback_starvation_count >= 2:
+            logger.warning(
+                "VOICE_INPUT: repeated recognizer callback starvation (count=%d, locale=%s)",
+                self._callback_starvation_count,
+                self._locale,
+            )
+
     def _audio_buffer_callback(self, buffer: Any, when: Any) -> None:
-        """Tap callback: forward audio buffers to the recognition request."""
-        if self._voice_debug:
-            self._tap_buffer_count += 1
-            if self._tap_buffer_count == 1 or self._tap_buffer_count % 200 == 0:
-                logger.info(
-                    "VOICE_INPUT: tap feeding Speech (buffers=%d) — no STT partial lines? try "
-                    "stt.native_requires_on_device=false and stt.native_voice_processing=false",
-                    self._tap_buffer_count,
-                )
+        """Tap callback: forward audio buffers to the recognition request.
+
+        Signal gate: RMS is checked on the first 60 buffers (~2.8s at 44.1kHz
+        with 2048-frame buffers).  If real audio is detected (RMS > -80 dB),
+        ``_signal_verified`` is set so callers know the mic path is healthy.
+
+        Silence detection: if 15 consecutive buffers are digital-silence
+        (RMS <= -95 dB), the engine is torn down and rebuilt with progressive
+        configuration fallback (VPIO disable, on-device relaxation, device
+        rebinding).
+        """
+        self._tap_buffer_count += 1
+
+        check_rms = self._tap_buffer_count <= 60 or (
+            self._voice_debug and self._tap_buffer_count % 200 == 0
+        )
+        rms_db = self._estimate_rms_db(buffer) if check_rms else None
+        self._note_audio_activity(rms_db)
+
+        if rms_db is not None:
+            if rms_db <= -95.0:
+                self._consecutive_silent_buffers += 1
+            else:
+                self._consecutive_silent_buffers = 0
+                if not self._signal_verified:
+                    self._signal_verified = True
+                    logger.info(
+                        "VOICE_INPUT: mic signal verified (rms=%.1f dB at buffer %d) — audio path healthy",
+                        rms_db, self._tap_buffer_count,
+                    )
+
+        if (self._consecutive_silent_buffers >= 15
+                and self._engine_restart_count < self._max_engine_restarts):
+            self._engine_restart_count += 1
+            logger.warning(
+                "VOICE_INPUT: %d consecutive silent buffers (rms<=−95 dB) — "
+                "restarting AVAudioEngine to rebind audio session (attempt %d/%d)",
+                self._consecutive_silent_buffers,
+                self._engine_restart_count,
+                self._max_engine_restarts,
+            )
+            self._consecutive_silent_buffers = 0
+            self._schedule_engine_restart()
+            return
+
+        if self._voice_debug and rms_db is not None and (
+            self._tap_buffer_count == 1 or self._tap_buffer_count % 200 == 0
+        ):
+            logger.info(
+                "VOICE_INPUT: tap feeding Speech (buffers=%d, rms=%.1f dB, signal_ok=%s)",
+                self._tap_buffer_count, rms_db, self._signal_verified,
+            )
+
         with self._recognition_lock:
             req = self._recognition_request
             if req is not None:
                 req.appendAudioPCMBuffer_(buffer)
+
+    # ── sounddevice capture (bypasses AVAudioEngine input tap) ──
+
+    def _start_sounddevice_capture(self) -> bool:
+        """Open a sounddevice InputStream that feeds audio to SFSpeechRecognitionRequest.
+
+        AVAudioEngine's input tap delivers zero-valued buffers when input and
+        output devices use different CoreAudio clock domains (e.g. built-in mic +
+        Bluetooth output).  sounddevice (PortAudio) reads from CoreAudio directly
+        and is immune to this issue.
+        """
+        try:
+            import sounddevice as sd
+
+            sr = 16000
+            self._sd_audio_format = (
+                _AVFoundation.AVAudioFormat.alloc()
+                .initStandardFormatWithSampleRate_channels_(float(sr), 1)
+            )
+            if self._sd_audio_format is None:
+                logger.debug("sounddevice capture: AVAudioFormat alloc failed")
+                return False
+
+            self._sd_stream = sd.InputStream(
+                samplerate=sr,
+                channels=1,
+                dtype="float32",
+                blocksize=self._audio_buffer_frames,
+                callback=self._sd_audio_callback,
+            )
+            self._sd_stream.start()
+            logger.info(
+                "Native STT: using sounddevice capture (PortAudio/CoreAudio) — "
+                "%d Hz, 1 ch, blocksize=%d — bypassing AVAudioEngine input tap",
+                sr, self._audio_buffer_frames,
+            )
+            return True
+        except Exception as exc:
+            logger.info(
+                "sounddevice capture unavailable (%s), falling back to AVAudioEngine", exc,
+            )
+            self._sd_stream = None
+            self._sd_audio_format = None
+            return False
+
+    def _sd_audio_callback(self, indata: Any, frames: int, time_info: Any, status: Any) -> None:
+        """sounddevice InputStream callback — mirrors _audio_buffer_callback."""
+        import numpy as np
+
+        self._tap_buffer_count += 1
+
+        check_rms = self._tap_buffer_count <= 60 or (
+            self._voice_debug and self._tap_buffer_count % 200 == 0
+        )
+        rms_db: float | None = None
+        if check_rms:
+            rms = float(np.sqrt(np.mean(indata ** 2)))
+            rms_db = 20.0 * float(np.log10(max(rms, 1e-10))) if rms > 1e-10 else -96.0
+        self._note_audio_activity(rms_db)
+
+        if rms_db is not None:
+            if rms_db <= -95.0:
+                self._consecutive_silent_buffers += 1
+            else:
+                self._consecutive_silent_buffers = 0
+                if not self._signal_verified:
+                    self._signal_verified = True
+                    logger.info(
+                        "VOICE_INPUT: mic signal verified (rms=%.1f dB at buffer %d) — audio path healthy",
+                        rms_db, self._tap_buffer_count,
+                    )
+
+        if rms_db is not None and (
+            self._tap_buffer_count == 1 or self._tap_buffer_count % 200 == 0
+        ):
+            logger.info(
+                "VOICE_INPUT: tap feeding Speech (buffers=%d, rms=%.1f dB, signal_ok=%s)",
+                self._tap_buffer_count, rms_db, self._signal_verified,
+            )
+
+        with self._recognition_lock:
+            req = self._recognition_request
+            if req is not None:
+                buf = self._numpy_to_pcm_buffer(indata, frames)
+                if buf is not None:
+                    req.appendAudioPCMBuffer_(buf)
+                elif not getattr(self, "_logged_buf_fail", False):
+                    self._logged_buf_fail = True
+                    logger.error(
+                        "VOICE_INPUT: _numpy_to_pcm_buffer returned None — "
+                        "no audio will reach speech recognizer (check AVAudioPCMBuffer creation)",
+                    )
+
+    def _numpy_to_pcm_buffer(self, np_data: Any, frames: int) -> Any:
+        """Convert a numpy float32 array to AVAudioPCMBuffer for SFSpeech.
+
+        Uses pyobjc varlist element-wise assignment (verified at 0.05ms / 2048
+        frames).  ctypes.cast / memmove cannot handle objc.varlist pointers.
+        """
+        try:
+            fmt = self._sd_audio_format
+            if fmt is None:
+                return None
+            buf = _AVFoundation.AVAudioPCMBuffer.alloc().initWithPCMFormat_frameCapacity_(
+                fmt, frames,
+            )
+            if buf is None:
+                return None
+            buf.setFrameLength_(frames)
+            fcd = buf.floatChannelData()
+            if fcd is None:
+                return None
+            ch0 = fcd[0]
+            vals = np_data.ravel().tolist()
+            for i, v in enumerate(vals):
+                ch0[i] = v
+            return buf
+        except Exception:
+            if not getattr(self, "_logged_buf_fail", False):
+                self._logged_buf_fail = True
+                logger.warning("VOICE_INPUT: AVAudioPCMBuffer creation failed", exc_info=True)
+            return None
+
+    @staticmethod
+    def _estimate_rms_db(buffer: Any) -> float:
+        """Quick RMS estimate from the first channel of an AVAudioPCMBuffer (dBFS).
+
+        Uses objc.varlist.as_buffer() for zero-copy numpy access.
+        ctypes.cast does NOT work with pyobjc varlist pointers.
+        """
+        try:
+            import numpy as np
+
+            data = buffer.floatChannelData()
+            if data is None:
+                return -96.0
+            count = int(buffer.frameLength())
+            if count == 0:
+                return -96.0
+            raw = data[0].as_buffer(count)
+            arr = np.frombuffer(raw, dtype=np.float32)
+            rms = float(np.sqrt(np.mean(arr ** 2)))
+            if rms < 1e-10:
+                return -96.0
+            return 20.0 * float(np.log10(rms))
+        except Exception:
+            return -96.0
+
+    def _schedule_engine_restart(self) -> None:
+        """Schedule a full AVAudioEngine teardown + rebuild on the main thread.
+
+        Called from the tap callback when sustained digital silence is detected
+        (typically after a CoreAudio default-device switch that the engine
+        didn't pick up).
+        """
+        loop = self._loop
+        if loop is None:
+            return
+        try:
+            loop.call_soon_threadsafe(self._restart_audio_engine)
+        except RuntimeError:
+            pass
+
+    def _restart_audio_engine(self) -> None:
+        """Tear down and rebuild the capture path to rebind to the current system default input.
+
+        Uses progressive fallback to resolve persistent silence:
+          attempt 1: same config + re-assert CoreAudio default
+          attempt 2: disable Voice Processing I/O (AEC silences mic when
+                     input/output are on different hardware)
+          attempt 3: also relax on-device recognition requirement
+        """
+        has_capture = self._audio_engine is not None or self._using_sounddevice
+        if not self._listening or not has_capture:
+            return
+
+        from core.state_manager import AtomState
+        cur = self._state.current
+        if cur is AtomState.SPEAKING:
+            logger.debug(
+                "VOICE_INPUT: deferring engine restart — TTS is speaking "
+                "(VPIO echo cancellation causes silence during playback)",
+            )
+            if self._loop:
+                self._loop.call_later(2.0, self._restart_audio_engine)
+            return
+
+        attempt = self._engine_restart_count
+
+        if attempt >= 2 and self._native_voice_processing:
+            self._native_voice_processing = False
+            logger.info(
+                "VOICE_INPUT: attempt %d — disabling Voice Processing I/O "
+                "(echo cancellation causes silence when input != output hardware)",
+                attempt,
+            )
+
+        if attempt >= 3 and self._native_requires_on_device:
+            self._native_requires_on_device = False
+            logger.info(
+                "VOICE_INPUT: attempt %d — allowing server-assisted recognition "
+                "(on-device may yield no partials for some locale/device combos)",
+                attempt,
+            )
+
+        logger.info(
+            "VOICE_INPUT: rebuilding AVAudioEngine (attempt %d/%d, vpio=%s, on_device=%s)",
+            attempt, self._max_engine_restarts,
+            self._native_voice_processing, self._native_requires_on_device,
+        )
+
+        on_final = self._on_final
+        on_partial = self._on_partial
+        loop = self._loop
+
+        self.stop_listening()
+        self._cleanup()
+
+        if self._rebind_audio_device:
+            try:
+                ok = self._rebind_audio_device()
+                logger.info(
+                    "VOICE_INPUT: re-asserted CoreAudio default to '%s' before rebuild (ok=%s)",
+                    self._preferred_device_name, ok,
+                )
+            except Exception:
+                logger.debug("VOICE_INPUT: device rebind failed", exc_info=True)
+
+        import time as _time
+        _time.sleep(0.8)
+
+        ok = self.start_listening(loop=loop, on_final=on_final, on_partial=on_partial)
+        if ok:
+            logger.info("VOICE_INPUT: AVAudioEngine restarted successfully — mic should be live now")
+        else:
+            logger.error("VOICE_INPUT: AVAudioEngine restart failed — %s", self._last_error)
 
     def _recognition_result_handler(self, *args: Any) -> None:
         """Called by SFSpeechRecognizer with partial/final results.
@@ -680,6 +1093,8 @@ class NativeSTT:
                 "Native STT: recognition resultHandler invoked (arity=%d) — callbacks are wired",
                 len(args),
             )
+        self._last_result_callback_time = time.monotonic()
+        self._callback_starvation_count = 0
 
         if error is not None:
             err_desc = _format_ns_error(error)
@@ -754,7 +1169,8 @@ class NativeSTT:
         SFSpeechRecognizer completes one streaming request per final; without a new
         request, buffers keep appending to a finished session and no further results fire.
         """
-        if not self._listening or self._audio_engine is None or self._recognizer is None:
+        has_capture = self._audio_engine is not None or self._using_sounddevice
+        if not self._listening or not has_capture or self._recognizer is None:
             return
         try:
             with self._recognition_lock:
@@ -819,10 +1235,17 @@ class NativeSTT:
         if self._native_stop_audio_delay_s > 0:
             time.sleep(self._native_stop_audio_delay_s)
 
+        if self._sd_stream is not None:
+            try:
+                self._sd_stream.stop()
+            except Exception:
+                logger.debug("sounddevice stream stop error", exc_info=True)
+
         if self._audio_engine is not None:
             try:
                 self._audio_engine.inputNode().removeTapOnBus_(0)
                 self._audio_engine.stop()
+                self._audio_engine.reset()
             except Exception:
                 logger.debug("Audio engine stop error", exc_info=True)
 
@@ -846,6 +1269,17 @@ class NativeSTT:
     def _cleanup(self) -> None:
         """Release all resources."""
         self._listening = False
+        if self._sd_stream is not None:
+            try:
+                self._sd_stream.stop()
+            except Exception:
+                pass
+            try:
+                self._sd_stream.close()
+            except Exception:
+                pass
+        self._sd_stream = None
+        self._sd_audio_format = None
         if self._audio_engine is not None:
             try:
                 self._audio_engine.inputNode().removeTapOnBus_(0)
@@ -855,6 +1289,10 @@ class NativeSTT:
                 self._audio_engine.stop()
             except Exception:
                 pass
+            try:
+                self._audio_engine.reset()
+            except Exception:
+                pass
         self._audio_engine = None
         self._recognition_request = None
         self._recognition_task = None
@@ -862,6 +1300,7 @@ class NativeSTT:
 
     def shutdown(self) -> None:
         """Full shutdown."""
+        self._cancel_speech_runloop_pump()
         self.stop_listening()
         self._cleanup()
         self._recognizer = None
@@ -894,6 +1333,7 @@ class NativeSTT:
         loop = asyncio.get_running_loop()
         self._loop = loop
         self._running_async = True
+        self._ensure_speech_runloop_pump()
 
         def _on_final(text: str) -> None:
             if text and text.strip():
@@ -933,96 +1373,99 @@ class NativeSTT:
 
         post_cd_s = float(self._config.get("post_tts_cooldown_ms", 800) or 0) / 1000.0
 
-        while getattr(self, "_running_async", False):
-            now = time.monotonic()
-            if self._voice_debug and now >= self._dbg_next_status_log:
-                self._dbg_next_status_log = now + self._voice_debug_interval_s
-                cur = self._state.current
-                hint = ""
-                if cur is not AtomState.LISTENING and not (
-                    self._barge_in_during_speak and cur is AtomState.SPEAKING
-                ):
-                    hint = (
-                        " | NOTE: mic only opens when AtomState=LISTENING "
-                        "(blocked during THINKING/SPEAKING/SLEEP/IDLE)"
-                        + (
-                            " [barge_in_during_speak: mic may open during SPEAKING]"
-                            if self._barge_in_during_speak
-                            else ""
+        try:
+            while getattr(self, "_running_async", False):
+                now = time.monotonic()
+                if self._voice_debug and now >= self._dbg_next_status_log:
+                    self._dbg_next_status_log = now + self._voice_debug_interval_s
+                    cur = self._state.current
+                    hint = ""
+                    if cur is not AtomState.LISTENING and not (
+                        self._barge_in_during_speak and cur is AtomState.SPEAKING
+                    ):
+                        hint = (
+                            " | NOTE: mic only opens when AtomState=LISTENING "
+                            "(blocked during THINKING/SPEAKING/SLEEP/IDLE)"
+                            + (
+                                " [barge_in_during_speak: mic may open during SPEAKING]"
+                                if self._barge_in_during_speak
+                                else ""
+                            )
                         )
-                    )
-                logger.info(
-                    "VOICE_DEBUG: atom_state=%s | native_stt_listening=%s | mic_field=%s | "
-                    "stt_available=%s | speech_perm=%s | mic_perm=%s | last_err=%s | launch_mode=%s%s",
-                    getattr(cur, "value", cur),
-                    self._listening,
-                    (self.mic_name or "")[:120],
-                    self._available,
-                    self.speech_permission_status,
-                    self.microphone_permission_status,
-                    self._last_error,
-                    os.environ.get("ATOM_LAUNCH_MODE", ""),
-                    hint,
-                )
-
-            if not self._listening:
-                cur = self._state.current
-                allow_mic = (
-                    cur is AtomState.LISTENING
-                    or cur is AtomState.IDLE
-                    or (self._barge_in_during_speak and cur is AtomState.SPEAKING)
-                    or cur is AtomState.THINKING
-                )
-                if cur is AtomState.SLEEP:
-                    await asyncio.sleep(0.5)
-                    continue
-                if not allow_mic:
-                    await asyncio.sleep(0.12)
-                    continue
-                if self._need_post_tts_cooldown:
-                    self._need_post_tts_cooldown = False
-                    if post_cd_s > 0:
-                        logger.info(
-                            "Native STT: post-TTS cooldown %.2fs before mic (config stt.post_tts_cooldown_ms)",
-                            post_cd_s,
-                        )
-                        await asyncio.sleep(post_cd_s)
-                ok = self.start_listening(
-                    loop=loop, on_final=_on_final, on_partial=_on_partial,
-                )
-                if not ok:
-                    retries += 1
-                    self._last_error = self._last_error or "Native STT failed to start"
-                    if not self._available or retries > max_retries:
-                        logger.warning(
-                            "Native STT unavailable (retries=%d, available=%s) — "
-                            "voice input disabled for this session",
-                            retries, self._available,
-                        )
-                        self._running_async = False
-                        return
-                    logger.warning("Native STT start failed, retrying in 5s (%d/%d)", retries, max_retries)
-                    await asyncio.sleep(5.0)
-                    continue
-                retries = 0
-            elif self._last_speech_time > 0:
-                idle_s = time.monotonic() - self._last_speech_time
-                if idle_s > _MAX_RECORD_S:
                     logger.info(
-                        "STT: no speech for %.1fs (max=%.1fs) — restarting recognition chain",
-                        idle_s, _MAX_RECORD_S,
+                        "VOICE_DEBUG: atom_state=%s | native_stt_listening=%s | mic_field=%s | "
+                        "stt_available=%s | speech_perm=%s | mic_perm=%s | last_err=%s | launch_mode=%s%s",
+                        getattr(cur, "value", cur),
+                        self._listening,
+                        (self.mic_name or "")[:120],
+                        self._available,
+                        self.speech_permission_status,
+                        self.microphone_permission_status,
+                        self._last_error,
+                        os.environ.get("ATOM_LAUNCH_MODE", ""),
+                        hint,
                     )
-                    self._last_speech_time = time.monotonic()
-                    try:
-                        self._restart_recognition_chain()
-                    except Exception:
-                        logger.warning("STT: timeout restart failed, forcing full restart")
-                        self._listening = False
-            await asyncio.sleep(0.5)
+
+                if not self._listening:
+                    cur = self._state.current
+                    allow_mic = (
+                        cur is AtomState.LISTENING
+                        or cur is AtomState.IDLE
+                        or (self._barge_in_during_speak and cur is AtomState.SPEAKING)
+                    )
+                    if cur is AtomState.SLEEP:
+                        await asyncio.sleep(0.5)
+                        continue
+                    if not allow_mic:
+                        await asyncio.sleep(0.12)
+                        continue
+                    if self._need_post_tts_cooldown:
+                        self._need_post_tts_cooldown = False
+                        if post_cd_s > 0:
+                            logger.info(
+                                "Native STT: post-TTS cooldown %.2fs before mic (config stt.post_tts_cooldown_ms)",
+                                post_cd_s,
+                            )
+                            await asyncio.sleep(post_cd_s)
+                    ok = self.start_listening(
+                        loop=loop, on_final=_on_final, on_partial=_on_partial,
+                    )
+                    if not ok:
+                        retries += 1
+                        self._last_error = self._last_error or "Native STT failed to start"
+                        if not self._available or retries > max_retries:
+                            logger.warning(
+                                "Native STT unavailable (retries=%d, available=%s) — "
+                                "voice input disabled for this session",
+                                retries, self._available,
+                            )
+                            self._running_async = False
+                            return
+                        logger.warning("Native STT start failed, retrying in 5s (%d/%d)", retries, max_retries)
+                        await asyncio.sleep(5.0)
+                        continue
+                    retries = 0
+                elif self._last_speech_time > 0:
+                    idle_s = time.monotonic() - self._last_speech_time
+                    if idle_s > _MAX_RECORD_S:
+                        logger.info(
+                            "STT: no speech for %.1fs (max=%.1fs) — restarting recognition chain",
+                            idle_s, _MAX_RECORD_S,
+                        )
+                        self._last_speech_time = time.monotonic()
+                        try:
+                            self._restart_recognition_chain()
+                        except Exception:
+                            logger.warning("STT: timeout restart failed, forcing full restart")
+                            self._listening = False
+                await asyncio.sleep(0.5)
+        finally:
+            self._cancel_speech_runloop_pump()
 
     def stop(self) -> None:
         """Stop async listen loop + underlying recognition."""
         self._running_async = False
+        self._cancel_speech_runloop_pump()
         self.stop_listening()
 
     async def on_state_changed(self, old, new, **_kw) -> None:

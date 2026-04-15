@@ -26,6 +26,7 @@ _STUCK_TIMEOUT_S = 15.0
 _MAX_RESTARTS_PER_WINDOW = 5
 _RESTART_WINDOW_S = 300.0
 _CHECK_INTERVAL_S = 2.0
+_CHAIN_RESTARTS_BEFORE_FULL = 3
 
 
 class STTWatchdog:
@@ -50,6 +51,7 @@ class STTWatchdog:
         self._restart_times: list[float] = []
         self._total_restarts: int = 0
         self._total_silent_detections: int = 0
+        self._consecutive_chain_restarts: int = 0
 
         self._task: asyncio.Task | None = None
         self._shutdown = asyncio.Event()
@@ -60,6 +62,7 @@ class STTWatchdog:
     def on_speech_partial(self, text: str = "", **_kw: Any) -> None:
         """Called from bus on every STT partial -- updates liveness."""
         self._last_partial_time = time.monotonic()
+        self._consecutive_chain_restarts = 0
 
     def on_speech_final(self, text: str = "", **_kw: Any) -> None:
         """Called from bus on every STT final -- updates liveness."""
@@ -109,22 +112,47 @@ class STTWatchdog:
         if not is_running:
             return
 
+        state_mgr = getattr(stt, "_state", None)
+        if state_mgr is not None:
+            try:
+                from core.state_manager import AtomState
+                cur = state_mgr.current
+                if cur is AtomState.SPEAKING:
+                    return
+            except Exception:
+                pass
+
         since_partial = now - self._last_partial_time
         since_final = now - self._last_final_time
 
         tap_count = getattr(stt, "_tap_buffer_count", 0)
         audio_flowing = tap_count > self._last_tap_count
         self._last_tap_count = tap_count
+        last_audio_rms_db = float(getattr(stt, "_last_audio_rms_db", -96.0))
+        last_speech_candidate = float(getattr(stt, "_last_speech_candidate_time", 0.0) or 0.0)
+        speech_likely = (now - last_speech_candidate) < 3.0 if last_speech_candidate > 0 else False
 
-        if is_listening and since_partial > self._silent_timeout and audio_flowing:
+        if is_listening and since_partial > self._silent_timeout and audio_flowing and speech_likely:
             self._total_silent_detections += 1
             logger.warning(
-                "STT Watchdog: no partials for %.1fs but audio is flowing "
-                "(tap_count=%d) -- possible stuck recognizer",
-                since_partial, tap_count,
+                "STT Watchdog: no partials for %.1fs despite speech-like audio "
+                "(tap_count=%d, rms=%.1f dB) -- recognizer likely starved",
+                since_partial, tap_count, last_audio_rms_db,
             )
+            starvation_fn = getattr(stt, "_on_recognition_starvation", None)
+            if callable(starvation_fn):
+                try:
+                    starvation_fn()
+                except Exception:
+                    logger.debug("STT Watchdog: recognition starvation hook failed", exc_info=True)
             if self._can_restart():
-                await self._restart_stt(stt, "silent_with_audio")
+                await self._restart_stt(stt, "recognition_starved")
+        elif is_listening and since_partial > self._silent_timeout and audio_flowing:
+            logger.debug(
+                "STT Watchdog: audio is flowing but no speech-like activity yet "
+                "(tap_count=%d, rms=%.1f dB) -- suppressing restart",
+                tap_count, last_audio_rms_db,
+            )
 
         if is_listening and since_final > self._stuck_timeout and since_partial > self._stuck_timeout:
             last_error = getattr(stt, "_last_error", None)
@@ -146,23 +174,47 @@ class STTWatchdog:
 
     async def _restart_stt(self, stt: Any, reason: str) -> None:
         self._total_restarts += 1
+        self._consecutive_chain_restarts += 1
         self._restart_times.append(time.monotonic())
-        logger.info("STT Watchdog: restarting STT (%s, restart #%d)", reason, self._total_restarts)
 
-        restart_fn = getattr(stt, "_restart_recognition_chain", None)
-        if callable(restart_fn):
+        needs_full_restart = self._consecutive_chain_restarts >= _CHAIN_RESTARTS_BEFORE_FULL
+
+        if needs_full_restart:
+            logger.warning(
+                "STT Watchdog: %d consecutive chain restarts with no partials — "
+                "escalating to full engine restart with device rebinding (#%d)",
+                self._consecutive_chain_restarts, self._total_restarts,
+            )
+            self._consecutive_chain_restarts = 0
+        else:
+            logger.info("STT Watchdog: restarting STT (%s, restart #%d, chain #%d/%d)",
+                        reason, self._total_restarts,
+                        self._consecutive_chain_restarts, _CHAIN_RESTARTS_BEFORE_FULL)
+
+        if not needs_full_restart:
+            restart_fn = getattr(stt, "_restart_recognition_chain", None)
+            if callable(restart_fn):
+                try:
+                    loop = asyncio.get_running_loop()
+                    await loop.run_in_executor(None, restart_fn)
+                    self._last_partial_time = time.monotonic()
+                    logger.info("STT Watchdog: recognition chain restarted successfully")
+                    self._bus.emit_fast("stt_watchdog_restart", reason=reason, restart_count=self._total_restarts)
+                    return
+                except Exception:
+                    logger.warning("STT Watchdog: chain restart failed, trying full stop/start", exc_info=True)
+
+        rebind_fn = getattr(stt, "_rebind_audio_device", None)
+        if callable(rebind_fn):
             try:
-                loop = asyncio.get_running_loop()
-                await loop.run_in_executor(None, restart_fn)
-                self._last_partial_time = time.monotonic()
-                logger.info("STT Watchdog: recognition chain restarted successfully")
-                return
+                rebind_fn()
+                logger.info("STT Watchdog: re-asserted CoreAudio device before full restart")
             except Exception:
-                logger.warning("STT Watchdog: chain restart failed, trying full stop/start", exc_info=True)
+                logger.debug("STT Watchdog: device rebind failed", exc_info=True)
 
         try:
             stt.stop_listening()
-            await asyncio.sleep(0.5)
+            await asyncio.sleep(0.8)
             start_fn = getattr(stt, "start_listening", None)
             if callable(start_fn):
                 loop = getattr(stt, "_loop", None)
@@ -170,7 +222,7 @@ class STTWatchdog:
                 on_partial = getattr(stt, "_on_partial", None)
                 start_fn(loop=loop, on_final=on_final, on_partial=on_partial)
                 self._last_partial_time = time.monotonic()
-                logger.info("STT Watchdog: full STT restart completed")
+                logger.info("STT Watchdog: full STT restart completed (engine rebuilt)")
         except Exception:
             logger.exception("STT Watchdog: full restart failed")
 

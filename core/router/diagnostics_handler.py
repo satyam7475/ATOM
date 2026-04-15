@@ -34,6 +34,7 @@ class DiagnosticsHandler:
         "_stt", "_tts", "_metrics", "_local_brain",
         "_health_monitor", "_evolution", "_behavior_tracker",
         "_config", "_state_snapshot_provider", "_report_publisher",
+        "_audio_intel",
     )
 
     def __init__(self, config: dict | None = None) -> None:
@@ -47,6 +48,7 @@ class DiagnosticsHandler:
         self._behavior_tracker: Any = None
         self._state_snapshot_provider: Callable[[], dict[str, Any]] | None = None
         self._report_publisher: Callable[[dict[str, Any]], Any] | None = None
+        self._audio_intel: Any = None
 
     def configure(
         self,
@@ -59,6 +61,7 @@ class DiagnosticsHandler:
         behavior_tracker: Any = None,
         state_snapshot_provider: Callable[[], dict[str, Any]] | None = None,
         report_publisher: Callable[[dict[str, Any]], Any] | None = None,
+        audio_intel: Any = None,
     ) -> None:
         """Wire diagnostic dependencies after construction."""
         if stt is not None:
@@ -79,6 +82,8 @@ class DiagnosticsHandler:
             self._state_snapshot_provider = state_snapshot_provider
         if report_publisher is not None:
             self._report_publisher = report_publisher
+        if audio_intel is not None:
+            self._audio_intel = audio_intel
 
     def _get_state_snapshot(self) -> dict[str, Any]:
         if self._state_snapshot_provider is None:
@@ -103,6 +108,16 @@ class DiagnosticsHandler:
         report = self._build_self_check_report()
         self._publish_report(report)
         return str(report.get("summary_text") or "")
+
+    def audio_diagnostics(self) -> str:
+        """Return audio intelligence status for voice/text 'audio diagnostics' command."""
+        if self._audio_intel is None:
+            return "Audio Intelligence Engine is not active."
+        try:
+            return self._audio_intel.diagnostic_report()
+        except Exception:
+            logger.debug("audio_diagnostics failed", exc_info=True)
+            return "Audio diagnostics unavailable."
 
     def mode_status(self) -> str:
         """Return the active runtime mode from shared state, not LLM guesswork."""

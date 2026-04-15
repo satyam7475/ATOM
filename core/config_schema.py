@@ -37,6 +37,108 @@ CONFIG_SCHEMA: dict[str, Any] = {
             },
             "additionalProperties": False,
         },
+        "audio_intelligence": {
+            "type": "object",
+            "properties": {
+                "enabled": {
+                    "type": "boolean",
+                    "description": "Enable the Audio Intelligence Engine for automatic device discovery, testing, and selection.",
+                },
+                "auto_select": {
+                    "type": "boolean",
+                    "description": "Automatically select the best audio device at boot.",
+                },
+                "active_test_duration_s": {
+                    "type": "number",
+                    "minimum": 0.5,
+                    "maximum": 10.0,
+                    "description": "Duration in seconds to record from each device during active testing.",
+                },
+                "allow_bluetooth": {
+                    "type": "boolean",
+                    "description": "Allow Bluetooth devices to be selected (penalised but not excluded).",
+                },
+                "bluetooth_penalty": {
+                    "type": "number",
+                    "minimum": 0.0,
+                    "maximum": 1.0,
+                    "description": "Score penalty applied to Bluetooth devices (0.0-1.0).",
+                },
+                "min_rms_threshold_db": {
+                    "type": "number",
+                    "minimum": -120,
+                    "maximum": 0,
+                    "description": "Minimum RMS in dBFS; devices below this are rejected as dead/muted.",
+                },
+                "monitoring_interval_s": {
+                    "type": "number",
+                    "minimum": 5,
+                    "maximum": 120,
+                    "description": "Seconds between watchdog health checks.",
+                },
+                "degradation_checks_before_switch": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 20,
+                    "description": "Consecutive failed health checks before triggering a device switch.",
+                },
+                "voice_feedback": {
+                    "type": "boolean",
+                    "description": "Speak device status changes via TTS (Jarvis personality).",
+                },
+                "prefer_device": {
+                    "type": ["string", "null"],
+                    "description": "Preferred device name; gets a +0.1 score bonus when matched.",
+                },
+                "vad_aggressiveness": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 3,
+                    "description": "WebRTC VAD aggressiveness (0=least aggressive, 3=most).",
+                },
+                "set_system_default": {
+                    "type": "boolean",
+                    "description": "Programmatically set macOS system default input via CoreAudio.",
+                },
+                "debug_logging": {
+                    "type": "boolean",
+                    "description": "Enable verbose audio intelligence debug logs.",
+                },
+                "context_aware": {
+                    "type": "boolean",
+                    "description": "Enable context-aware device switching based on active app, time, and activity.",
+                },
+                "device_learning": {
+                    "type": "boolean",
+                    "description": "Enable persistent device history to learn which devices work best over time.",
+                },
+                "predictive_switching": {
+                    "type": "boolean",
+                    "description": "Enable predictive switching that detects quality degradation trends before failure.",
+                },
+                "predictive_rms_slope_threshold": {
+                    "type": "number",
+                    "minimum": -5.0,
+                    "maximum": 0.0,
+                    "description": "RMS slope threshold (dB/check) below which predictive pre-warming triggers.",
+                },
+                "predictive_snr_slope_threshold": {
+                    "type": "number",
+                    "minimum": -5.0,
+                    "maximum": 0.0,
+                    "description": "SNR slope threshold (dB/check) below which predictive pre-warming triggers.",
+                },
+                "night_suppress_feedback": {
+                    "type": "boolean",
+                    "description": "Suppress voice feedback during night hours (22:00-07:00).",
+                },
+                "low_confidence_ask_user": {
+                    "type": "boolean",
+                    "description": "Emit audio_confirm_needed event when switch confidence is low instead of switching silently.",
+                },
+            },
+            "additionalProperties": False,
+        },
         "stt": {
             "type": "object",
             "properties": {
@@ -159,9 +261,9 @@ CONFIG_SCHEMA: dict[str, Any] = {
                 },
                 "native_tap_sample_rate": {
                     "type": "number",
-                    "minimum": 8000,
+                    "minimum": 0,
                     "maximum": 48000,
-                    "description": "If set (e.g. 48000), force mono tap at this sample rate for Speech; 0 = match device.",
+                    "description": "Force mono tap at this sample rate for Speech (e.g. 48000); 0 = match device format (default).",
                 },
             },
             "additionalProperties": False,

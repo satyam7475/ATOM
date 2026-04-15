@@ -48,6 +48,7 @@ class MicDeviceProfile:
     supports_44khz: bool = False
     failure_count: int = 0
     last_failure_time: float = 0.0
+    core_audio_id: int = 0
 
 
 class MicManager:

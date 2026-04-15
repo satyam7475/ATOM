@@ -227,6 +227,7 @@ async def main() -> None:
         intent_engine=intent_engine,
     )
     voice_pipeline.build()
+    voice_pipeline.build_audio_intelligence()
     stt = voice_pipeline.stt
     tts = voice_pipeline.tts
     stt_runtime_label = voice_pipeline.stt_runtime_label
@@ -1235,19 +1236,60 @@ async def main() -> None:
         logger.info("STT model loading in background...")
 
         try:
-            loop = asyncio.get_running_loop()
-
-            devices = await loop.run_in_executor(None, mic_manager.profile_devices)
-            if devices:
-                best = mic_manager.get_best_device(
-                    prefer_bluetooth=config.get("mic", {}).get("prefer_bluetooth", True),
-                )
+            audio_intel = voice_pipeline.audio_intelligence
+            if audio_intel is not None and config.get("audio_intelligence", {}).get("enabled", True):
+                best = await audio_intel.boot()
                 if best:
-                    mic_manager.active_device = best
                     logger.info(
-                        "Audio device selected: '%s' (%s, quality=%d/100)",
+                        "Audio Intelligence: '%s' (%s, score=%.3f)",
                         best.name, best.device_type, best.quality_score,
                     )
+                    if audio_intel.input_output_hardware_mismatch and hasattr(stt, "_native_voice_processing"):
+                        stt._native_voice_processing = False
+                        logger.info(
+                            "Auto-disabled Voice Processing I/O — input (%s) and output (%s) "
+                            "are on different hardware (VPIO echo cancellation causes silence)",
+                            best.device_type,
+                            audio_intel._selected_output.device_type if audio_intel._selected_output else "?",
+                        )
+                    if hasattr(stt, "set_audio_device_rebinder") and audio_intel._selected_input:
+                        sel = audio_intel._selected_input
+                        def _rebind() -> bool:
+                            return audio_intel.apply_system_default(sel)
+                        stt.set_audio_device_rebinder(_rebind, sel.name)
+                        logger.info("STT device rebinder wired for '%s' (CoreAudio ID %d)", sel.name, sel.core_audio_id)
+                    if hasattr(stt, "preflight_mic_check"):
+                        loop = asyncio.get_running_loop()
+                        mic_ok = await loop.run_in_executor(None, stt.preflight_mic_check)
+                        if not mic_ok:
+                            logger.warning(
+                                "Pre-flight mic check: '%s' returned dead signal — "
+                                "AVAudioEngine may still work (continuing)",
+                                best.name,
+                            )
+                else:
+                    logger.warning("Audio Intelligence: no suitable device found, falling back to MicManager")
+                    loop = asyncio.get_running_loop()
+                    devices = await loop.run_in_executor(None, mic_manager.profile_devices)
+                    if devices:
+                        fallback = mic_manager.get_best_device(
+                            prefer_bluetooth=config.get("mic", {}).get("prefer_bluetooth", True),
+                        )
+                        if fallback:
+                            mic_manager.active_device = fallback
+            else:
+                loop = asyncio.get_running_loop()
+                devices = await loop.run_in_executor(None, mic_manager.profile_devices)
+                if devices:
+                    best_legacy = mic_manager.get_best_device(
+                        prefer_bluetooth=config.get("mic", {}).get("prefer_bluetooth", True),
+                    )
+                    if best_legacy:
+                        mic_manager.active_device = best_legacy
+                        logger.info(
+                            "Audio device selected (legacy): '%s' (%s, quality=%d/100)",
+                            best_legacy.name, best_legacy.device_type, best_legacy.quality_score,
+                        )
 
             if hasattr(stt, "async_preload"):
                 await stt.async_preload()
@@ -1544,6 +1586,7 @@ async def main() -> None:
         health_monitor=health_monitor,
         state_snapshot_provider=atom_runtime.snapshot,
         report_publisher=_publish_self_check_report,
+        audio_intel=voice_pipeline.audio_intelligence,
     )
 
     async def _on_atom_readiness(report: dict[str, object] | None = None, **_kw) -> None:

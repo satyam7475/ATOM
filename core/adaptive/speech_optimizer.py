@@ -42,6 +42,6 @@ class SpeechOptimizer:
             pause *= 1.1
 
         return {
-            "rate_multiplier": round(max(0.7, min(rate, 1.5)), 3),
+            "rate_multiplier": round(max(0.85, min(rate, 1.35)), 3),
             "pause_multiplier": round(max(0.5, min(pause, 1.5)), 3),
         }

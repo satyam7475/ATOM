@@ -22,6 +22,8 @@ _NEGATIVE = frozenset({
     "bad", "hate", "annoying", "issue", "problem", "error", "wrong",
     "broken", "fail", "failed", "terrible", "awful", "stupid", "slow",
     "bug", "crash", "stuck", "frustrated", "angry", "useless",
+    "not", "doesn't", "isn't", "can't", "won't", "never",
+    "sucks", "horrible", "rubbish", "garbage", "pathetic",
 })
 
 _URGENT = frozenset({
@@ -63,7 +65,7 @@ class EmotionAnalyzer:
             score -= 0.5
 
         urgent = bool(words & _URGENT)
-        intensity = min(1.0, abs(score) / 3.0)
+        intensity = min(1.0, abs(score) / 2.0)
 
         if score >= 2:
             return EmotionResult("happy", max(intensity, 0.5))
@@ -75,4 +77,4 @@ class EmotionAnalyzer:
             return EmotionResult("stressed", 0.6)
         if score >= 1:
             return EmotionResult("calm", 0.3)
-        return EmotionResult("neutral", 0.2)
+        return EmotionResult("neutral", 0.15)

@@ -114,23 +114,34 @@ _SYSTEM_VOICE_ALIASES = frozenset({
     "system", "default", "siri", "apple", "apple_siri", "match_system", "",
 })
 
-# When no explicit voice matches: premium neural first (Siri-class quality on Apple Silicon).
+# When no explicit voice matches: premium neural first, then compact natural
+# voices, then Eloquence as last resort. Warm feminine voices are preferred
+# for the "Friday" assistant personality.
 _PREFERRED_VOICES = [
-    "com.apple.voice.premium.en-GB.Martha",
-    "com.apple.voice.enhanced.en-GB.Martha",
-    "com.apple.eloquence.en-GB.Flo",
-    "com.apple.eloquence.en-GB.Shelley",
-    "com.apple.eloquence.en-GB.Sandy",
+    # Premium / enhanced neural (Siri-class, require download from Spoken Content settings)
     "com.apple.voice.premium.en-US.Samantha",
     "com.apple.voice.enhanced.en-US.Samantha",
+    "com.apple.voice.premium.en-GB.Serena",
+    "com.apple.voice.enhanced.en-GB.Serena",
+    "com.apple.voice.premium.en-IN.Rani",
+    "com.apple.voice.enhanced.en-IN.Rani",
+    "com.apple.voice.premium.en-AU.Karen",
+    "com.apple.voice.enhanced.en-AU.Karen",
+    "com.apple.voice.premium.en-GB.Kate",
+    "com.apple.voice.enhanced.en-GB.Kate",
+    "com.apple.voice.premium.en-GB.Martha",
+    "com.apple.voice.enhanced.en-GB.Martha",
+    "com.apple.voice.premium.en-US.Zoe",
+    "com.apple.voice.enhanced.en-US.Zoe",
+    # Compact natural voices (pre-installed, decent quality)
     "com.apple.voice.compact.en-US.Samantha",
-    "com.apple.voice.premium.en-GB.Malcolm",
-    "com.apple.voice.premium.en-GB.Daniel",
-    "com.apple.voice.enhanced.en-GB.Daniel",
-    "com.apple.voice.premium.en-US.Evan",
-    "com.apple.voice.enhanced.en-US.Evan",
-    "com.apple.voice.premium.en-AU.Lee",
-    "com.apple.speech.synthesis.voice.daniel.premium",
+    "com.apple.voice.Tara",
+    "com.apple.voice.compact.en-AU.Karen",
+    "com.apple.voice.compact.en-IE.Moira",
+    "com.apple.voice.compact.en-ZA.Tessa",
+    "com.apple.voice.compact.en-GB.Daniel",
+    # Eloquence (robotic, avoid unless nothing else is available)
+    "com.apple.eloquence.en-GB.Shelley",
     "com.apple.eloquence.en-US.Eddy",
 ]
 
@@ -333,9 +344,10 @@ class _NativeSynth:
     don't block asyncio. The asyncio layer awaits via run_in_executor.
     """
 
-    def __init__(self, voice_id: str, rate: float) -> None:
+    def __init__(self, voice_id: str, rate: float, pitch_shift: float = 0.0) -> None:
         self._voice_id = voice_id
         self._rate = rate
+        self._pitch_shift = pitch_shift
         self._synth: Any = None
         self._stop_flag = threading.Event()
 
@@ -346,6 +358,16 @@ class _NativeSynth:
         if self._voice_id:
             synth.setVoice_(self._voice_id)
         synth.setRate_(self._rate)
+        if self._pitch_shift != 0.0:
+            try:
+                pitch_prop = getattr(_AppKit, "NSSpeechPitchBaseProperty", "pbas")
+                result = synth.objectForProperty_error_(pitch_prop, None)
+                base_pitch = result[0] if isinstance(result, tuple) else result
+                if base_pitch is not None:
+                    new_pitch = float(base_pitch) + self._pitch_shift
+                    synth.setObject_forProperty_error_(new_pitch, pitch_prop, None)
+            except Exception:
+                pass
         self._synth = synth
 
         synth.startSpeakingString_(text)
@@ -389,7 +411,7 @@ class MacOSTTSAsync:
         state: StateManager,
         max_lines: int = 4,
         voice: str = "system",
-        rate: int = 200,
+        rate: int = 165,
     ) -> None:
         self._bus = bus
         self._state = state
@@ -434,12 +456,19 @@ class MacOSTTSAsync:
 
         if _HAS_NATIVE:
             self._voice_id = _pick_best_voice(self._voice_request)
-            self._native_synth = _NativeSynth(self._voice_id, float(self._rate))
+            is_premium = "premium" in self._voice_id or "enhanced" in self._voice_id
+            is_eloquence = "eloquence" in self._voice_id
+            pitch_shift = 4.0 if not is_eloquence else 0.0
+            self._native_synth = _NativeSynth(self._voice_id, float(self._rate), pitch_shift)
             self._backend = "NSSpeechSynthesizer"
 
             voice_name = self._voice_id.rsplit(".", 1)[-1] if self._voice_id else "default"
-            is_premium = "premium" in self._voice_id or "enhanced" in self._voice_id
-            quality = "premium neural" if is_premium else "standard"
+            if is_premium:
+                quality = "premium neural"
+            elif is_eloquence:
+                quality = "eloquence"
+            else:
+                quality = "compact"
             logger.info(
                 "macOS TTS ready — %s (%s voice '%s', rate=%d)",
                 self._backend, quality, voice_name, self._rate,

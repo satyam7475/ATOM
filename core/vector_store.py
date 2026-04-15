@@ -61,7 +61,7 @@ class VectorStore:
     _COLLECTIONS = ("conversations", "facts", "documents", "interactions")
 
     __slots__ = (
-        "_store_dir", "_client", "_collections", "_using_chromadb",
+        "_backend", "_store_dir", "_client", "_collections", "_using_chromadb",
         "_fallback_data", "_fallback_dirty",
         "_stats_cache", "_stats_cache_ts",
     )
