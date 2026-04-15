@@ -46,10 +46,12 @@ Owner: Satyam
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
+from pathlib import Path
 from typing import Any, TYPE_CHECKING
 
 from core.identity_engine import IdentityEngine
@@ -150,6 +152,8 @@ class JarvisCore:
         self._memory: MemoryEngine | None = None
         self._goals: GoalEngine | None = None
         self._quota: ProactiveInsightQuota | None = None
+
+        self._load_persisted()
 
         jcfg = self._config.get("jarvis_core", {})
         self._proactive_interval = jcfg.get("proactive_interval_s", 120.0)
@@ -301,7 +305,9 @@ class JarvisCore:
                 )
 
         # Emotion-aware tone adjustment
-        adjustments = self._identity.get_personality_adjustment({"hour": s.hour})
+        adjustments = self._identity.get_personality_adjustment(
+            {"hour": self._situation.hour},
+        )
         context["suggested_tone"] = adjustments.get("tone", "normal")
         context["suggested_verbosity"] = adjustments.get("verbosity", "medium")
 
@@ -926,6 +932,7 @@ class JarvisCore:
         self._shutdown.set()
         if self._task and not self._task.done():
             self._task.cancel()
+        self.persist()
 
     async def _proactive_loop(self) -> None:
         """Periodic proactive intelligence generation."""
@@ -973,5 +980,42 @@ class JarvisCore:
             except Exception:
                 logger.debug("JARVIS proactive loop error", exc_info=True)
 
+    _PERSIST_PATH = Path("logs/jarvis_state.json")
+
     def persist(self) -> None:
-        pass
+        """Save JARVIS state for cross-session continuity."""
+        state = {
+            "conversation_count": self._conversation_count,
+            "last_briefing_date": self._last_briefing_date,
+            "last_eod_date": self._last_eod_date,
+            "last_idle_summary_time": self._last_idle_summary_time,
+            "delivered_categories": self._delivered_categories,
+            "delivered_insights": self._delivered_insights[-50:],
+            "emotion_shift_count": self._emotion_shift_count,
+            "last_emotion": self._last_emotion,
+            "session_start": self._session_start,
+        }
+        try:
+            self._PERSIST_PATH.parent.mkdir(exist_ok=True)
+            self._PERSIST_PATH.write_text(
+                json.dumps(state, indent=2, default=str), encoding="utf-8",
+            )
+            logger.debug("JARVIS state persisted to %s", self._PERSIST_PATH)
+        except Exception:
+            logger.debug("Failed to persist JARVIS state", exc_info=True)
+
+    def _load_persisted(self) -> None:
+        """Restore state from a previous session if available."""
+        try:
+            if not self._PERSIST_PATH.exists():
+                return
+            data = json.loads(self._PERSIST_PATH.read_text(encoding="utf-8"))
+            self._last_briefing_date = data.get("last_briefing_date", "")
+            self._last_eod_date = data.get("last_eod_date", "")
+            self._last_idle_summary_time = data.get("last_idle_summary_time", 0.0)
+            self._delivered_categories = data.get("delivered_categories", {})
+            self._delivered_insights = data.get("delivered_insights", [])
+            self._last_emotion = data.get("last_emotion", "neutral")
+            logger.info("JARVIS state restored from %s", self._PERSIST_PATH)
+        except Exception:
+            logger.debug("Failed to load JARVIS state", exc_info=True)

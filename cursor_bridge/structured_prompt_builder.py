@@ -206,6 +206,7 @@ class StructuredPromptBuilder:
         self._context_fusion = None
         self._real_world_intel = None
         self._preference_store = None
+        self._intent_continuity = None
 
     @property
     def system_prompt_hash(self) -> int:
@@ -225,6 +226,10 @@ class StructuredPromptBuilder:
     def set_preference_store(self, preference_store) -> None:
         """v22: Wire PreferenceStore for owner preference injection into prompts."""
         self._preference_store = preference_store
+
+    def set_intent_continuity(self, intent_continuity) -> None:
+        """Wire IntentContinuity for goal/thread-aware prompt injection."""
+        self._intent_continuity = intent_continuity
 
     def _build_system_layer(self) -> str:
         """Layer 1: JARVIS-level System Identity."""
@@ -404,6 +409,14 @@ class StructuredPromptBuilder:
                 pref_block = self._preference_store.get_context_block()
                 if pref_block:
                     parts.append(f"OWNER PREFERENCES:\n{pref_block}")
+            except Exception:
+                pass
+
+        if self._intent_continuity is not None:
+            try:
+                intent_block = self._intent_continuity.context_for_prompt()
+                if intent_block:
+                    parts.append(intent_block)
             except Exception:
                 pass
 

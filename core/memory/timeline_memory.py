@@ -6,14 +6,20 @@ Thread-safe for Router + brain + executor callbacks.
 
 from __future__ import annotations
 
+import json
 import re
 import threading
 import time
 from collections import Counter, deque
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 logger = __import__("logging").getLogger("atom.timeline")
+
+_PERSIST_PATH = Path("logs/timeline_memory.json")
+_PERSIST_INTERVAL_S = 300.0
+_PERSIST_MAX_EVENTS = 200
 
 
 @dataclass
@@ -31,6 +37,8 @@ class TimelineMemory:
         self._summarize_on_prune = bool(summarize_on_prune)
         self._events: deque[TimelineEvent] = deque(maxlen=self._max)
         self._lock = threading.RLock()
+        self._last_persist_time: float = 0.0
+        self._load()
 
     def event_count(self) -> int:
         with self._lock:
@@ -58,6 +66,7 @@ class TimelineMemory:
             logger.info("v7_timeline type=%s keys=%s", type, list(ev.data.keys()))
         except Exception:
             pass
+        self.save()
 
     def get_recent_events(self, window_sec: float) -> list[TimelineEvent]:
         cutoff = time.time() - max(0.0, float(window_sec))
@@ -175,3 +184,84 @@ class TimelineMemory:
         """True if meaningful timeline activity within idle_sec."""
         evs = self.get_recent_events(idle_sec)
         return len(evs) >= 2
+
+    # ── Persistence ──────────────────────────────────────────────────
+
+    def save(self, force: bool = False) -> None:
+        """Persist timeline to disk. Auto-called periodically and on shutdown."""
+        now = time.time()
+        if not force and (now - self._last_persist_time) < _PERSIST_INTERVAL_S:
+            return
+        with self._lock:
+            events = list(self._events)[-_PERSIST_MAX_EVENTS:]
+        records = [
+            {"type": e.type, "data": e.data, "ts": e.timestamp}
+            for e in events
+        ]
+        try:
+            _PERSIST_PATH.parent.mkdir(exist_ok=True)
+            _PERSIST_PATH.write_text(
+                json.dumps(records, default=str), encoding="utf-8",
+            )
+            self._last_persist_time = now
+            logger.debug("Timeline persisted (%d events)", len(records))
+        except Exception:
+            logger.debug("Timeline persist failed", exc_info=True)
+
+    def _load(self) -> None:
+        """Restore timeline from a previous session."""
+        try:
+            if not _PERSIST_PATH.exists():
+                return
+            raw = json.loads(_PERSIST_PATH.read_text(encoding="utf-8"))
+            if not isinstance(raw, list):
+                return
+            with self._lock:
+                for item in raw[-self._max:]:
+                    ev = TimelineEvent(
+                        type=item.get("type", "unknown"),
+                        data=item.get("data", {}),
+                        timestamp=float(item.get("ts", 0)),
+                    )
+                    self._events.append(ev)
+            logger.info("Timeline restored (%d events from disk)", len(raw))
+        except Exception:
+            logger.debug("Timeline load failed", exc_info=True)
+
+    def summarize_session(self, window_sec: float = 3600.0) -> str:
+        """Generate a cross-session recall summary.
+
+        Useful for "what did I do earlier?" queries and for
+        injecting episodic context into the LLM.
+        """
+        evs = self.get_recent_events(window_sec)
+        if not evs:
+            return "No recent activity recorded."
+
+        queries = []
+        actions = []
+        errors = 0
+        for ev in evs:
+            if ev.type == "user_query":
+                q = (ev.data.get("text") or "")[:100]
+                if q:
+                    queries.append(q)
+            elif ev.type == "action":
+                name = ev.data.get("tool") or ev.data.get("name") or "action"
+                actions.append(name)
+            elif ev.type == "error":
+                errors += 1
+
+        parts = []
+        duration_min = (evs[-1].timestamp - evs[0].timestamp) / 60
+        parts.append(f"Session span: {duration_min:.0f} minutes, {len(evs)} events.")
+
+        if queries:
+            parts.append(f"Topics discussed: {', '.join(queries[-5:])}")
+        if actions:
+            unique_actions = list(dict.fromkeys(actions))
+            parts.append(f"Actions taken: {', '.join(unique_actions[-5:])}")
+        if errors:
+            parts.append(f"Errors encountered: {errors}")
+
+        return " ".join(parts)

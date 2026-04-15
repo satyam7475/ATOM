@@ -376,7 +376,7 @@ class MacOSTTSAsync:
     Public API matches EdgeTTSAsync / TTSAsync for drop-in replacement.
     """
 
-    _SPEAK_WORD_LIMIT: int = 18
+    _SPEAK_WORD_LIMIT: int = 40
     # Coalesce tiny stream fragments so NSSpeechSynthesizer does not speak word-by-word.
     _STREAM_UNPUNCT_MIN_WORDS: int = 8
     _STREAM_UNPUNCT_BATCH: int = 14
@@ -415,6 +415,10 @@ class MacOSTTSAsync:
         self._stream_task: asyncio.Task | None = None
         self._stream_generation: int = 0
         self._stream_speak_buffer: str = ""
+
+        from voice.speech_enhancer import SpeechEnhancer
+        self._enhancer = SpeechEnhancer(base_rate=rate)
+        self._current_emotion: str = "neutral"
 
     # ── Initialization ─────────────────────────────────────────────
 
@@ -460,13 +464,17 @@ class MacOSTTSAsync:
             await self._say_subprocess(text)
 
     async def _say_subprocess(self, text: str) -> None:
-        """Fallback: spawn `say` subprocess."""
+        """Fallback: spawn `say` subprocess with dynamic rate."""
         if self._cancel_requested or not text:
             return
+        emo = self._current_emotion
+        enhanced = self._enhancer.enhance(text, emotion=emo)
+        rate = enhanced.rate
+        speak_text = enhanced.say_silence_text if enhanced.pause_points else text
         cmd = ["say"]
         if self._voice_request:
             cmd.extend(["-v", self._voice_request])
-        cmd.extend(["-r", str(self._rate), "--", text])
+        cmd.extend(["-r", str(rate), "--", speak_text])
         try:
             self._say_proc = await asyncio.create_subprocess_exec(
                 *cmd,
@@ -547,18 +555,23 @@ class MacOSTTSAsync:
     def _is_duplicate_chunk(self, text: str) -> bool:
         """Skip only immediate repeats of the same spoken chunk (streaming overlap).
 
-        A short ring buffer used to catch duplicates caused the model to repeat
-        a phrase later in the stream to be mistaken for a duplicate — skipping
-        speech and sounding like dropped words.
+        Uses a sliding window of the last 2 full normalized chunks.
+        Short chunks (< 4 words) are never considered duplicates since
+        common phrases like "Sure, Boss" can legitimately repeat.
         """
         key = self._chunk_key(text)
         if not key:
             return True
+        if len(key.split()) < 4:
+            self._recent_spoken_chunks.append(key)
+            if len(self._recent_spoken_chunks) > 3:
+                self._recent_spoken_chunks = self._recent_spoken_chunks[-3:]
+            return False
         if self._recent_spoken_chunks and key == self._recent_spoken_chunks[-1]:
             return True
         self._recent_spoken_chunks.append(key)
-        if len(self._recent_spoken_chunks) > 2:
-            self._recent_spoken_chunks = self._recent_spoken_chunks[-2:]
+        if len(self._recent_spoken_chunks) > 3:
+            self._recent_spoken_chunks = self._recent_spoken_chunks[-3:]
         return False
 
     def _pop_next_stream_segment(self, force: bool) -> str:
@@ -687,25 +700,39 @@ class MacOSTTSAsync:
         if self._cancel_requested:
             return
 
+        emo = emotion or self._current_emotion
+        enhanced = self._enhancer.enhance(text, emotion=emo)
+        dynamic_rate = enhanced.rate
+
         async with self._speak_lock:
             if self._cancel_requested:
                 return
             self._cancel_requested = False
             self._playing = True
+
+            if self._native_synth:
+                self._native_synth._rate = float(dynamic_rate)
+
             try:
                 sentences = _split_sentences(text)
                 if len(sentences) <= 1:
-                    logger.info("TTS [%s]: '%s'", self._backend, text[:80])
+                    logger.info("TTS [%s rate=%d]: '%s'", self._backend, dynamic_rate, text[:80])
                     await self._speak_one(text)
                 else:
                     logger.info(
-                        "TTS [%s, %d sentences]: '%s'",
-                        self._backend, len(sentences), text[:80],
+                        "TTS [%s, %d sentences, rate=%d]: '%s'",
+                        self._backend, len(sentences), dynamic_rate, text[:80],
                     )
-                    for sentence in sentences:
+                    for i, sentence in enumerate(sentences):
                         if self._cancel_requested:
                             break
                         await self._speak_one(sentence)
+                        if i < len(sentences) - 1 and not self._cancel_requested:
+                            pause = self._enhancer.compute_inter_sentence_pause(
+                                sentence, emotion=emo,
+                            )
+                            if pause > 0:
+                                await asyncio.sleep(pause)
             except asyncio.CancelledError:
                 await self.stop()
                 raise
@@ -716,6 +743,8 @@ class MacOSTTSAsync:
                 )
             finally:
                 self._playing = False
+                if self._native_synth:
+                    self._native_synth._rate = float(self._rate)
 
     # ── Public API ─────────────────────────────────────────────────
 
@@ -737,6 +766,12 @@ class MacOSTTSAsync:
                 await self._speak_one(phrase)
             finally:
                 self._playing = False
+
+    def set_emotion(self, emotion: str) -> None:
+        """Update the current emotional context for dynamic rate control."""
+        if emotion and emotion != self._current_emotion:
+            self._current_emotion = emotion
+            logger.debug("TTS emotion updated: %s", emotion)
 
     def next_ack_phrase(self) -> str:
         phrase = ACK_PHRASES[self._ack_idx % len(ACK_PHRASES)]

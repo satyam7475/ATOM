@@ -100,16 +100,23 @@ class ProactiveAwareness:
         return None
 
     def check_idle(self, idle_seconds: float) -> str | None:
-        """Return an idle hint if user has been quiet for a while."""
+        """Return an idle hint if user has been quiet for a while.
+
+        Uses a 45s threshold for lightweight checks (delegated to JarvisCore
+        for deeper intelligence). The generic "still here" message fires
+        only after 5+ minutes.
+        """
         if not self._enabled:
-            return None
-        if idle_seconds < 300:
             return None
         now = time.monotonic()
         if now - self._last_idle_hint < _IDLE_HINT_COOLDOWN_S:
             return None
+        if idle_seconds < 45:
+            return None
         self._last_idle_hint = now
-        return "Still here whenever you need me, Boss."
+        if idle_seconds >= 300:
+            return "Still here whenever you need me, Boss."
+        return None
 
     def on_new_day(self) -> None:
         """Reset daily state. Call from midnight check or startup."""

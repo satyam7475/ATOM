@@ -154,8 +154,18 @@ class OwnerUnderstanding:
 
         self._task: asyncio.Task | None = None
         self._shutdown = asyncio.Event()
+        self._prediction_engine: Any = None
+        self._second_brain: Any = None
 
         self._load_model()
+
+    def wire_prediction(self, prediction_engine: Any) -> None:
+        """Wire PredictionEngine for populating next_likely_action."""
+        self._prediction_engine = prediction_engine
+
+    def wire_second_brain(self, brain: Any) -> None:
+        """Wire SecondBrain for feeding learned observations."""
+        self._second_brain = brain
 
     # ── Model Persistence ─────────────────────────────────────────
 
@@ -287,6 +297,18 @@ class OwnerUnderstanding:
         })
         if len(self._interaction_log) > _MAX_INTERACTION_HISTORY:
             self._interaction_log = self._interaction_log[-_MAX_INTERACTION_HISTORY:]
+
+        if self._second_brain is not None and self._total_interactions % 10 == 0:
+            try:
+                self._second_brain.learn_fact(
+                    f"Owner communication style: "
+                    f"formality={self.communication.formality_level:.1f}, "
+                    f"avg_length={self.communication.avg_sentence_length:.0f}w, "
+                    f"preferred_response={self.communication.preferred_response_length}",
+                    category="owner_profile",
+                )
+            except Exception:
+                pass
 
     def process_response_feedback(self, query: str, response: str,
                                    was_helpful: bool = True) -> None:
@@ -543,6 +565,19 @@ class OwnerUnderstanding:
                 self.topics.recent_topics[0] if isinstance(self.topics.recent_topics[0], str)
                 else self.topics.recent_topics[0][0]
             )
+
+        if self._prediction_engine is not None:
+            try:
+                preds = self._prediction_engine.predict_next(max_results=1)
+                if preds and preds[0].confidence >= 0.5:
+                    p = preds[0]
+                    action_str = p.action.replace("_", " ")
+                    target = f" {p.target}" if p.target else ""
+                    self.anticipation.next_likely_action = f"{action_str}{target}"
+                else:
+                    self.anticipation.next_likely_action = ""
+            except Exception:
+                pass
 
         self.anticipation.mood_appropriate_greeting = self._generate_mood_greeting()
 
