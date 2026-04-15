@@ -126,6 +126,34 @@ def _is_deep_relationship() -> bool:
     return _session_depth() > 100
 
 
+_system_context: dict[str, Any] = {}
+
+
+def update_system_context(ctx: dict[str, Any]) -> None:
+    """Feed real-time system state for context-aware responses."""
+    global _system_context
+    _system_context = dict(ctx or {})
+
+
+def _active_app() -> str:
+    return str(_system_context.get("active_app", ""))
+
+
+def context_aware_prefix() -> str:
+    """Optional prefix based on system context (battery, time, workload)."""
+    parts: list[str] = []
+    battery = _system_context.get("battery_pct", 100)
+    plugged = _system_context.get("battery_plugged", True)
+    if isinstance(battery, (int, float)) and battery <= 15 and not plugged:
+        parts.append(f"Battery at {int(battery)}%.")
+
+    cpu = _system_context.get("cpu_pct", 0)
+    if isinstance(cpu, (int, float)) and cpu > 85:
+        parts.append("System is under heavy load.")
+
+    return " ".join(parts)
+
+
 # ── ADAPTIVE GREETINGS ───────────────────────────────────────────────
 
 def greeting_response() -> str:
@@ -528,15 +556,27 @@ def polish_response(text: str, *, source: str = "general") -> str:
     for old, new in _SOFTEN_MAP:
         t = t.replace(old, new)
 
-    # Keep focus mode concise, but preserve key guidance.
+    # Emotion-driven brevity: adapt to owner's emotional state and style.
+    emotion = _emotion()
+    owner_pref = ""
+    if _owner_engine is not None:
+        owner_pref = getattr(
+            _owner_engine.communication, "preferred_response_length", "",
+        )
+        avg_len = getattr(_owner_engine.communication, "avg_sentence_length", 8.0)
+        if avg_len < 5 and verb == "full":
+            verb = "minimal"
+
     if verb == "silent":
         return ""
     if source == "thinking_ack":
         t = _limit_reply(t, max_sentences=1, max_chars=90)
-    elif verb == "minimal":
+    elif verb == "minimal" or owner_pref == "short":
         t = _limit_reply(t, max_sentences=2, max_chars=140)
     elif voice_verbosity in {"brief", "terse"}:
         t = _limit_reply(t, max_sentences=2, max_chars=180)
+    elif emotion in ("frustrated", "stressed"):
+        t = _limit_reply(t, max_sentences=3, max_chars=200)
 
     # Normalize terminal punctuation for better TTS rhythm.
     if t and t[-1] not in ".!?":
@@ -549,6 +589,12 @@ def polish_response(text: str, *, source: str = "general") -> str:
         lower = t.lower()
         if lower in {"done.", "all done.", "handled.", "taken care of."}:
             t = f"Done, Boss."
+
+    # Inject critical system context prefix (battery dying, system overloaded).
+    if source not in {"thinking_ack", "stream_chunk"}:
+        prefix = context_aware_prefix()
+        if prefix:
+            t = f"{prefix} {t}"
 
     return t
 

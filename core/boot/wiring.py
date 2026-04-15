@@ -34,6 +34,7 @@ def wire_events(
     priority_sched=None,
     v3: bool = False,
     v4: bool = False,
+    command_loop=None,
 ) -> dict:
     """Wire all event bus handlers. Extracted from main() for testability.
 
@@ -90,6 +91,7 @@ def wire_events(
         local_brain=local_brain,
         llm_queue=llm_queue,
         indicator=indicator,
+        command_loop=command_loop,
     )
     bus.on(
         "state_changed",
@@ -107,6 +109,8 @@ def wire_events(
             source="stt.on_state_changed",
         ),
     )
+    _speech_target = command_loop.submit if command_loop is not None else router.on_speech
+
     if priority_sched is not None:
         from core.priority_scheduler import PRIORITY_VOICE
 
@@ -121,7 +125,7 @@ def wire_events(
                 async def _job() -> None:
                     if shutdown_event.is_set():
                         return
-                    await router.on_speech(text, **kw)
+                    await _speech_target(text, **kw)
 
                 return _job()
 
@@ -133,7 +137,7 @@ def wire_events(
                 _guard_handler(
                     "speech_final",
                     _speech_via_priority,
-                    source="router.on_speech.priority",
+                    source="command_loop.submit.priority",
                 ),
             )
     else:
@@ -143,7 +147,7 @@ def wire_events(
             await voice_interrupt.prepare_for_new_speech(text, **kw)
             if local_brain is not None:
                 local_brain.request_preempt()
-            await router.on_speech(text, **kw)
+            await _speech_target(text, **kw)
 
         if not v4:
             bus.on(
@@ -151,7 +155,7 @@ def wire_events(
                 _guard_handler(
                     "speech_final",
                     _speech_final_direct,
-                    source="router.on_speech.direct",
+                    source="command_loop.submit.direct",
                 ),
             )
 
@@ -250,6 +254,27 @@ def wire_events(
             source="tts.on_partial_response",
         ),
     )
+
+    async def _on_jarvis_insight(message: str = "", **kw) -> None:
+        """Route proactive insights from JarvisCore to TTS."""
+        if message:
+            bus.emit_long("response_ready", text=message)
+
+    bus.on("jarvis_insight", _on_jarvis_insight)
+
+    async def _on_suggestion_ready(suggestions: list = None, **kw) -> None:
+        """Speak the top suggestion if confidence is high."""
+        if suggestions and len(suggestions) > 0:
+            bus.emit_long("response_ready", text=suggestions[0])
+
+    bus.on("suggestion_ready", _on_suggestion_ready)
+
+    async def _on_emotion_for_tts(emotion: str = "", **kw) -> None:
+        """Forward detected emotion to TTS for dynamic prosody."""
+        if emotion and hasattr(tts, "set_emotion"):
+            tts.set_emotion(emotion)
+
+    bus.on("user_emotion_detected", _on_emotion_for_tts)
     bus.on(
         "tts_complete",
         _guard_handler(
@@ -649,10 +674,15 @@ def wire_events(
         if text.strip():
             indicator.add_log("info", f"[screen] {text.strip()}")
 
+    async def on_voice_ack(text: str = "", **_kw) -> None:
+        if text and tts is not None:
+            asyncio.create_task(tts.speak_ack(text))
+
     bus.on("response_ready", log_response)
     bus.on("partial_response", log_partial)
     bus.on("text_display", on_text_display)
     bus.on("thinking_ack", log_thinking_ack)
+    bus.on("voice_ack", on_voice_ack)
     bus.on("cursor_query", log_cursor_query)
 
     # ── Metrics ──────────────────────────────────────────────────
@@ -848,6 +878,15 @@ def wire_events(
         "fs_event",
         _guard_handler("fs_event", on_fs_event, source="wiring.on_fs_event"),
     )
+
+    async def _on_system_state_for_personality(
+        snapshot: dict | None = None, **_kw,
+    ) -> None:
+        if snapshot:
+            from core.adaptive_personality import update_system_context
+            update_system_context(snapshot)
+
+    bus.on("system_state_update", _on_system_state_for_personality)
 
     return {
         "perceived": _perceived,

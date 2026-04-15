@@ -14,8 +14,6 @@ Features:
   - Built-in wake word detection (checks partials for "atom"/"hey atom")
   - Language support: en-US (primary), extensible to other locales
 
-Falls back to faster-whisper STT if SFSpeechRecognizer is unavailable.
-
 Requires: macOS 10.15+, pyobjc-framework-Speech, pyobjc-framework-AVFoundation
 Authorization: user must grant Speech Recognition + Microphone permissions.
 
@@ -698,6 +696,18 @@ class NativeSTT:
         transcript = str(result.bestTranscription().formattedString())
         is_final = result.isFinal()
 
+        try:
+            segments = result.bestTranscription().segments()
+            if segments and len(segments) > 0:
+                confidences = [
+                    float(seg.confidence()) for seg in segments
+                    if float(seg.confidence()) > 0
+                ]
+                if confidences:
+                    self._last_confidence = sum(confidences) / len(confidences)
+        except Exception:
+            pass
+
         self._last_speech_time = time.monotonic()
 
         if is_final:
@@ -717,17 +727,18 @@ class NativeSTT:
                 else:
                     logger.debug("STT partial: '%s'", transcript)
 
-                lower = transcript.lower().strip()
-                for phrase in _WAKE_PHRASES:
-                    if lower.endswith(phrase) or lower == phrase:
-                        logger.info("Wake phrase detected in partial: '%s'", phrase)
-                        self._emit_threadsafe(
-                            lambda p=phrase: self._bus.emit(
-                                "wake_word_detected", wake_word=p,
-                            ),
-                            None,
-                        )
-                        break
+                from voice.listening_modes import WakeWordFilter
+                if not hasattr(self, "_wake_filter"):
+                    self._wake_filter = WakeWordFilter(cooldown_s=1.5)
+                wake_match = self._wake_filter.check(transcript)
+                if wake_match:
+                    logger.info("Wake phrase detected in partial: '%s'", wake_match)
+                    self._emit_threadsafe(
+                        lambda p=wake_match: self._bus.emit(
+                            "wake_word_detected", wake_word=p,
+                        ),
+                        None,
+                    )
 
                 if self._on_partial:
                     self._emit_threadsafe(self._on_partial, transcript)
@@ -949,12 +960,15 @@ class NativeSTT:
 
             if not self._listening:
                 cur = self._state.current
-                if cur is AtomState.THINKING:
-                    await asyncio.sleep(0.12)
-                    continue
-                allow_mic = cur is AtomState.LISTENING or (
-                    self._barge_in_during_speak and cur is AtomState.SPEAKING
+                allow_mic = (
+                    cur is AtomState.LISTENING
+                    or cur is AtomState.IDLE
+                    or (self._barge_in_during_speak and cur is AtomState.SPEAKING)
+                    or cur is AtomState.THINKING
                 )
+                if cur is AtomState.SLEEP:
+                    await asyncio.sleep(0.5)
+                    continue
                 if not allow_mic:
                     await asyncio.sleep(0.12)
                     continue
@@ -1002,7 +1016,9 @@ class NativeSTT:
             if old is AtomState.SPEAKING and new is AtomState.LISTENING:
                 self._need_post_tts_cooldown = True
 
-            if new in (AtomState.LISTENING, AtomState.SPEAKING):
+            if new is AtomState.SLEEP:
+                self.stop()
+            elif new in (AtomState.LISTENING, AtomState.SPEAKING, AtomState.THINKING, AtomState.IDLE):
                 already_running = (
                     self._async_task is not None
                     and not self._async_task.done()
@@ -1012,8 +1028,5 @@ class NativeSTT:
                     self._async_task = asyncio.create_task(
                         self.async_start_listening()
                     )
-            elif old in (AtomState.LISTENING, AtomState.SPEAKING) and \
-                    new not in (AtomState.LISTENING, AtomState.SPEAKING):
-                self.stop()
         except Exception:
             logger.debug("on_state_changed error", exc_info=True)
