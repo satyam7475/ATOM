@@ -306,6 +306,8 @@ class NativeSTT:
 
         self._on_final: Callable[[str], None] | None = None
         self._on_partial: Callable[[str], None] | None = None
+        self._partial_stable_since: float = 0.0
+        self._partial_finalize_s: float = 1.8
         # After TTS, wait before reopening mic (avoids AVAudioEngine vs output conflict).
         self._need_post_tts_cooldown: bool = False
 
@@ -920,6 +922,8 @@ class NativeSTT:
                 self._tap_buffer_count, rms_db, self._signal_verified,
             )
 
+        self._maybe_finalize_stable_partial()
+
         with self._recognition_lock:
             req = self._recognition_request
             if req is not None:
@@ -932,6 +936,34 @@ class NativeSTT:
                         "VOICE_INPUT: _numpy_to_pcm_buffer returned None — "
                         "no audio will reach speech recognizer (check AVAudioPCMBuffer creation)",
                     )
+
+    def _maybe_finalize_stable_partial(self) -> None:
+        """Promote a partial to final if text has been stable for _partial_finalize_s.
+
+        Called from the audio callback so it runs at capture rate (~60-100 Hz).
+        SFSpeechRecognizer in streaming mode often never sets isFinal=True,
+        so this is the primary mechanism to emit speech_final events.
+        """
+        if not self._partial_stable_since:
+            return
+        text = self._last_partial
+        if not text or not text.strip():
+            return
+        now = time.monotonic()
+        elapsed = now - self._partial_stable_since
+        if elapsed < self._partial_finalize_s:
+            return
+        logger.info(
+            "STT: partial stable for %.1fs — promoting to final: '%s'",
+            elapsed, text,
+        )
+        self._last_final = text
+        self._last_error = None
+        self._last_partial = ""
+        self._partial_stable_since = 0.0
+        if self._on_final:
+            self._emit_threadsafe(self._on_final, text)
+        self._restart_recognition_chain()
 
     def _numpy_to_pcm_buffer(self, np_data: Any, frames: int) -> Any:
         """Convert a numpy float32 array to AVAudioPCMBuffer for SFSpeech.
@@ -1157,15 +1189,16 @@ class NativeSTT:
         if is_final:
             self._last_final = transcript
             self._last_error = None
+            self._partial_stable_since = 0.0
             logger.info("STT final: '%s'", transcript)
             if self._on_final:
                 self._emit_threadsafe(self._on_final, transcript)
-            # One SFSpeechAudioBufferRecognitionRequest completes after each final; start a new
-            # recognition task while keeping AVAudioEngine + tap (continuous listen).
             self._restart_recognition_chain()
         else:
+            now = time.monotonic()
             if transcript != self._last_partial:
                 self._last_partial = transcript
+                self._partial_stable_since = now
                 if self._voice_debug:
                     logger.info("STT partial: '%s'", transcript[:200])
                 else:
@@ -1186,6 +1219,22 @@ class NativeSTT:
 
                 if self._on_partial:
                     self._emit_threadsafe(self._on_partial, transcript)
+            elif (
+                transcript.strip()
+                and self._partial_stable_since > 0
+                and (now - self._partial_stable_since) >= self._partial_finalize_s
+            ):
+                logger.info(
+                    "STT: partial stable for %.1fs — treating as final: '%s'",
+                    now - self._partial_stable_since, transcript,
+                )
+                self._last_final = transcript
+                self._last_error = None
+                self._last_partial = ""
+                self._partial_stable_since = 0.0
+                if self._on_final:
+                    self._emit_threadsafe(self._on_final, transcript)
+                self._restart_recognition_chain()
 
     def _restart_recognition_chain(self) -> None:
         """After each isFinal, start a new request+task; the engine tap keeps running.
@@ -1255,6 +1304,7 @@ class NativeSTT:
             return self._last_final
 
         self._listening = False
+        self._partial_stable_since = 0.0
 
         if self._native_stop_audio_delay_s > 0:
             time.sleep(self._native_stop_audio_delay_s)

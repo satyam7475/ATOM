@@ -68,7 +68,7 @@
         "min_audio_duration_s": 0.42,
         "audio_buffer_frames": 2048,
         "native_stop_audio_delay_ms": 120,
-        "voice_debug": false,
+        "voice_debug": true,
         "voice_debug_interval_s": 30,
         "barge_in_during_speak": false,
         "native_requires_on_device": true,

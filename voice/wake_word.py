@@ -128,24 +128,21 @@ class WakeWordEngine:
     def _detection_loop(self) -> None:
         """Main detection loop -- runs in a dedicated thread."""
         try:
-            import pyaudio
+            import sounddevice as sd
             import numpy as np
 
-            audio = pyaudio.PyAudio()
-            stream = audio.open(
-                format=pyaudio.paInt16,
-                channels=1,
-                rate=16000,
-                input=True,
-                frames_per_buffer=1280,
-            )
+            _RATE = 16000
+            _BLOCK = 1280
 
-            logger.info("Wake word listening on microphone...")
+            logger.info("Wake word listening on microphone (sounddevice %d Hz)...", _RATE)
 
             while self._running:
                 try:
-                    data = stream.read(1280, exception_on_overflow=False)
-                    samples = np.frombuffer(data, dtype=np.int16)
+                    audio_f32 = sd.rec(
+                        _BLOCK, samplerate=_RATE, channels=1,
+                        dtype="float32", blocking=True,
+                    )
+                    samples = (audio_f32.ravel() * 32767).astype(np.int16)
 
                     prediction = self._model.predict(samples)
 
@@ -166,10 +163,6 @@ class WakeWordEngine:
                     if self._running:
                         logger.debug("Wake word audio error: %s", e)
                         time.sleep(0.5)
-
-            stream.stop_stream()
-            stream.close()
-            audio.terminate()
 
         except Exception:
             logger.exception("Wake word detection loop failed")
