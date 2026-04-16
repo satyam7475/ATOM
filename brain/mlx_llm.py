@@ -187,6 +187,26 @@ class MLXBrain:
             if self._loaded_roles[role] and self._fingerprints[role] == str(model_path):
                 return True
 
+            # When primary and fast point to the same directory, reuse one load (RAM + stability).
+            other = "fast" if role == "primary" else "primary"
+            other_path = Path(self._path_for_role(other))
+            if (
+                other_path.resolve() == model_path.resolve()
+                and self._loaded_roles[other]
+                and self._fingerprints[other] == str(model_path)
+                and self._models[other] is not None
+            ):
+                self._models[role] = self._models[other]
+                self._tokenizers[role] = self._tokenizers[other]
+                self._fingerprints[role] = str(model_path)
+                self._loaded_roles[role] = True
+                self._load_failed[role] = False
+                logger.info(
+                    "MLX: sharing loaded weights for role=%s with %s (%s)",
+                    role, other, model_path.name,
+                )
+                return True
+
             self._load_failed[role] = False
             self._unload_role_unlocked(role)
             try:

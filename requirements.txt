@@ -59,27 +59,24 @@ chromadb>=0.5.0
 PyMuPDF>=1.24.0
 python-docx>=1.1.0
 
-# ─── Optional: Legacy / Cross-platform fallbacks (not needed on macOS) ───
-# These are REPLACED by native macOS frameworks on Apple Silicon:
-#   faster-whisper → SFSpeechRecognizer (pyobjc-framework-Speech)
-#   SpeechRecognition + PyAudio → AVAudioEngine (pyobjc-framework-AVFoundation)
-#   easyocr → Vision framework (pyobjc-framework-Vision)
-#   openwakeword → SFSpeechRecognizer keyword detection
-#   edge-tts + pygame → NSSpeechSynthesizer (pyobjc-framework-Cocoa)
+# ─── Voice extras (recommended): wake word + offline STT fallback ───────────
+faster-whisper>=1.2.0
+openwakeword>=0.6.0
 #
-# Install these only if you need cross-platform or specific features:
-# faster-whisper==1.2.1    # Whisper STT (cross-platform, GPU via CTranslate2)
+# ─── Optional: Legacy / cross-platform fallbacks ────────────────────────────
+# Primary macOS path uses SFSpeech + AVAudio/sounddevice; Whisper is fallback.
+# Optional extras:
 # SpeechRecognition==3.14.6  # Mic capture wrapper
 # PyAudio==0.2.14          # PortAudio binding (needs brew install portaudio)
 # edge-tts==7.2.7          # Microsoft neural TTS (needs network)
 # pygame==2.6.1            # Audio playback for Edge TTS
 # llama-cpp-python==0.3.2  # Non-MLX GGUF fallback (legacy / development only)
-# openwakeword>=0.6.0      # Wake word detection (replaced by SFSpeech)
+# openwakeword             # (see recommended lines above)
 # easyocr>=1.7.0           # Screen OCR (replaced by Vision framework)
 # kokoro-tts==2.3.0        # Kokoro TTS alternative
 # keyboard==0.13.5         # Global hotkey (needs root on macOS)
 # mss==10.1.0              # Fast screenshots (screencapture is sufficient)
 
 # ─── Dev / CI ────────────────────────────────────────────────────────────
-# pytest>=8.0.0
-# pytest-asyncio>=0.24.0
+pytest>=8.0.0
+pytest-asyncio>=0.24.0
