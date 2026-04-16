@@ -5,7 +5,11 @@ atom_vector_db/
 # Logs and test output
 logs/
 *.log
+atomlogs.txt
 .test_results/
+
+# Data backups
+data_backup_*/
 
 # Environment
 .env
