@@ -20,6 +20,7 @@ Thread-safety hardening (v10):
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 import time
 import weakref
@@ -229,11 +230,22 @@ class AsyncEventBus(PriorityEventBus):
         self._queue.put_nowait((priority, time.monotonic(), self._seq, event, data, "long"))
 
     @staticmethod
+    def _invoke(handler: EventHandler, data: dict[str, Any]) -> Any:
+        """Call handler and return awaitable; wraps sync handlers transparently."""
+        result = handler(**data)
+        if result is None and not inspect.iscoroutinefunction(handler):
+            fut: asyncio.Future[None] = asyncio.get_event_loop().create_future()
+            fut.set_result(None)
+            return fut
+        return result
+
+    @staticmethod
     async def _long_call(handler: EventHandler, event: str,
                          data: dict[str, Any]) -> None:
         try:
-            await asyncio.wait_for(
-                handler(**data), timeout=LONG_HANDLER_TIMEOUT_S)
+            result = handler(**data)
+            if asyncio.iscoroutine(result):
+                await asyncio.wait_for(result, timeout=LONG_HANDLER_TIMEOUT_S)
         except asyncio.TimeoutError:
             logger.error(
                 "Long handler %s TIMED OUT on '%s' (>%.0fs)",
@@ -247,7 +259,9 @@ class AsyncEventBus(PriorityEventBus):
     async def _fast_call(handler: EventHandler, event: str,
                          data: dict[str, Any]) -> None:
         try:
-            await handler(**data)
+            result = handler(**data)
+            if asyncio.iscoroutine(result):
+                await result
         except Exception:
             logger.exception("Handler %s failed on event '%s'",
                              handler.__qualname__, event)
@@ -257,7 +271,9 @@ class AsyncEventBus(PriorityEventBus):
                                 data: dict[str, Any]) -> None:
         """Optimized path for single-handler fast events."""
         try:
-            await handler(**data)
+            result = handler(**data)
+            if asyncio.iscoroutine(result):
+                await result
         except Exception:
             logger.exception("Handler %s failed on event '%s'",
                              handler.__qualname__, event)
@@ -266,7 +282,9 @@ class AsyncEventBus(PriorityEventBus):
     async def _safe_call(handler: EventHandler, event: str, data: dict[str, Any]) -> None:
         t0 = time.perf_counter()
         try:
-            await asyncio.wait_for(handler(**data), timeout=HANDLER_TIMEOUT_S)
+            result = handler(**data)
+            if asyncio.iscoroutine(result):
+                await asyncio.wait_for(result, timeout=HANDLER_TIMEOUT_S)
         except asyncio.TimeoutError:
             logger.error(
                 "Handler %s TIMED OUT on event '%s' (>%.0fs) -- cancelled",

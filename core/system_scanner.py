@@ -933,8 +933,37 @@ class SystemScanner:
         return result
 
     def _check_gpu_compute(self) -> dict[str, Any]:
-        """Check GPU availability for compute (CUDA/ROCm)."""
+        """Check GPU availability for compute (CUDA/ROCm/Apple Metal)."""
         result: dict[str, Any] = {"status": "warn", "detail": ""}
+        # Apple Silicon via MLX or MPS
+        if sys.platform == "darwin":
+            try:
+                import platform as _plat
+                chip = _plat.processor() or ""
+                if "arm" in _plat.machine().lower():
+                    try:
+                        import mlx.core  # noqa: F401
+                        result["status"] = "pass"
+                        result["detail"] = f"Apple Silicon GPU (MLX, {chip or 'arm64'})"
+                        result["gpu"] = chip or "Apple Silicon"
+                        return result
+                    except ImportError:
+                        pass
+                    try:
+                        import torch
+                        if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+                            result["status"] = "pass"
+                            result["detail"] = f"Apple Silicon GPU (MPS, {chip or 'arm64'})"
+                            result["gpu"] = chip or "Apple Silicon"
+                            return result
+                    except (ImportError, Exception):
+                        pass
+                    result["status"] = "pass"
+                    result["detail"] = f"Apple Silicon Neural Engine ({chip or 'arm64'})"
+                    result["gpu"] = chip or "Apple Silicon"
+                    return result
+            except Exception:
+                pass
         try:
             import torch
             if torch.cuda.is_available():
@@ -1013,26 +1042,39 @@ class SystemScanner:
 
     def _check_dependencies(self) -> dict[str, Any]:
         """Check critical Python dependencies."""
-        deps = {
+        core_deps = {
             "numpy": "numpy",
+            "psutil": "psutil",
+        }
+        optional_deps = {
             "speech_recognition": "SpeechRecognition",
             "pyaudio": "PyAudio",
-            "psutil": "psutil",
             "faster_whisper": "faster-whisper",
         }
         available = []
         missing = []
-        for module, package in deps.items():
+        optional_missing = []
+        for module, package in core_deps.items():
             try:
                 __import__(module)
                 available.append(package)
             except ImportError:
                 missing.append(package)
+        for module, package in optional_deps.items():
+            try:
+                __import__(module)
+                available.append(package)
+            except ImportError:
+                optional_missing.append(package)
 
-        status = "pass" if not missing else ("warn" if len(missing) <= 2 else "fail")
+        status = "pass" if not missing else ("warn" if len(missing) <= 1 else "fail")
+        if not missing and optional_missing:
+            status = "pass"
         detail_parts = [f"{len(available)} available"]
         if missing:
             detail_parts.append(f"{len(missing)} missing: {', '.join(missing)}")
+        if optional_missing:
+            detail_parts.append(f"{len(optional_missing)} optional: {', '.join(optional_missing)}")
         return {
             "status": status,
             "detail": ", ".join(detail_parts),

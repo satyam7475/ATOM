@@ -89,3 +89,10 @@ def setup_logging(level: int = logging.INFO) -> None:
     root.addFilter(privacy_filter)
     root.addHandler(file_handler)
     root.addHandler(console_handler)
+
+    # Silence noisy third-party loggers
+    for noisy in (
+        "httpx", "httpcore", "huggingface_hub", "huggingface_hub.utils._http",
+        "sentence_transformers", "urllib3", "filelock",
+    ):
+        logging.getLogger(noisy).setLevel(logging.WARNING)

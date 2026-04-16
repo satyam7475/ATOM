@@ -2354,6 +2354,13 @@ async def main() -> None:
                 except Exception:
                     logger.debug("Self-tune error", exc_info=True)
 
+            snapshot_cycles = max(1, 1800 // maint_interval)
+            if cycle % snapshot_cycles == 0:
+                try:
+                    cold_start.persist_snapshot()
+                except Exception:
+                    logger.debug("Cold start snapshot persist failed", exc_info=True)
+
             if proactive_alerts and state.current.value in ("idle", "listening"):
                 try:
                     bat = psutil.sensors_battery()

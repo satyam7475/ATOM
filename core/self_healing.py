@@ -785,8 +785,10 @@ class StartupValidator:
 
         optional_packages = {
             "psutil": "system monitoring",
-            "keyboard": "global hotkey",
             "chromadb": "vector memory",
+        }
+        silent_optional = {
+            "keyboard": "global hotkey",
             "cryptography": "encrypted vault",
         }
         for package, purpose in optional_packages.items():
@@ -794,6 +796,11 @@ class StartupValidator:
                 importlib.import_module(package)
             except ImportError:
                 warnings.append(f"Optional: {package} not installed ({purpose})")
+        for package, purpose in silent_optional.items():
+            try:
+                importlib.import_module(package)
+            except ImportError:
+                logger.debug("Optional: %s not installed (%s)", package, purpose)
 
         log_dir = Path("logs")
         try:

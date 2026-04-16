@@ -52,12 +52,20 @@ class STTWatchdog:
         self._total_restarts: int = 0
         self._total_silent_detections: int = 0
         self._consecutive_chain_restarts: int = 0
+        self._was_listening: bool = False
 
         self._task: asyncio.Task | None = None
         self._shutdown = asyncio.Event()
 
     def attach_stt(self, stt: Any) -> None:
         self._stt_ref = stt
+
+    def reset_timers(self) -> None:
+        """Reset liveness timers -- call when STT (re)starts listening."""
+        now = time.monotonic()
+        self._last_partial_time = now
+        self._last_final_time = now
+        self._last_tap_count = 0
 
     async def on_speech_partial(self, text: str = "", **_kw: Any) -> None:
         """Called from bus on every STT partial -- updates liveness."""
@@ -110,6 +118,16 @@ class STTWatchdog:
         is_running = getattr(stt, "_running_async", False)
 
         if not is_running:
+            self._was_listening = False
+            return
+
+        # Auto-reset timers on listening transition (fixes premature restart after TTS)
+        if is_listening and not self._was_listening:
+            self.reset_timers()
+            self._was_listening = True
+            return
+        if not is_listening:
+            self._was_listening = False
             return
 
         state_mgr = getattr(stt, "_state", None)
@@ -132,7 +150,13 @@ class STTWatchdog:
         last_speech_candidate = float(getattr(stt, "_last_speech_candidate_time", 0.0) or 0.0)
         speech_likely = (now - last_speech_candidate) < 3.0 if last_speech_candidate > 0 else False
 
+        # Guard: don't restart if we received a partial very recently
+        last_partial_text = str(getattr(stt, "_last_partial", "") or "")
+        recent_partial = since_partial < 3.0
+
         if is_listening and since_partial > self._silent_timeout and audio_flowing and speech_likely:
+            if recent_partial:
+                return
             self._total_silent_detections += 1
             logger.warning(
                 "STT Watchdog: no partials for %.1fs despite speech-like audio "
@@ -146,6 +170,13 @@ class STTWatchdog:
                 except Exception:
                     logger.debug("STT Watchdog: recognition starvation hook failed", exc_info=True)
             if self._can_restart():
+                # Preserve accumulated partial before restart
+                if last_partial_text.strip():
+                    logger.info(
+                        "STT Watchdog: salvaging partial '%s' before restart",
+                        last_partial_text[:120],
+                    )
+                    self._bus.emit_fast("speech_partial", text=last_partial_text)
                 await self._restart_stt(stt, "recognition_starved")
         elif is_listening and since_partial > self._silent_timeout and audio_flowing:
             logger.debug(
@@ -162,6 +193,12 @@ class STTWatchdog:
                     since_final, str(last_error)[:80],
                 )
                 if self._can_restart():
+                    if last_partial_text.strip():
+                        logger.info(
+                            "STT Watchdog: salvaging partial '%s' before restart",
+                            last_partial_text[:120],
+                        )
+                        self._bus.emit_fast("speech_partial", text=last_partial_text)
                     await self._restart_stt(stt, "stuck_with_error")
 
     def _can_restart(self) -> bool:

@@ -320,9 +320,10 @@ class NativeSTT:
         )
         # On-device-only often yields zero partials on Bluetooth + some locales (e.g. en-IN).
         # When False, Apple may use server-assisted recognition (requires network; not fully private).
-        self._native_requires_on_device: bool = bool(
+        self._native_requires_on_device_cfg: bool = bool(
             self._config.get("native_requires_on_device", True),
         )
+        self._native_requires_on_device: bool = self._native_requires_on_device_cfg
         # Voice Processing I/O can break or silence some Bluetooth headsets — disable to test.
         self._native_voice_processing: bool = bool(
             self._config.get("native_voice_processing", True),
@@ -1095,13 +1096,29 @@ class NativeSTT:
             )
         self._last_result_callback_time = time.monotonic()
         self._callback_starvation_count = 0
+        # Restore on-device preference once callbacks are flowing
+        if not self._native_requires_on_device and self._native_requires_on_device_cfg:
+            self._native_requires_on_device = True
+            logger.info("Native STT: callbacks flowing — re-enabling requiresOnDeviceRecognition")
 
         if error is not None:
             err_desc = _format_ns_error(error)
-            self._last_error = err_desc
-            if "kAFAssistantErrorDomain" in err_desc or "216" in err_desc:
+            is_no_speech = "1110" in err_desc or "No speech detected" in err_desc
+            is_cancel = "216" in err_desc or "kLSRErrorDomain" in err_desc
+            is_expected = "kAFAssistantErrorDomain" in err_desc or is_cancel
+
+            if is_no_speech:
+                logger.debug("Recognition: no speech detected (normal silence) — restarting chain quietly")
+                self._last_error = None
+                try:
+                    self._restart_recognition_chain()
+                except Exception:
+                    self._listening = False
+            elif is_expected:
                 logger.debug("Recognition (cancel/expected): %s", err_desc)
+                self._last_error = err_desc
             else:
+                self._last_error = err_desc
                 logger.warning("STT recognition error: %s — attempting auto-restart", err_desc)
                 try:
                     self._restart_recognition_chain()
