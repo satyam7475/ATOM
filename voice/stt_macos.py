@@ -843,11 +843,18 @@ class NativeSTT:
         output devices use different CoreAudio clock domains (e.g. built-in mic +
         Bluetooth output).  sounddevice (PortAudio) reads from CoreAudio directly
         and is immune to this issue.
+
+        SFSpeechRecognizer requires audio at the mic's native sample rate (typically
+        48 kHz on MacBook Air).  Resampling to 16 kHz causes "No speech detected".
         """
         try:
             import sounddevice as sd
 
-            sr = 16000
+            dev_info = sd.query_devices(kind="input")
+            native_sr = int(dev_info.get("default_samplerate", 48000))
+            sr = native_sr if native_sr > 0 else 48000
+            blocksize = max(self._audio_buffer_frames, sr // 8)
+
             self._sd_audio_format = (
                 _AVFoundation.AVAudioFormat.alloc()
                 .initStandardFormatWithSampleRate_channels_(float(sr), 1)
@@ -860,14 +867,14 @@ class NativeSTT:
                 samplerate=sr,
                 channels=1,
                 dtype="float32",
-                blocksize=self._audio_buffer_frames,
+                blocksize=blocksize,
                 callback=self._sd_audio_callback,
             )
             self._sd_stream.start()
             logger.info(
                 "Native STT: using sounddevice capture (PortAudio/CoreAudio) — "
-                "%d Hz, 1 ch, blocksize=%d — bypassing AVAudioEngine input tap",
-                sr, self._audio_buffer_frames,
+                "%d Hz (native), 1 ch, blocksize=%d — bypassing AVAudioEngine input tap",
+                sr, blocksize,
             )
             return True
         except Exception as exc:
