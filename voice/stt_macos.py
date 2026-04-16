@@ -23,6 +23,7 @@ Owner: Satyam
 from __future__ import annotations
 
 import asyncio
+import collections
 import logging
 import os
 import plistlib
@@ -310,6 +311,7 @@ class NativeSTT:
         self._partial_finalize_s: float = 1.8
         # After TTS, wait before reopening mic (avoids AVAudioEngine vs output conflict).
         self._need_post_tts_cooldown: bool = False
+        self._audio_prebuffer: collections.deque = collections.deque(maxlen=12)
 
         self._voice_debug: bool = bool(self._config.get("voice_debug", False))
         self._voice_debug_interval_s: float = max(
@@ -924,6 +926,9 @@ class NativeSTT:
 
         self._maybe_finalize_stable_partial()
 
+        import numpy as np
+        self._audio_prebuffer.append(np.array(indata, copy=True))
+
         with self._recognition_lock:
             req = self._recognition_request
             if req is not None:
@@ -1236,6 +1241,24 @@ class NativeSTT:
                     self._emit_threadsafe(self._on_final, transcript)
                 self._restart_recognition_chain()
 
+    def _flush_prebuffer_to_request(self, req: Any) -> int:
+        """Replay buffered audio frames into a fresh recognition request.
+
+        Returns the number of frames flushed.  This ensures speech that arrived
+        during a recognition-chain swap is not lost.
+        """
+        frames_flushed = 0
+        snapshot = list(self._audio_prebuffer)
+        for chunk in snapshot:
+            buf = self._numpy_to_pcm_buffer(chunk, chunk.shape[0])
+            if buf is not None:
+                try:
+                    req.appendAudioPCMBuffer_(buf)
+                    frames_flushed += chunk.shape[0]
+                except Exception:
+                    break
+        return frames_flushed
+
     def _restart_recognition_chain(self) -> None:
         """After each isFinal, start a new request+task; the engine tap keeps running.
 
@@ -1260,6 +1283,8 @@ class NativeSTT:
             self._apply_speech_request_policy(new_req)
             self._apply_speech_request_hints(new_req)
 
+            flushed = self._flush_prebuffer_to_request(new_req)
+
             block = self._speech_pyobjc_block or self._recognition_result_handler
             new_task = self._recognizer.recognitionTaskWithRequest_resultHandler_(
                 new_req, block,
@@ -1273,7 +1298,13 @@ class NativeSTT:
                 self._recognition_request = new_req
                 self._recognition_task = new_task
             self._last_partial = ""
-            logger.debug("Native STT: recognition chain restarted for next utterance")
+            if flushed:
+                logger.debug(
+                    "Native STT: recognition chain restarted (pre-buffered %d frames)",
+                    flushed,
+                )
+            else:
+                logger.debug("Native STT: recognition chain restarted for next utterance")
         except Exception as exc:
             self._last_error = str(exc)
             logger.warning("STT: failed to restart recognition chain: %s — forcing full restart", exc)
@@ -1552,6 +1583,9 @@ class NativeSTT:
 
             if old is AtomState.SPEAKING and new is AtomState.LISTENING:
                 self._need_post_tts_cooldown = True
+                if self._listening:
+                    self._restart_recognition_chain()
+                    self._audio_prebuffer.clear()
 
             if new is AtomState.SLEEP:
                 self.stop()
