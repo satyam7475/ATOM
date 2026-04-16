@@ -108,7 +108,7 @@ class ActionExecutor:
                 },
             )
         except Exception:
-            pass
+            logger.debug('Action executor touch failed', exc_info=True)
 
     def execute(self, tool_call: ToolCall) -> ActionResult:
         """Execute a single tool call through the security pipeline."""
@@ -157,7 +157,7 @@ class ActionExecutor:
                             {"tool": name, "blocked": True, "reason": reason[:200]},
                         )
                     except Exception:
-                        pass
+                        logger.debug('core reasoning action executor optional step failed', exc_info=True)
                 return ActionResult(
                     tool_name=name, success=False,
                     blocked=True, block_reason=reason,
@@ -190,7 +190,7 @@ class ActionExecutor:
                             {"tool": name, "success": True, "elapsed_ms": elapsed},
                         )
                     except Exception:
-                        pass
+                        logger.debug('core reasoning action executor optional step failed', exc_info=True)
                 return ActionResult(
                     tool_name=name, success=True,
                     output=response or "Action completed.",
@@ -263,7 +263,7 @@ class ActionExecutor:
                             {"tool": name, "blocked": True, "reason": reason[:200]},
                         )
                     except Exception:
-                        pass
+                        logger.debug('core reasoning action executor optional step failed', exc_info=True)
                 return ActionResult(
                     tool_name=name, success=False,
                     blocked=True, block_reason=reason,
@@ -300,7 +300,7 @@ class ActionExecutor:
                             {"tool": name, "success": True, "elapsed_ms": elapsed},
                         )
                     except Exception:
-                        pass
+                        logger.debug('core reasoning action executor optional step failed', exc_info=True)
                 return ActionResult(
                     tool_name=name, success=True,
                     output=response or "Action completed.",

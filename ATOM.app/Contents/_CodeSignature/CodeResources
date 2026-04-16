@@ -23,6 +23,15 @@
 	</dict>
 	<key>files2</key>
 	<dict>
+		<key>MacOS/atom_python</key>
+		<dict>
+			<key>cdhash</key>
+			<data>
+			t8llg3O3p9pqKKKL18YwA5uNy+E=
+			</data>
+			<key>requirement</key>
+			<string>cdhash H"b7c9658373b7a7da6a28a28bd7c630039b8dcbe1"</string>
+		</dict>
 		<key>Resources/Assets.car</key>
 		<dict>
 			<key>hash2</key>

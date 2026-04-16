@@ -107,6 +107,18 @@ _CREATIVE_HINTS = re.compile(
     re.I,
 )
 
+_ACTION_HINTS = re.compile(
+    r"\b("
+    r"play|open|launch|start|set\s+(?:a\s+)?reminder|remind\s+me|"
+    r"send|close|stop|pause|resume|music|song|youtube|"
+    r"mail|email|calendar|timer|alarm|schedule|"
+    r"download|upload|install|uninstall|delete|create|"
+    r"let'?s\s+have\s+(?:some\s+)?(?:music|song|fun)|"
+    r"put\s+on\s+(?:some\s+)?(?:music|song)"
+    r")\b",
+    re.I,
+)
+
 _BUDDY_HINTS = re.compile(
     r"\b("
     r"hello|hi|hey|how\s+are|sup|buddy|atom|thanks|thank\s+you|chat|"
@@ -837,6 +849,8 @@ class CognitiveKernel:
             return CognitiveBudgetTier.INFO
         if _INFO_HINTS.search(low):
             return CognitiveBudgetTier.INFO
+        if _ACTION_HINTS.search(low):
+            return CognitiveBudgetTier.COMPLEX
         if response_mode is ResponseMode.SHORT:
             return CognitiveBudgetTier.SIMPLE
         if _CREATIVE_HINTS.search(low):

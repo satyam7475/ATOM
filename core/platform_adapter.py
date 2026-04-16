@@ -225,7 +225,7 @@ class PlatformAdapter:
                 )
                 return result.stdout.strip()
         except Exception:
-            pass
+            logger.debug('CPU brand string query failed', exc_info=True)
         return platform.processor() or "Unknown CPU"
 
     def _get_gpu_info(self) -> tuple[str, float]:
@@ -249,7 +249,7 @@ class PlatformAdapter:
             pynvml.nvmlShutdown()
             return name, vram_gb
         except Exception:
-            pass
+            logger.debug('CPU brand string query failed', exc_info=True)
 
         if self.os_type == OSType.WINDOWS:
             try:
@@ -268,7 +268,7 @@ class PlatformAdapter:
                             pass
                         return parts[1].strip(), vram
             except Exception:
-                pass
+                logger.debug('Subprocess run failed', exc_info=True)
         return "", 0.0
 
     def _get_gpu_info_macos(self) -> tuple[str, float]:
@@ -313,7 +313,7 @@ class PlatformAdapter:
                 count = user32.GetSystemMetrics(80)
                 return max(1, count), f"{w}x{h}"
             except Exception:
-                pass
+                logger.debug('Subprocess run failed', exc_info=True)
         elif self.os_type == OSType.MACOS:
             return self._get_display_info_macos()
         elif self.os_type == OSType.LINUX:
@@ -328,7 +328,7 @@ class PlatformAdapter:
                         res = line.strip().split()[0]
                         return max(1, count), res
             except Exception:
-                pass
+                logger.debug('Subprocess run failed', exc_info=True)
         return 1, "unknown"
 
     def _get_display_info_macos(self) -> tuple[int, str]:
@@ -397,7 +397,7 @@ class PlatformAdapter:
                 proc = psutil.Process(pid.value)
                 process_name = proc.name()
             except Exception:
-                pass
+                logger.debug('Process lookup failed', exc_info=True)
 
             app_name = title.rsplit(" - ", 1)[-1].strip() if " - " in title else title
             return {
@@ -633,7 +633,7 @@ class PlatformAdapter:
                             ))
                             winreg.CloseKey(subkey)
                         except Exception:
-                            pass
+                            logger.debug('core platform adapter optional step failed', exc_info=True)
                     winreg.CloseKey(key)
                 except FileNotFoundError:
                     pass
@@ -660,7 +660,7 @@ class PlatformAdapter:
                             if len(parts) >= 3:
                                 apps.append(InstalledApp(name=parts[1], version=parts[2]))
                 except Exception:
-                    pass
+                    logger.debug('Subprocess run failed', exc_info=True)
                 break
         return apps
 
@@ -759,7 +759,7 @@ class PlatformAdapter:
                 subprocess.run(["brightness", str(frac)], timeout=5)
                 return True
         except Exception:
-            pass
+            logger.debug('Subprocess run failed', exc_info=True)
         return False
 
     # ── Notification ──────────────────────────────────────────────
@@ -796,7 +796,7 @@ class PlatformAdapter:
                 if self._applescript is not None:
                     return self._applescript.send_notification(title, message)
         except Exception:
-            pass
+            logger.debug('Subprocess run failed', exc_info=True)
         return False
 
     # ── Service Management ────────────────────────────────────────
@@ -818,7 +818,7 @@ class PlatformAdapter:
                             "start_type": info.get("start_type", ""),
                         })
                     except Exception:
-                        pass
+                        logger.debug('Subprocess run failed', exc_info=True)
             elif self.os_type == OSType.MACOS:
                 result = subprocess.run(
                     ["launchctl", "list"],

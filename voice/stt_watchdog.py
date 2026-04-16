@@ -26,7 +26,19 @@ _STUCK_TIMEOUT_S = 15.0
 _MAX_RESTARTS_PER_WINDOW = 5
 _RESTART_WINDOW_S = 300.0
 _CHECK_INTERVAL_S = 2.0
-_CHAIN_RESTARTS_BEFORE_FULL = 3
+# After this many consecutive chain restarts (with SFSpeechRecognizer
+# recreate) that still produce zero partials, escalate to a full engine
+# restart — stop_listening + recreate_recognizer + start_listening, which
+# also rebuilds the sounddevice stream and CoreAudio binding. Keeping this
+# low is important because if chain-level recreate cannot recover (e.g.
+# stale CoreAudio session), spending more attempts there just delays the
+# real fix.
+_CHAIN_RESTARTS_BEFORE_FULL = 2
+# If a full-restart sequence produces zero productive partials within this
+# window, we count it as a failed recovery. Accumulating the configured
+# threshold of failed recoveries triggers engine failover (to Whisper).
+_FULL_RESTART_PRODUCTIVITY_WINDOW_S = 10.0
+_FULL_RESTART_FAILURES_BEFORE_SWAP = 3
 
 
 class STTWatchdog:
@@ -47,12 +59,21 @@ class STTWatchdog:
         self._last_final_time: float = time.monotonic()
         self._last_tap_count: int = 0
         self._stt_ref: Any = None
+        # Tighter starvation threshold once we've had at least one
+        # successful turn — the recognizer is warmed up so a silent
+        # stretch is more likely a real stall than a slow cold start.
+        self._had_successful_turn: bool = False
 
         self._restart_times: list[float] = []
         self._total_restarts: int = 0
         self._total_silent_detections: int = 0
         self._consecutive_chain_restarts: int = 0
         self._was_listening: bool = False
+        # Full-restart failure tracking for engine failover to Whisper.
+        self._full_restart_attempts: int = 0
+        self._full_restart_failures: int = 0
+        self._last_full_restart_time: float = 0.0
+        self._failover_pending: bool = False
 
         self._task: asyncio.Task | None = None
         self._shutdown = asyncio.Event()
@@ -69,13 +90,51 @@ class STTWatchdog:
 
     async def on_speech_partial(self, text: str = "", **_kw: Any) -> None:
         """Called from bus on every STT partial -- updates liveness."""
-        self._last_partial_time = time.monotonic()
+        now = time.monotonic()
+        self._last_partial_time = now
         self._consecutive_chain_restarts = 0
+        # A productive partial proves the most recent full restart worked;
+        # reset the failover failure counter so noise doesn't accumulate.
+        if (self._last_full_restart_time > 0
+                and (now - self._last_full_restart_time)
+                < _FULL_RESTART_PRODUCTIVITY_WINDOW_S
+                and text and text.strip()):
+            if self._full_restart_failures > 0:
+                logger.info(
+                    "STT Watchdog: productive partial after full restart — "
+                    "resetting failure counter (%d -> 0)",
+                    self._full_restart_failures,
+                )
+            self._full_restart_failures = 0
+            self._last_full_restart_time = 0.0
 
     async def on_speech_final(self, text: str = "", **_kw: Any) -> None:
         """Called from bus on every STT final -- updates liveness."""
         self._last_final_time = time.monotonic()
         self._last_partial_time = time.monotonic()
+        if text and text.strip():
+            self._had_successful_turn = True
+        if (self._last_full_restart_time > 0
+                and text and text.strip()):
+            self._full_restart_failures = 0
+            self._last_full_restart_time = 0.0
+
+    async def on_needs_full_restart(self, reason: str = "", **_kw: Any) -> None:
+        """Bus handler for hardened-STT escalation signals (empty-final
+        cascade, recreate storm). Forces a full engine restart."""
+        stt = self._stt_ref
+        if stt is None:
+            return
+        if not self._can_restart():
+            return
+        logger.warning(
+            "STT Watchdog: escalation from engine (%s) — forcing full restart",
+            reason or "unspecified",
+        )
+        # Jump straight to full restart — the engine already decided chain
+        # restarts won't help.
+        self._consecutive_chain_restarts = _CHAIN_RESTARTS_BEFORE_FULL
+        await self._restart_stt(stt, f"engine_escalation:{reason}")
 
     def start(self) -> None:
         if self._task is not None and not self._task.done():
@@ -138,7 +197,7 @@ class STTWatchdog:
                 if cur is AtomState.SPEAKING:
                     return
             except Exception:
-                pass
+                logger.debug('voice stt watchdog optional step failed', exc_info=True)
 
         since_partial = now - self._last_partial_time
         since_final = now - self._last_final_time
@@ -154,7 +213,18 @@ class STTWatchdog:
         last_partial_text = str(getattr(stt, "_last_partial", "") or "")
         recent_partial = since_partial < 3.0
 
-        if is_listening and since_partial > self._silent_timeout and audio_flowing and speech_likely:
+        # After the first successful turn the recognizer is warmed up — a
+        # silent stretch is a much stronger signal of a real stall, so we
+        # drop the threshold from 8s to 5s. On the very first turn we keep
+        # the more generous budget to avoid restarting a recognizer that's
+        # simply slow to emit its first partial.
+        effective_silent_timeout = (
+            max(4.0, self._silent_timeout - 3.0)
+            if self._had_successful_turn
+            else self._silent_timeout
+        )
+
+        if is_listening and since_partial > effective_silent_timeout and audio_flowing and speech_likely:
             if recent_partial:
                 return
             self._total_silent_detections += 1
@@ -178,7 +248,7 @@ class STTWatchdog:
                     )
                     self._bus.emit_fast("speech_partial", text=last_partial_text)
                 await self._restart_stt(stt, "recognition_starved")
-        elif is_listening and since_partial > self._silent_timeout and audio_flowing:
+        elif is_listening and since_partial > effective_silent_timeout and audio_flowing:
             logger.debug(
                 "STT Watchdog: audio is flowing but no speech-like activity yet "
                 "(tap_count=%d, rms=%.1f dB) -- suppressing restart",
@@ -188,9 +258,21 @@ class STTWatchdog:
         if is_listening and since_final > self._stuck_timeout and since_partial > self._stuck_timeout:
             last_error = getattr(stt, "_last_error", None)
             if last_error:
+                err_str = str(last_error)
+                # kLSRErrorDomain code=301 is Apple's "recognition session
+                # cancelled/expired" signal — it fires whenever the session
+                # sits idle for a while. It is NOT fatal; escalating it to
+                # a full engine rebuild causes an avoidable race with
+                # AudioIntelligenceEngine's device switch and produces the
+                # `PaMacCore err=-50` cascade seen in the field. Prefer a
+                # lightweight chain-restart here.
+                is_soft_timeout = "kLSRErrorDomain" in err_str and "code=301" in err_str
+
                 logger.warning(
-                    "STT Watchdog: stuck for %.1fs with error '%s' -- restarting",
-                    since_final, str(last_error)[:80],
+                    "STT Watchdog: stuck for %.1fs with error '%s' -- %s",
+                    since_final,
+                    err_str[:80],
+                    "soft chain-restart (kLSRErrorDomain 301)" if is_soft_timeout else "restarting",
                 )
                 if self._can_restart():
                     if last_partial_text.strip():
@@ -199,7 +281,10 @@ class STTWatchdog:
                             last_partial_text[:120],
                         )
                         self._bus.emit_fast("speech_partial", text=last_partial_text)
-                    await self._restart_stt(stt, "stuck_with_error")
+                    if is_soft_timeout:
+                        await self._soft_chain_restart(stt, reason="klsr_301_timeout")
+                    else:
+                        await self._restart_stt(stt, "stuck_with_error")
 
     def _can_restart(self) -> bool:
         now = time.monotonic()
@@ -220,6 +305,82 @@ class STTWatchdog:
         return True
 
     async def _restart_stt(self, stt: Any, reason: str) -> None:
+        from voice.recovery_lock import voice_recovery_lock
+
+        async with voice_recovery_lock(
+            f"stt_watchdog:{reason}",
+            max_wait_s=2.0,
+        ) as got_lock:
+            if not got_lock:
+                logger.info(
+                    "STT Watchdog: skipping '%s' restart — another voice "
+                    "recovery path is in flight",
+                    reason,
+                )
+                return
+            await self._restart_stt_locked(stt, reason)
+
+    async def _soft_chain_restart(self, stt: Any, *, reason: str) -> None:
+        """Lightweight chain-level restart for benign Apple-framework
+        timeouts (kLSRErrorDomain 301). Only touches the SFSpeechRecognition
+        chain — NOT the audio engine / CoreAudio tap — so it can't race
+        with AudioIntelligenceEngine.seamless_switch and produce the
+        ``PaMacCore err=-50`` cascade.
+
+        Still serialised through ``voice_recovery_lock`` so overlapping
+        soft + hard restarts inside the same watchdog cycle are impossible.
+        """
+        from voice.recovery_lock import voice_recovery_lock
+
+        async with voice_recovery_lock(
+            f"stt_watchdog_soft:{reason}",
+            max_wait_s=1.0,
+        ) as got_lock:
+            if not got_lock:
+                logger.info(
+                    "STT Watchdog: skipping soft chain restart (%s) — another "
+                    "voice recovery path is in flight",
+                    reason,
+                )
+                return
+
+            self._total_restarts += 1
+            self._consecutive_chain_restarts += 1
+            self._restart_times.append(time.monotonic())
+
+            restart_fn = getattr(stt, "_restart_recognition_chain", None)
+            if not callable(restart_fn):
+                logger.info(
+                    "STT Watchdog: soft chain restart requested but backend "
+                    "'%s' exposes no _restart_recognition_chain — falling back "
+                    "to full restart",
+                    type(stt).__name__,
+                )
+                await self._restart_stt_locked(stt, f"soft_fallback:{reason}")
+                return
+
+            try:
+                loop = asyncio.get_running_loop()
+                await loop.run_in_executor(None, restart_fn)
+                self._last_partial_time = time.monotonic()
+                logger.info(
+                    "STT Watchdog: soft chain-restart completed (%s, #%d)",
+                    reason, self._total_restarts,
+                )
+                self._bus.emit_fast(
+                    "stt_watchdog_restart",
+                    reason=f"soft:{reason}",
+                    restart_count=self._total_restarts,
+                )
+            except Exception:
+                logger.warning(
+                    "STT Watchdog: soft chain-restart failed (%s) — escalating",
+                    reason,
+                    exc_info=True,
+                )
+                await self._restart_stt_locked(stt, f"soft_fallback:{reason}")
+
+    async def _restart_stt_locked(self, stt: Any, reason: str) -> None:
         self._total_restarts += 1
         self._consecutive_chain_restarts += 1
         self._restart_times.append(time.monotonic())
@@ -233,6 +394,50 @@ class STTWatchdog:
                 self._consecutive_chain_restarts, self._total_restarts,
             )
             self._consecutive_chain_restarts = 0
+            # Before running the restart, check whether the PREVIOUS full
+            # restart produced any productive output. If not, bump the
+            # failure counter; once we hit the swap threshold, ask the
+            # pipeline to swap engines (one-shot) and skip further native
+            # recovery in this session.
+            now = time.monotonic()
+            prev = self._last_full_restart_time
+            if prev > 0:
+                since_prev = now - prev
+                if since_prev >= _FULL_RESTART_PRODUCTIVITY_WINDOW_S:
+                    # We only reach here if no productive partial landed in
+                    # on_speech_partial within the window; that resets the
+                    # counter. Therefore this is a failure.
+                    self._full_restart_failures += 1
+                    logger.warning(
+                        "STT Watchdog: previous full restart produced no partials "
+                        "within %.0fs — failure %d/%d",
+                        _FULL_RESTART_PRODUCTIVITY_WINDOW_S,
+                        self._full_restart_failures,
+                        _FULL_RESTART_FAILURES_BEFORE_SWAP,
+                    )
+                    if (self._full_restart_failures
+                            >= _FULL_RESTART_FAILURES_BEFORE_SWAP
+                            and not self._failover_pending):
+                        self._failover_pending = True
+                        logger.error(
+                            "STT Watchdog: %d full-restart failures — asking "
+                            "pipeline to swap to Whisper",
+                            self._full_restart_failures,
+                        )
+                        try:
+                            self._bus.emit_fast(
+                                "stt_swap_to_whisper",
+                                reason=f"{self._full_restart_failures}_full_restart_failures",
+                            )
+                        except Exception:
+                            logger.debug(
+                                "STT Watchdog: emit stt_swap_to_whisper failed",
+                                exc_info=True,
+                            )
+                        # Skip the native restart — pipeline will own the swap.
+                        return
+            self._full_restart_attempts += 1
+            self._last_full_restart_time = now
         else:
             logger.info("STT Watchdog: restarting STT (%s, restart #%d, chain #%d/%d)",
                         reason, self._total_restarts,
@@ -259,19 +464,48 @@ class STTWatchdog:
             except Exception:
                 logger.debug("STT Watchdog: device rebind failed", exc_info=True)
 
+        # Raise the auto-start suppression gate BEFORE stop_listening so the
+        # STT's own _run_async loop can't race us and call start_listening
+        # during our await — which would bind a fresh recognition task to
+        # the stale recognizer and orphan the subsequent recreate.
+        begin_fn = getattr(stt, "begin_full_restart", None)
+        end_fn = getattr(stt, "end_full_restart", None)
         try:
-            stt.stop_listening()
+            if callable(begin_fn):
+                begin_fn()
+            else:
+                # Defensive path for older builds; may race with _run_async.
+                stt.stop_listening()
             await asyncio.sleep(0.8)
+            recreate_fn = getattr(stt, "_recreate_recognizer", None)
+            if callable(recreate_fn):
+                try:
+                    recreate_fn()
+                except Exception:
+                    logger.debug("STT Watchdog: recognizer recreate failed", exc_info=True)
             start_fn = getattr(stt, "start_listening", None)
             if callable(start_fn):
                 loop = getattr(stt, "_loop", None)
                 on_final = getattr(stt, "_on_final", None)
                 on_partial = getattr(stt, "_on_partial", None)
-                start_fn(loop=loop, on_final=on_final, on_partial=on_partial)
-                self._last_partial_time = time.monotonic()
-                logger.info("STT Watchdog: full STT restart completed (engine rebuilt)")
+                ok = start_fn(loop=loop, on_final=on_final, on_partial=on_partial)
+                if ok:
+                    self._last_partial_time = time.monotonic()
+                    logger.info(
+                        "STT Watchdog: full STT restart completed (engine + recognizer rebuilt)",
+                    )
+                else:
+                    logger.warning(
+                        "STT Watchdog: start_listening returned False after full restart",
+                    )
         except Exception:
             logger.exception("STT Watchdog: full restart failed")
+        finally:
+            if callable(end_fn):
+                try:
+                    end_fn()
+                except Exception:
+                    logger.debug("STT Watchdog: end_full_restart failed", exc_info=True)
 
         self._bus.emit_fast("stt_watchdog_restart", reason=reason, restart_count=self._total_restarts)
 
@@ -283,6 +517,9 @@ class STTWatchdog:
             "since_last_partial_s": round(now - self._last_partial_time, 1),
             "since_last_final_s": round(now - self._last_final_time, 1),
             "recent_restarts": len(self._restart_times),
+            "full_restart_attempts": self._full_restart_attempts,
+            "full_restart_failures": self._full_restart_failures,
+            "failover_pending": self._failover_pending,
         }
 
 

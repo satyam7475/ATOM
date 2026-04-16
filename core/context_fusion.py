@@ -163,6 +163,7 @@ class ContextFusionEngine:
         "_timeline",
         "_jarvis", "_session_start", "_last_fused_context",
         "_action_log", "_config",
+        "_second_brain", "_prediction_engine",
     )
 
     def __init__(
@@ -181,6 +182,8 @@ class ContextFusionEngine:
         self._session_start = time.time()
         self._last_fused_context: FusedContext | None = None
         self._action_log: list[dict] = []
+        self._second_brain: Any = None
+        self._prediction_engine: Any = None
 
     def wire(
         self,
@@ -190,6 +193,8 @@ class ContextFusionEngine:
         conv_memory: ConversationMemory | None = None,
         timeline: TimelineMemory | None = None,
         jarvis: JarvisCore | None = None,
+        second_brain: Any = None,
+        prediction_engine: Any = None,
     ) -> None:
         """Wire intelligence sources after initialization."""
         self._owner = owner
@@ -198,6 +203,8 @@ class ContextFusionEngine:
         self._conv_memory = conv_memory
         self._timeline = timeline
         self._jarvis = jarvis
+        self._second_brain = second_brain
+        self._prediction_engine = prediction_engine
 
     def log_action(self, action: str, detail: str = "") -> None:
         self._action_log.append({
@@ -311,6 +318,33 @@ class ContextFusionEngine:
             except Exception:
                 ctx.longterm_store_hint = ""
 
+            if query:
+                try:
+                    import asyncio
+                    loop = asyncio.get_running_loop()
+                    future = asyncio.run_coroutine_threadsafe(
+                        self._memory.retrieve(query, k=3), loop,
+                    )
+                    ctx.relevant_memories = future.result(timeout=2.0)
+                except Exception:
+                    pass
+
+        if self._second_brain is not None and query:
+            try:
+                ctx.relevant_facts = self._second_brain.retrieve(query, k=3)
+            except Exception:
+                pass
+
+        if self._prediction_engine is not None:
+            try:
+                preds = self._prediction_engine.predict_next(max_results=3)
+                ctx.predictions = [
+                    f"{p.action} {p.target or ''}".strip()
+                    for p in preds if p.confidence >= 0.3
+                ]
+            except Exception:
+                pass
+
         try:
             from core.l1_cache import l1_cache
             ctx.l1_cache_summary = l1_cache.get_summary_for_llm()
@@ -403,6 +437,15 @@ class ContextFusionEngine:
 
         if ctx.l1_cache_summary:
             lines.append(f"[FAST MEMORY] {ctx.l1_cache_summary}")
+
+        if ctx.relevant_memories:
+            lines.append(f"[MEMORIES] {' | '.join(ctx.relevant_memories[:3])}")
+
+        if ctx.relevant_facts:
+            lines.append(f"[FACTS] {' | '.join(ctx.relevant_facts[:3])}")
+
+        if ctx.predictions:
+            lines.append(f"[PREDICTIONS] {', '.join(ctx.predictions[:3])}")
 
         if ctx.recent_actions:
             lines.append(f"[RECENT] {', '.join(ctx.recent_actions[-3:])}")

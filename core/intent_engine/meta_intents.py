@@ -41,8 +41,21 @@ _THANKS = re.compile(
     r"(\s+atom|\s+buddy|\s+boss)?[\s!.]*$", re.I)
 
 _STATUS = re.compile(
-    r"(are\s+you\s+(there|alive|ready|listening|awake)|"
-    r"you\s+there|atom\s+status|status\s+check|"
+    r"(are\s+you\s+(there|alive|ready|listening|awake|online|up)|"
+    r"you\s+(there|alive|ready|listening|awake|online|up)|"
+    r"atom\s+status|status\s+check|"
+    # Health / system-status intent — casual check of "is everything ok"
+    # AND verbose "what is the health status of atom" style queries.
+    # The previous regex missed all of these and routed them to the LLM
+    # which then leaked chain-of-thought answers.
+    r"(?:what(?:'|\u2019)?s?|tell\s+me|give\s+me|show\s+me|check)\s+"
+    r"(?:the\s+|your\s+|atom(?:'s)?\s+)?"
+    r"(?:health|system|status|health\s+status|system\s+status|overall\s+status)\b|"
+    r"health\s+(?:status|check|report)\b|"
+    r"system\s+(?:status|health|check|report)\b|"
+    r"(?:everything|all|it|we)\s+(?:ok|okay|good|fine|alright|running)|"
+    r"how(?:'|\u2019)?s?\s+(?:it|everything|atom|the\s+system)\s+"
+    r"(?:going|running|doing|looking)|"
     r"can\s+you\s+hear\s+me|^hello\s+there[\s!?.]*$)", re.I)
 
 _USAGE = re.compile(
@@ -52,10 +65,14 @@ _USAGE = re.compile(
 _CONFIRM = re.compile(
     r"^(yes|yeah|yep|yup|sure|okay|ok|go|go\s+ahead|yes\s+play|play|play\s+it|"
     r"haan|ha|han|theek\s+hai|chalu\s+karo|kar\s+do|confirm|do\s+it|proceed|"
-    r"go\s+for\s+it|absolutely|definitely)[\s!.]*$", re.I)
+    r"go\s+for\s+it|absolutely|definitely|"
+    r"yes\s+confirm|yes\s+go|yes\s+go\s+ahead|yes\s+do\s+it|confirm\s+it|"
+    r"yes\s+proceed|yes\s+please|sure\s+go\s+ahead|ok\s+go|okay\s+go|"
+    r"haan\s+chalu\s+karo|haan\s+kar\s+do)[\s!.]*$", re.I)
 
 _DENY = re.compile(
-    r"^(no|nah|nahi|mat\s+karo|cancel|stop|don't|dont)[\s!.]*$", re.I)
+    r"^(no|nah|nahi|nope|mat\s+karo|cancel|stop|don't|dont|"
+    r"no\s+cancel|nahi\s+mat\s+karo|no\s+don't|no\s+stop)[\s!.]*$", re.I)
 
 
 def check(text: str) -> IntentResult | None:

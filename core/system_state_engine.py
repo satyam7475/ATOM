@@ -156,7 +156,7 @@ def _get_foreground_app() -> tuple[str, str]:
             ctx.get("active_window_title", "") or "",
         )
     except Exception:
-        pass
+        logger.debug('Subprocess run failed', exc_info=True)
 
     try:
         import subprocess
@@ -186,7 +186,7 @@ def _get_media_state() -> tuple[bool, str]:
             if app in apps:
                 return True, app
     except Exception:
-        pass
+        logger.debug('Subprocess run failed', exc_info=True)
     return False, ""
 
 

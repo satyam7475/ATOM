@@ -60,7 +60,11 @@ def warm_up_intent_engine(intent_engine: Any) -> None:
     throwaway string. Safe to call during bootstrap."""
     try:
         t0 = time.perf_counter()
-        intent_engine.classify("warm up intent engine test query")
+        silent = getattr(intent_engine, "classify_silent", None)
+        if callable(silent):
+            silent("warm up intent engine test query")
+        else:
+            intent_engine.classify("warm up intent engine test query")
         ms = (time.perf_counter() - t0) * 1000
         logger.info("Intent engine warm-up: %.1fms", ms)
     except Exception as exc:
@@ -155,7 +159,7 @@ class ParallelPipeline:
                 oldest = next(iter(self._prefetched))
                 del self._prefetched[oldest]
         except Exception:
-            pass
+            logger.debug('core fast path optional step failed', exc_info=True)
 
     def get_prefetched(self, text: str) -> Any:
         """Retrieve a pre-classified intent if available."""

@@ -329,6 +329,11 @@ class ToolRegistry:
             Tool("show_goals", "Show active goals", "goals", "safe"),
             Tool("run_code", "Execute a Python expression safely", "utility", "moderate",
                  [ToolParameter("code", "string", "Python code to execute", True)]),
+            Tool("run_terminal_command", "Execute a shell/terminal command on macOS and return the output", "system", "moderate",
+                 [ToolParameter("command", "string", "The shell command to execute", True),
+                  ToolParameter("timeout", "integer", "Max seconds to wait (default 15)", False)],
+                 examples=["list files in home", "check disk space", "show running processes",
+                            "what is my IP address", "create a folder on desktop"]),
         ]
 
         for tool in builtins:

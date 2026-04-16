@@ -63,6 +63,108 @@ _TRAILING_ASSISTANT_LOOP_RE = re.compile(
     r"(?:\s*(?:ATOM|Assistant)\s*:\s*){2,}\s*$",
     re.I,
 )
+# Wrapper-only prefixes emitted by small models when the generation collapses
+# into a speaker-label loop. When the visible text after trimming is ONLY one
+# of these + junk, we treat it as unusable so the caller can fall back instead
+# of shipping half-a-sentence + a hallucinated quoted completion.
+_WRAPPER_ONLY_PREFIXES: tuple[str, ...] = (
+    "the answer is",
+    "my answer is",
+    "the answer:",
+    "answer:",
+    "response:",
+    "final answer:",
+    "here is the answer",
+    "here's the answer",
+)
+
+# Chain-of-thought prefaces that small instruction-tuned models (Qwen3-4B,
+# Llama-3-8B, etc.) still leak even after system-prompt rules. We strip any
+# leading run of these from the visible output before TTS so Boss never hears
+# ATOM narrating its own reasoning aloud.
+#
+# The pattern peels off one preface sentence at a time; we keep applying it
+# until the output starts with an answer token. The final ". " / "? " boundary
+# is included in the match so the following real sentence stays clean.
+_COT_PREFACE_RE = re.compile(
+    r"""
+    ^\s*                                  # leading whitespace
+    (?:
+        # \"Okay(,)? let's/lets see\"  /  \"let me think\"  /  \"alright so\"
+        (?:okay|ok|alright|well|so|hmm+|um+|uh+)\b[,.!]?\s*
+        (?:let(?:'|\u2019)?s?\s+(?:see|think|break|try|start|go)\b[^.?!]*[.?!]\s*)?
+      |
+        let(?:'|\u2019)?s?\s+(?:see|think|break|try|start|go)\b[^.?!]*[.?!]\s*
+      |
+        let\s+me\s+think\b[^.?!]*[.?!]\s*
+      |
+        # Third-person narration about the user.
+        (?:the\s+user|boss|the\s+speaker)\s+(?:is\s+)?(?:asking|wants|says|said|needs|wondering)[^.?!]*[.?!]\s*
+      |
+        # Meta narration \"The question is ...\" / \"So, the question is ...\"
+        (?:so\s+)?(?:the\s+)?(?:question|query|request)\s+is\b[^.?!]*[.?!]\s*
+      |
+        # \"I should / I need to ...\" internal-monologue stems.
+        i\s+(?:should|need\s+to|have\s+to|must)\s+(?:think|consider|figure|reason|recall)\b[^.?!]*[.?!]\s*
+      |
+        # Fill / stall particles at the very front.
+        (?:hmm+|um+|uh+|er+|ah+)[,.!]?\s+
+    )+
+    """,
+    re.IGNORECASE | re.VERBOSE | re.DOTALL,
+)
+
+
+def _strip_cot_prefaces(text: str) -> str:
+    """Remove chain-of-thought / stall preface sentences from the head of a
+    reply. Idempotent and safe on empty strings — returns the trimmed tail
+    which is the actual spoken answer.
+    """
+    if not text:
+        return text
+    prev = None
+    out = text
+    # Loop until fixed point (each run peels at most one preface sentence
+    # thanks to the outer `+`, so two passes are usually enough).
+    for _ in range(3):
+        if out == prev:
+            break
+        prev = out
+        out = _COT_PREFACE_RE.sub("", out, count=1).lstrip()
+    return out
+
+
+def _looks_like_wrapper_preface(text: str) -> bool:
+    """Return True when *text* begins with a preface like 'The answer is ...'
+    AND the content after the wrapper looks like a stalled-model artefact
+    (short remainder OR a quoted one-liner). Examples::
+
+        "The answer is \\"Okay, I'll play the song for you.\\""   -> True
+        "The answer is 42."                                    -> True
+        "The answer is Newton's first law: every object..."     -> False
+
+    The second form (short remainder, no quotes) catches raw collapses;
+    the first form (any remainder, but wrapped in quotes) catches the
+    classic Qwen-small hallucination regardless of inner length because
+    quoting is itself a symptom of the model pretending to answer.
+    Empty input returns False — caller already handles emptiness.
+    """
+    stripped = (text or "").strip().lower()
+    if not stripped:
+        return False
+    for prefix in _WRAPPER_ONLY_PREFIXES:
+        if stripped.startswith(prefix):
+            remainder = stripped[len(prefix):].strip(" :.,;")
+            # Quoted inner text — always treat as wrapper hallucination.
+            for lq, rq in (('"', '"'), ("'", "'"),
+                           ("\u201c", "\u201d"), ("\u2018", "\u2019"),
+                           ("`", "`")):
+                if remainder.startswith(lq) and rq in remainder[1:]:
+                    return True
+            # Unquoted but short — stall pattern.
+            if len(remainder.split()) <= 6:
+                return True
+    return False
 
 
 class MLXBrain:
@@ -333,8 +435,27 @@ class MLXBrain:
         if not guarded:
             return "", None, False
 
+        # Peel off any chain-of-thought / meta prefaces leaked by the model
+        # BEFORE the speaker-loop / stop-sequence checks. This way a reply
+        # that starts with "Okay, let's see. Newton's first law is …" gets
+        # trimmed to the useful sentence instead of being shipped whole or
+        # declared unusable.
+        stripped_cot = _strip_cot_prefaces(guarded)
+        if stripped_cot != guarded:
+            guarded = stripped_cot
+        if not guarded:
+            # Entire response was narration. Force caller fallback.
+            return "", "cot_only", True
+
         trimmed = _TRAILING_ASSISTANT_LOOP_RE.sub("", guarded).rstrip()
         if trimmed != guarded:
+            # A speaker-label loop terminated generation early. If the pre-loop
+            # buffer is only a wrapper preface like `The answer is "..."` with
+            # almost no real content, treat it as unusable — small models
+            # produce exactly this pattern when they stall, and emitting it
+            # causes "ATOM invented an action" hallucinations downstream.
+            if _looks_like_wrapper_preface(trimmed):
+                return "", "speaker_label_loop_wrapper", True
             return trimmed, "speaker_label_loop", True
 
         stop_hit = cls._find_stop_hit(guarded, stop_sequences)
@@ -404,7 +525,7 @@ class MLXBrain:
             try:
                 mx.reset_peak_memory()
             except Exception:
-                pass
+                logger.debug('MLX peak memory reset failed', exc_info=True)
 
         try:
             for resp in stream_generate(
@@ -473,7 +594,7 @@ class MLXBrain:
                 try:
                     on_token("", True)
                 except Exception:
-                    pass
+                    logger.debug('Stream end callback failed', exc_info=True)
             return "", False
 
     def _generate_sync(

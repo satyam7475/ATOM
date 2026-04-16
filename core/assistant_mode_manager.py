@@ -121,5 +121,5 @@ class AssistantModeManager:
             if isinstance(v, str) and v in ALLOWED_MODES:
                 return v
         except Exception:
-            pass
+            logger.debug('Directory ensure failed', exc_info=True)
         return None

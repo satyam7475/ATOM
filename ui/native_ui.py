@@ -73,7 +73,7 @@ def _appkit_subprocess_worker(conn: mp.connection.Connection,
                         action = str(b)
                     conn.send({"type": "js_call", "action": action})
                 except Exception:
-                    pass
+                    logger.debug('PyObjC bridge call failed', exc_info=True)
 
         handler = ATOMScriptHandler.alloc().init()
 
@@ -90,7 +90,7 @@ def _appkit_subprocess_worker(conn: mp.connection.Connection,
             prefs.setValue_forKey_(True, "allowFileAccessFromFileURLs")
             prefs.setValue_forKey_(True, "allowUniversalAccessFromFileURLs")
         except Exception:
-            pass
+            logger.debug('PyObjC bridge call failed', exc_info=True)
 
         # ── Window ──
         screen = NSScreen.mainScreen()
@@ -175,7 +175,7 @@ def _appkit_subprocess_worker(conn: mp.connection.Connection,
                     try:
                         webview.evaluateJavaScript_completionHandler_(msg["code"], None)
                     except Exception:
-                        pass
+                        logger.debug('Socket recv failed', exc_info=True)
 
             pool = objc.autorelease_pool()
             try:
@@ -193,7 +193,7 @@ def _appkit_subprocess_worker(conn: mp.connection.Connection,
         try:
             conn.send({"type": "error", "msg": traceback.format_exc()})
         except Exception:
-            pass
+            logger.debug('Socket recv failed', exc_info=True)
         os._exit(1)
 
 
@@ -274,7 +274,7 @@ class NativeATOMWindow:
                     self.broadcast_system_stats(stats)
                     time.sleep(2.0)
             except Exception:
-                pass
+                logger.debug('Socket recv failed', exc_info=True)
 
         self._stats_thread = threading.Thread(target=_stat_loop, daemon=True)
         self._stats_thread.start()
@@ -286,7 +286,7 @@ class NativeATOMWindow:
             try:
                 self._parent_conn.send({"type": "shutdown"})
             except Exception:
-                pass
+                logger.debug('Socket recv failed', exc_info=True)
         if self._process:
             self._process.join(timeout=2)
             if self._process.is_alive():
@@ -297,7 +297,7 @@ class NativeATOMWindow:
             try:
                 self._parent_conn.send({"type": "eval_js", "code": js_code})
             except Exception:
-                pass
+                logger.debug('CPU percent probe failed', exc_info=True)
 
     # ── API ─────────────────────────────────────
 

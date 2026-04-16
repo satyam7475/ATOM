@@ -580,7 +580,7 @@ class RagEngine:
                             val_min,
                         )
                 except Exception:
-                    pass
+                    logger.debug('core rag rag engine optional step failed', exc_info=True)
             logger.info(
                 "v7_graph_hit conf=%.3f snippets=%d project=%s",
                 graph_conf,
@@ -619,7 +619,7 @@ class RagEngine:
                 try:
                     self._feedback.record_graph_hit()
                 except Exception:
-                    pass
+                    logger.debug('core rag rag engine optional step failed', exc_info=True)
             self._record_chunk_usage(chunks)
             return RagRetrieveResult(
                 chunks=chunks,
@@ -665,7 +665,7 @@ class RagEngine:
             try:
                 self._feedback.record_rag_fallback()
             except Exception:
-                pass
+                logger.debug('core rag rag engine optional step failed', exc_info=True)
         logger.info("v7_rag_fallback reason=vector_embed query=%s", (query or "")[:80])
         q_emb, skipped = await self._embed_query(query)
         now = time.time()

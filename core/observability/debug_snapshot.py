@@ -74,4 +74,4 @@ def log_v7_debug_snapshot(payload: dict[str, Any]) -> None:
     try:
         logger.info("v7_debug_snapshot %s", payload)
     except Exception:
-        pass
+        logger.debug('CPU percent probe failed', exc_info=True)

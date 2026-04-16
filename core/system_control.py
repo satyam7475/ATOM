@@ -220,7 +220,7 @@ class SystemControl:
                         if conn.pid:
                             pid_name = psutil.Process(conn.pid).name()
                     except Exception:
-                        pass
+                        logger.debug('Subprocess run failed', exc_info=True)
                     ports.append({
                         "port": conn.laddr.port,
                         "address": conn.laddr.ip,
@@ -437,7 +437,7 @@ class SystemControl:
                     except FileNotFoundError:
                         pass
             except Exception:
-                pass
+                logger.debug('core system control optional step failed', exc_info=True)
 
             startup_folder = Path.home() / "AppData" / "Roaming" / "Microsoft" / "Windows" / "Start Menu" / "Programs" / "Startup"
             if startup_folder.exists():
@@ -477,7 +477,7 @@ class SystemControl:
                             "scope": "login_item",
                         })
             except Exception:
-                pass
+                logger.debug('Subprocess run failed', exc_info=True)
 
         elif self._is_linux:
             autostart = Path.home() / ".config" / "autostart"

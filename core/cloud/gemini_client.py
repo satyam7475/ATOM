@@ -232,7 +232,7 @@ class GeminiClient:
             try:
                 error_body = e.read().decode("utf-8", errors="ignore")[:200]
             except Exception:
-                pass
+                logger.debug('core cloud gemini client optional step failed', exc_info=True)
             self._record_failure(f"HTTP {e.code}: {error_body}")
             logger.warning(
                 "Gemini HTTP error %d (%.0fms): %s",
@@ -337,9 +337,13 @@ class GeminiClient:
     ) -> tuple[str, bool]:
         """Ask using the fast conversational (buddy) model."""
         default_system = (
-            "You are ATOM, a personal AI assistant created by Satyam Yadav. "
+            "You are ATOM, a personal AI assistant (JARVIS-style) created by Satyam Yadav. "
             "You call him 'Boss'. You are friendly, witty, concise, and helpful. "
-            "Keep responses short and conversational unless asked for detail."
+            "Keep responses short and conversational unless asked for detail. "
+            "Never invent or promise actions the user did not explicitly request. "
+            "If the query is unclear or looks like noisy transcription, ask ONE short "
+            "clarifying question instead of guessing. Ground factual claims in supplied "
+            "context; if you don't have the information, say so."
         )
         return await self.ask(
             query,
@@ -361,7 +365,10 @@ class GeminiClient:
             "You are ATOM, an advanced AI system created by Satyam Yadav. "
             "You are methodical, thorough, and precise. "
             "Think step by step. Provide detailed, well-structured answers. "
-            "For code, always include explanations."
+            "For code, always include explanations. "
+            "Ground every factual claim in supplied context or tool outputs; never "
+            "fabricate specifics. If the question is ambiguous, state your assumption "
+            "briefly before answering, or ask one clarifying question."
         )
         return await self.ask(
             query,
@@ -432,7 +439,7 @@ class GeminiClient:
                 try:
                     resp.fp.raw._sock.settimeout(0.1)
                 except Exception:
-                    pass
+                    logger.debug('core cloud gemini client optional step failed', exc_info=True)
                 resp_iter = iter(resp)
                 while True:
                     if self._streaming_cancelled:
@@ -489,7 +496,7 @@ class GeminiClient:
             try:
                 error_body = e.read().decode("utf-8", errors="ignore")[:200]
             except Exception:
-                pass
+                logger.debug('Stream end callback failed', exc_info=True)
             self._record_failure(f"HTTP {e.code}: {error_body}")
             logger.warning(
                 "Gemini streaming HTTP error %d (%.0fms): %s",

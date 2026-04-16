@@ -377,7 +377,7 @@ class _NativeSynth:
                     new_pitch = float(base_pitch) + self._pitch_shift
                     synth.setObject_forProperty_error_(new_pitch, pitch_prop, None)
             except Exception:
-                pass
+                logger.debug('macOS speech synth step failed', exc_info=True)
         self._synth = synth
 
         synth.startSpeakingString_(text)
@@ -398,7 +398,7 @@ class _NativeSynth:
             try:
                 synth.stopSpeaking()
             except Exception:
-                pass
+                logger.debug('macOS speech synth step failed', exc_info=True)
 
 
 # ── Main TTS class ───────────────────────────────────────────────────
@@ -551,7 +551,7 @@ class MacOSTTSAsync:
                 try:
                     proc.kill()
                 except Exception:
-                    pass
+                    logger.debug('voice tts macos optional step failed', exc_info=True)
 
     def _normalize_stream_text(self, text: str) -> str:
         cleaned = _clean_for_tts(text).strip()
@@ -897,7 +897,7 @@ class MacOSTTSAsync:
                 while not queue.empty():
                     queue.get_nowait()
             except Exception:
-                pass
+                logger.debug('Audio stream stop failed', exc_info=True)
         await self._kill_procs()
         await self.stop()
 
@@ -917,7 +917,7 @@ class MacOSTTSAsync:
             try:
                 queue.put_nowait(("", True))
             except Exception:
-                pass
+                logger.debug('Audio stream stop failed', exc_info=True)
         await self._kill_procs()
         await asyncio.sleep(0.02)
 

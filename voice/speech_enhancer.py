@@ -121,7 +121,7 @@ class SpeechEnhancer:
 
         rate += _EMOTION_RATE_MAP.get(emotion, 0)
 
-        return max(130, min(210, rate))
+        return max(155, min(240, rate))
 
     def _find_pause_points(self, text: str) -> list[int]:
         """Find positions where micro-pauses improve naturalism."""

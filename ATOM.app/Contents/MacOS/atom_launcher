@@ -1,0 +1,32 @@
+#!/bin/bash
+# ATOM.app launcher — resolves the TCC bundle requirement.
+#
+# When macOS grants Speech Recognition and Microphone permissions, it binds
+# them to the *process bundle* (Info.plist).  Running `python main.py` directly
+# from a venv means the "bundle" is Python.framework, which lacks the usage
+# descriptions and causes TCC to deny or silently block access.
+#
+# This launcher:
+#   1. Sets ATOM_LAUNCH_MODE=bundle so stt_macos.py knows it has a valid bundle.
+#   2. Sets ATOM_APP_BUNDLE to this .app so the Info.plist is found.
+#   3. exec's the venv Python with main.py — the process inherits this bundle's
+#      TCC entitlements while keeping the full venv environment.
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+BUNDLE_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+ATOM_ROOT="$(cd "$BUNDLE_ROOT/.." && pwd)"
+
+export ATOM_LAUNCH_MODE="bundle"
+export ATOM_APP_BUNDLE="$BUNDLE_ROOT"
+
+# Auto-detect virtualenv
+if [ -f "$ATOM_ROOT/.venv/bin/python" ]; then
+    PYTHON="$ATOM_ROOT/.venv/bin/python"
+elif [ -f "$ATOM_ROOT/venv/bin/python" ]; then
+    PYTHON="$ATOM_ROOT/venv/bin/python"
+else
+    PYTHON="$(which python3)"
+fi
+
+cd "$ATOM_ROOT"
+exec "$PYTHON" main.py "$@"

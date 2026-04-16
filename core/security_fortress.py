@@ -402,13 +402,16 @@ class IntegrityMonitor:
         logger.info("Integrity baseline created: %d files hashed", len(self._baseline))
         return self._baseline
 
-    def verify(self) -> tuple[bool, list[dict[str, str]]]:
+    def verify(self, security_mode: str = "normal") -> tuple[bool, list[dict[str, str]]]:
         """Verify all source files against baseline.
 
         Returns (all_ok, violations) where violations is a list of
         dicts with keys: file, type (modified|added|deleted), details.
         """
         if not self._baseline:
+            if security_mode in ("strict", "paranoid"):
+                return False, [{"file": "integrity.json", "type": "baseline_missing",
+                                "details": "Integrity baseline missing. Manual reset required in strict mode."}]
             self.create_baseline()
             return True, []
 
@@ -595,7 +598,7 @@ class SecurityAuditTrail:
                     entry = json.loads(last_line)
                     self._last_hash = entry.get("hash", "GENESIS")
         except Exception:
-            pass
+            logger.debug('Directory ensure failed', exc_info=True)
 
     def log(
         self,
@@ -957,7 +960,8 @@ class SecurityFortress:
 
     def check_integrity(self) -> tuple[bool, str]:
         """Verify all ATOM source files against baseline."""
-        ok, violations = self._integrity.verify()
+        sec_mode = self._config.get("security", {}).get("mode", "normal")
+        ok, violations = self._integrity.verify(security_mode=sec_mode)
         if ok:
             self._audit.log("integrity_check", "All files intact")
             return True, (

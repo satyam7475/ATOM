@@ -234,7 +234,7 @@ class RuntimeWatchdog:
         try:
             self._bus.emit_fast("metrics_event", counter="errors_total")
         except Exception:
-            pass
+            logger.debug('Fast bus emit failed', exc_info=True)
 
         if stage == "llm_inference":
             if self._local_brain is not None:
@@ -249,7 +249,7 @@ class RuntimeWatchdog:
             try:
                 self._bus.emit("llm_error", source="watchdog", error="llm_timeout")
             except Exception:
-                pass
+                logger.debug('Metrics counter emit failed', exc_info=True)
             self._maybe_recover(f"LLM inference timed out after {timeout_s:.1f}s")
             return
 
@@ -258,7 +258,7 @@ class RuntimeWatchdog:
             try:
                 self._bus.emit("text_display", text="[Watchdog] TTS timed out; audio skipped.")
             except Exception:
-                pass
+                logger.debug('Metrics counter emit failed', exc_info=True)
             self._maybe_recover(
                 f"TTS synthesis timed out after {timeout_s:.1f}s",
                 schedule_restart=False,

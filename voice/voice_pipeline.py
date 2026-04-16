@@ -23,6 +23,7 @@ import asyncio
 import logging
 import os
 import sys
+import time as _time
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -104,6 +105,7 @@ class VoicePipeline:
         self._listening_mode: Any = None
         self._loop_task: asyncio.Task | None = None
         self._audio_intel: Any = None
+        self._earcons: Any = None
 
     def build(self) -> None:
         """Construct STT and TTS engines based on config + platform."""
@@ -208,10 +210,47 @@ class VoicePipeline:
             intent_engine=self._intent_engine,
         ), ""
 
+    def _load_persisted_failover_reason(self) -> str:
+        """Read data/atom_runtime.json, return the stored failover reason
+        (empty string if none). Used to honor a prior session's decision
+        to stay on Whisper instead of re-provoking native STT."""
+        try:
+            import json as _json
+            import pathlib as _pl
+            path = _pl.Path("data/atom_runtime.json")
+            if not path.exists():
+                return ""
+            data = _json.loads(path.read_text() or "{}")
+            return str(data.get("stt_failover_reason") or "").strip()
+        except Exception:
+            logger.debug("failover flag load failed", exc_info=True)
+            return ""
+
     def _build_stt(self) -> None:
         stt_cfg = self._config.get("stt", {})
         engine_pref = str(stt_cfg.get("engine", "macos_native") or "macos_native").strip().lower()
         logger.info("STT engine preference: %s (platform=%s)", engine_pref, sys.platform)
+
+        # If a previous session failed over to Whisper due to unrecoverable
+        # native breakage, honor that decision on this boot — unless the
+        # user has explicitly set stt.engine = macos_native (which implies
+        # "I want to try native again"). The "auto" preference respects
+        # the persisted flag.
+        persisted_reason = self._load_persisted_failover_reason()
+        if (persisted_reason
+                and engine_pref in ("auto",)
+                and sys.platform == "darwin"):
+            logger.warning(
+                "STT: persisted failover flag present (%s) — starting with Whisper",
+                persisted_reason[:80],
+            )
+            self.stt = self._build_faster_whisper_stt()
+            if isinstance(self.stt, _DisabledSTT):
+                self.stt_runtime_label = "Disabled (whisper unavailable)"
+            else:
+                self.stt_runtime_label = "Faster-Whisper (persisted failover)"
+                self._stt_failed_over = True
+            return
 
         if sys.platform == "darwin":
             if engine_pref in ("macos_native", "auto"):
@@ -398,15 +437,249 @@ class VoicePipeline:
             self._stt_watchdog.attach_stt(self.stt)
         self._bus.on("speech_partial", self._stt_watchdog.on_speech_partial)
         self._bus.on("speech_final", self._stt_watchdog.on_speech_final)
+        # Hardened NativeSTT emits this event when it detects empty-isFinal
+        # cascades or recreate storms it cannot recover from locally.
+        self._bus.on("stt_needs_full_restart", self._stt_watchdog.on_needs_full_restart)
+        # Watchdog asks us to swap the engine after repeated failovers.
+        self._bus.on("stt_swap_to_whisper", self._on_swap_to_whisper_event)
         return self._stt_watchdog
 
+    async def _on_swap_to_whisper_event(self, reason: str = "", **_kw: Any) -> None:
+        """Bus handler: watchdog asked us to swap to Whisper."""
+        try:
+            self.swap_to_whisper(reason=reason or "watchdog_request")
+        except Exception:
+            logger.exception("STT failover: swap_to_whisper failed")
+
+    def swap_to_whisper(self, *, reason: str = "failover") -> bool:
+        """Swap the primary STT from NativeSTT (SFSpeechRecognizer) to
+        faster-whisper (STTAsync) at runtime, after the native engine has
+        proven unrecoverable in this process.
+
+        Returns True if the swap succeeded (Whisper now active), False if
+        Whisper is unavailable (dependencies missing etc.).
+        """
+        # Idempotent: if we've already swapped, don't try again.
+        if getattr(self, "_stt_failed_over", False):
+            return True
+        if self.stt is not None:
+            current_name = type(self.stt).__name__
+            if current_name in ("STTAsync", "_DisabledSTT"):
+                return False
+
+        logger.warning(
+            "STT failover: swapping %s -> faster-whisper (%s)",
+            type(self.stt).__name__ if self.stt is not None else "None",
+            reason,
+        )
+
+        old = self.stt
+        if old is not None:
+            try:
+                old.shutdown()
+            except Exception:
+                logger.debug("STT failover: old stt shutdown failed", exc_info=True)
+
+        new_stt = self._build_faster_whisper_stt()
+        if isinstance(new_stt, _DisabledSTT):
+            logger.error(
+                "STT failover: Whisper unavailable — '%s'. Voice input will stay in disabled state.",
+                getattr(new_stt, "_reason", "unknown"),
+            )
+            self.stt = new_stt
+            self.stt_runtime_label = "Disabled (whisper unavailable)"
+            self._stt_failed_over = True
+            self._persist_failover_flag(reason=f"whisper_unavailable:{reason}")
+            return False
+
+        self.stt = new_stt
+        self.stt_runtime_label = "Faster-Whisper (runtime failover)"
+        self._stt_failed_over = True
+
+        # Re-wire the watchdog to the new engine.
+        if self._stt_watchdog is not None:
+            try:
+                self._stt_watchdog.attach_stt(new_stt)
+            except Exception:
+                logger.debug("STT failover: watchdog rewire failed", exc_info=True)
+
+        # Re-wire state-change handler so the new engine participates in
+        # LISTENING/SPEAKING transitions.
+        on_state = getattr(new_stt, "on_state_changed", None)
+        if callable(on_state):
+            try:
+                self._bus.on("state_changed", on_state)
+            except Exception:
+                logger.debug("STT failover: state_changed rewire failed", exc_info=True)
+
+        # Kick the new engine into life.
+        try:
+            import asyncio as _aio
+            loop = _aio.get_running_loop()
+            loop.create_task(new_stt.async_start_listening())
+        except RuntimeError:
+            logger.debug("STT failover: no running loop to start new engine")
+        except Exception:
+            logger.debug("STT failover: new engine start failed", exc_info=True)
+
+        self._persist_failover_flag(reason=reason)
+        logger.info(
+            "STT failover complete: voice input now via faster-whisper (reason=%s)",
+            reason,
+        )
+        try:
+            self._bus.emit_fast("stt_failover_complete", reason=reason)
+        except Exception:
+            logger.debug("STT failover: emit_fast failed", exc_info=True)
+        return True
+
+    def _persist_failover_flag(self, *, reason: str) -> None:
+        """Persist a one-shot flag so ATOM boots with Whisper next time if
+        native was unrecoverable in this session."""
+        try:
+            import json as _json
+            import pathlib as _pl
+            path = _pl.Path("data/atom_runtime.json")
+            path.parent.mkdir(parents=True, exist_ok=True)
+            existing: dict = {}
+            if path.exists():
+                try:
+                    existing = _json.loads(path.read_text() or "{}")
+                except Exception:
+                    existing = {}
+            existing["stt_failover_reason"] = reason
+            try:
+                import datetime as _dt
+                existing["stt_failover_at"] = _dt.datetime.utcnow().isoformat() + "Z"
+            except Exception:
+                pass
+            path.write_text(_json.dumps(existing, indent=2))
+        except Exception:
+            logger.debug("STT failover: persist flag failed", exc_info=True)
+
     def build_listening_mode(self) -> Any:
-        """Build the dual-channel listening mode controller."""
+        """Build the dual-channel listening mode controller and wire the
+        mode-flip handlers.
+
+        Flow:
+            wake_word_detected       -> ACTIVE (route speech_final to Router)
+            15s idle after tts_done  -> PASSIVE (ignore speech unless wake)
+        """
         from voice.listening_modes import ListeningModeController
 
         always_active = self._wake_word is None or not getattr(self._wake_word, "is_available", False)
         self._listening_mode = ListeningModeController(always_active=always_active)
+
+        self._passive_revert_task: asyncio.Task | None = None
+        # Extended to 30s so short pauses / half-second breaths during a
+        # follow-up correction don't flip us back to PASSIVE mid-dialog.
+        self._passive_revert_delay_s: float = float(
+            self._config.get("stt", {}).get("passive_revert_delay_s", 30.0),
+        )
+        # Minimum gap between partial-triggered kicks so we don't thrash
+        # the scheduler on every 50-ms partial.
+        self._passive_revert_kick_min_s: float = 1.0
+        self._passive_revert_last_kick_t: float = 0.0
+
+        def _cancel_revert_task() -> None:
+            task = self._passive_revert_task
+            if task is not None and not task.done():
+                task.cancel()
+                self._passive_revert_task = None
+
+        def _arm_revert_task(delay_s: float) -> None:
+            """Always cancel + re-arm. Safe to call from any event."""
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                return
+            _cancel_revert_task()
+            if self._listening_mode is None:
+                return
+            if getattr(self._listening_mode, "_always_active", False):
+                return
+            if getattr(self._listening_mode, "is_passive", False):
+                return
+            self._passive_revert_task = loop.create_task(
+                self._schedule_passive_revert(delay_s),
+            )
+
+        self._arm_passive_revert = _arm_revert_task  # type: ignore[attr-defined]
+        self._cancel_passive_revert = _cancel_revert_task  # type: ignore[attr-defined]
+
+        async def _on_wake_word(**kw: Any) -> None:
+            try:
+                word = str(kw.get("wake_word") or kw.get("word") or "wake")
+                self._listening_mode.activate(f"wake_phrase:{word}")
+                _cancel_revert_task()
+            except Exception:
+                logger.debug("wake_word_detected handler failed", exc_info=True)
+
+        async def _on_tts_complete(**_kw: Any) -> None:
+            # Whenever we finish speaking, the user is still in an active
+            # exchange — give them the full 30s window to respond before
+            # we quietly slip back to PASSIVE.
+            _arm_revert_task(self._passive_revert_delay_s)
+
+        async def _on_partial_or_final(**_kw: Any) -> None:
+            # Any detected speech resets the revert timer so a user who is
+            # mid-sentence / mid-correction never falls off a cliff.
+            now = _time.time()
+            if (now - self._passive_revert_last_kick_t) < self._passive_revert_kick_min_s:
+                return
+            self._passive_revert_last_kick_t = now
+            _arm_revert_task(self._passive_revert_delay_s)
+
+        # Also hook tts_delivery_metrics because some backends emit that
+        # *before* tts_complete and sometimes skip tts_complete entirely
+        # on cancellation.
+        async def _on_tts_metrics(**_kw: Any) -> None:
+            _arm_revert_task(self._passive_revert_delay_s)
+
+        async def _on_tts_start(**_kw: Any) -> None:
+            # Cancel any pending passive revert while ATOM is actively
+            # speaking — without this the 30s timer can fire mid-TTS, flip
+            # us to PASSIVE, and silently swallow the user's follow-up.
+            _cancel_revert_task()
+
+        async def _on_user_query(**_kw: Any) -> None:
+            # A cursor_query event means the user's speech was captured and
+            # forwarded for a reply — keep us ACTIVE until TTS completes.
+            _cancel_revert_task()
+
+        self._bus.on("wake_word_detected", _on_wake_word)
+        self._bus.on("tts_complete", _on_tts_complete)
+        self._bus.on("speech_partial", _on_partial_or_final)
+        self._bus.on("speech_final", _on_partial_or_final)
+        self._bus.on("tts_delivery_metrics", _on_tts_metrics)
+        self._bus.on("tts_start", _on_tts_start)
+        self._bus.on("tts_stream", _on_tts_start)
+        self._bus.on("cursor_query", _on_user_query)
+        self._bus.on("partial_response", _on_user_query)
+
+        # Give the native STT a reference so it can gate speech_final
+        # emission while in PASSIVE mode (no wake phrase -> ignore).
+        try:
+            if self.stt is not None:
+                set_mode = getattr(self.stt, "attach_listening_mode", None)
+                if callable(set_mode):
+                    set_mode(self._listening_mode)
+                else:
+                    setattr(self.stt, "_listening_mode_ref", self._listening_mode)
+        except Exception:
+            logger.debug("stt listening mode wire failed", exc_info=True)
+
         return self._listening_mode
+
+    async def _schedule_passive_revert(self, delay_s: float) -> None:
+        try:
+            await asyncio.sleep(max(1.0, float(delay_s)))
+            if self._listening_mode is not None:
+                self._listening_mode.deactivate("idle_timeout")
+        except asyncio.CancelledError:
+            return
+        except Exception:
+            logger.debug("passive revert task error", exc_info=True)
 
     @property
     def stt_watchdog(self) -> Any:
@@ -430,6 +703,71 @@ class VoicePipeline:
         )
         return self._audio_intel
 
+    def build_earcons(self) -> Any:
+        """Build the (optional) Earcons engine and wire lifecycle cues.
+
+        Driven by config:
+          voice.earcons.enabled              bool  (default True)
+          voice.earcons.volume               float (0..1, default 0.45)
+          voice.earcons.heartbeat_enabled    bool  (default False)
+          voice.earcons.heartbeat_interval_s float (default 600)
+        """
+        from voice.earcons import Earcons
+
+        vcfg = (self._config.get("voice") or {}).get("earcons", {}) or {}
+        self._earcons = Earcons(
+            enabled=bool(vcfg.get("enabled", True)),
+            volume=float(vcfg.get("volume", 0.45)),
+            heartbeat_enabled=bool(vcfg.get("heartbeat_enabled", False)),
+            heartbeat_interval_s=float(vcfg.get("heartbeat_interval_s", 600.0)),
+        )
+        if not self._earcons.is_enabled:
+            return self._earcons
+
+        async def _on_wake(**_kw: Any) -> None:
+            try:
+                self._earcons.play("wake", min_interval_s=0.4)
+            except Exception:
+                logger.debug("earcons wake play failed", exc_info=True)
+
+        async def _on_done(**_kw: Any) -> None:
+            try:
+                self._earcons.play("done", min_interval_s=0.4)
+            except Exception:
+                logger.debug("earcons done play failed", exc_info=True)
+
+        async def _on_failover(**_kw: Any) -> None:
+            try:
+                self._earcons.play("error", min_interval_s=1.0)
+            except Exception:
+                logger.debug("earcons error play failed", exc_info=True)
+
+        async def _on_thinking(**_kw: Any) -> None:
+            # Soft click played ~1.2s after the brain accepts a query but
+            # before the first TTS sentence is ready. Eliminates the dead
+            # silence window without forcing a verbose "let me check" ack.
+            try:
+                self._earcons.play("thinking", min_interval_s=2.0)
+            except Exception:
+                logger.debug("earcons thinking play failed", exc_info=True)
+
+        self._bus.on("wake_word_detected", _on_wake)
+        self._bus.on("tts_complete", _on_done)
+        self._bus.on("stt_failover_complete", _on_failover)
+        self._bus.on("stt_watchdog_restart", _on_failover)
+        self._bus.on("thinking_earcon", _on_thinking)
+
+        if self._earcons._heartbeat_enabled:
+            try:
+                self._earcons.start_heartbeat(
+                    lambda: (self.stt is not None
+                             and getattr(self.stt, "_listening", False)),
+                )
+            except Exception:
+                logger.debug("earcons heartbeat start failed", exc_info=True)
+
+        return self._earcons
+
     def configure_audio_intelligence(self) -> None:
         """Wire STT/TTS into the Audio Intelligence Engine after build()."""
         if self._audio_intel is not None:
@@ -450,6 +788,12 @@ class VoicePipeline:
         if self._stt_watchdog is None:
             self.build_stt_watchdog()
         self._stt_watchdog.start()
+
+        if self._earcons is None:
+            try:
+                self.build_earcons()
+            except Exception:
+                logger.debug("Earcons build failed", exc_info=True)
 
         if self._audio_intel is not None:
             self.configure_audio_intelligence()
@@ -503,6 +847,11 @@ class VoicePipeline:
 
     def shutdown(self) -> None:
         """Cleanly shut down all voice components."""
+        if self._earcons is not None:
+            try:
+                self._earcons.shutdown()
+            except Exception:
+                logger.debug("Earcons shutdown error", exc_info=True)
         if self._audio_intel is not None:
             try:
                 self._audio_intel.shutdown()

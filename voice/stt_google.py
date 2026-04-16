@@ -359,7 +359,7 @@ class STTGoogle:
             try:
                 mic_obj.__exit__(None, None, None)
             except Exception:
-                pass
+                logger.debug('voice stt google optional step failed', exc_info=True)
             if self._mic_device_index is not None:
                 self._rejected_bt_indices.add(self._mic_device_index)
             self._fallback_to_default_mic()
@@ -372,7 +372,7 @@ class STTGoogle:
             try:
                 mic_obj.__exit__(None, None, None)
             except Exception:
-                pass
+                logger.debug('voice stt google optional step failed', exc_info=True)
             time.sleep(3.0)
             if self._mic_device_index is not None:
                 self._rejected_bt_indices.add(self._mic_device_index)
@@ -685,7 +685,7 @@ class STTGoogle:
             try:
                 self._persistent_mic.__exit__(None, None, None)
             except Exception:
-                pass
+                logger.debug('Fast bus emit failed', exc_info=True)
             self._persistent_mic = None
             self._persistent_source = None
 
@@ -693,7 +693,7 @@ class STTGoogle:
             try:
                 self._audio.terminate()
             except Exception:
-                pass
+                logger.debug('Fast bus emit failed', exc_info=True)
             self._audio = None
             logger.info("PyAudio reset -- will re-detect mic on next listen")
 
@@ -754,7 +754,7 @@ class STTGoogle:
             try:
                 self._bus.emit("silence_timeout")
             except Exception:
-                pass
+                logger.debug('Async sleep step failed', exc_info=True)
 
     # Alias expected by some wiring paths
     async def async_start_listening(self, **kw) -> None:
@@ -813,7 +813,7 @@ class STTGoogle:
                 try:
                     self._persistent_mic.__exit__(None, None, None)
                 except Exception:
-                    pass
+                    logger.debug('Async task spawn failed', exc_info=True)
                 self._persistent_mic = None
                 self._persistent_source = None
             if self._audio:

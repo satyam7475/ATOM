@@ -143,7 +143,7 @@ class DreamEngine:
                 self._last_dream_time = data.get("last_dream", 0.0)
                 self._dream_count = data.get("total_dreams", 0)
             except Exception:
-                pass
+                logger.debug('JSON state load failed', exc_info=True)
 
     def start(self) -> None:
         if not self._enabled:
@@ -256,7 +256,7 @@ class DreamEngine:
                 min_idle_minutes=self._min_idle,
             )
         except Exception:
-            pass
+            logger.debug('Fast bus emit failed', exc_info=True)
 
         patterns = self._find_patterns()
         dream_result["patterns"] = patterns
@@ -323,7 +323,7 @@ class DreamEngine:
         try:
             self._bus.emit_fast("dream_cycle_end", result=dream_result)
         except Exception:
-            pass
+            logger.debug('Fast bus emit failed', exc_info=True)
         self._bus.emit_fast("dream_complete", result=dream_result)
         self.persist()
 
@@ -353,7 +353,7 @@ class DreamEngine:
                     eng.embed_sync(text[:500])
                     n += 1
                 except Exception:
-                    pass
+                    logger.debug('Fast bus emit failed', exc_info=True)
             return n
 
         for topic in self._prewarm_topics:
@@ -427,7 +427,7 @@ class DreamEngine:
                 vec = embed.embed_sync(query)
                 embedded_ixs.append((i, query, vec))
             except Exception:
-                pass
+                logger.debug('Embedding sync call failed', exc_info=True)
 
         if not embedded_ixs:
             return []
@@ -495,7 +495,7 @@ class DreamEngine:
             try:
                 self._bus.emit_fast("dream_fact_learned", fact=fact)
             except Exception:
-                pass
+                logger.debug('Fast bus emit failed', exc_info=True)
 
             # 2. Actually store in SecondBrain (the critical fix)
             if self._second_brain is not None:
@@ -524,14 +524,14 @@ class DreamEngine:
                         )
                         stored_count += 1
                 except Exception:
-                    pass
+                    logger.debug('Fast bus emit failed', exc_info=True)
 
         # Persist SecondBrain if we stored anything
         if stored_count > 0 and self._second_brain is not None:
             try:
                 self._second_brain.persist()
             except Exception:
-                pass
+                logger.debug('Fast bus emit failed', exc_info=True)
 
         logger.info(
             "Dream memory strengthening: %d facts + patterns stored in SecondBrain",

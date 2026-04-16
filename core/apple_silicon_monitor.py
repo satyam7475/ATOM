@@ -199,7 +199,7 @@ class AppleSiliconMonitor:
                             except ValueError:
                                 pass
         except Exception:
-            pass
+            logger.debug('Subprocess run failed', exc_info=True)
         return "nominal"
 
     def _read_cpu_temp(self) -> float:
@@ -218,7 +218,7 @@ class AppleSiliconMonitor:
                 level = int(result.stdout.strip())
                 return 35.0 + (level * 0.70)
         except Exception:
-            pass
+            logger.debug('Subprocess run failed', exc_info=True)
         return 0.0
 
     def _read_power(self) -> dict:
@@ -233,7 +233,7 @@ class AppleSiliconMonitor:
                     "power_watts": 0.0,
                 }
         except Exception:
-            pass
+            logger.debug('Subprocess run failed', exc_info=True)
         return {"battery_pct": 100.0, "on_battery": False, "power_watts": 0.0}
 
     def _read_cpu_percent(self) -> float:

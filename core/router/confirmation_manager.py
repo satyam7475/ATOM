@@ -238,7 +238,7 @@ class ConfirmationManager:
                 result=outcome,
             )
         except Exception:
-            pass
+            logger.debug('core router confirmation manager optional step failed', exc_info=True)
 
     # ── Prompt building ───────────────────────────────────────────────
 

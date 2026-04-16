@@ -342,6 +342,7 @@ class NativeSTT:
         self._signal_verified: bool = False
         self._sd_stream: Any = None
         self._sd_audio_format: Any = None
+        self._sd_sample_rate: int = 0
         self._using_sounddevice: bool = False
         self._speech_runloop_task: asyncio.Task | None = None
         self._last_result_callback_time: float = 0.0
@@ -349,8 +350,53 @@ class NativeSTT:
         self._last_audio_rms_db: float = -96.0
         self._last_speech_candidate_time: float = 0.0
         self._callback_starvation_count: int = 0
+        self._on_device_proven_broken: bool = False
         # Plain function passed to recognitionTaskWithRequest — bound methods can fail to bridge as ObjC blocks.
         self._speech_pyobjc_block: Callable[..., None] | None = None
+        # Count of consecutive recognition-chain restarts that produced zero partials.
+        # Used to escalate to a full SFSpeechRecognizer recreation (the request/task
+        # swap is insufficient once Apple's recognizer enters a zombie state).
+        self._chain_restart_no_partial_count: int = 0
+        self._max_chain_restarts_before_recreate: int = 2
+        self._last_chain_restart_time: float = 0.0
+        # Tracks whether the CURRENT recognition chain emitted at least one
+        # real partial/final with text. Error callbacks (e.g. 1110 "No speech
+        # detected") DO NOT flip this flag; they must not be mistaken for a
+        # productive chain or the zombie-detection counter never escalates.
+        self._got_partial_since_restart: bool = False
+        # Count of consecutive recognizer recreations that still produced no
+        # partials. Used to abandon on-device entirely and try server-assisted
+        # before the watchdog escalates to a full engine restart.
+        self._consecutive_recreates_no_partial: int = 0
+        # Gate used by the watchdog's full-restart path to stop the
+        # _run_async auto-start loop from racing with
+        # stop_listening → recreate_recognizer → start_listening. Without
+        # this, the async loop sees _listening=False during the watchdog's
+        # asyncio.sleep and calls start_listening() itself, binding a new
+        # recognitionTask to the *old* (zombie) recognizer; the watchdog's
+        # subsequent recreate then orphans the fresh recognizer.
+        self._suppress_auto_start: bool = False
+
+        # Runaway protection — Apple's recognizer can fire isFinal=True with
+        # empty transcript at ~100 Hz when it is unhappy. Without these
+        # guards, each empty final triggers _restart_recognition_chain →
+        # _recreate_recognizer in a tight self-feeding loop (observed: 200+
+        # recreates in 20s). The fields below break the loop at three layers:
+        #   1. empty-final counter escalates to a full-restart request after
+        #      a small threshold, instead of ping-ponging chain restarts.
+        #   2. chain-restart debounce rejects calls closer than 250 ms.
+        #   3. recreate rate-limit: min 1 s between recreates, max 5 per 10 s
+        #      window; exceeding the window signals the external watchdog.
+        self._consecutive_empty_finals: int = 0
+        self._max_empty_finals_before_escalate: int = 3
+        self._chain_restart_debounce_s: float = 0.25
+        self._pending_chain_restart: bool = False
+        self._last_recreate_time: float = 0.0
+        self._min_recreate_interval_s: float = 1.0
+        self._recreate_times_window: collections.deque = collections.deque(maxlen=16)
+        self._max_recreates_in_window: int = 5
+        self._recreates_window_s: float = 10.0
+        self._escalation_requested: bool = False
 
     @property
     def is_available(self) -> bool:
@@ -486,9 +532,10 @@ class NativeSTT:
                     )
                     want_on_device = False
             except Exception:
-                pass
+                logger.debug('voice stt macos optional step failed', exc_info=True)
         req.setRequiresOnDeviceRecognition_(bool(want_on_device))
-        if not want_on_device:
+        if not want_on_device and not getattr(self, "_logged_on_device_off", False):
+            self._logged_on_device_off = True
             logger.info(
                 "Native STT: requiresOnDeviceRecognition=False (locale=%s) — network speech may be used",
                 self._locale,
@@ -585,6 +632,22 @@ class NativeSTT:
             self._last_result_callback_time = 0.0
             self._last_audio_rms_db = -96.0
             self._last_speech_candidate_time = 0.0
+            self._got_partial_since_restart = False
+            self._chain_restart_no_partial_count = 0
+            self._last_chain_restart_time = 0.0
+            self._callback_starvation_count = 0
+            # NOTE: deliberately DO NOT reset _native_requires_on_device or
+            # _on_device_proven_broken here. If a prior session in this
+            # process was forced to server-assisted (because on-device
+            # silently starved), we want that fallback to persist through
+            # a watchdog full restart — otherwise start_listening would
+            # keep flipping us back to the broken on-device path on every
+            # recovery attempt. A full process restart reinitialises the
+            # flag from _native_requires_on_device_cfg (__init__).
+            #
+            # _consecutive_recreates_no_partial likewise persists so the
+            # recreate-escalation ladder keeps advancing across full
+            # restarts until a partial is actually observed.
 
             self._recognition_request = (
                 _Speech.SFSpeechAudioBufferRecognitionRequest.alloc().init()
@@ -598,7 +661,8 @@ class NativeSTT:
             if sd_ok:
                 self._using_sounddevice = True
                 mic_label = _probe_default_input_mic_label()
-                device_fmt_label = "16000 Hz, 1 ch"
+                sd_sr = int(getattr(self, "_sd_sample_rate", 48000) or 48000)
+                device_fmt_label = f"{sd_sr} Hz, 1 ch"
                 capture_label = "sounddevice (PortAudio/CoreAudio direct)"
             else:
                 self._using_sounddevice = False
@@ -764,20 +828,103 @@ class NativeSTT:
             pass
 
     def _on_recognition_starvation(self) -> None:
-        """Progressively relax recognizer constraints when mic is healthy but callbacks never arrive."""
+        """Force recognizer recreation on the next chain restart.
+
+        A starvation signal means ``recognitionTaskWithRequest`` is alive but
+        never invoking its result handler despite audio flowing. Apple's stack
+        occasionally loses its server/NE binding mid-session; the only
+        reliable fix is to drop the SFSpeechRecognizer object and allocate a
+        new one on the next chain restart. The recreate itself decides whether
+        to keep on-device enabled (first attempt) or drop to server-assisted
+        (subsequent attempts when on-device repeatedly silently starves).
+        """
         self._callback_starvation_count += 1
-        if self._callback_starvation_count == 1 and self._native_requires_on_device:
-            self._native_requires_on_device = False
-            logger.warning(
-                "VOICE_INPUT: healthy mic but no Speech callbacks — disabling "
-                "requiresOnDeviceRecognition for the next recognition task",
-            )
-        elif self._callback_starvation_count >= 2:
-            logger.warning(
-                "VOICE_INPUT: repeated recognizer callback starvation (count=%d, locale=%s)",
-                self._callback_starvation_count,
-                self._locale,
-            )
+        logger.warning(
+            "VOICE_INPUT: recognizer callback starvation (locale=%s, starvation #%d) — "
+            "forcing SFSpeechRecognizer recreate on next chain restart",
+            self._locale, self._callback_starvation_count,
+        )
+        # Explicitly invalidate the "current chain had partials" signal so the
+        # chain-restart logic classifies this chain as zombie regardless of
+        # any error callbacks it produced.
+        self._got_partial_since_restart = False
+        # Force the upcoming chain restart to recreate the recognizer object.
+        self._chain_restart_no_partial_count = max(
+            self._chain_restart_no_partial_count,
+            self._max_chain_restarts_before_recreate,
+        )
+
+    def begin_full_restart(self) -> None:
+        """Raise the auto-start suppression gate and tear the engine down.
+
+        Used by the STT watchdog to make the full restart cycle atomic
+        with respect to the ``_run_async`` auto-start loop. Without this
+        gate, ``_run_async`` would see ``_listening=False`` during the
+        watchdog's ``await asyncio.sleep`` and call ``start_listening``
+        itself — binding a fresh ``SFSpeechRecognitionTask`` to the stale
+        (zombie) recognizer; the subsequent ``_recreate_recognizer`` would
+        then leave the fresh recognizer orphaned and the recognizer would
+        stay silent forever.
+
+        Pair with ``end_full_restart`` after ``start_listening``.
+        """
+        self._suppress_auto_start = True
+        try:
+            self.stop_listening()
+        except Exception:
+            logger.debug("Native STT: stop_listening raised during full restart", exc_info=True)
+
+    def end_full_restart(self) -> None:
+        """Release the auto-start suppression gate. Safe to call twice."""
+        self._suppress_auto_start = False
+
+    def attach_listening_mode(self, controller: Any) -> None:
+        """Wire a ListeningModeController so PASSIVE mode can gate
+        ``speech_final`` emission. Safe to call multiple times."""
+        self._listening_mode_ref = controller
+
+    # Phrases that must always pass through the PASSIVE gate so user
+    # corrections / interruptions of a bad reply aren't silently dropped.
+    # Kept small (10 entries) so scanning cost stays negligible.
+    _CORRECTION_PHRASES: tuple[str, ...] = (
+        "no,", "no.", "no —", "no,",
+        "i'm not asking", "im not asking", "i am not asking",
+        "not what i meant", "not what i said", "that's not what i asked",
+        "wait,", "wait —", "hold on", "stop,", "stop.",
+        "actually,", "actually ",
+        "i meant ", "i mean ",
+        "correction:", "correction,", "let me rephrase",
+        "you misunderstood", "that's wrong", "thats wrong",
+    )
+
+    @classmethod
+    def _is_correction_phrase(cls, text_lower: str) -> bool:
+        """True when the transcript opens with a short correction / stop
+        signal. We scan the first ~90 characters so a leading filler like
+        `um, wait, ...` is still caught."""
+        if not text_lower:
+            return False
+        window = text_lower[:90]
+        return any(phrase in window for phrase in cls._CORRECTION_PHRASES)
+
+    def _should_feed_recognizer(self) -> bool:
+        """Return True if audio frames should reach SFSpeechRecognizer now.
+
+        Blocks TTS-echo feedback by refusing to forward mic audio while
+        ATOM is SPEAKING/THINKING (or any non-listening state). The only
+        exception is when barge-in during SPEAKING is explicitly enabled
+        via config (headphone setups).
+        """
+        try:
+            from core.state_manager import AtomState
+            cur = self._state.current
+        except Exception:
+            return True
+        if cur is AtomState.LISTENING:
+            return True
+        if cur is AtomState.SPEAKING and self._barge_in_during_speak:
+            return True
+        return False
 
     def _audio_buffer_callback(self, buffer: Any, when: Any) -> None:
         """Tap callback: forward audio buffers to the recognition request.
@@ -833,6 +980,13 @@ class NativeSTT:
                 self._tap_buffer_count, rms_db, self._signal_verified,
             )
 
+        # Hard state gate: do not forward audio to the recognizer unless we
+        # are actually in LISTENING. Without this, ATOM's own TTS output is
+        # picked up by the mic during SPEAKING and recognized as user
+        # speech, producing the "bot answers itself" feedback loop.
+        if not self._should_feed_recognizer():
+            return
+
         with self._recognition_lock:
             req = self._recognition_request
             if req is not None:
@@ -875,6 +1029,7 @@ class NativeSTT:
                 callback=self._sd_audio_callback,
             )
             self._sd_stream.start()
+            self._sd_sample_rate = sr
             logger.info(
                 "Native STT: using sounddevice capture (PortAudio/CoreAudio) — "
                 "%d Hz (native), 1 ch, blocksize=%d — bypassing AVAudioEngine input tap",
@@ -926,6 +1081,14 @@ class NativeSTT:
 
         self._maybe_finalize_stable_partial()
 
+        # State gate: while ATOM is SPEAKING/THINKING/SLEEP/IDLE the mic
+        # audio must NOT reach the recognizer (echo feedback) and must NOT
+        # enter the prebuffer (else a fresh chain restart flushes that
+        # TTS-tainted audio into a new request and instantly triggers an
+        # empty isFinal cascade). Drop the frame entirely.
+        if not self._should_feed_recognizer():
+            return
+
         import numpy as np
         self._audio_prebuffer.append(np.array(indata, copy=True))
 
@@ -970,6 +1133,11 @@ class NativeSTT:
         self._last_error = None
         self._last_partial = ""
         self._partial_stable_since = 0.0
+        # This promotion is from a real partial with text — mark the
+        # current chain as productive so the recreate counter doesn't
+        # escalate on the following routine restart.
+        self._got_partial_since_restart = True
+        self._consecutive_recreates_no_partial = 0
         if self._on_final:
             self._emit_threadsafe(self._on_final, text)
         self._restart_recognition_chain()
@@ -1096,6 +1264,12 @@ class NativeSTT:
         on_partial = self._on_partial
         loop = self._loop
 
+        # Block the _run_async auto-start loop until this restart finishes —
+        # otherwise it would see _listening=False during our teardown window
+        # and call start_listening before we do, dropping on-device attempts
+        # and creating a duplicate recognition task.
+        self._suppress_auto_start = True
+
         self.stop_listening()
         self._cleanup()
 
@@ -1109,14 +1283,32 @@ class NativeSTT:
             except Exception:
                 logger.debug("VOICE_INPUT: device rebind failed", exc_info=True)
 
+        def _deferred_restart() -> None:
+            try:
+                ok_ = self.start_listening(
+                    loop=loop, on_final=on_final, on_partial=on_partial,
+                )
+                if ok_:
+                    logger.info(
+                        "VOICE_INPUT: AVAudioEngine restarted successfully — mic should be live now",
+                    )
+                else:
+                    logger.error(
+                        "VOICE_INPUT: AVAudioEngine restart failed — %s",
+                        self._last_error,
+                    )
+            finally:
+                self._suppress_auto_start = False
+
+        loop_ref = loop or self._loop
+        if loop_ref and loop_ref.is_running():
+            loop_ref.call_later(0.8, _deferred_restart)
+            logger.info("VOICE_INPUT: AVAudioEngine restart scheduled (0.8s delay, non-blocking)")
+            return
+
         import time as _time
         _time.sleep(0.8)
-
-        ok = self.start_listening(loop=loop, on_final=on_final, on_partial=on_partial)
-        if ok:
-            logger.info("VOICE_INPUT: AVAudioEngine restarted successfully — mic should be live now")
-        else:
-            logger.error("VOICE_INPUT: AVAudioEngine restart failed — %s", self._last_error)
+        _deferred_restart()
 
     def _recognition_result_handler(self, *args: Any) -> None:
         """Called by SFSpeechRecognizer with partial/final results.
@@ -1143,11 +1335,6 @@ class NativeSTT:
                 len(args),
             )
         self._last_result_callback_time = time.monotonic()
-        self._callback_starvation_count = 0
-        # Restore on-device preference once callbacks are flowing
-        if not self._native_requires_on_device and self._native_requires_on_device_cfg:
-            self._native_requires_on_device = True
-            logger.info("Native STT: callbacks flowing — re-enabling requiresOnDeviceRecognition")
 
         if error is not None:
             err_desc = _format_ns_error(error)
@@ -1156,7 +1343,20 @@ class NativeSTT:
             is_expected = "kAFAssistantErrorDomain" in err_desc or is_cancel
 
             if is_no_speech:
-                logger.debug("Recognition: no speech detected (normal silence) — restarting chain quietly")
+                # Apple fires 1110 after each silence gap; these cascade
+                # through every pause and are expected. Log the first one
+                # at INFO so the chain-restart churn is visible in logs,
+                # subsequent ones at DEBUG to avoid log spam.
+                if not getattr(self, "_logged_no_speech", False):
+                    self._logged_no_speech = True
+                    logger.info(
+                        "Recognition: first 'no speech detected' (1110) — normal after silence, "
+                        "chain will be restarted transparently; further 1110s logged at DEBUG",
+                    )
+                else:
+                    logger.debug(
+                        "Recognition: no speech detected (normal silence) — restarting chain quietly",
+                    )
                 self._last_error = None
                 try:
                     self._restart_recognition_chain()
@@ -1191,7 +1391,7 @@ class NativeSTT:
                 if confidences:
                     self._last_confidence = sum(confidences) / len(confidences)
         except Exception:
-            pass
+            logger.debug('voice stt macos optional step failed', exc_info=True)
 
         self._last_speech_time = time.monotonic()
 
@@ -1199,15 +1399,56 @@ class NativeSTT:
             self._last_final = transcript
             self._last_error = None
             self._partial_stable_since = 0.0
-            logger.info("STT final: '%s'", transcript)
-            if self._on_final:
-                self._emit_threadsafe(self._on_final, transcript)
-            self._restart_recognition_chain()
+            has_text = bool(transcript and transcript.strip())
+            if has_text:
+                self._got_partial_since_restart = True
+                self._consecutive_recreates_no_partial = 0
+                self._consecutive_empty_finals = 0
+                logger.info("STT final: '%s'", transcript)
+                if self._on_final:
+                    self._emit_threadsafe(self._on_final, transcript)
+                self._restart_recognition_chain()
+            else:
+                # Apple periodically emits isFinal=True with empty transcript
+                # (idle session tear-down, model hiccup, or after we flushed
+                # stale prebuffer audio). Treating each one as a trigger for
+                # _restart_recognition_chain creates a 100 Hz self-feeding
+                # loop. Count them instead; escalate to a full watchdog
+                # restart after a small threshold.
+                self._consecutive_empty_finals += 1
+                logger.debug(
+                    "STT: empty isFinal #%d — suppressing chain restart",
+                    self._consecutive_empty_finals,
+                )
+                if (self._consecutive_empty_finals
+                        >= self._max_empty_finals_before_escalate):
+                    if not self._escalation_requested:
+                        self._escalation_requested = True
+                        logger.warning(
+                            "STT: %d consecutive empty isFinals — requesting "
+                            "full restart via watchdog",
+                            self._consecutive_empty_finals,
+                        )
+                        try:
+                            self._bus.emit("stt_needs_full_restart",
+                                           reason="empty_final_cascade")
+                        except Exception:
+                            logger.debug(
+                                "STT: emit stt_needs_full_restart failed",
+                                exc_info=True,
+                            )
         else:
             now = time.monotonic()
             if transcript != self._last_partial:
                 self._last_partial = transcript
                 self._partial_stable_since = now
+                if transcript and transcript.strip():
+                    # Only REAL partials with text count as "productive";
+                    # this gate is consulted by the chain-restart logic to
+                    # decide whether the recognizer is progressing or
+                    # silently zombie-ing.
+                    self._got_partial_since_restart = True
+                    self._consecutive_recreates_no_partial = 0
                 if self._voice_debug:
                     logger.info("STT partial: '%s'", transcript[:200])
                 else:
@@ -1241,6 +1482,8 @@ class NativeSTT:
                 self._last_error = None
                 self._last_partial = ""
                 self._partial_stable_since = 0.0
+                self._got_partial_since_restart = True
+                self._consecutive_recreates_no_partial = 0
                 if self._on_final:
                     self._emit_threadsafe(self._on_final, transcript)
                 self._restart_recognition_chain()
@@ -1263,25 +1506,225 @@ class NativeSTT:
                     break
         return frames_flushed
 
+    def _recreate_recognizer(self) -> bool:
+        """Recreate SFSpeechRecognizer itself (not just the request/task).
+
+        Apple's recognizer can enter a zombie state where new recognition
+        tasks never emit partials/finals even though audio flows. The only
+        reliable recovery is to allocate a fresh ``SFSpeechRecognizer`` with
+        the same locale. Called from ``_restart_recognition_chain`` after
+        multiple chain restarts produced zero partials.
+
+        On the first recreate attempt in a recovery cycle we restore the
+        configured on-device preference — the previous ``_on_recognition_starvation``
+        call would have force-disabled it, but a brand-new recognizer object
+        deserves a fresh on-device attempt. Only after the recreate itself
+        fails to produce partials do we give up on on-device.
+        """
+        if _Speech is None or _Foundation is None:
+            return False
+        now = time.monotonic()
+        # Hard rate limit: refuse recreates closer than 1 s apart. A tight
+        # loop through `_restart_recognition_chain` would otherwise spend
+        # ~10 ms per cycle recreating, turning the process into a CPU hog
+        # and flooding the log with hundreds of recreate_attempt lines.
+        if (self._last_recreate_time > 0
+                and (now - self._last_recreate_time)
+                < self._min_recreate_interval_s):
+            logger.debug(
+                "STT: recreate suppressed (last %.2fs ago, min %.2fs)",
+                now - self._last_recreate_time,
+                self._min_recreate_interval_s,
+            )
+            return False
+        # Window-based circuit breaker: too many recreates in a short window
+        # means the underlying recognizer is unrecoverable at this layer —
+        # escalate to the external STTWatchdog (which can swap engines)
+        # instead of churning more SFSpeechRecognizer instances.
+        self._recreate_times_window.append(now)
+        window_start = now - self._recreates_window_s
+        recent = [t for t in self._recreate_times_window if t >= window_start]
+        if len(recent) > self._max_recreates_in_window:
+            if not self._escalation_requested:
+                self._escalation_requested = True
+                logger.warning(
+                    "STT: %d recreates in %.0fs — circuit-breaking and "
+                    "escalating to watchdog for full restart / failover",
+                    len(recent), self._recreates_window_s,
+                )
+                try:
+                    self._bus.emit(
+                        "stt_needs_full_restart",
+                        reason="recreate_storm",
+                    )
+                except Exception:
+                    logger.debug(
+                        "STT: emit stt_needs_full_restart failed",
+                        exc_info=True,
+                    )
+            return False
+        self._last_recreate_time = now
+        try:
+            old = self._recognizer
+            locale = _Foundation.NSLocale.alloc().initWithLocaleIdentifier_(
+                self._locale,
+            )
+            new_rec = _Speech.SFSpeechRecognizer.alloc().initWithLocale_(locale)
+            if new_rec is None or not new_rec.isAvailable():
+                logger.warning(
+                    "Native STT: recognizer recreate failed (locale=%s unavailable)",
+                    self._locale,
+                )
+                return False
+            try:
+                new_rec.setSupportsOnDeviceRecognition_(True)
+            except Exception:
+                logger.debug(
+                    "Native STT: setSupportsOnDeviceRecognition_ not settable on new recognizer",
+                    exc_info=True,
+                )
+            try:
+                self._recognizer_supports_on_device = bool(
+                    new_rec.supportsOnDeviceRecognition()
+                )
+            except Exception:
+                self._recognizer_supports_on_device = False
+            self._recognizer = new_rec
+            del old
+
+            # Policy: decide whether the fresh recognizer should attempt
+            # on-device recognition or fall back to server-assisted.
+            #
+            # * First recreate in a recovery cycle: retry on-device (the
+            #   previous recognizer instance may have been the zombie, not
+            #   Apple's on-device pipeline in general).
+            # * Subsequent recreates or any point after we previously gave
+            #   up on on-device: stay on server-assisted — retrying
+            #   on-device just reproduces the same zombie and wastes time.
+            self._consecutive_recreates_no_partial += 1
+            on_device_available = (
+                self._recognizer_supports_on_device
+                and self._native_requires_on_device_cfg
+            )
+            if (
+                self._consecutive_recreates_no_partial <= 1
+                and on_device_available
+                and not self._on_device_proven_broken
+            ):
+                self._native_requires_on_device = True
+                self._logged_on_device_off = False
+                logger.info(
+                    "Native STT: fresh recognizer — re-enabling on-device recognition "
+                    "(locale=%s, recreate_attempt=%d)",
+                    self._locale, self._consecutive_recreates_no_partial,
+                )
+            else:
+                # Either on-device is not supported, or we've previously
+                # seen on-device silently starve. Stay server-assisted
+                # for the remainder of this process to try a different
+                # recognition code path.
+                self._native_requires_on_device = False
+                self._on_device_proven_broken = True
+                self._logged_on_device_off = False
+                logger.info(
+                    "Native STT: fresh recognizer — keeping on-device DISABLED "
+                    "(recreate_attempt=%d, proven_broken=%s)",
+                    self._consecutive_recreates_no_partial,
+                    self._on_device_proven_broken,
+                )
+            logger.info(
+                "Native STT: SFSpeechRecognizer recreated (locale=%s, on_device_supported=%s) — "
+                "clearing zombie recognizer state",
+                self._locale, self._recognizer_supports_on_device,
+            )
+            return True
+        except Exception as exc:
+            logger.warning("Native STT: recognizer recreate exception: %s", exc)
+            return False
+
     def _restart_recognition_chain(self) -> None:
         """After each isFinal, start a new request+task; the engine tap keeps running.
 
         SFSpeechRecognizer completes one streaming request per final; without a new
         request, buffers keep appending to a finished session and no further results fire.
+
+        If multiple consecutive chain restarts produce zero partials, the
+        underlying SFSpeechRecognizer is assumed zombie and a full recognizer
+        recreate is performed before the next chain attempt.
         """
         has_capture = self._audio_engine is not None or self._using_sounddevice
         if not self._listening or not has_capture or self._recognizer is None:
             return
+
+        now = time.monotonic()
+        # Debounce: callbacks and the promote-stable path can each fire chain
+        # restart within milliseconds of one another. Absorb calls that land
+        # inside the debounce window — without this, Apple's empty-isFinal
+        # and 1110 cascades run the method at ~100 Hz.
+        if (self._last_chain_restart_time > 0
+                and (now - self._last_chain_restart_time)
+                < self._chain_restart_debounce_s):
+            self._pending_chain_restart = True
+            return
+        self._pending_chain_restart = False
+        # Only REAL partials/finals (with text) flip _got_partial_since_restart;
+        # error callbacks (1110 "No speech detected") don't, so a chain that
+        # only produced errors is correctly classified as "no partials".
+        had_partials_since_last_restart = bool(self._got_partial_since_restart) or bool(
+            self._last_partial,
+        )
+        if had_partials_since_last_restart:
+            # A healthy chain restart (e.g. after a productive final). Drop the
+            # no-partial counter but preserve any forced-recreate sentinel
+            # already set by _on_recognition_starvation (which pre-fills the
+            # counter at the max threshold before this function runs).
+            if self._chain_restart_no_partial_count < self._max_chain_restarts_before_recreate:
+                self._chain_restart_no_partial_count = 0
+        elif self._last_chain_restart_time > 0:
+            self._chain_restart_no_partial_count += 1
+        self._last_chain_restart_time = now
+
+        must_recreate = (
+            self._chain_restart_no_partial_count
+            >= self._max_chain_restarts_before_recreate
+        )
+        if must_recreate:
+            logger.warning(
+                "Native STT: %d chain restarts with zero partials — recreating SFSpeechRecognizer",
+                self._chain_restart_no_partial_count,
+            )
+
         try:
             with self._recognition_lock:
                 old_task = self._recognition_task
+                old_req = self._recognition_request
                 self._recognition_request = None
                 self._recognition_task = None
             if old_task is not None:
                 try:
                     old_task.cancel()
                 except Exception:
-                    pass
+                    logger.debug('Speech task cancel failed', exc_info=True)
+            if old_req is not None:
+                try:
+                    old_req.endAudio()
+                except Exception:
+                    logger.debug('Speech request endAudio failed', exc_info=True)
+
+            if must_recreate:
+                # Flushing stale audio (including TTS echo tail) into a fresh
+                # recognizer immediately trips empty-isFinal again and
+                # restarts the loop we are trying to escape.
+                self._audio_prebuffer.clear()
+                recreated = self._recreate_recognizer()
+                if recreated:
+                    self._chain_restart_no_partial_count = 0
+                else:
+                    # Rate-limit refused to recreate — back off and let the
+                    # external watchdog take over; do not continue to build a
+                    # new request on a recognizer we already know is zombie.
+                    self._chain_restart_no_partial_count = 0
+                    return
 
             new_req = _Speech.SFSpeechAudioBufferRecognitionRequest.alloc().init()
             self._apply_speech_request_policy(new_req)
@@ -1302,6 +1745,14 @@ class NativeSTT:
                 self._recognition_request = new_req
                 self._recognition_task = new_task
             self._last_partial = ""
+            self._partial_stable_since = 0.0
+            # Start the new chain in a "no partials yet" state so the next
+            # restart correctly reflects whether THIS chain emitted anything.
+            self._got_partial_since_restart = False
+            # Reset internal idle clock so the async loop's 15s no-speech
+            # watchdog doesn't immediately re-fire on top of the external
+            # STTWatchdog's restart.
+            self._last_speech_time = now
             if flushed:
                 logger.debug(
                     "Native STT: recognition chain restarted (pre-buffered %d frames)",
@@ -1349,6 +1800,17 @@ class NativeSTT:
                 self._sd_stream.stop()
             except Exception:
                 logger.debug("sounddevice stream stop error", exc_info=True)
+            # Close the stream too — leaving it merely stopped holds a
+            # PortAudio handle to CoreAudio; on restart we would end up
+            # with two stream objects targeting the same device which can
+            # silently feed zero-valued audio (or fail to open fresh).
+            try:
+                self._sd_stream.close()
+            except Exception:
+                logger.debug("sounddevice stream close error", exc_info=True)
+            self._sd_stream = None
+            self._sd_audio_format = None
+            self._using_sounddevice = False
 
         if self._audio_engine is not None:
             try:
@@ -1358,19 +1820,33 @@ class NativeSTT:
             except Exception:
                 logger.debug("Audio engine stop error", exc_info=True)
 
-        if self._recognition_request is not None:
-            try:
-                self._recognition_request.endAudio()
-            except Exception:
-                pass
+        # Drop the request/task references under the lock so chain-restart
+        # code and async result callbacks can't mis-route buffers into a
+        # dead recognizer during the stop/recreate/start sequence.
+        with self._recognition_lock:
+            old_req = self._recognition_request
+            old_task = self._recognition_task
+            self._recognition_request = None
+            self._recognition_task = None
 
-        if self._recognition_task is not None:
+        if old_req is not None:
             try:
-                self._recognition_task.cancel()
+                old_req.endAudio()
             except Exception:
-                pass
+                logger.debug('Audio stream stop failed', exc_info=True)
+
+        if old_task is not None:
+            try:
+                old_task.cancel()
+            except Exception:
+                logger.debug('Audio stream stop failed', exc_info=True)
 
         self._speech_pyobjc_block = None
+
+        # Drop any audio captured during the teardown window so it cannot
+        # be flushed into a fresh recognition request by a future chain
+        # restart (common cause of empty-isFinal cascades on reopen).
+        self._audio_prebuffer.clear()
 
         logger.info("Native STT listening stopped")
         return self._last_final or self._last_partial
@@ -1382,26 +1858,26 @@ class NativeSTT:
             try:
                 self._sd_stream.stop()
             except Exception:
-                pass
+                logger.debug('Audio stream stop failed', exc_info=True)
             try:
                 self._sd_stream.close()
             except Exception:
-                pass
+                logger.debug('Audio stream stop failed', exc_info=True)
         self._sd_stream = None
         self._sd_audio_format = None
         if self._audio_engine is not None:
             try:
                 self._audio_engine.inputNode().removeTapOnBus_(0)
             except Exception:
-                pass
+                logger.debug('Audio stream stop failed', exc_info=True)
             try:
                 self._audio_engine.stop()
             except Exception:
-                pass
+                logger.debug('Audio stream stop failed', exc_info=True)
             try:
                 self._audio_engine.reset()
             except Exception:
-                pass
+                logger.debug('Audio stream stop failed', exc_info=True)
         self._audio_engine = None
         self._recognition_request = None
         self._recognition_task = None
@@ -1447,6 +1923,49 @@ class NativeSTT:
         def _on_final(text: str) -> None:
             if text and text.strip():
                 self._last_error = None
+                # PASSIVE-mode gate: if the ListeningModeController is in
+                # PASSIVE mode and this transcript has no wake phrase, do
+                # not forward it to the command pipeline. The mic stays
+                # live for wake-word detection; this just suppresses the
+                # "command" channel so random background chatter does not
+                # trigger the Router.
+                #
+                # EXCEPTION: correction / interruption phrases always pass
+                # through. If the user just heard a wrong reply and says
+                # "no, I'm not asking about the song" we must NOT silently
+                # drop that — it's the most important utterance in the
+                # entire conversation.
+                lm = getattr(self, "_listening_mode_ref", None)
+                if lm is not None:
+                    try:
+                        if getattr(lm, "is_passive", False):
+                            from voice.listening_modes import WakeWordFilter
+                            lower_text = text.lower()
+                            has_wake = any(
+                                ph in lower_text
+                                for ph in WakeWordFilter.WAKE_PHRASES
+                            )
+                            is_correction = self._is_correction_phrase(lower_text)
+                            if not has_wake and not is_correction:
+                                logger.debug(
+                                    "STT: suppressing speech_final in PASSIVE mode (no wake phrase): '%s'",
+                                    text[:60],
+                                )
+                                return
+                            if is_correction and not has_wake:
+                                logger.info(
+                                    "STT: PASSIVE mode bypassed by correction phrase — '%s'",
+                                    text[:60],
+                                )
+                                try:
+                                    lm.activate("correction_phrase")
+                                except Exception:
+                                    logger.debug(
+                                        "correction-phrase activate failed",
+                                        exc_info=True,
+                                    )
+                    except Exception:
+                        logger.debug("listening-mode gate failed", exc_info=True)
                 loop.call_soon_threadsafe(
                     lambda t=text: (
                         self._bus.emit_fast(
@@ -1528,6 +2047,16 @@ class NativeSTT:
                     if not allow_mic:
                         await asyncio.sleep(0.12)
                         continue
+                    # The watchdog's full-restart path sets this flag while it
+                    # runs stop → recreate → start atomically. Without the
+                    # gate, this loop would see _listening=False during the
+                    # watchdog's await and preempt it by calling start_listening
+                    # itself, binding a fresh task to the stale recognizer and
+                    # orphaning the subsequent recreate. Sleep until the
+                    # watchdog clears the suppression.
+                    if self._suppress_auto_start:
+                        await asyncio.sleep(0.05)
+                        continue
                     if self._need_post_tts_cooldown:
                         self._need_post_tts_cooldown = False
                         if post_cd_s > 0:
@@ -1536,6 +2065,19 @@ class NativeSTT:
                                 post_cd_s,
                             )
                             await asyncio.sleep(post_cd_s)
+                        # Purge anything captured during the cooldown and
+                        # any pre-TTS partial state so the new listening
+                        # turn starts from a clean slate.
+                        self._audio_prebuffer.clear()
+                        self._last_partial = ""
+                        self._partial_stable_since = 0.0
+                        self._got_partial_since_restart = False
+                        self._consecutive_empty_finals = 0
+                        self._escalation_requested = False
+                    # Re-check after the cooldown sleep: the watchdog may have
+                    # raised the gate while we yielded, and we must not race it.
+                    if self._suppress_auto_start or self._listening:
+                        continue
                     ok = self.start_listening(
                         loop=loop, on_final=_on_final, on_partial=_on_partial,
                     )
@@ -1585,12 +2127,40 @@ class NativeSTT:
             if self._permanently_disabled:
                 return
 
+            # LISTENING -> SPEAKING / THINKING: stop the mic entirely. The
+            # audio callback state-gate already drops frames, but fully
+            # tearing down the recognition request+task prevents Apple
+            # from emitting empty isFinals on a dangling session and
+            # releases the sounddevice stream so it cannot silently hold
+            # the CoreAudio handle during TTS playback.
+            if (old is AtomState.LISTENING
+                    and new in (AtomState.SPEAKING, AtomState.THINKING)
+                    and self._listening
+                    and not self._barge_in_during_speak):
+                try:
+                    self.stop_listening()
+                except Exception:
+                    logger.debug(
+                        "STT: stop_listening on LISTENING->%s failed",
+                        new.value, exc_info=True,
+                    )
+                self._audio_prebuffer.clear()
+                self._last_partial = ""
+                self._partial_stable_since = 0.0
+                self._consecutive_empty_finals = 0
+
             if old is AtomState.SPEAKING and new is AtomState.LISTENING:
                 self._need_post_tts_cooldown = True
                 self._last_partial = ""
                 self._partial_stable_since = 0.0
                 self._last_speech_time = time.monotonic()
                 self._audio_prebuffer.clear()
+                # A SPEAKING -> LISTENING transition opens a fresh listening
+                # turn; start the new turn's chain-health tracking from zero
+                # so we don't misclassify it based on the prior turn's state.
+                self._got_partial_since_restart = False
+                self._consecutive_empty_finals = 0
+                self._escalation_requested = False
 
             if new is AtomState.SLEEP:
                 self.stop()

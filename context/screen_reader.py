@@ -209,7 +209,7 @@ class ScreenReader:
                     logger.debug("Screenshot captured via PowerShell")
                     return str(tmp_path)
             except Exception:
-                pass
+                logger.debug('Subprocess run failed', exc_info=True)
 
         return None
 
@@ -278,7 +278,7 @@ class ScreenReader:
                 if bundle.get("clipboard"):
                     parts.append(f"Clipboard: {bundle['clipboard'][:500]}")
         except Exception:
-            pass
+            logger.debug('context screen reader optional step failed', exc_info=True)
 
         text = " | ".join(parts) if parts else "Unable to read screen content."
         return {

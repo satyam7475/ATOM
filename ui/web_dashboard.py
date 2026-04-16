@@ -281,7 +281,7 @@ class WebDashboard:
                 from core.owner_gate import mark_session_authenticated as _mark_ok
                 _mark_ok(True)
             except Exception:
-                pass
+                logger.debug('Owner gate check failed', exc_info=True)
 
         ws = web.WebSocketResponse(heartbeat=15.0)
         await ws.prepare(request)
@@ -413,7 +413,7 @@ class WebDashboard:
                             except Exception:
                                 logger.exception("Text input callback failed")
         except Exception:
-            pass
+            logger.debug('Runtime mode read failed', exc_info=True)
         finally:
             auth_cfg = self._config.get("auth") or {}
             if bound_session_id and auth_cfg.get("revoke_on_ws_close"):
@@ -426,7 +426,7 @@ class WebDashboard:
                 from core.security_context import current_session_id
                 current_session_id.set(None)
             except Exception:
-                pass
+                logger.debug('Runtime mode read failed', exc_info=True)
             self._clients.discard(ws)
             logger.info("Dashboard client disconnected (%d remaining)",
                         len(self._clients))
@@ -501,7 +501,7 @@ class WebDashboard:
                         "gpu_sched_queue_depth", 0,
                     )
                 except Exception:
-                    pass
+                    logger.debug('Async sleep step failed', exc_info=True)
 
                 await self._broadcast(payload)
             except Exception as exc:

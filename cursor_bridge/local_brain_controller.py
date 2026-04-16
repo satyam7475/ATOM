@@ -62,8 +62,27 @@ _INLINE_TRACE_RE = re.compile(r"^(?:[a-z_]+\([^)]{0,200}\)\s*[→:=-]+\s*)+", re
 _TRANSCRIPT_SPLIT_RE = re.compile(r"\b(?:User|Boss|ATOM|Assistant):", re.I)
 _TRANSCRIPT_LABEL_RE = re.compile(r"\b(?:User|Boss|ATOM|Assistant):\s*", re.I)
 _REPEATED_SPEAKER_RE = re.compile(r"^(?:(?:User|Boss|ATOM|Assistant)\s*:?\s*)+$", re.I)
+# Broadened: also flag chain-of-thought prefaces and third-person narration so
+# the quality-reject check can drop them. The previous regex only anchored on
+# a handful of instruction echoes ("direct answer", "strict output recovery");
+# real model leaks include "Okay, let's see …" and "So the user is asking …"
+# which we now catch explicitly.
 _INSTRUCTION_ECHO_RE = re.compile(
-    r"^(?:the final answer should|reply with|direct answer|current user request|strict output recovery|response contract|the user is asking|this is a|boss explicitly asked)\b",
+    r"^(?:"
+    r"the final answer should|reply with|direct answer|current user request|"
+    r"strict output recovery|response contract|the user is asking|this is a|"
+    r"boss explicitly asked|"
+    # CoT / stall prefaces below.
+    r"okay,?\s+(?:let'?s|lets|let me)\b|"
+    r"alright,?\s+(?:so|let'?s|lets|let me)\b|"
+    r"well,?\s+(?:so|let'?s|lets|let me)\b|"
+    r"let'?s\s+(?:see|think|break|try|start)\b|"
+    r"let\s+me\s+(?:think|see|try|consider)\b|"
+    r"hmm+,?|um+,?|uh+,?|"
+    r"(?:so,?\s+)?the\s+(?:question|query|request)\s+is\b|"
+    r"the\s+user\s+(?:is\s+)?(?:asking|wants|says|said)\b|"
+    r"i\s+(?:should|need\s+to|have\s+to|must)\s+(?:think|consider|figure|reason|recall)\b"
+    r")",
     re.I,
 )
 _IMPERATIVE_ECHO_RE = re.compile(
@@ -71,6 +90,48 @@ _IMPERATIVE_ECHO_RE = re.compile(
     re.I,
 )
 _MEMORY_ACK_RE = re.compile(r'^"?((?:yes,\s*)?i remember (?:it|that))\.?"?$', re.I)
+
+# Strip leading chain-of-thought prefaces from any emittable sentence before
+# it reaches TTS. Mirrors the MLX-side stripper but runs on the controller
+# output path so non-MLX fallbacks (e.g. cloud responses) also stay clean.
+_COT_PREFACE_STRIP_RE = re.compile(
+    r"""
+    ^\s*
+    (?:
+        (?:okay|ok|alright|well|so|hmm+|um+|uh+)\b[,.!]?\s*
+        (?:let(?:'|\u2019)?s?\s+(?:see|think|break|try|start|go)\b[^.?!]*[.?!]\s*)?
+      |
+        let(?:'|\u2019)?s?\s+(?:see|think|break|try|start|go)\b[^.?!]*[.?!]\s*
+      |
+        let\s+me\s+(?:think|see|try|consider)\b[^.?!]*[.?!]\s*
+      |
+        (?:the\s+user|boss|the\s+speaker)\s+(?:is\s+)?(?:asking|wants|says|said|needs|wondering)[^.?!]*[.?!]\s*
+      |
+        (?:so\s+)?(?:the\s+)?(?:question|query|request)\s+is\b[^.?!]*[.?!]\s*
+      |
+        i\s+(?:should|need\s+to|have\s+to|must)\s+(?:think|consider|figure|reason|recall)\b[^.?!]*[.?!]\s*
+      |
+        (?:hmm+|um+|uh+|er+|ah+)[,.!]?\s+
+    )+
+    """,
+    re.IGNORECASE | re.VERBOSE | re.DOTALL,
+)
+
+
+def _strip_cot_preface(text: str) -> str:
+    """Peel chain-of-thought / stall prefaces from the head of an emittable
+    sentence. Safe on empty input and idempotent across repeated calls.
+    """
+    if not text:
+        return text
+    prev = None
+    out = text
+    for _ in range(3):
+        if out == prev:
+            break
+        prev = out
+        out = _COT_PREFACE_STRIP_RE.sub("", out, count=1).lstrip()
+    return out
 
 MAX_REACT_STEPS = 3
 
@@ -108,8 +169,10 @@ class LocalBrainController:
         self._total_tool_calls = 0
         self._total_react_loops = 0
         self._first_token_latencies: list[float] = []
+        self._generation_id: int = 0
 
         self._inference_guard: Any = None
+        self._curiosity_engine: Any = None
 
         self._rag_engine: Any = None
         self._gpu_coord: Any = None
@@ -143,6 +206,28 @@ class LocalBrainController:
         self._gemini_client: Any = None
         self._semantic_cache: Any = None
         self._preference_store: Any = None
+
+        # Optional vetter — invoked on the final LLM text before it leaves
+        # the controller. Wired from the Router so it can apply verb-match
+        # and low-confidence guardrails that transform action-promise
+        # hallucinations into short clarifying questions.
+        self._response_vetter: Any = None
+
+        # Per-turn streaming state used to break the guardrail-cascade. When
+        # the stream vetter rewrites a sentence mid-flight we mark the turn
+        # as ``_turn_vetter_rewrote`` so the end-of-turn logic can (a) skip
+        # a redundant second vet pass and (b) accept the clarifier as the
+        # final response instead of triggering strict recovery. The emitted
+        # sentence buffer (``_turn_emitted_sentences``) lets recovery paths
+        # recover the already-spoken text rather than emit "I lost that".
+        self._turn_vetter_rewrote: bool = False
+        self._turn_emitted_sentences: list[str] = []
+
+    def attach_response_vetter(self, vetter: Any) -> None:
+        """Wire a callable `vetter(query, reply, confidence) -> str` that
+        may rewrite the reply to a safer clarification when grounding is
+        weak. Set to None to disable."""
+        self._response_vetter = vetter
 
         from core.cognition.intent_classifier import IntentClassifier
         from core.cognition.planner import PlannerEngine
@@ -222,6 +307,13 @@ class LocalBrainController:
 
     def _sanitize_emittable_text(self, text: str) -> str:
         cleaned = _INLINE_TRACE_RE.sub("", self._compact_text(text)).strip(" -:>")
+        if not cleaned:
+            return ""
+
+        # Peel any leading chain-of-thought preface (defense-in-depth; the
+        # MLX guard should have already stripped these, but non-MLX paths
+        # and mid-stream flushes still land here with narration intact).
+        cleaned = _strip_cot_preface(cleaned)
         if not cleaned:
             return ""
 
@@ -460,9 +552,12 @@ class LocalBrainController:
         trace_id: str | None,
         query_plan: Any | None = None,
         late_depth: int = 0,
+        scheduled_gen_id: int = 0,
     ) -> None:
         """Single follow-up generation with high-confidence RAG after budget miss."""
         await asyncio.sleep(0.06)
+        if scheduled_gen_id and self._generation_id != scheduled_gen_id:
+            return
         await self.on_query(
             text,
             memory_context=memory_context,
@@ -481,6 +576,9 @@ class LocalBrainController:
 
     def attach_inference_guard(self, guard: Any) -> None:
         self._inference_guard = guard
+
+    def attach_curiosity_engine(self, engine: Any) -> None:
+        self._curiosity_engine = engine
 
     def attach_runtime_watchdog(self, watchdog: Any) -> None:
         self._runtime_watchdog = watchdog
@@ -560,11 +658,11 @@ class LocalBrainController:
         try:
             self._bus.emit("metrics_event", counter="errors_total")
         except Exception:
-            pass
+            logger.debug('Metrics counter emit failed', exc_info=True)
         try:
             self._bus.emit("llm_error", source="local", error=str(exc)[:200])
         except Exception:
-            pass
+            logger.debug('Metrics counter emit failed', exc_info=True)
         try:
             self._bus.emit_long(
                 "response_ready",
@@ -621,6 +719,13 @@ class LocalBrainController:
             )
             return
 
+        self._generation_id += 1
+        gen_id = self._generation_id
+        # Reset per-turn streaming cascade-break state (see docstring on
+        # self._turn_vetter_rewrote in __init__).
+        self._turn_vetter_rewrote = False
+        self._turn_emitted_sentences = []
+
         from context.privacy_filter import redact as _redact
         logger.info("Agentic brain query: '%s'", _redact(text[:120]))
         
@@ -635,6 +740,17 @@ class LocalBrainController:
             from core.perception.screen_reader import ScreenReader
             vision = ScreenReader(gemini_client=self._gemini_client)
             result = await vision.analyze_screen(text)
+            if self._response_vetter is not None and isinstance(result, str) and result:
+                try:
+                    vetted = self._response_vetter(text, result, 0.6)
+                    if isinstance(vetted, str) and vetted.strip() and vetted != result:
+                        logger.info(
+                            "Router guardrail rewrote PERCEPTION reply: '%s' -> '%s'",
+                            result[:80], vetted[:80],
+                        )
+                        result = vetted
+                except Exception:
+                    logger.debug("PERCEPTION vetter failed", exc_info=True)
             self._bus.emit_long("response_ready", text=result)
             return
             
@@ -657,7 +773,7 @@ class LocalBrainController:
             try:
                 self._feedback_engine.evaluate_actual_vs_predictions(text, self._prev_predictions)
             except Exception:
-                pass
+                logger.debug('Prediction feedback evaluation failed', exc_info=True)
 
         policy_query = str(_kw.get("policy_query") or text)
 
@@ -792,7 +908,7 @@ class LocalBrainController:
                     {"text": text[:2000], "runtime_mode": self._current_runtime_mode},
                 )
             except Exception:
-                pass
+                logger.debug('Timeline query event append failed', exc_info=True)
         self._recent_queries.append(text.strip())
 
         t0_total = time.perf_counter()
@@ -915,6 +1031,8 @@ class LocalBrainController:
                         confidence=res.confidence,
                         trace_id=trace_id,
                     )
+                    if self._generation_id != gen_id:
+                        return
                     self.request_preempt()
                     asyncio.create_task(
                         self._retry_with_late_rag(
@@ -926,6 +1044,7 @@ class LocalBrainController:
                             trace_id,
                             query_plan=query_plan,
                             late_depth=late_depth,
+                            scheduled_gen_id=gen_id,
                         ),
                         name="atom_rag_late_restart",
                     )
@@ -951,7 +1070,7 @@ class LocalBrainController:
                         getattr(rag_res, "retrieval_source", ""),
                     )
                 except Exception:
-                    pass
+                    logger.debug('RAG retrieval log formatting failed', exc_info=True)
                 self._last_retrieval_source = str(
                     getattr(rag_res, "retrieval_source", "") or "",
                 )
@@ -962,7 +1081,7 @@ class LocalBrainController:
                         else:
                             self._feedback_engine.record_prefetch_event(False)
                     except Exception:
-                        pass
+                        logger.debug('RAG retrieval log formatting failed', exc_info=True)
                 try:
                     from core.observability.per_module_latency import get_latency_board
 
@@ -970,7 +1089,7 @@ class LocalBrainController:
                     if rms > 0:
                         get_latency_board().record_module_call("rag", rms, error=False)
                 except Exception:
-                    pass
+                    logger.debug('RAG retrieval log formatting failed', exc_info=True)
                 if rag_res.chunks:
                     rag_document_context = rag_res.document_context
                     rag_enrichment = rag_res.enrichment_block or None
@@ -994,6 +1113,7 @@ class LocalBrainController:
                 emit_partial=(react_step == 0 and not observations and not should_buffer_response),
                 model_role=plan_model_role,
                 max_tokens_override=max_tokens_override,
+                policy_query=policy_query,
             )
 
             if preempted:
@@ -1002,7 +1122,26 @@ class LocalBrainController:
                 self._bus.emit("metrics_event", counter="llm_preempted")
                 return
 
+            # Cascade break: if the stream vetter already delivered a safe
+            # clarifier (or any rewritten sentence) to TTS, treat that as the
+            # definitive reply. Triggering strict-recovery here would speak
+            # "I lost that answer" on top of the clarifier we just said.
+            vetter_delivered = self._turn_vetter_rewrote and bool(
+                self._turn_emitted_sentences
+            )
+
             if not raw_response:
+                if vetter_delivered:
+                    # Adopt the clarifier as final text — do NOT retry.
+                    rescued = " ".join(self._turn_emitted_sentences).strip()
+                    if rescued:
+                        logger.info(
+                            "Cascade break: stream vetter already delivered reply "
+                            "(%d sentences), skipping strict recovery",
+                            len(self._turn_emitted_sentences),
+                        )
+                        text_response_parts.append(rescued)
+                        break
                 if react_step == 0 and not observations and not repair_attempted:
                     repair_attempted = True
                     logger.warning("Brain produced no usable text; retrying in strict recovery mode")
@@ -1017,6 +1156,7 @@ class LocalBrainController:
                         emit_partial=False,
                         model_role=plan_model_role,
                         max_tokens_override=repair_tokens_override,
+                        policy_query=policy_query,
                     )
                     if retry_first_token_ms and not first_token_ms:
                         first_token_ms = retry_first_token_ms
@@ -1035,6 +1175,17 @@ class LocalBrainController:
 
             if candidate_text:
                 text_response_parts.append(candidate_text)
+            elif vetter_delivered:
+                # Same cascade-break: candidate was rejected but we already
+                # spoke a clarifier. Don't strict-recover; use the clarifier.
+                rescued = " ".join(self._turn_emitted_sentences).strip()
+                if rescued:
+                    logger.info(
+                        "Cascade break: candidate rejected but stream vetter "
+                        "delivered clarifier — accepting clarifier as final reply",
+                    )
+                    text_response_parts.append(rescued)
+                    break
             elif not parsed.has_tool_calls and react_step == 0 and not observations and not repair_attempted:
                 repair_attempted = True
                 logger.warning("Brain produced low-quality text; retrying in strict recovery mode")
@@ -1049,6 +1200,7 @@ class LocalBrainController:
                     emit_partial=False,
                     model_role=plan_model_role,
                     max_tokens_override=repair_tokens_override,
+                    policy_query=policy_query,
                 )
                 if retry_first_token_ms and not first_token_ms:
                     first_token_ms = retry_first_token_ms
@@ -1110,7 +1262,7 @@ class LocalBrainController:
                         error=not result.success,
                     )
                 except Exception:
-                    pass
+                    logger.debug('Tool latency board record failed', exc_info=True)
 
                 self._bus.emit(
                     "tool_executed",
@@ -1154,17 +1306,54 @@ class LocalBrainController:
                 )
 
         if not full_text:
-            logger.warning("Brain returned empty response (%.0fms)", elapsed_total)
-            self._bus.emit(
-                "text_display",
-                text="Recovery note: the local model returned no usable answer for this request.",
-            )
-            self._bus.emit_long(
-                "response_ready",
-                text="I lost that answer, Boss. Ask it once more.",
-            )
-            self._bus.emit("llm_error", source="local", error="empty_response")
-            return
+            # Cascade-safe recovery. Previously we always emitted
+            # "I lost that answer" + fired llm_error — but if the stream
+            # vetter already delivered a clarifier to TTS, that would
+            # speak on top of it. Treat three cases explicitly:
+            #   1. Vetter delivered clarifier -> reuse it (no llm_error).
+            #   2. WH / definition question   -> warm clarifier, no error.
+            #   3. Everything else            -> original behavior.
+            if self._turn_vetter_rewrote and self._turn_emitted_sentences:
+                rescued = " ".join(self._turn_emitted_sentences).strip()
+                logger.info(
+                    "Empty final text but stream vetter delivered reply — "
+                    "reusing clarifier (no llm_error): '%s'", rescued[:120],
+                )
+                full_text = rescued
+            else:
+                logger.warning("Brain returned empty response (%.0fms)", elapsed_total)
+                ql = (policy_query or "").lower().strip()
+                wh_prefixes = (
+                    "what ", "what's ", "whats ", "who ", "who's ",
+                    "when ", "where ", "why ", "how ", "which ",
+                    "define ", "explain ", "tell me about ", "meaning of ",
+                    "describe ",
+                )
+                is_wh = any(ql.startswith(p) for p in wh_prefixes)
+                if is_wh:
+                    import random
+                    wh_clarifiers = (
+                        "I need a second on that one, Boss — say it once more?",
+                        "Let me catch that again, Boss — mind repeating the question?",
+                        "I'm not sure I heard the full question, Boss. One more time?",
+                    )
+                    recovery_text = random.choice(wh_clarifiers)
+                    logger.info(
+                        "Empty LLM reply on WH question — emitting warm "
+                        "clarifier (no llm_error): '%s'", recovery_text,
+                    )
+                    self._bus.emit_long("response_ready", text=recovery_text)
+                    return
+                self._bus.emit(
+                    "text_display",
+                    text="Recovery note: the local model returned no usable answer for this request.",
+                )
+                self._bus.emit_long(
+                    "response_ready",
+                    text="I lost that answer, Boss. Ask it once more.",
+                )
+                self._bus.emit("llm_error", source="local", error="empty_response")
+                return
 
         # ── v22: Post-LLM Confidence Scoring + Cloud Fallback ────────
         if self._confidence_engine is not None:
@@ -1213,6 +1402,20 @@ class LocalBrainController:
             except Exception:
                 logger.info("v22 confidence scoring failed", exc_info=True)
 
+        if self._curiosity_engine is not None and text:
+            try:
+                should_record = repair_attempted
+                if not should_record and self._confidence_engine is not None:
+                    try:
+                        cs = self._confidence_engine.score(policy_query, full_text)
+                        should_record = cs < 0.3
+                    except Exception:
+                        pass
+                if should_record:
+                    self._curiosity_engine.record_knowledge_gap(text)
+            except Exception:
+                pass
+
         # ── v22: Decision Engine enrichment ───────────────────────────
         if self._decision_engine is not None:
             try:
@@ -1240,6 +1443,31 @@ class LocalBrainController:
         if saved_report_path:
             logger.info("Saved long report: %s", saved_report_path)
 
+        # Skip the end-of-turn vet pass when the stream vetter already
+        # delivered a clarifier — a second rewrite would produce a new
+        # clarifier ("I'm not sure I heard you right…" etc.) that conflicts
+        # with the one the user already heard streaming.
+        if self._response_vetter is not None and not self._turn_vetter_rewrote:
+            try:
+                confidence = 0.6
+                if self._confidence_engine is not None:
+                    try:
+                        confidence = float(
+                            self._confidence_engine.score(policy_query, final_text)
+                            or 0.6
+                        )
+                    except Exception:
+                        confidence = 0.6
+                vetted = self._response_vetter(policy_query, final_text, confidence)
+                if isinstance(vetted, str) and vetted.strip() and vetted != final_text:
+                    logger.info(
+                        "Router guardrail rewrote LLM reply (conf=%.2f): '%s' -> '%s'",
+                        confidence, final_text[:80], vetted[:80],
+                    )
+                    final_text = vetted
+            except Exception:
+                logger.debug("response_vetter failed", exc_info=True)
+
         if should_buffer_response:
             self._bus.emit_long("response_ready", text=final_text)
         elif react_step > 0:
@@ -1258,6 +1486,8 @@ class LocalBrainController:
             query=text.lower().strip(),
             response=final_text,
         )
+
+        self._bus.emit("llm_response_complete", text=final_text)
 
         try:
             from core.cognition.predictor import predict_next_queries
@@ -1279,7 +1509,7 @@ class LocalBrainController:
                             tsnips = self._timeline.context_snippets_for_prediction()
                             active_task = self._timeline.get_last_active_task()
                         except Exception:
-                            pass
+                            logger.debug('Timeline prediction snippets read failed', exc_info=True)
                     last_proj = None
                     recent_ent: list[dict[str, Any]] = []
                     if self._memory_graph is not None:
@@ -1287,7 +1517,7 @@ class LocalBrainController:
                             last_proj = self._memory_graph.get_last_active_project()
                             recent_ent = self._memory_graph.get_recent_entities(8)
                         except Exception:
-                            pass
+                            logger.debug('Timeline prediction snippets read failed', exc_info=True)
                     pred_ctx = {
                         "last_queries": list(self._recent_queries),
                         "active_task": active_task,
@@ -1312,13 +1542,13 @@ class LocalBrainController:
                                     [hint], merged, max_candidates=max_pf,
                                 )
                         except Exception:
-                            pass
+                            logger.debug('Timeline prediction snippets read failed', exc_info=True)
                     self._prev_predictions = list(merged[:12])
                     if self._feedback_engine is not None:
                         try:
                             self._feedback_engine.record_prefetch_scheduled(len(merged))
                         except Exception:
-                            pass
+                            logger.debug('Timeline prediction snippets read failed', exc_info=True)
                     eng = self._prefetch_engine or RagPrefetchEngine(
                         self._rag_engine, self._config,
                     )
@@ -1328,7 +1558,7 @@ class LocalBrainController:
                         prediction_accuracy=pred_acc,
                     )
         except Exception:
-            pass
+            logger.debug('Memory graph project lookup failed', exc_info=True)
 
         try:
             if self._suggester is not None and self._timeline is not None:
@@ -1346,7 +1576,42 @@ class LocalBrainController:
                 ):
                     self._bus.emit_fast("v7_suggestion", text=sug)
         except Exception:
-            pass
+            logger.debug('Timeline pattern hint merge failed', exc_info=True)
+
+    def _vet_stream_sentence(self, policy_query: str | None, text: str) -> str:
+        """Run the router guardrail on a single streaming sentence.
+
+        The streaming path emits ``partial_response`` events token-by-token,
+        so bad LLM output reaches TTS long before the end-of-stream vetter
+        at ``response_ready`` can see it. This hook applies the same
+        ``vet_llm_response`` pass per-sentence, catching action-promise
+        hallucinations inside quoted wrappers like ``The answer is "..."``
+        before we speak them.
+
+        Returns the (possibly rewritten) sentence. Falls back to ``text``
+        unchanged if no vetter is attached or vetting raises.
+
+        Side effect: flips ``self._turn_vetter_rewrote`` to True on any real
+        rewrite so end-of-turn logic can break the cascade (skip strict
+        recovery when we already delivered a safe clarifier).
+        """
+        if self._response_vetter is None or not text:
+            return text
+        query = policy_query or ""
+        if not query:
+            return text
+        try:
+            vetted = self._response_vetter(query, text, 0.6)
+            if isinstance(vetted, str) and vetted.strip() and vetted != text:
+                logger.info(
+                    "Streaming guardrail rewrote sentence: '%s' -> '%s'",
+                    text[:80], vetted[:80],
+                )
+                self._turn_vetter_rewrote = True
+                return vetted
+        except Exception:
+            logger.debug("Streaming vetter failed", exc_info=True)
+        return text
 
     async def _run_llm_streaming(
         self,
@@ -1356,6 +1621,7 @@ class LocalBrainController:
         emit_partial: bool = True,
         model_role: str | None = None,
         max_tokens_override: int | None = None,
+        policy_query: str | None = None,
         _watchdog_guard: bool = False,
     ) -> tuple[str, float, bool]:
         """Run LLM inference with optional streaming to TTS.
@@ -1373,6 +1639,7 @@ class LocalBrainController:
                     emit_partial=emit_partial,
                     model_role=model_role,
                     max_tokens_override=max_tokens_override,
+                    policy_query=policy_query,
                     _watchdog_guard=True,
                 ),
                 default=("", 0.0, True),
@@ -1398,6 +1665,25 @@ class LocalBrainController:
         generate_task = asyncio.create_task(
             self._llm.generate_streaming(prompt, **generate_kwargs)
         )
+
+        # Thinking earcon: schedule a soft click at 1.2s if no first token
+        # AND no TTS emission yet. Cancelled when we actually emit content.
+        # Only when emit_partial is True (i.e. user-facing turn).
+        thinking_earcon_task: asyncio.Task | None = None
+        if emit_partial:
+            async def _thinking_earcon_delay() -> None:
+                try:
+                    await asyncio.sleep(1.2)
+                    if first_token_time[0] is None:
+                        try:
+                            self._bus.emit("thinking_earcon")
+                        except Exception:
+                            pass
+                except asyncio.CancelledError:
+                    return
+                except Exception:
+                    logger.debug("Thinking earcon scheduler failed", exc_info=True)
+            thinking_earcon_task = asyncio.create_task(_thinking_earcon_delay())
 
         stream_id = uuid.uuid4().hex
         sentence_buffer = ""
@@ -1433,10 +1719,22 @@ class LocalBrainController:
                 sentence_buffer += token_text
 
                 if emit_partial:
-                    ready = self._extract_complete_sentence(sentence_buffer)
+                    # First-chunk acceleration: for the VERY first emission
+                    # we allow a clause boundary (comma / semicolon / em-dash)
+                    # so TTS starts speaking ~1s sooner on longer first
+                    # sentences. Subsequent chunks stick to full sentences.
+                    ready = None
+                    if sentences_emitted == 0:
+                        ready = self._extract_first_clause(sentence_buffer)
+                    if ready is None:
+                        ready = self._extract_complete_sentence(sentence_buffer)
                     if ready:
                         sentence_text, remainder = ready
                         safe_sentence = self._sanitize_emittable_text(sentence_text)
+                        if safe_sentence:
+                            vet_fn = getattr(self, "_vet_stream_sentence", None)
+                            if callable(vet_fn):
+                                safe_sentence = vet_fn(policy_query, safe_sentence)
                         if safe_sentence:
                             sentences_emitted += 1
                             self._bus.emit_long(
@@ -1448,13 +1746,35 @@ class LocalBrainController:
                                 stream_id=stream_id,
                             )
                             full_response_parts.append(safe_sentence)
+                            try:
+                                self._turn_emitted_sentences.append(safe_sentence)
+                            except Exception:
+                                pass
                         sentence_buffer = remainder
+
+            while not token_queue.empty():
+                try:
+                    tok, done_flag = token_queue.get_nowait()
+                    if tok:
+                        sentence_buffer += tok
+                    if done_flag:
+                        trailing_sentence = sentence_buffer.strip()
+                        break
+                except asyncio.QueueEmpty:
+                    break
 
             result = await generate_task
             answer, preempted = result
 
+            if not trailing_sentence:
+                trailing_sentence = sentence_buffer.strip()
+
             if trailing_sentence and not preempted:
                 safe_trailing = self._sanitize_emittable_text(trailing_sentence)
+                if safe_trailing:
+                    vet_fn = getattr(self, "_vet_stream_sentence", None)
+                    if callable(vet_fn):
+                        safe_trailing = vet_fn(policy_query, safe_trailing)
                 if safe_trailing:
                     sentences_emitted += 1
                     if emit_partial:
@@ -1467,6 +1787,10 @@ class LocalBrainController:
                             stream_id=stream_id,
                         )
                     full_response_parts.append(safe_trailing)
+                    try:
+                        self._turn_emitted_sentences.append(safe_trailing)
+                    except Exception:
+                        pass
 
             raw_full_text = " ".join(full_response_parts).strip() if full_response_parts else answer
             full_text = " ".join(full_response_parts).strip() if full_response_parts else self._sanitize_emittable_text(answer)
@@ -1478,14 +1802,19 @@ class LocalBrainController:
                 self._bus.emit("metrics_event", counter="llm_sanitized_empty")
 
             if sentences_emitted == 0 and full_text and emit_partial and not preempted:
-                self._bus.emit_long(
-                    "partial_response",
-                    text=full_text,
-                    is_first=True,
-                    is_last=True,
-                    source="local",
-                    stream_id=stream_id,
-                )
+                vet_fn = getattr(self, "_vet_stream_sentence", None)
+                vetted_full = vet_fn(policy_query, full_text) if callable(vet_fn) else full_text
+                if vetted_full:
+                    if vetted_full != full_text:
+                        full_text = vetted_full
+                    self._bus.emit_long(
+                        "partial_response",
+                        text=full_text,
+                        is_first=True,
+                        is_last=True,
+                        source="local",
+                        stream_id=stream_id,
+                    )
 
             first_token_ms = (
                 (first_token_time[0] - t0_total) * 1000
@@ -1499,8 +1828,11 @@ class LocalBrainController:
             try:
                 await generate_task
             except Exception:
-                pass
+                logger.debug('Metrics counter emit failed', exc_info=True)
             raise
+        finally:
+            if thinking_earcon_task is not None and not thinking_earcon_task.done():
+                thinking_earcon_task.cancel()
 
     def _emit_final_metrics(
         self,
@@ -1530,7 +1862,7 @@ class LocalBrainController:
                 error=False,
             )
         except Exception:
-            pass
+            logger.debug('Generate task await after cancel failed', exc_info=True)
 
         try:
             from core.unified_trace import new_trace
@@ -1541,7 +1873,7 @@ class LocalBrainController:
             ut.decision_path.extend(["llm_stream", "react_loop"])
             self._bus.emit("v7_unified_trace", **ut.to_dict())
         except Exception:
-            pass
+            logger.debug('Generate task await after cancel failed', exc_info=True)
 
         logger.info(
             "Brain: %.0fms total, %.0fms first-token, %d words, %d tool calls this turn",
@@ -1553,7 +1885,7 @@ class LocalBrainController:
                 fm = self._feedback_engine.compute_accuracy_metrics()
                 logger.info("v7_feedback_metrics %s", fm)
             except Exception:
-                pass
+                logger.debug('LLM latency board record failed', exc_info=True)
 
     @staticmethod
     def _extract_complete_sentence(buffer: str) -> tuple[str, str] | None:
@@ -1571,6 +1903,34 @@ class LocalBrainController:
             return buffer.rstrip(), ""
 
         return None
+
+    @staticmethod
+    def _extract_first_clause(buffer: str) -> tuple[str, str] | None:
+        """Fast-path for the FIRST chunk: emit on a clause break to cut
+        perceived first-audio latency from ~4s to ~1.5s.
+
+        Matches a comma / semicolon / em-dash followed by whitespace, but
+        only when the buffer is already >= 24 characters (so we don't
+        truncate a short prefix like "Newton," into its own slice).
+
+        Used exclusively when ``sentences_emitted == 0``. Subsequent chunks
+        fall back to full-sentence boundaries for better prosody.
+        """
+        if len(buffer) < 24:
+            return None
+        # Skip the first 20 chars so we never cut a greeting like "Hi, Boss"
+        # in half — we want a natural mid-sentence break.
+        match = re.search(r"[,;—](?:\s|$)", buffer[20:])
+        if not match:
+            return None
+        split_pos = 20 + match.end()
+        head = buffer[:split_pos].rstrip()
+        tail = buffer[split_pos:]
+        # Don't split on a micro-fragment like "Okay," or "Well,"
+        head_words = head.split()
+        if len(head_words) < 4:
+            return None
+        return head, tail
 
     def close(self) -> None:
         avg_first_token = (

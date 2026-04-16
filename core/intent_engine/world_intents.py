@@ -26,7 +26,7 @@ _BRIEFING = re.compile(
     r"\b(brief(ing)?|morning\s+brief|daily\s+brief|"
     r"give\s+me\s+(a\s+)?brief|catch\s+me\s+up|"
     r"what\s+did\s+i\s+miss|update\s+me|"
-    r"what('?s|\s+is)\s+new|status\s+report)\b", re.I)
+    r"what('?s|\s+is)\s+new)\b", re.I)
 
 _WORLD_CLOCK = re.compile(
     r"\b(world\s+(clock|time)|time\s+(in|at|around)\s+\w+|"

@@ -6,6 +6,10 @@ Thread-safe for Router + brain + executor callbacks.
 
 from __future__ import annotations
 
+import logging
+
+logger = logging.getLogger('atom.core.memory.timeline_memory')
+
 import json
 import re
 import threading
@@ -65,7 +69,7 @@ class TimelineMemory:
         try:
             logger.info("v7_timeline type=%s keys=%s", type, list(ev.data.keys()))
         except Exception:
-            pass
+            logger.debug('Observability step failed', exc_info=True)
         self.save()
 
     def get_recent_events(self, window_sec: float) -> list[TimelineEvent]:
@@ -147,7 +151,7 @@ class TimelineMemory:
         try:
             logger.info("v7_timeline_patterns found=%d", len(out))
         except Exception:
-            pass
+            logger.debug('Timeline summary for prompt failed', exc_info=True)
         return out
 
     def get_repeated_tasks(

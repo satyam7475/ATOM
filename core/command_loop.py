@@ -237,8 +237,8 @@ class CommandLoop:
                 except Exception:
                     logger.debug("Intent continuity update failed", exc_info=True)
 
-            # ── Inline suggestion (delayed so it doesn't collide) ────
-            if self._suggestion_engine is not None:
+            # ── Inline suggestion (only after action commands, not quick/conversational) ──
+            if self._suggestion_engine is not None and response_ms > 100:
                 try:
                     active_app = ""
                     if self._system_state_engine is not None:

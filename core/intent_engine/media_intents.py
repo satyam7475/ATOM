@@ -12,7 +12,10 @@ _PLAY_YOUTUBE = re.compile(
     r"\b(play|start|bajao|chalao)\s+(?P<query>.+?)\s+(on\s+)?(youtube|screen)\b|"
     r"\b(play|start|bajao)\s+youtube\b|"
     r"\b(gana|gaana|song|music|sangeet)\s+(play|bajao|chalao|chala|suna|sunao)\s*(karo|kar\s+do|do)?\b|"
-    r"\b(play|bajao|chalao|suna)\s+(gana|gaana|song|music|sangeet)\b",
+    r"\b(play|bajao|chalao|suna)\s+(gana|gaana|song|music|sangeet)\b|"
+    r"\b(?:let'?s\s+)?(?:have|put\s+on|listen\s+to)\s+(?:some\s+)?(?:music|song|gana|gaana|sangeet)\s+(?:on\s+)?(?:youtube|screen)\b|"
+    r"\b(?:music|song|gana|gaana)\s+(?:on\s+)?(?:youtube|screen)\s*(?:play|chalao|bajao|laga)?\b|"
+    r"\b(?:youtube|screen)\s+(?:pe|par|on)\s+(?:music|song|gana|gaana|kuch)\s*(?:play|chalao|bajao|laga|suna)?\b",
     re.I,
 )
 

@@ -614,7 +614,7 @@ class VoicePresenceTracker:
                     mode=new_mode, density=round(density, 1),
                 )
             except Exception:
-                pass
+                logger.debug('Event bus emit failed', exc_info=True)
 
     @property
     def mode(self) -> str:
@@ -1186,7 +1186,7 @@ class AudioIntelligenceEngine:
                 boot_time_ms=round(self._boot_time_ms),
             )
         except Exception:
-            pass
+            logger.debug('Event bus emit failed', exc_info=True)
 
         self._emit_state_diff()
         return best
@@ -1228,77 +1228,97 @@ class AudioIntelligenceEngine:
             logger.info("Seamless switch blocked by cooldown (reason=%s, target=%s)", reason, new_device.name)
             return False
 
+        from voice.recovery_lock import voice_recovery_lock, stream_drain_delay
+
         old_name = old_device_name or (self._selected_input.name if self._selected_input else "none")
         logger.info("Seamless switch: '%s' -> '%s' (reason=%s, conf=%.2f)", old_name, new_device.name, reason, confidence)
-        self._switch_in_progress = True
 
-        try:
-            if self._stt and hasattr(self._stt, "stop"):
-                self._stt.stop()
-            elif self._stt and hasattr(self._stt, "stop_listening"):
-                self._stt.stop_listening()
-
-            ok = self.apply_system_default(new_device)
-            if not ok:
-                logger.warning("System default switch failed for '%s'", new_device.name)
-
-            await asyncio.sleep(0.3)
-
-            if self._stt and hasattr(self._stt, "async_start_listening"):
-                await self._stt.async_start_listening()
-            elif self._stt and hasattr(self._stt, "start_listening"):
-                await self._stt.start_listening()
-
-            self._selected_input = new_device
-            self._last_switch_time = time.monotonic()
-            self.match_output_device(new_device)
-            if self._selected_output:
-                self.apply_output_default(self._selected_output)
-
-            if self._mic_manager:
-                from voice.mic_manager import MicDeviceProfile
-                self._mic_manager.active_device = MicDeviceProfile(
-                    index=new_device.index,
-                    name=new_device.name,
-                    host_api=new_device.host_api,
-                    max_input_channels=new_device.channels,
-                    default_sample_rate=int(new_device.sample_rate),
-                    input_latency_ms=new_device.input_latency_ms,
-                    device_type=new_device.device_type,
-                    quality_score=int(new_device.quality_score * 100),
-                    is_default=True,
-                    supports_16khz=(8000 <= new_device.sample_rate <= 48000),
-                    supports_44khz=(new_device.sample_rate >= 44100),
+        async with voice_recovery_lock(
+            f"audio_intelligence:{reason}",
+            max_wait_s=2.0,
+        ) as got_lock:
+            if not got_lock:
+                logger.info(
+                    "Seamless switch deferred — STT watchdog is restarting (reason=%s)",
+                    reason,
                 )
+                return False
+
+            self._switch_in_progress = True
 
             try:
-                self._bus.emit(
-                    "audio_device_switched",
-                    old=old_name,
-                    new=new_device.name,
-                    score=new_device.quality_score,
+                if self._stt and hasattr(self._stt, "stop"):
+                    self._stt.stop()
+                elif self._stt and hasattr(self._stt, "stop_listening"):
+                    self._stt.stop_listening()
+
+                # Give CoreAudio time to fully release the old input stream
+                # before we re-bind. Without this, the subsequent start_listening
+                # sees PaMacCore (AUHAL) err=-50 because the device is still
+                # owned by the previous PortAudio stream.
+                await stream_drain_delay(400)
+
+                ok = self.apply_system_default(new_device)
+                if not ok:
+                    logger.warning("System default switch failed for '%s'", new_device.name)
+
+                await asyncio.sleep(0.3)
+
+                if self._stt and hasattr(self._stt, "start_listening"):
+                    self._stt.start_listening()
+                elif self._stt and hasattr(self._stt, "async_start_listening"):
+                    asyncio.ensure_future(self._stt.async_start_listening())
+
+                self._selected_input = new_device
+                self._last_switch_time = time.monotonic()
+                self.match_output_device(new_device)
+                if self._selected_output:
+                    self.apply_output_default(self._selected_output)
+
+                if self._mic_manager:
+                    from voice.mic_manager import MicDeviceProfile
+                    self._mic_manager.active_device = MicDeviceProfile(
+                        index=new_device.index,
+                        name=new_device.name,
+                        host_api=new_device.host_api,
+                        max_input_channels=new_device.channels,
+                        default_sample_rate=int(new_device.sample_rate),
+                        input_latency_ms=new_device.input_latency_ms,
+                        device_type=new_device.device_type,
+                        quality_score=int(new_device.quality_score * 100),
+                        is_default=True,
+                        supports_16khz=(8000 <= new_device.sample_rate <= 48000),
+                        supports_44khz=(new_device.sample_rate >= 44100),
+                    )
+
+                try:
+                    self._bus.emit(
+                        "audio_device_switched",
+                        old=old_name,
+                        new=new_device.name,
+                        score=new_device.quality_score,
+                        reason=reason,
+                    )
+                except Exception:
+                    logger.debug('Async sleep step failed', exc_info=True)
+
+                self._emit_state_diff()
+
+                await self.voice_feedback(
+                    "switch" if reason != "bt_disconnect" else "lost",
+                    confidence=confidence,
+                    device_name=new_device.name,
+                    old_device=old_name,
                     reason=reason,
                 )
+                return True
+
             except Exception:
-                pass
-
-            self._emit_state_diff()
-
-            await self.voice_feedback(
-                "switch" if reason != "bt_disconnect" else "lost",
-                confidence=confidence,
-                device_name=new_device.name,
-                old_device=old_name,
-                reason=reason,
-            )
-            return True
-
-        except Exception:
-            logger.exception("Seamless switch failed")
-            await self.voice_feedback("switch_failed")
-            return False
-        finally:
-            self._switch_in_progress = False
+                logger.exception("Seamless switch failed")
+                await self.voice_feedback("switch_failed")
+                return False
+            finally:
+                self._switch_in_progress = False
 
     # ── Phase 7: Voice Feedback (context-aware + confidence gating) ───
 
@@ -1358,7 +1378,7 @@ class AudioIntelligenceEngine:
                     event=event, confidence=confidence, **kwargs,
                 )
             except Exception:
-                pass
+                logger.debug('Event bus emit failed', exc_info=True)
             return
 
         if self._tts is None:

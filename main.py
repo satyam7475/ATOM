@@ -845,6 +845,8 @@ async def main() -> None:
             config,
             brain_mode_manager=brain_mode_mgr,
         )
+        if local_brain is not None:
+            local_brain.attach_curiosity_engine(curiosity_engine)
         logger.info("Cognitive layer initialized (8 modules, incl. dream + curiosity)")
     else:
         logger.info("Cognitive layer DISABLED via config")
@@ -878,6 +880,8 @@ async def main() -> None:
         conv_memory=conv_memory,
         timeline=timeline_memory,
         jarvis=jarvis_core,
+        second_brain=second_brain if cognitive_enabled else None,
+        prediction_engine=prediction_engine if cognitive_enabled else None,
     )
 
     real_world_intel = RealWorldIntelligence(config)
@@ -1085,7 +1089,7 @@ async def main() -> None:
         try:
             running_loop.call_soon_threadsafe(bus.emit, "shutdown_requested")
         except Exception:
-            pass
+            logger.debug('main optional step failed', exc_info=True)
 
     _MODE_LABELS = {
         "optimal": "Optimal",
@@ -1335,7 +1339,7 @@ async def main() -> None:
                         try:
                             ss2 = system_monitor.get_system_state()
                         except Exception:
-                            pass
+                            logger.debug('Async task spawn failed', exc_info=True)
                     m = feedback_engine.compute_accuracy_metrics()
                     pre = get_last_preemption_score()
                     ap2 = None
@@ -1345,7 +1349,7 @@ async def main() -> None:
                         ):
                             ap2 = local_brain._memory_graph.get_last_active_project()
                     except Exception:
-                        pass
+                        logger.debug('Memory graph project lookup failed', exc_info=True)
                     tl_n2 = timeline_memory.event_count() if timeline_memory else 0
                     tl_p2 = timeline_memory.recent_preview(6) if timeline_memory else []
                     snap = get_debug_snapshot(
@@ -1844,7 +1848,7 @@ async def main() -> None:
                 if local_brain is not None and getattr(local_brain, "_memory_graph", None):
                     active_proj = local_brain._memory_graph.get_last_active_project()
             except Exception:
-                pass
+                logger.debug('Memory graph project lookup failed', exc_info=True)
             tl_n = timeline_memory.event_count() if timeline_memory else 0
             tl_prev = timeline_memory.recent_preview(8) if timeline_memory else []
             snap = get_debug_snapshot(
@@ -1982,7 +1986,7 @@ async def main() -> None:
     )
     wire_voice_auth(
         bus=bus, security_fortress=security_fortress,
-        context_engine=context_engine,
+        context_engine=context_engine, stt=stt,
     )
     wire_real_world(
         bus=bus, real_world_intel=real_world_intel,
@@ -2050,7 +2054,10 @@ async def main() -> None:
         watcher_interval,
         maint_interval,
     )
-    await state.transition(AtomState.LISTENING)
+    # NOTE: do NOT transition to LISTENING yet. We start in THINKING so the
+    # STT listen loop doesn't briefly open the mic and then have to tear it
+    # back down when _startup_greeting transitions to SPEAKING.
+    await state.transition(AtomState.THINKING)
 
     async def _startup_greeting() -> None:
         """Speak a context-aware greeting with world intelligence."""
@@ -2076,7 +2083,21 @@ async def main() -> None:
         if temporal.is_holiday:
             greeting_bits.append(f"Today is {temporal.holiday_name}.")
 
-        greeting = f"{time_g} All systems online. {' '.join(greeting_bits)} What do you need?"
+        # Varied boot-specific opener so every start sounds fresh. The
+        # adaptive greeting ends with its own "What do you need?" or
+        # similar, so we don't tack one on twice.
+        import random as _random
+        boot_opener_pool = [
+            "All systems online.",
+            "Online and warmed up.",
+            "Systems are up.",
+            "Everything's green.",
+            "I'm up and running.",
+            "Fully booted.",
+        ]
+        boot_opener = _random.choice(boot_opener_pool)
+        tail = " What do you need?" if not time_g.rstrip().endswith("?") else ""
+        greeting = f"{time_g} {boot_opener} {' '.join(greeting_bits)}{tail}".strip()
         atom_runtime.patch_section(
             "reasoning",
             {
@@ -2094,14 +2115,27 @@ async def main() -> None:
                     logger.info("Battery check failed", exc_info=True)
         logger.info("Startup greeting: %s", greeting[:200])
 
-        await state.transition(AtomState.THINKING)
+        # Speak the boot greeting; partial_response handler will push state
+        # to SPEAKING while TTS plays, then back to LISTENING when done.
         bus.emit_long("partial_response", text=greeting, is_first=True, is_last=True)
 
         await stt_preload_done.wait()
         logger.info("STT ready -- ATOM fully operational")
+
+        # Once TTS has finished the boot greeting, ensure we land in
+        # LISTENING so the STT loop opens the mic. If state machine already
+        # brought us to LISTENING (TTS completion path), this transition is
+        # a no-op.
+        if state.current is not AtomState.LISTENING:
+            try:
+                await state.transition(AtomState.LISTENING)
+            except Exception:
+                logger.debug(
+                    "post-greeting transition to LISTENING failed",
+                    exc_info=True,
+                )
         # Do NOT await async_start_listening() here: on_state_changed already create_task()s
-        # exactly one listen loop when state is LISTENING/SPEAKING. Awaiting it duplicated the
-        # loop and raced the mic with startup TTS (LISTENING→THINKING→SPEAKING→LISTENING).
+        # exactly one listen loop when state is LISTENING/SPEAKING.
         try:
             bus.emit("restart_listening")
         except Exception:

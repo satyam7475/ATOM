@@ -363,7 +363,7 @@ class HealthMonitor:
         try:
             ram = psutil.virtual_memory().percent
         except Exception:
-            pass
+            logger.debug('Fast bus emit failed', exc_info=True)
 
         weekday = now.weekday()
         self._bus.emit_fast(
@@ -394,7 +394,7 @@ class HealthMonitor:
                 info = get_foreground_window_info()
                 return str(info.get("app_name") or info.get("window_title") or "")[:80]
             except Exception:
-                pass
+                logger.debug('Fast bus emit failed', exc_info=True)
             return ""
 
         if sys.platform != "win32":
@@ -408,7 +408,7 @@ class HealthMonitor:
                 _user32.GetWindowTextW(hwnd, buf, length + 1)
                 return buf.value[:80]
         except Exception:
-            pass
+            logger.debug('Fast bus emit failed', exc_info=True)
         return ""
 
     # ── Subsystem Checks ─────────────────────────────────────────────

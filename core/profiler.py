@@ -38,7 +38,7 @@ def _record(phase: str, elapsed_ms: float) -> None:
         from core.metrics import get_metrics
         get_metrics().record_latency(f"profiler_{phase}", elapsed_ms)
     except Exception:
-        pass
+        logger.debug('Profiler step failed', exc_info=True)
 
 
 def profile(phase: str) -> Callable[[F], F]:

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import math
 import re
+from datetime import datetime
 
 from .base import IntentResult, clean_slot
 
@@ -18,6 +19,15 @@ _REMINDER = re.compile(
     r"(?P<unit>seconds?|secs?|minutes?|mins?|hours?|hrs?)\s*"
     r"(?:to\s+|for\s+)?"
     r"(?P<task>.+)", re.I)
+
+_REMINDER_CLOCK = re.compile(
+    r"\b(?:remind\s+me|set\s+(?:a\s+)?reminder)\s+"
+    r"(?:at\s+|for\s+)?"
+    r"(?P<hour>\d{1,2})\s*(?::(?P<minute>\d{2}))?\s*"
+    r"(?P<ampm>[AaPp][Mm])"
+    r"(?:\s+(?:to\s+|for\s+|about\s+)(?P<task>.+))?",
+    re.I,
+)
 
 _REMINDER_REV = re.compile(
     r"\bremind\s+me\s+to\s+(?P<task>.+?)\s+in\s+(?P<amount>\d+)\s*"
@@ -86,12 +96,12 @@ _SELF_CHECK = re.compile(
 _SCREEN_ANALYZE = re.compile(
     r"\b(analy[sz]e|look\s+at|read|check|see|describe|explain|review|scan|inspect)"
     r"\s+(my\s+|the\s+|this\s+)?"
-    r"(screen|display|monitor|code|page|window|tab|error|bug)"
+    r"(screen|display|monitor)"
     r"(\s+.+)?$|"
     r"\bwhat('?s|\s+is)\s+(on\s+)?(my\s+|the\s+)?screen\b|"
     r"\bscreen\s+(pe|par|ko)\s+(kya|dekho|padho|check)\b|"
     r"\bscreen\s+dekho\b|"
-    r"\bwhat\s+(do|can)\s+you\s+see\b", re.I)
+    r"\bwhat\s+(do|can)\s+you\s+see\s+on\s+(my\s+|the\s+)?screen\b", re.I)
 
 _SYSTEM_ANALYZE = re.compile(
     r"\b(?:analyze\s+(?:my\s+)?system|system\s+analys(?:is|e)|"
@@ -320,6 +330,30 @@ def check(text: str) -> IntentResult | None:
     if m:
         return IntentResult("screen_analyze", action="screen_analyze",
                             action_args={"question": text.strip()})
+
+    m = _REMINDER_CLOCK.search(text)
+    if m:
+        hour = int(m.group("hour"))
+        minute = int(m.group("minute") or 0)
+        ampm = m.group("ampm").upper()
+        if ampm == "PM" and hour != 12:
+            hour += 12
+        elif ampm == "AM" and hour == 12:
+            hour = 0
+        now = datetime.now()
+        target = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        if target <= now:
+            from datetime import timedelta
+            target += timedelta(days=1)
+        secs = max(1, int((target - now).total_seconds()))
+        task = clean_slot(m.group("task")) or f"reminder at {m.group('hour')}:{minute:02d} {ampm}"
+        time_label = f"{m.group('hour')}:{minute:02d} {ampm}"
+        return IntentResult(
+            "set_reminder",
+            response=f"Reminder set for {time_label}, Boss.",
+            action="set_reminder",
+            action_args={"label": task, "delay_seconds": secs},
+        )
 
     m = _REMINDER_REV.search(text)
     if m:

@@ -4,6 +4,10 @@ ATOM -- Hardware profile helpers for Apple Silicon-aware runtime decisions.
 
 from __future__ import annotations
 
+import logging
+
+logger = logging.getLogger('atom.core.hardware_profile')
+
 import platform
 import subprocess
 from typing import Any
@@ -23,7 +27,7 @@ def _chip_name() -> str:
         if name:
             return name
     except Exception:
-        pass
+        logger.debug('CPU brand string query failed', exc_info=True)
     try:
         model = platform.uname().machine
         return f"Apple Silicon ({model})" if model else "Apple Silicon"

@@ -56,7 +56,7 @@
         "bilingual": true,
         "sample_rate": 16000,
         "chunk_size": 2048,
-        "post_tts_cooldown_ms": 350,
+        "post_tts_cooldown_ms": 600,
         "preload": true,
         "calibration_delay_s": 2.0,
         "min_energy_threshold": 400,
@@ -73,17 +73,26 @@
         "barge_in_during_speak": false,
         "native_requires_on_device": true,
         "native_voice_processing": true,
-        "native_tap_sample_rate": 0
+        "native_tap_sample_rate": 0,
+        "passive_revert_delay_s": 30.0
     },
     "tts": {
         "engine": "macos_native",
         "max_lines": 4,
         "macos_voice": "system",
-        "macos_rate": 165,
+        "macos_rate": 195,
         "edge_voice": "en-GB-SoniaNeural",
         "edge_rate": "+0%",
         "edge_postprocess": true,
         "edge_ack_cache": true
+    },
+    "voice": {
+        "earcons": {
+            "enabled": true,
+            "volume": 0.45,
+            "heartbeat_enabled": false,
+            "heartbeat_interval_s": 600
+        }
     },
     "context": {
         "enable_clipboard": true,
@@ -117,7 +126,7 @@
         "enabled": true,
         "model_path": "models/qwen3-8b-q4_k_m.gguf",
         "mlx_primary_model": "models/qwen3-4b-mlx",
-        "mlx_fast_model": "models/qwen3-4b-mlx",
+        "mlx_fast_model": "models/qwen3-1.7b-mlx",
         "mlx_default_role": "fast",
         "n_ctx": 4096,
         "n_threads": 4,
@@ -178,7 +187,7 @@
         "mode": "web",
         "web_port": 8765,
         "auto_open_browser": true,
-        "password_auth_enabled": false,
+        "password_auth_enabled": true,
         "voice_only_input": false,
         "jarvis_boot_splash": true
     },
@@ -544,6 +553,6 @@
         "enabled": false,
         "max_size": 256,
         "ttl_seconds": 600,
-        "threshold": 0.85
+        "threshold": 0.92
     }
 }

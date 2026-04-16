@@ -79,6 +79,28 @@ _CONTRADICTION_MARKERS = re.compile(
     re.I,
 )
 
+# Replies that promise an imperative action. If the *query* was a
+# WH / definition-style question (what/who/why/…), promising an action
+# in the reply is almost always a fabricated hallucination and should
+# slash the confidence score.
+_ACTION_PROMISE_RE = re.compile(
+    r"\b("
+    r"i'?ll\s+\w+|i\s+will\s+\w+|i'?m\s+going\s+to\s+\w+|"
+    r"let\s+me\s+\w+|okay,?\s+i'?ll\s+\w+|sure,?\s+i'?ll\s+\w+|"
+    r"playing\s+\w+|opening\s+\w+|starting\s+\w+|launching\s+\w+|"
+    r"turning\s+(?:on|off)\s+\w+|enabling\s+\w+|disabling\s+\w+|"
+    r"sending\s+\w+|creating\s+\w+|deleting\s+\w+"
+    r")\b",
+    re.I,
+)
+
+# WH / definition-style queries where an action-promise reply is always wrong.
+_WH_QUERY_RE = re.compile(
+    r"^\s*(?:what|who|when|where|why|how|which|whose|"
+    r"define|explain|describe|meaning\s+of|tell\s+me\s+about)\b",
+    re.I,
+)
+
 # Question types for length sanity
 _COMPLEX_QUESTION = re.compile(
     r"\b("
@@ -168,14 +190,29 @@ class ConfidenceEngine:
         # Clamp to [0, 1]
         total = max(0.0, min(1.0, total))
 
+        # Reply-aware penalty: a WH question that gets an action-promise
+        # reply is ALWAYS a fabrication (no legit "what is Newton's law"
+        # ever warrants "I'll play the song"). Crush the score so the
+        # escalation gate and post-TTS guardrail both fire.
+        action_penalty = 1.0
+        if _ACTION_PROMISE_RE.search(response or "") and _WH_QUERY_RE.search(query or ""):
+            action_penalty = 0.2
+            logger.warning(
+                "Confidence penalty: action-promise in reply to WH-query — "
+                "query='%s', reply='%s'",
+                (query or "")[:60], (response or "")[:80],
+            )
+            total *= action_penalty
+
         logger.debug(
             "Confidence: %.2f (rep=%.2f vag=%.2f len=%.2f coh=%.2f "
-            "hed=%.2f avo=%.2f con=%.2f)",
+            "hed=%.2f avo=%.2f con=%.2f) action_penalty=%.2f",
             total,
             signals["repetition"], signals["vagueness"],
             signals["length_sanity"], signals["coherence"],
             signals["hedging"], signals["avoidance"],
             signals["contradiction"],
+            action_penalty,
         )
 
         return round(total, 3)

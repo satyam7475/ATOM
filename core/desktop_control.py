@@ -378,7 +378,7 @@ def get_screen_size() -> tuple:
                 if len(parts) == 4:
                     return (int(parts[2]), int(parts[3]))
         except Exception:
-            pass
+            logger.debug('Subprocess run failed', exc_info=True)
         try:
             result = subprocess.run(
                 ["system_profiler", "SPDisplaysDataType", "-json"],
@@ -395,7 +395,7 @@ def get_screen_size() -> tuple:
                         h = int(parts[1].split()[0].strip())
                         return (w, h)
         except Exception:
-            pass
+            logger.debug('Subprocess run failed', exc_info=True)
     return (1920, 1080)
 
 

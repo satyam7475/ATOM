@@ -63,7 +63,7 @@ def wire_events(
                 try:
                     metrics.inc("errors_total")
                 except Exception:
-                    pass
+                    logger.debug('Error metric increment failed', exc_info=True)
         return _wrapped
 
     _didnt_catch_count = {"n": 0}
@@ -360,6 +360,17 @@ def wire_events(
 
     # ── Local LLM only (offline) — serial queue + fast bus handler ─
     if local_brain is not None:
+        # Attach Router's anti-hallucination vetter so action-promise
+        # fabrications or low-confidence LLM output get rewritten to a
+        # short clarifying question before they reach TTS.
+        try:
+            attach_vetter = getattr(local_brain, "attach_response_vetter", None)
+            vetter = getattr(router, "vet_llm_response", None)
+            if callable(attach_vetter) and callable(vetter):
+                attach_vetter(vetter)
+        except Exception:
+            logger.debug("response vetter wiring failed", exc_info=True)
+
         async def _local_brain_query(text: str, **kw) -> None:
             async def _run_brain() -> None:
                 if shutdown_event.is_set():
@@ -462,9 +473,9 @@ def wire_events(
     bus.on("jarvis_insight", _on_jarvis_insight)
 
     async def _on_suggestion_ready(suggestions: list = None, **kw) -> None:
-        """Speak the top suggestion if confidence is high."""
+        """Forward suggestions to dashboard only — never collide with active TTS."""
         if suggestions and len(suggestions) > 0:
-            bus.emit_long("response_ready", text=suggestions[0])
+            bus.emit_fast("dashboard_suggestion", suggestions=suggestions)
 
     bus.on("suggestion_ready", _on_suggestion_ready)
 
@@ -1001,13 +1012,13 @@ def wire_events(
                 try:
                     child.terminate()
                 except Exception:
-                    pass
+                    logger.debug('Child process terminate failed', exc_info=True)
             _, alive = psutil.wait_procs(current.children(), timeout=2)
             for p in alive:
                 try:
                     p.kill()
                 except Exception:
-                    pass
+                    logger.debug('Child process terminate failed', exc_info=True)
             if alive:
                 logger.info("Force-killed %d lingering child processes", len(alive))
         except Exception:

@@ -305,10 +305,10 @@ class OwnerUnderstanding:
                     f"formality={self.communication.formality_level:.1f}, "
                     f"avg_length={self.communication.avg_sentence_length:.0f}w, "
                     f"preferred_response={self.communication.preferred_response_length}",
-                    category="owner_profile",
+                    tags=["owner_profile"],
                 )
             except Exception:
-                pass
+                logger.debug('JSON state write failed', exc_info=True)
 
     def process_response_feedback(self, query: str, response: str,
                                    was_helpful: bool = True) -> None:
@@ -577,7 +577,7 @@ class OwnerUnderstanding:
                 else:
                     self.anticipation.next_likely_action = ""
             except Exception:
-                pass
+                logger.debug('Action prediction fusion failed', exc_info=True)
 
         self.anticipation.mood_appropriate_greeting = self._generate_mood_greeting()
 

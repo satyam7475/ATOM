@@ -22,7 +22,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import re
+import shlex
 import time
 from typing import TYPE_CHECKING, Any
 
@@ -250,7 +252,7 @@ class Router:
         try:
             self._bus.emit_fast("metrics_event", counter="errors_total")
         except Exception:
-            pass
+            logger.debug('Fast bus emit failed', exc_info=True)
         if self._timeline is not None:
             try:
                 self._timeline.append_event(
@@ -261,7 +263,7 @@ class Router:
                     },
                 )
             except Exception:
-                pass
+                logger.debug('Fast bus emit failed', exc_info=True)
         try:
             self._emit_response(user_message)
         except Exception:
@@ -278,6 +280,164 @@ class Router:
             out, _speech = self._adaptive.process_response(out)
         polished = personality.polish_response(out, source="router")
         self._bus.emit_long("response_ready", text=polished, **kw)
+
+    # ── LLM output guardrail (hallucinated-action + low-confidence) ─
+    _ACTION_PROMISE_PATTERNS = (
+        "i'll ", "i will ", "i am going to ", "i'm going to ", "let me ",
+        "okay, i'll", "okay, i will", "sure, i'll", "sure, i will",
+        "playing ", "opening ", "setting ", "starting ", "launching ",
+        "turning on ", "turning off ", "enabling ", "disabling ",
+        "sending ", "creating ", "adding ", "deleting ",
+    )
+    # Verb roots matched against the user query. If the reply promises an
+    # action but none of these roots appears (or a close synonym), we treat
+    # it as a fabricated action and replace with a clarifier.
+    _ACTION_VERBS = {
+        "play": ("play", "song", "music", "track", "video"),
+        "open": ("open", "launch", "show", "bring up"),
+        "start": ("start", "begin", "run", "launch"),
+        "set": ("set", "schedule", "remind", "timer", "alarm"),
+        "send": ("send", "email", "message", "text", "ping"),
+        "create": ("create", "make", "new"),
+        "add": ("add", "append", "insert"),
+        "delete": ("delete", "remove", "clear", "trash"),
+        "turn": ("turn", "toggle", "enable", "disable"),
+        "close": ("close", "quit", "kill", "stop"),
+    }
+    # Strip these leading formatting wrappers before vetting. Small local
+    # models sometimes emit `The answer is "..."` which hides a fabricated
+    # action promise inside the quoted content.
+    _REPLY_WRAPPER_PREFIXES = (
+        "the answer is ", "my answer is ", "the answer: ",
+        "answer: ", "response: ", "reply: ", "final answer: ",
+        "here is the answer: ", "here's the answer: ",
+    )
+    # WH / definition style queries that should never legitimately produce
+    # an action promise. If the query starts with one of these AND the reply
+    # promises an action, it's a hallucination regardless of verb-match.
+    _WH_QUERY_PREFIXES = (
+        "what ", "what's ", "whats ", "who ", "who's ", "whos ",
+        "when ", "where ", "why ", "how ", "how's ", "hows ",
+        "which ", "whose ", "define ", "explain ", "tell me about ",
+        "meaning of ", "describe ",
+    )
+    _LOW_CONFIDENCE_THRESHOLD: float = 0.5
+    _CLARIFIER_TEMPLATES = (
+        "I didn't quite catch that, Boss — what did you mean exactly?",
+        "I'm not sure I heard you right, Boss. Could you rephrase that?",
+        "That didn't come through clearly, Boss. Mind repeating it?",
+    )
+
+    @classmethod
+    def _unwrap_reply(cls, reply: str) -> str:
+        """Strip `The answer is "..."` / `Answer: ...` style wrappers so the
+        inner content can be action-vetted. Returns the unwrapped text with
+        surrounding quotes trimmed; falls back to the original string when
+        no wrapper is found."""
+        stripped = (reply or "").strip()
+        lowered = stripped.lower()
+        for prefix in cls._REPLY_WRAPPER_PREFIXES:
+            if lowered.startswith(prefix):
+                inner = stripped[len(prefix):].strip()
+                # Trim matching wrapping quotes (straight, curly, or back).
+                for quote_pair in (('"', '"'), ("'", "'"),
+                                   ("\u201c", "\u201d"), ("\u2018", "\u2019"),
+                                   ("`", "`")):
+                    lq, rq = quote_pair
+                    if inner.startswith(lq) and inner.endswith(rq) and len(inner) > 1:
+                        inner = inner[1:-1].strip()
+                        break
+                # Strip a trailing "." / ".." dangling from the wrapper.
+                while inner.endswith(".."):
+                    inner = inner[:-1]
+                return inner
+        return stripped
+
+    @classmethod
+    def _reply_contains_action_promise(cls, reply_lower: str) -> str:
+        """Return the first action-promise pattern found anywhere in the
+        first 160 characters of the (lowercased) reply, or empty string.
+
+        Using a substring scan over an inspection window (vs ``startswith``)
+        catches wrappers like `The answer is "Okay, I'll play..."` and
+        padded prefaces like `Sure thing, I'll ...`.
+        """
+        window = reply_lower[:160]
+        for pattern in cls._ACTION_PROMISE_PATTERNS:
+            if pattern in window:
+                return pattern
+        return ""
+
+    @classmethod
+    def _query_has_matching_verb(cls, query_lower: str) -> bool:
+        for _verb, synonyms in cls._ACTION_VERBS.items():
+            if any(syn in query_lower for syn in synonyms):
+                return True
+        return False
+
+    @classmethod
+    def _query_is_wh(cls, query_lower: str) -> bool:
+        return any(query_lower.startswith(p) for p in cls._WH_QUERY_PREFIXES)
+
+    def vet_llm_response(self, query: str, reply: str,
+                         confidence: float = 0.6) -> str:
+        """Guardrail over LLM output before TTS.
+
+        Replaces the reply with a short clarification question when:
+          1. The reply promises an action ("I'll play...", "Opening...")
+             AND either (a) the query is a WH/definition question (no action
+             should ever be legitimate) or (b) no matching verb/noun root
+             appears in the query. Wrappers such as `The answer is "..."`
+             are unwrapped before the scan so quoted action-promises cannot
+             slip through.
+          2. Confidence is below _LOW_CONFIDENCE_THRESHOLD and the reply
+             looks like a confident factual / action statement.
+
+        Returns the possibly-rewritten reply. Safe to call from any thread;
+        purely synchronous text transform.
+        """
+        q = (query or "").lower().strip()
+        r_raw = (reply or "").strip()
+        if not r_raw or not q:
+            return reply
+
+        r_unwrapped = self._unwrap_reply(r_raw)
+        lower_reply = r_unwrapped.lower()
+
+        pattern_hit = self._reply_contains_action_promise(lower_reply)
+        if pattern_hit:
+            is_wh_query = self._query_is_wh(q)
+            matched_verb = self._query_has_matching_verb(q)
+            if is_wh_query or not matched_verb:
+                import random
+                clarifier = random.choice(self._CLARIFIER_TEMPLATES)
+                logger.warning(
+                    "Router guardrail: action-promise '%s' in reply without "
+                    "matching %s (query='%s', reply='%s') — emitting clarifier",
+                    pattern_hit.strip(),
+                    "WH-query context" if is_wh_query else "verb",
+                    q[:60], r_raw[:120],
+                )
+                return clarifier
+
+        if confidence < self._LOW_CONFIDENCE_THRESHOLD and len(r_raw) > 15:
+            ack = ""
+            try:
+                if self._conv_mgr is not None:
+                    ack = self._conv_mgr.smart_ack(query) or ""
+            except Exception:
+                ack = ""
+            clarifier = (
+                (ack + " " if ack else "")
+                + "I'm not fully confident I got that right — what did you mean exactly, Boss?"
+            ).strip()
+            logger.info(
+                "Router guardrail: low LLM confidence (%.2f) — asking clarification",
+                confidence,
+            )
+            return clarifier
+
+        return reply
 
     def _emit_thinking_ack(self, text: str) -> None:
         polished = personality.polish_response(text or "", source="thinking_ack")
@@ -348,7 +508,7 @@ class Router:
                     {"text": raw_text[:2000], "source": "router"},
                 )
             except Exception:
-                pass
+                logger.debug('Fast path step failed', exc_info=True)
 
         if self._conv_memory is not None:
             self._conv_memory.on_new_user_query(raw_text)
@@ -391,7 +551,7 @@ class Router:
             try:
                 self._user_memory.track_app_usage(_system_ctx.get("active_app", ""))
             except Exception:
-                pass
+                logger.debug('User memory inject failed', exc_info=True)
 
         # ── 3. Clipboard injection (implicit context) ────────────────
         clipboard_injected = False
@@ -512,7 +672,7 @@ class Router:
             if extra_router > 0.05:
                 b.record_module_call("router", extra_router, error=False)
         except Exception:
-            pass
+            logger.debug('Fast bus emit failed', exc_info=True)
 
         if self._conv_memory is not None:
             self._conv_memory.set_classified(result.intent, result.action)
@@ -583,7 +743,20 @@ class Router:
                 self._local_queries += 1
                 self._bus.emit_fast("metrics_event", counter="local_routed_queries")
                 if result.intent == "status":
-                    self._emit_response(self._status_with_usage(result.response))
+                    status_text = self._status_with_usage(
+                        result.response, query=clean_text,
+                    )
+                    # Defense-in-depth: run canned status text through the
+                    # same vetter the LLM output uses. A future edit that
+                    # adds an action phrase to status replies would still
+                    # be caught.
+                    try:
+                        status_text = self.vet_llm_response(
+                            clean_text, status_text, confidence=0.95,
+                        )
+                    except Exception:
+                        logger.debug("status vet failed", exc_info=True)
+                    self._emit_response(status_text)
                     return
                 self._emit_response(result.response)
                 return
@@ -753,6 +926,12 @@ class Router:
         Uses a dispatch table for O(1) lookup instead of long if/elif chains.
         Returns the response text, or None to use default response.
         """
+        if hasattr(self, '_security') and hasattr(self._security, 'fortress_gate'):
+            fg_ok, fg_reason = self._security.fortress_gate(action)
+            if not fg_ok:
+                logger.warning("fortress_gate denied action: %s — %s", action, fg_reason)
+                return fg_reason
+
         handler = self._ACTION_DISPATCH.get(action)
         if handler is not None:
             return handler(self, action, args)
@@ -1320,6 +1499,7 @@ class Router:
         "list_workflows": "_do_list_workflows",
         "screen_read": "_do_screen_read",
         "show_dream_summary": "_do_show_dream_summary",
+        "run_terminal_command": "_do_run_terminal_command",
         "set_goal": "_do_set_goal",
         "show_goals": "_do_show_goals",
     }
@@ -1415,6 +1595,33 @@ class Router:
                             action_args={})
         return ""
 
+    def _do_run_terminal_command(self, _action: str, args: dict) -> str:
+        import subprocess as _sp
+        cmd = args.get("command", "").strip()
+        if not cmd:
+            return "No command provided, Boss."
+        cmd_ok, cmd_reason = self._security.is_safe_command(cmd)
+        if not cmd_ok:
+            return f"Blocked for safety: {cmd_reason}"
+        try:
+            argv = shlex.split(cmd, posix=(os.name != "nt"))
+        except ValueError:
+            return "Couldn't parse that command, Boss."
+        if not argv:
+            return "No command provided, Boss."
+        try:
+            result = _sp.run(
+                argv, shell=False, capture_output=True, text=True, timeout=30,
+            )
+            output = (result.stdout or result.stderr or "").strip()[:500]
+            return output or "Command completed with no output."
+        except _sp.TimeoutExpired:
+            return "Command timed out after 30 seconds."
+        except FileNotFoundError:
+            return f"Command not found: {argv[0]}"
+        except Exception as e:
+            return f"Command failed: {str(e)[:100]}"
+
     # ── Screen analysis (with OCR) ─────────────────────────────────────
 
     async def _handle_screen_analyze(self, args: dict) -> None:
@@ -1488,7 +1695,7 @@ class Router:
                 try:
                     self._semantic_cache.put(clean_text, response, source=f"cloud:{model_role}")
                 except Exception:
-                    pass
+                    logger.debug('Cloud reason gate failed', exc_info=True)
 
             # Update metrics
             self._llm_queries += 1
@@ -1540,7 +1747,7 @@ class Router:
                         clean_text, use_cloud_summarizer=True,
                     )
                 except Exception:
-                    pass
+                    logger.debug('Cloud reason gate failed', exc_info=True)
 
             if not summary:
                 summary = search_text
@@ -1551,14 +1758,14 @@ class Router:
                     enriched = self._decision_engine.enrich(clean_text, summary)
                     summary = enriched.enriched or summary
                 except Exception:
-                    pass
+                    logger.debug('Cloud search gate failed', exc_info=True)
 
             # Cache
             if self._semantic_cache is not None:
                 try:
                     self._semantic_cache.put(clean_text, summary, source="search")
                 except Exception:
-                    pass
+                    logger.debug('Cloud search gate failed', exc_info=True)
 
             self._llm_queries += 1
             self._bus.emit_fast("metrics_event", counter="cloud_search_queries")
@@ -1849,9 +2056,15 @@ class Router:
                 _flush_batch(False)
 
         default_system = (
-            "You are ATOM, a personal AI assistant created by Satyam Yadav. "
+            "You are ATOM, a personal AI assistant (JARVIS-style) created by Satyam Yadav. "
             "You call him 'Boss'. You are friendly, witty, concise, and helpful. "
-            "Keep responses short and conversational unless asked for detail."
+            "Keep responses short and conversational unless asked for detail. "
+            "Never invent or promise actions the user did not explicitly request — "
+            "do not say things like 'I'll play the song', 'opening YouTube', or "
+            "'setting a reminder' unless Boss asked for that exact action in this turn. "
+            "If the transcribed query is unclear or nonsensical, ask ONE short clarifying "
+            "question instead of guessing. Ground every factual claim in supplied context; "
+            "if the context doesn't contain the answer, say you don't have that yet."
         )
 
         _adaptive_concise = (
@@ -1905,7 +2118,34 @@ class Router:
 
     # ── Helpers ─────────────────────────────────────────────────────
 
-    def _status_with_usage(self, base: str) -> str:
+    # Presence-check queries — short social "are you there" pings that
+    # should NEVER get a diagnostic percent readout. Matched against the
+    # lowercased query in ``_status_with_usage``.
+    _PRESENCE_CHECK_PATTERNS: tuple[str, ...] = (
+        "can you hear me", "can u hear me",
+        "are you there", "you there", "u there",
+        "are you alive", "you alive",
+        "are you awake", "you awake",
+        "are you ready", "you ready",
+        "are you listening", "you listening",
+        "hello there", "hey there", "hi there",
+        "are you up", "you up",
+        "are you online",
+    )
+
+    def _is_presence_check(self, query: str) -> bool:
+        q = (query or "").lower().strip()
+        if not q:
+            return False
+        return any(p in q for p in self._PRESENCE_CHECK_PATTERNS)
+
+    def _status_with_usage(self, base: str, *, query: str = "") -> str:
+        """Return ATOM's status reply. For casual presence checks (e.g.
+        "can you hear me", "you there?") we drop the percent readout and
+        answer like a person — anything else keeps the diagnostic tail.
+        """
+        if self._is_presence_check(query):
+            return base
         total = self._local_queries + self._llm_queries
         if total <= 0:
             return base

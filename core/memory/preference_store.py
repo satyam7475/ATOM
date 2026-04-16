@@ -313,7 +313,7 @@ class PreferenceStore:
             try:
                 self._conn.close()
             except Exception:
-                pass
+                logger.debug('core memory preference store optional step failed', exc_info=True)
             self._conn = None
 
 

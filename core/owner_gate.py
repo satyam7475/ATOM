@@ -34,7 +34,7 @@ def configure(config: dict | None = None) -> None:
         from core.identity.session_manager import configure as _sess_cfg
         _sess_cfg(config)
     except Exception:
-        pass
+        logger.debug('Owner gate check failed', exc_info=True)
     oc = _config.get("owner", {})
     ui = _config.get("ui", {})
     tok = (oc.get("dashboard_access_token") or ui.get("dashboard_access_token")

@@ -106,6 +106,14 @@ ATOM_STATE_DEFAULTS: dict[str, Any] = {
         "launch_mode": "",
         "app_bundle": "",
         "perceived_latency_ms": None,
+        "user_sentiment": "",
+        "updated_at": 0.0,
+    },
+    "macos_integration": {
+        "siri_shortcuts_available": False,
+        "native_nlp_available": False,
+        "avspeech_active": False,
+        "bundle_mode": False,
         "updated_at": 0.0,
     },
     "mode": {

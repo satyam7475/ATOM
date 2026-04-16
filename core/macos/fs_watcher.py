@@ -168,7 +168,7 @@ class FSWatcher:
             try:
                 CFRunLoopStop(self._runloop_ref)
             except Exception:
-                pass
+                logger.debug('PyObjC bridge call failed', exc_info=True)
         if self._thread is not None:
             self._thread.join(timeout=3.0)
             self._thread = None

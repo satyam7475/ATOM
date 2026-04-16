@@ -9,6 +9,9 @@ and their core logic works. Run from the ATOM root directory:
 
 import sys
 import os
+import logging
+
+logger = logging.getLogger('atom.tests.test_v22_hybrid')
 
 # Ensure ATOM root is in path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -337,7 +340,7 @@ def test_preference_crud():
             os.path.dirname(os.path.abspath(__file__)), "test_prefs.db"
         ))
     except Exception:
-        pass
+        logger.debug('File remove failed', exc_info=True)
 
     return True
 

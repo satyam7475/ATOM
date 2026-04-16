@@ -112,7 +112,7 @@ def resolve_runtime_mode(
                 logger.info("v7_mode_selected mode=SECURE reason=paranoid_hint")
                 return "SECURE", info
         except Exception:
-            pass
+            logger.debug('Runtime mode read failed', exc_info=True)
 
     logger.info("v7_mode_selected mode=%s reason=default_heuristic", default_mode)
     return default_mode, info

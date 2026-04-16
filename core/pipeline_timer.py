@@ -204,4 +204,4 @@ class PipelineTimer:
 
                 get_latency_board().record_module_call("tts", float(tts_ms), error=False)
             except Exception:
-                pass
+                logger.debug('Observability step failed', exc_info=True)

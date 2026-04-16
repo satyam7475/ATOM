@@ -46,15 +46,23 @@ class DummyController:
         self._runtime_watchdog = None
         self._bus = FakeBus()
         self._llm = llm
+        self._turn_vetter_rewrote = False
+        self._turn_emitted_sentences: list[str] = []
 
     def _extract_complete_sentence(self, text: str):
         return LocalBrainController._extract_complete_sentence(text)
+
+    def _extract_first_clause(self, text: str):
+        return LocalBrainController._extract_first_clause(text)
 
     def _sanitize_emittable_text(self, text: str):
         return LocalBrainController._sanitize_emittable_text(self, text)
 
     def _compact_text(self, text: str):
         return LocalBrainController._compact_text(text)
+
+    def _vet_stream_sentence(self, policy_query: str | None, text: str) -> str:
+        return text
 
 
 async def test_preempted_stream_skips_final_partial() -> None:

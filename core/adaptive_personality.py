@@ -51,6 +51,31 @@ _owner_engine: OwnerUnderstanding | None = None
 _modes_engine: PersonalityModes | None = None
 _identity_engine = IdentityEngine()
 
+# Short recency trackers so back-to-back greetings/statuses/thanks don't
+# pick the exact same phrase twice in a row. We track just the last
+# choice per category to keep the memory footprint trivial.
+_last_greeting: str = ""
+_last_status: str = ""
+_last_thanks: str = ""
+
+
+def _pick_without_repeat(pool: list[str], last: str) -> tuple[str, str]:
+    """Return a random choice from pool, avoiding ``last`` when possible.
+
+    Also returns the chosen string so the caller can update its recency
+    tracker. Falls back to the last value when the pool has a single
+    element.
+    """
+    if not pool:
+        return "", last
+    if len(pool) == 1:
+        return pool[0], pool[0]
+    candidates = [p for p in pool if p != last]
+    if not candidates:
+        candidates = pool
+    choice = random.choice(candidates)
+    return choice, choice
+
 
 def set_owner(name: str = "Satyam", title: str = "Boss") -> None:
     global _OWNER_NAME, _OWNER_TITLE
@@ -139,19 +164,51 @@ def _active_app() -> str:
     return str(_system_context.get("active_app", ""))
 
 
-def context_aware_prefix() -> str:
-    """Optional prefix based on system context (battery, time, workload)."""
-    parts: list[str] = []
+def context_aware_prefix(*, source: str = "general", intent_hint: str = "") -> str:
+    """Optional prefix based on system context (battery, time, workload,
+    foreground app). Kept to at most ONE short sentence — callers should
+    skip it for short acks/stream chunks where it would feel bolted on.
+
+    The prefix is selected in priority order (most-urgent first) so at most
+    one signal ever lands in the final string:
+
+        1. Critical battery while on battery
+        2. Heavy CPU load
+        3. Screen/foreground context (only for greeting-style turns)
+        4. Time-of-day (only for greeting/status turns)
+    """
     battery = _system_context.get("battery_pct", 100)
     plugged = _system_context.get("battery_plugged", True)
     if isinstance(battery, (int, float)) and battery <= 15 and not plugged:
-        parts.append(f"Battery at {int(battery)}%.")
+        return f"Battery at {int(battery)}%."
 
     cpu = _system_context.get("cpu_pct", 0)
     if isinstance(cpu, (int, float)) and cpu > 85:
-        parts.append("System is under heavy load.")
+        return "System is under heavy load."
 
-    return " ".join(parts)
+    intent_lower = (intent_hint or "").lower()
+    is_greeting_turn = any(
+        kw in intent_lower
+        for kw in ("greet", "status", "intro", "hello", "hi", "sup")
+    ) or source in {"greeting", "status", "wake"}
+    if not is_greeting_turn:
+        return ""
+
+    foreground = str(_system_context.get("active_app", "") or "").strip()
+    if foreground and foreground.lower() not in {"finder", "unknown"}:
+        return f"You're in {foreground}."
+
+    try:
+        hour = datetime.datetime.now().hour
+    except Exception:
+        return ""
+    if 5 <= hour < 12:
+        return "It's morning."
+    if 17 <= hour < 21:
+        return "It's evening."
+    if hour >= 21 or hour < 5:
+        return "It's late."
+    return ""
 
 
 # ── ADAPTIVE GREETINGS ───────────────────────────────────────────────
@@ -233,7 +290,9 @@ def greeting_response() -> str:
         else:
             pool = _default_greeting_pool(time_greeting, b, o)
 
-    return random.choice(pool)
+    global _last_greeting
+    choice, _last_greeting = _pick_without_repeat(pool, _last_greeting)
+    return choice
 
 
 def _time_greeting(hour: int) -> str:
@@ -433,9 +492,44 @@ def status_response() -> str:
         return "Online."
 
     depth = _session_depth()
+    emotion = _emotion()
+
+    global _last_status
+
+    # Deep-relationship users get a more personal check-in.
     if depth > 200:
-        return f"I'm right here, {b}. {depth} conversations in, and I'm not going anywhere."
-    return f"All systems green. I'm with you, {b}. Ready for anything."
+        deep_pool = [
+            f"I'm right here, {b}. {depth} conversations in and I'm not going anywhere.",
+            f"Still with you, {b}. {depth} chats later and counting.",
+            f"Always here, {b}. We've done this {depth} times already.",
+        ]
+        choice, _last_status = _pick_without_repeat(deep_pool, _last_status)
+        return choice
+
+    # Emotion-aware replies so presence checks feel like a real pulse.
+    if emotion in ("tired", "stressed"):
+        pool = [
+            f"Here, {b}. Take a breath — I've got you.",
+            f"Right with you, {b}. Slow down, we're fine.",
+            f"Still here, {b}. Whatever you need.",
+        ]
+    elif emotion in ("excited", "happy"):
+        pool = [
+            f"Right here, {b}. What's the move?",
+            f"Yep, with you. Ready when you are, {b}.",
+            f"Here and listening, {b}.",
+        ]
+    else:
+        pool = [
+            f"All systems green, {b}. Ready when you are.",
+            f"I'm here, {b}. Everything's running smoothly.",
+            f"Right here, {b}. All good on my end.",
+            f"Still here, {b}. Standing by.",
+            f"Online and listening, {b}.",
+            f"Right with you, {b}. Everything's nominal.",
+        ]
+    choice, _last_status = _pick_without_repeat(pool, _last_status)
+    return choice
 
 
 def exit_response() -> str:
@@ -591,8 +685,20 @@ def polish_response(text: str, *, source: str = "general") -> str:
             t = f"Done, Boss."
 
     # Inject critical system context prefix (battery dying, system overloaded).
+    # Greeting-style turns also get a short presence cue ("It's evening."
+    # or "You're in Chrome.") — but never for streaming chunks or acks.
     if source not in {"thinking_ack", "stream_chunk"}:
-        prefix = context_aware_prefix()
+        # Detect a greeting-shaped reply cheaply so we can unlock the
+        # time/foreground-app branch of context_aware_prefix without
+        # inspecting intent metadata (which isn't plumbed here).
+        lower_t = t.lower()
+        intent_hint = ""
+        if (lower_t.startswith(("hey", "hello", "hi ", "good morning",
+                                 "good afternoon", "good evening", "welcome"))
+                or lower_t.startswith("morning, ")
+                or lower_t.startswith("evening, ")):
+            intent_hint = "greet"
+        prefix = context_aware_prefix(source=source, intent_hint=intent_hint)
         if prefix:
             t = f"{prefix} {t}"
 

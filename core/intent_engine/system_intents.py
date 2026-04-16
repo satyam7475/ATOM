@@ -28,25 +28,40 @@ _BRIGHTNESS_DOWN = re.compile(
     r"\b(decrease\s+brightness|brightness\s+down|dimmer|dim\s+screen|brightness\s+kam)\b", re.I)
 
 _SHUTDOWN_PC = re.compile(
-    r"\b(shutdown\s+(pc|computer|system|laptop|windows)|"
-    r"power\s+off\s+(pc|computer|system)|turn\s+off\s+(pc|computer|system))\b", re.I)
+    r"\b(shut\s*down\s+(?:my\s+)?(?:pc|computer|system|laptop|windows|mac|macbook|this)|"
+    r"power\s+off\s+(?:my\s+)?(?:pc|computer|system|mac|macbook|laptop)|"
+    r"turn\s+off\s+(?:my\s+)?(?:pc|computer|system|mac|macbook|laptop))\b", re.I)
 
 _RESTART_PC = re.compile(
-    r"\b(restart\s+(pc|computer|system|laptop|windows)|reboot)\b", re.I)
+    r"\b(restart\s+(?:my\s+)?(?:pc|computer|system|laptop|windows|mac|macbook|this)|reboot)\b", re.I)
 
 _LOGOFF = re.compile(
     r"\b(log\s*off|sign\s*out|logout|log\s+out)\b", re.I)
 
 _SLEEP_PC = re.compile(
-    r"\b(sleep\s+(pc|computer|system|laptop)|put\s+(pc|computer|it)\s+to\s+sleep|"
+    r"\b(sleep\s+(?:my\s+)?(?:pc|computer|system|laptop|mac|macbook)|"
+    r"put\s+(?:my\s+)?(?:pc|computer|it|mac|macbook|laptop)\s+to\s+sleep|"
     r"hibernate)\b", re.I)
 
 _EMPTY_RECYCLE_BIN = re.compile(
-    r"\b(empty\s+recycle\s+bin|clear\s+recycle\s+bin|clean\s+trash|"
-    r"delete\s+recycle\s+bin|recycle\s+bin\s+(empty|clear))\b", re.I)
+    r"\b(empty\s+(?:recycle\s+bin|trash|dustbin)|clear\s+(?:recycle\s+bin|trash)|"
+    r"clean\s+trash|delete\s+recycle\s+bin|recycle\s+bin\s+(empty|clear)|"
+    r"trash\s+(?:empty|clear|clean))\b", re.I)
 
 _FLUSH_DNS = re.compile(
     r"\b(flush\s+dns|clear\s+dns|dns\s+flush|reset\s+dns)\b", re.I)
+
+_TERMINAL_CMD = re.compile(
+    r"^(?:run|execute|terminal|shell|command)\s*[:\-]?\s*(.+)",
+    re.I,
+)
+_TERMINAL_EXPLICIT = re.compile(
+    r"\b(?:run\s+(?:the\s+)?(?:command|terminal|shell)|"
+    r"execute\s+(?:the\s+)?(?:command|terminal|shell)|"
+    r"in\s+(?:the\s+)?terminal\s+(?:run|execute|type)|"
+    r"(?:terminal|shell)\s+command)\b",
+    re.I,
+)
 
 
 def check(text: str) -> IntentResult | None:
@@ -79,6 +94,15 @@ def check(text: str) -> IntentResult | None:
         return IntentResult("empty_recycle_bin", action="empty_recycle_bin", action_args={})
     if _FLUSH_DNS.search(text):
         return IntentResult("flush_dns", action="flush_dns", action_args={})
+
+    m = _TERMINAL_CMD.search(text)
+    if m:
+        cmd = m.group(1).strip()
+        return IntentResult("run_terminal_command", action="run_terminal_command",
+                            action_args={"command": cmd})
+    if _TERMINAL_EXPLICIT.search(text):
+        return IntentResult("run_terminal_command", action="run_terminal_command",
+                            action_args={"command": text})
     return None
 
 

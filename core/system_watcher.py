@@ -153,7 +153,7 @@ class SystemWatcher:
             try:
                 self._pa.terminate()
             except Exception:
-                pass
+                logger.debug('PyAudio device step failed', exc_info=True)
             self._pa = None
 
     def _get_pyaudio(self):
@@ -273,7 +273,7 @@ class SystemWatcher:
             self._last_plugged = plugged
             self._last_battery_level = level
         except Exception:
-            pass
+            logger.debug('Fast bus emit failed', exc_info=True)
 
     def _check_bluetooth(self) -> None:
         devices = self._get_audio_devices()
@@ -324,7 +324,7 @@ class SystemWatcher:
                             if not top_proc_name:
                                 top_proc_name = p.info['name']
                     except Exception:
-                        pass
+                        logger.debug('Fast bus emit failed', exc_info=True)
                 detail = ", ".join(top[:3]) if top else "multiple processes"
                 msg = f"Boss, CPU is at {cpu:.0f}% -- {detail}."
                 if top_proc_name:

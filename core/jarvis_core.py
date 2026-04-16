@@ -137,6 +137,7 @@ class JarvisCore:
         self._delivered_categories: dict[str, float] = {}
         self._last_briefing_date: str = ""
         self._last_eod_date: str = ""
+        self._last_morning_greet_date: str = ""
         self._last_idle_summary_time: float = 0.0
         self._session_start = time.time()
         self._conversation_count = 0
@@ -156,7 +157,9 @@ class JarvisCore:
         self._load_persisted()
 
         jcfg = self._config.get("jarvis_core", {})
-        self._proactive_interval = jcfg.get("proactive_interval_s", 120.0)
+        # Shortened from 120s to 45s so ATOM feels alive — the priority
+        # floor and per-category cooldown still prevent spam.
+        self._proactive_interval = jcfg.get("proactive_interval_s", 45.0)
         self._morning_briefing_enabled = jcfg.get("morning_briefing", True)
         self._eod_review_enabled = jcfg.get("eod_review", True)
         self._idle_summary_enabled = jcfg.get("idle_summary", True)
@@ -581,9 +584,92 @@ class JarvisCore:
                 ))
                 self._last_eod_date = today_str
 
+        # ── Ambient / alive-feel insights (low priority, short cooldown) ──
+        # These keep ATOM feeling present without being naggy. Each uses
+        # a distinct category so the per-category cooldown gates frequency.
+        ambient = self._generate_ambient_insights(s, now_dt, now)
+        insights.extend(ambient)
+
         # Filter: deduplicate, respect cooldowns, remove expired
         self._pending_insights = self._filter_insights(insights, now)
         return self._pending_insights
+
+    def _generate_ambient_insights(
+        self,
+        s: Any,
+        now_dt: Any,
+        now_ts: float,
+    ) -> list[ProactiveInsight]:
+        """Low-priority presence remarks — the 'alive' layer of JARVIS.
+
+        Separate from health/battery/project/goal because these are purely
+        ambient observations. Priority 7 so any concrete insight beats them;
+        category cooldown prevents repetition within ~10 min windows.
+        """
+        out: list[ProactiveInsight] = []
+        try:
+            # Morning greet (once per morning): ATOM notices Boss is back.
+            if (now_dt.hour in (8, 9, 10)
+                    and s.session_duration_min < 5
+                    and self._conversation_count <= 1
+                    and getattr(self, "_last_morning_greet_date", "") != now_dt.strftime("%Y-%m-%d")):
+                goals_count = 0
+                if self._goals is not None:
+                    try:
+                        goals_count = len(self._goals.get_active_goals() or [])
+                    except Exception:
+                        goals_count = 0
+                if goals_count:
+                    msg = (
+                        f"Morning, Boss. {goals_count} goal"
+                        f"{'s' if goals_count != 1 else ''} on deck."
+                    )
+                else:
+                    msg = "Morning, Boss. Ready when you are."
+                out.append(ProactiveInsight(
+                    category="ambient_morning",
+                    priority=7,
+                    source="time",
+                    message=msg,
+                    expires_at=now_ts + 1800,
+                ))
+                self._last_morning_greet_date = now_dt.strftime("%Y-%m-%d")
+
+            # Long single-app focus (90 min+): ATOM remarks on deep focus.
+            foreground_app = str(
+                getattr(s, "foreground_app", "") or "",
+            ).strip()
+            focus_min = float(getattr(s, "foreground_focus_min", 0.0) or 0.0)
+            if foreground_app and focus_min >= 90:
+                out.append(ProactiveInsight(
+                    category="ambient_focus",
+                    priority=7,
+                    source="foreground",
+                    message=(
+                        f"You've been in {foreground_app} for "
+                        f"{focus_min:.0f} minutes, Boss. Need a reset, "
+                        f"or are you in the zone?"
+                    ),
+                    expires_at=now_ts + 3600,
+                ))
+
+            # Gentle battery nudge at 20% (between the critical 10 and
+            # watchful 25 buckets). Catches the moment most users forget.
+            if (getattr(s, "is_on_battery", False)
+                    and 18 <= float(getattr(s, "battery_percent", 100) or 100) <= 22):
+                out.append(ProactiveInsight(
+                    category="ambient_battery",
+                    priority=7,
+                    source="system",
+                    message=(
+                        f"Battery's at {float(s.battery_percent):.0f}, Boss. "
+                        f"Plug in when ready."
+                    ),
+                    expires_at=now_ts + 1800,
+                ))
+        except Exception:
+            logger.debug("ambient insight build failed", exc_info=True)
+        return out
 
     def _filter_insights(
         self, insights: list[ProactiveInsight], now: float,

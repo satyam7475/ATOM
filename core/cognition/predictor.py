@@ -7,6 +7,10 @@ timeline / memory graph context.
 
 from __future__ import annotations
 
+import logging
+
+logger = logging.getLogger('atom.core.cognition.predictor')
+
 import re
 import time
 from datetime import datetime
@@ -112,7 +116,7 @@ def predict_next_queries(context: dict[str, Any]) -> list[str]:
         try:
             uniq = feedback_engine.reorder_predictions(uniq)
         except Exception:
-            pass
+            logger.debug('Feedback engine hook failed', exc_info=True)
     try:
         logger.info(
             "v7_prediction count=%d sample=%s",
@@ -120,5 +124,5 @@ def predict_next_queries(context: dict[str, Any]) -> list[str]:
             uniq[:3],
         )
     except Exception:
-        pass
+        logger.debug('Feedback engine hook failed', exc_info=True)
     return uniq

@@ -69,6 +69,18 @@ class IntentEngine:
         )
 
     def classify(self, text: str) -> IntentResult:
+        return self._classify(text, silent=False)
+
+    def classify_silent(self, text: str) -> IntentResult:
+        """Same as classify() but suppresses the per-call INFO log line.
+
+        Used by cold-start warmup paths that invoke the engine dozens of
+        times and would otherwise flood the log with "Intent: '…' ->
+        fallback/LLM" entries before ATOM has even said hello.
+        """
+        return self._classify(text, silent=True)
+
+    def _classify(self, text: str, *, silent: bool) -> IntentResult:
         t0 = time.perf_counter()
         text = text.strip()
         if not text:
@@ -92,8 +104,10 @@ class IntentEngine:
 
         elapsed = (time.perf_counter() - t0) * 1000
         if result:
-            logger.info("Intent: '%s' -> %s (%.1fms)", text[:60], result.intent, elapsed)
+            if not silent:
+                logger.info("Intent: '%s' -> %s (%.1fms)", text[:60], result.intent, elapsed)
             return result
 
-        logger.info("Intent: '%s' -> fallback/LLM (%.1fms)", text[:60], elapsed)
+        if not silent:
+            logger.info("Intent: '%s' -> fallback/LLM (%.1fms)", text[:60], elapsed)
         return IntentResult("fallback")

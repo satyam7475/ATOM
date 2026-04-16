@@ -63,7 +63,7 @@ def compute_preemption_improvement_score(
             conf, relevance_gain, context_gain, restart_cost, score,
         )
     except Exception:
-        pass
+        logger.debug('Preemption check failed', exc_info=True)
     return score
 
 

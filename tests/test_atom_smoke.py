@@ -31,11 +31,18 @@ def test_mlx_model_directories_exist() -> None:
         assert p.is_dir(), f"MLX model directory missing: {p}"
 
 
-def test_mlx_brain_shares_single_path_when_configured() -> None:
-    """When primary == fast path, MLXBrain should report same resolved paths."""
+def test_mlx_brain_has_distinct_tier_paths() -> None:
+    """Fast and primary tiers should point to distinct model directories.
+
+    Earlier config kept both pointing at qwen3-4b-mlx, which made the
+    cognitive-kernel's fast-path tier pointless. The settings now route
+    fast traffic at qwen3-1.7b-mlx while primary stays on the 4b model.
+    """
     from brain.mlx_llm import MLXBrain
 
     raw = (_ATOM_ROOT / "config" / "settings.json").read_text(encoding="utf-8")
     cfg = json.loads(raw)
     b = MLXBrain(cfg)
-    assert Path(b._primary_path).resolve() == Path(b._fast_path).resolve()
+    assert Path(b._primary_path).resolve() != Path(b._fast_path).resolve()
+    assert Path(b._primary_path).is_dir()
+    assert Path(b._fast_path).is_dir()

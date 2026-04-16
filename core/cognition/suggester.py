@@ -104,14 +104,14 @@ class SuggestionEngine:
                         f'You often ask about "{label}" -- want a quick recap?',
                     )
         except Exception:
-            pass
+            logger.debug('core cognition suggester optional step failed', exc_info=True)
 
         try:
             tasks = timeline.get_repeated_tasks(window_sec=48 * 3600.0)
             for t in tasks[:1]:
                 suggestions.append(f'Want me to continue with "{t[:80]}"?')
         except Exception:
-            pass
+            logger.debug('core cognition suggester optional step failed', exc_info=True)
 
         return suggestions
 
@@ -165,7 +165,7 @@ class SuggestionEngine:
                     f'You\'ve asked "{rep}" multiple times. Want me to automate it?',
                 ]
         except Exception:
-            pass
+            logger.debug('Action prediction fusion failed', exc_info=True)
         return []
 
     def _from_system_context(self) -> list[str]:

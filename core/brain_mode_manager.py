@@ -253,5 +253,5 @@ class BrainModeManager:
             if isinstance(v, str):
                 return self.canonical_profile_name(v)
         except Exception:
-            pass
+            logger.debug('Directory ensure failed', exc_info=True)
         return None

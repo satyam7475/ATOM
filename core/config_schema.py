@@ -265,6 +265,12 @@ CONFIG_SCHEMA: dict[str, Any] = {
                     "maximum": 48000,
                     "description": "Force mono tap at this sample rate for Speech (e.g. 48000); 0 = match device format (default).",
                 },
+                "passive_revert_delay_s": {
+                    "type": "number",
+                    "minimum": 1.0,
+                    "maximum": 120.0,
+                    "description": "Seconds of silence after TTS completion before the dual-channel listening mode reverts to PASSIVE (wake-word gated). Reset on every TTS reply and user utterance.",
+                },
             },
             "additionalProperties": False,
         },

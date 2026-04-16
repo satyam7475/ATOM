@@ -97,7 +97,7 @@ def get_system_state() -> dict[str, Any]:
             len(top_apps),
         )
     except Exception:
-        pass
+        logger.debug('CPU percent probe failed', exc_info=True)
     return state
 
 

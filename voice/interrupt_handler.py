@@ -85,6 +85,9 @@ class VoiceInterruptHandler:
 
         Includes predictive barge-in: if partials arrive in rapid bursts
         (3+ within 500ms), pre-pause TTS before a full word forms.
+
+        Echo suppression: skips partials that match ATOM's own recent TTS
+        output to prevent the mic-speaker feedback loop on MacBook.
         """
         from core.state_manager import AtomState
 
@@ -93,6 +96,13 @@ class VoiceInterruptHandler:
             self._partial_timestamps.clear()
             return
         if not self.partial_indicates_voice_interrupt(text):
+            return
+
+        tts = self._tts
+        if tts is not None and hasattr(tts, "is_echo") and tts.is_echo(text):
+            logger.debug(
+                "Echo suppressed in interrupt handler: '%s'", (text or "")[:80],
+            )
             return
 
         now = time.monotonic()

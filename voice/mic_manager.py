@@ -113,7 +113,7 @@ class MicManager:
                 default_info = pa.get_default_input_device_info()
                 default_idx = int(default_info.get("index", -1))
             except Exception:
-                pass
+                logger.debug('PyAudio device step failed', exc_info=True)
 
             for i in range(pa.get_device_count()):
                 try:

@@ -271,7 +271,7 @@ class EdgeTTSAsync:
                 if any(kw in dev.lower() for kw in self._BT_KEYWORDS):
                     return dev
         except Exception:
-            pass
+            logger.debug('Async task spawn failed', exc_info=True)
         return None
 
     def set_postprocess(self, enabled: bool) -> None:
@@ -636,7 +636,7 @@ class EdgeTTSAsync:
                 pygame.mixer.stop()
                 pygame.mixer.music.stop()
             except Exception:
-                pass
+                logger.debug('voice tts edge optional step failed', exc_info=True)
             await asyncio.sleep(0.05)
 
     def _cleanup_temps(self) -> None:
@@ -662,7 +662,7 @@ class EdgeTTSAsync:
         try:
             self._bus.emit_fast("metrics_event", counter="errors_total")
         except Exception:
-            pass
+            logger.debug('Temp file unlink failed', exc_info=True)
         if fallback_text:
             try:
                 self._bus.emit("text_display", text=f"[Response on screen] {fallback_text}")
@@ -842,7 +842,7 @@ class EdgeTTSAsync:
                     import pygame
                     pygame.mixer.quit()
                 except Exception:
-                    pass
+                    logger.debug('Temp file unlink failed', exc_info=True)
             logger.info("Edge-TTS shut down (ack cache cleared)")
         except asyncio.CancelledError:
             raise

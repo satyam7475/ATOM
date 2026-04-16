@@ -46,7 +46,7 @@ class SecondBrain:
     """Vector-enhanced intelligence store -- ATOM's long-term memory."""
 
     __slots__ = (
-        "_memory", "_behavior", "_config",
+        "_memory", "_behavior", "_config", "_app_config",
         "_facts", "_preferences", "_corrections",
         "_dirty", "_vector_store", "_embedding_engine",
         "_vectors_ready", "_episodic_buffer",
@@ -60,7 +60,8 @@ class SecondBrain:
     ) -> None:
         self._memory = memory
         self._behavior = behavior
-        self._config = (config or {}).get("cognitive", {})
+        self._app_config = config or {}
+        self._config = self._app_config.get("cognitive", {})
 
         self._facts: list[dict] = []
         self._preferences: dict[str, Any] = {}
@@ -77,8 +78,8 @@ class SecondBrain:
         try:
             from core.embedding_engine import get_embedding_engine
             from core.vector_store import VectorStore
-            self._embedding_engine = get_embedding_engine()
-            self._vector_store = VectorStore()
+            self._embedding_engine = get_embedding_engine(self._app_config)
+            self._vector_store = VectorStore(self._app_config)
             self._vectors_ready = True
         except Exception:
             self._vectors_ready = False
@@ -227,7 +228,7 @@ class SecondBrain:
                     metadata={"source": "preference", "key": key},
                 )
             except Exception:
-                pass
+                logger.debug("Preference vector embed failed", exc_info=True)
 
         logger.debug("Learned preference: %s = %s", key, value)
 
@@ -271,7 +272,7 @@ class SecondBrain:
                     metadata={"source": "episodic", "importance": 0.8},
                 )
             except Exception:
-                pass
+                logger.debug("Episodic vector embed failed", exc_info=True)
 
     # ── Retrieval ──────────────────────────────────────────────────────
 

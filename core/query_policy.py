@@ -7,6 +7,10 @@ around one rule set: short by default, detailed only when explicitly asked.
 
 from __future__ import annotations
 
+import logging
+
+logger = logging.getLogger('atom.core.query_policy')
+
 import re
 from enum import Enum
 
@@ -157,7 +161,7 @@ def normalize_query(text: str) -> str:
 
         q = correct_text(q)
     except Exception:
-        pass
+        logger.debug('core query policy optional step failed', exc_info=True)
     q = _WS_RE.sub(" ", q.lower())
     for pattern, replacement in _NORMALIZATION_PATTERNS:
         q = pattern.sub(replacement, q)

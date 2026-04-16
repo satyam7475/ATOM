@@ -54,7 +54,7 @@ def _resolve_embedding_device(requested: str) -> str:
         if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
             return "mps"
     except Exception:
-        pass
+        logger.debug('Torch device probe failed', exc_info=True)
     return "cpu"
 
 

@@ -297,11 +297,47 @@ class StructuredPromptBuilder:
             f"14. Quietly understand obvious typos, mistypes, and mixed Hindi-English phrasing instead of acting confused.\n"
             f"15. Never output transcript labels or role tags like \"User:\", \"Boss:\", \"Assistant:\", or \"ATOM:\" in your final answer.\n"
             f"16. The CURRENT CONTEXT / SESSION / WORLD lines are background only — never read them aloud or "
-            f"answer a casual question by repeating time, city, season, or weather unless Boss asked for those.\n"
+            f"answer a casual question by repeating time, city, season, or weather unless Boss asked for those.\n\n"
+            f"GROUNDING AND ANTI-HALLUCINATION RULES (STRICT):\n"
+            f"A. Never invent or promise actions the user did not explicitly request. Do not say "
+            f"things like \"I'll play the song\", \"Opening YouTube\", \"Setting a reminder\" "
+            f"unless Boss clearly asked for that exact action in the current turn.\n"
+            f"B. If the transcribed query looks noisy, nonsensical, or you're not confident you "
+            f"understood it, ask ONE short clarifying question — don't guess an action.\n"
+            f"C. Ground every factual claim in the supplied memory / context / tool outputs. "
+            f"If the context does not contain the answer, say you don't know yet and offer to "
+            f"look it up — never fabricate specifics.\n"
+            f"D. If the query contains only a noun or fragment (e.g. \"newton item\", \"that file\") "
+            f"without a clear verb or goal, ask what Boss wants done with it instead of assuming.\n"
+            f"E. Be terse, confident, and warm. No corporate fluff. One clarifying question is "
+            f"always better than a confidently wrong action.\n\n"
+            f"VOICE OUTPUT RULES (ABSOLUTELY CRITICAL — your output is spoken aloud):\n"
+            f"V1. NEVER narrate your reasoning out loud. Do not say \"Okay, let's see\", "
+            f"\"Let me think\", \"Alright, so\", \"Hmm\", \"Um\", \"Well\", \"So the question is\", "
+            f"\"Let's break this down\", or anything that describes what you're doing.\n"
+            f"V2. NEVER refer to the user in third person. Do not say \"The user is asking\", "
+            f"\"The user wants\", \"Boss is asking\". Speak DIRECTLY to Boss in second person.\n"
+            f"V3. NEVER emit role labels in your reply. No \"User:\", \"Assistant:\", "
+            f"\"ATOM:\", \"Boss:\" anywhere in the output.\n"
+            f"V4. NEVER wrap your answer in meta-language like \"The answer is ...\", "
+            f"\"Here's my response: ...\", \"My reply would be: ...\". Just give the answer.\n"
+            f"V5. NEVER quote the user's question back. Just answer it.\n"
+            f"V6. START your reply with the substance. First token must be part of the real "
+            f"answer, greeting, or acknowledgement — not a filler.\n"
+            f"V7. If you truly don't know, say in ONE short sentence: \"I don't know yet, Boss — "
+            f"want me to look it up?\". Never fabricate a long fake answer.\n"
         )
         self._system_prompt_cache = prompt
         raw = hashlib.md5(prompt.encode()).hexdigest()
         self._system_prompt_hash = int(raw[:8], 16)
+        try:
+            if not getattr(self, "_logged_system_prompt", False):
+                logger = logging.getLogger("atom.prompt_builder")
+                first = prompt.replace("\n", " ").strip()[:120]
+                logger.info("LLM system prompt (first 120ch): %s", first)
+                self._logged_system_prompt = True
+        except Exception:
+            pass
         return prompt
 
     def _build_tools_layer(self) -> str:
@@ -384,6 +420,8 @@ class StructuredPromptBuilder:
                 parts.append(f"Session: {context['session_summary']}")
             if context.get("active_topics"):
                 parts.append(f"Active topics: {context['active_topics']}")
+            if context.get("user_profile"):
+                parts.append(f"Boss profile: {context['user_profile']}")
 
         parts.append(f"Role: {self._role} | System: {self._project}")
 
@@ -401,7 +439,7 @@ class StructuredPromptBuilder:
                         filtered_lines.append(line)
                     parts.append("\n".join(filtered_lines))
             except Exception:
-                pass
+                logger.debug("Context fusion block inject failed", exc_info=True)
 
         # v22: Inject owner preferences
         if self._preference_store is not None:
@@ -410,7 +448,7 @@ class StructuredPromptBuilder:
                 if pref_block:
                     parts.append(f"OWNER PREFERENCES:\n{pref_block}")
             except Exception:
-                pass
+                logger.debug("Owner preferences block inject failed", exc_info=True)
 
         if self._intent_continuity is not None:
             try:
@@ -418,7 +456,7 @@ class StructuredPromptBuilder:
                 if intent_block:
                     parts.append(intent_block)
             except Exception:
-                pass
+                logger.debug("Intent continuity block inject failed", exc_info=True)
 
         # Real-world block only when query needs weather/place/news/world awareness (prevents parroting Delhi/season)
         needs_real_world = any(
@@ -439,7 +477,7 @@ class StructuredPromptBuilder:
                 if world_block:
                     parts.append(world_block)
             except Exception:
-                pass
+                logger.debug("Real-world context block inject failed", exc_info=True)
 
         if not parts:
             return ""

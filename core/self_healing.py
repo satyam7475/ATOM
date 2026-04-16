@@ -244,7 +244,7 @@ class ExceptionTracker:
                 for entry in data[-_MAX_FAILURES:]:
                     self._failures.append(FailureRecord(**entry))
             except Exception:
-                pass
+                logger.debug('Self-healing failure log load failed', exc_info=True)
 
     def _persist(self) -> None:
         try:

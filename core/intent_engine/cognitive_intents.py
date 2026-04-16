@@ -47,17 +47,17 @@ _GOAL_COMPLETE_STEP = re.compile(
 )
 
 _GOAL_PAUSE = re.compile(
-    r"\b(?:pause|hold|freeze)\s+(?:goal\s+)?(.+)",
+    r"\b(?:pause|hold|freeze)\s+goal\s+(.+)",
     re.IGNORECASE,
 )
 
 _GOAL_RESUME = re.compile(
-    r"\b(?:resume|continue|unpause)\s+(?:goal\s+)?(.+)",
+    r"\b(?:resume|continue|unpause)\s+goal\s+(.+)",
     re.IGNORECASE,
 )
 
 _GOAL_ABANDON = re.compile(
-    r"\b(?:abandon|cancel|drop|give\s+up\s+on)\s+(?:goal\s+)?(.+)",
+    r"\b(?:abandon|cancel|drop|give\s+up\s+on)\s+goal\s+(.+)",
     re.IGNORECASE,
 )
 
@@ -229,7 +229,7 @@ def check(text: str) -> IntentResult | None:
         )
 
     if _PRODUCTIVITY.search(text):
-        return IntentResult("behavior_report", action="cognitive_behavior_report")
+        return IntentResult("cognitive_behavior_report", action="cognitive_behavior_report")
 
     if _SCHEDULING.search(text):
         return IntentResult("scheduling_advice", action="scheduling_advice")

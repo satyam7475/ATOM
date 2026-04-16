@@ -90,7 +90,7 @@ class PersistentEmbeddingCache:
                 if row:
                     return json.loads(row[0])
             except Exception:
-                pass
+                logger.debug('Hash digest step failed', exc_info=True)
         return None
 
     def put(self, query: str, vec: list[float]) -> None:

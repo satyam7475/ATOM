@@ -61,7 +61,10 @@ class SemanticCache:
         cfg = (config or {}).get("semantic_cache", {})
         self._max_size = int(cfg.get("max_size", 256))
         self._ttl = float(cfg.get("ttl_seconds", 600))
-        self._similarity_threshold = float(cfg.get("threshold", 0.85))
+        # Tightened from 0.85 — false positives at 0.85 caused ATOM to
+        # answer paraphrased but distinct questions with a cached reply for
+        # an unrelated query (e.g. "play the song" for "what is newton").
+        self._similarity_threshold = float(cfg.get("threshold", 0.92))
         self._enabled = bool(cfg.get("enabled", True))
 
         self._cache: OrderedDict[str, _CacheEntry] = OrderedDict()
@@ -189,7 +192,7 @@ class SemanticCache:
             try:
                 embedding = self._embedding_engine.embed_sync(query)
             except Exception:
-                pass
+                logger.debug('Embedding sync call failed', exc_info=True)
 
         with self._lock:
             entry = _CacheEntry(

@@ -144,7 +144,7 @@ class SiliconGovernor:
                     m.set_gauge("memory_pct", stats.memory_pct)
                     m.set_gauge("cpu_pct", stats.cpu_pct)
                 except Exception:
-                    pass
+                    logger.debug('Async task spawn failed', exc_info=True)
 
                 if self._bus is not None:
                     self._bus.emit_fast("silicon_stats_update", stats=payload)

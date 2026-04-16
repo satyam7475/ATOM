@@ -12,6 +12,10 @@ Each input is expected in [0, 1]; result is capped to [0, 10].
 
 from __future__ import annotations
 
+import logging
+
+logger = logging.getLogger('atom.core.system_health_score')
+
 import json
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -95,7 +99,7 @@ def estimate_from_runtime_json(path: Path) -> Dict[str, Any]:
             if isinstance(lat_agg, dict) and lat_agg.get("mean") is not None:
                 mean_latency_ms = float(lat_agg["mean"])
     except Exception:
-        pass
+        logger.debug('JSON state load failed', exc_info=True)
 
     prof = get_latency_snapshot()
     if prof:

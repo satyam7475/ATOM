@@ -58,6 +58,7 @@ BLOCKED_EXACT: frozenset[str] = frozenset({
 })
 
 SAFE_EXECUTABLES: frozenset[str] = frozenset({
+    # Windows
     "chrome", "msedge", "edge", "firefox", "brave",
     "notepad", "notepad++", "calc", "calculator",
     "explorer", "cmd", "powershell", "terminal",
@@ -70,9 +71,20 @@ SAFE_EXECUTABLES: frozenset[str] = frozenset({
     "taskmgr", "perfmon", "resmon",
     "mstsc", "control",
     "intellij", "pycharm", "webstorm",
+    # macOS (app names used as keys in APP_MAP)
+    "open", "safari", "finder", "mail", "email",
+    "notes", "messages", "facetime", "calendar", "reminders",
+    "photos", "music", "preview", "maps", "browser",
+    "google chrome", "activity monitor", "system preferences",
+    "system settings", "xcode",
+    "pages", "numbers", "keynote",
+    "file explorer", "files", "downloads", "documents", "desktop",
+    "command prompt", "task manager", "vs code", "visual studio code",
+    "microsoft edge", "microsoft teams",
 })
 
 SAFE_CLOSE_PROCESSES: frozenset[str] = frozenset({
+    # Windows
     "chrome.exe", "msedge.exe", "firefox.exe", "brave.exe",
     "notepad.exe", "notepad++.exe", "CalculatorApp.exe",
     "OUTLOOK.EXE", "ms-teams.exe",
@@ -80,6 +92,14 @@ SAFE_CLOSE_PROCESSES: frozenset[str] = frozenset({
     "Spotify.exe", "slack.exe", "Discord.exe", "Zoom.exe",
     "Postman.exe", "Code.exe", "Cursor.exe",
     "Docker Desktop.exe", "WhatsApp.exe", "Telegram.exe",
+    # macOS (app names for osascript quit)
+    "Google Chrome", "Safari", "Firefox", "Brave Browser",
+    "Microsoft Edge", "TextEdit", "Notes", "Calculator",
+    "Finder", "Mail", "Microsoft Outlook", "Microsoft Teams",
+    "Microsoft Word", "Microsoft Excel", "Microsoft PowerPoint",
+    "Spotify", "Slack", "Discord", "zoom.us",
+    "Postman", "Visual Studio Code", "Cursor",
+    "Docker", "WhatsApp", "Telegram",
 })
 
 SAFE_HOTKEYS: dict[str, str] = {
@@ -560,7 +580,7 @@ class SecurityPolicy:
             sensitive = {
                 "shutdown_pc", "restart_pc", "logoff", "sleep_pc",
                 "kill_process", "create_folder", "move_path", "copy_path",
-                "empty_recycle_bin", "flush_dns",
+                "empty_recycle_bin", "flush_dns", "run_terminal_command",
             }
             if action in sensitive:
                 self.audit_log(action, "Blocked: not authenticated", success=False)

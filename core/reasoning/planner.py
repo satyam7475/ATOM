@@ -130,7 +130,7 @@ class ReasoningPlanner:
             try:
                 parts.append(self._timeline.summary_for_prompt(window_sec=900.0, max_lines=4))
             except Exception:
-                pass
+                logger.debug('Planner timeline hint failed', exc_info=True)
         if self._system_monitor is not None:
             try:
                 st = self._system_monitor.get_system_state()
@@ -139,7 +139,7 @@ class ReasoningPlanner:
                 fg = (st.get("foreground_window_title") or "")[:60]
                 parts.append(f"System: CPU {cpu}% RAM {ram}% foreground: {fg}")
             except Exception:
-                pass
+                logger.debug('Planner timeline hint failed', exc_info=True)
         return "\n".join(p for p in parts if p)
 
     def needs_planning(self, query: str) -> bool:

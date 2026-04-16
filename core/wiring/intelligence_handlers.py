@@ -125,8 +125,26 @@ def wire_voice_auth(
     bus: AsyncEventBus,
     security_fortress: SecurityFortress,
     context_engine: Any,
+    stt: Any = None,
 ) -> None:
     """Wire voice auth and behavioral auth event handlers."""
+
+    _enrolling = {"active": False, "samples": 0, "needed": 5}
+
+    def _get_audio_from_stt():
+        """Extract recent audio samples from STT's prebuffer."""
+        if stt is None:
+            return None
+        try:
+            import numpy as np
+            prebuffer = getattr(stt, "_audio_prebuffer", None)
+            if prebuffer and len(prebuffer) > 0:
+                chunks = list(prebuffer)
+                audio = np.concatenate(chunks)
+                return audio
+        except Exception:
+            logger.debug("Failed to extract audio from STT prebuffer", exc_info=True)
+        return None
 
     async def _on_voice_enroll(intent: str = "", **kw) -> None:
         if intent == "voice_enroll":
@@ -135,12 +153,44 @@ def wire_voice_auth(
                               text="Voice authentication isn't available, Boss. "
                                    "Install resemblyzer or numpy to enable it.")
                 return
+            _enrolling["active"] = True
+            _enrolling["samples"] = 0
             bus.emit_long("response_ready",
                           text="Starting voice enrollment. Say a few natural sentences "
-                               "and I'll learn your voice, Boss. I need at least 3 samples.")
+                               "and I'll learn your voice, Boss. I need at least 5 samples.")
             security_fortress.log_security_event(
                 "voice_enroll_started", severity="INFO",
             )
+
+    async def _on_speech_for_enrollment(text: str = "", **kw) -> None:
+        """Capture speech audio for voice enrollment when active."""
+        if not _enrolling["active"]:
+            return
+        audio = _get_audio_from_stt()
+        if audio is None:
+            bus.emit_long("response_ready",
+                          text="Couldn't capture audio for enrollment, Boss. Try again.")
+            return
+        try:
+            result = security_fortress.voice_auth.enroll(audio)
+            _enrolling["samples"] += 1
+            if _enrolling["samples"] >= _enrolling["needed"]:
+                _enrolling["active"] = False
+                bus.emit_long("response_ready",
+                              text=f"Voice enrollment complete with {_enrolling['samples']} "
+                                   f"samples, Boss. {result.message}")
+                security_fortress.log_security_event(
+                    "voice_enroll_complete", severity="INFO",
+                )
+            else:
+                remaining = _enrolling["needed"] - _enrolling["samples"]
+                bus.emit_long("response_ready",
+                              text=f"Got sample {_enrolling['samples']}. "
+                                   f"{remaining} more needed. Keep talking, Boss.")
+        except Exception:
+            logger.debug("Voice enrollment sample failed", exc_info=True)
+            bus.emit_long("response_ready",
+                          text="That sample didn't work. Try speaking more clearly, Boss.")
 
     async def _on_voice_verify(intent: str = "", **kw) -> None:
         if intent == "voice_verify":
@@ -149,10 +199,15 @@ def wire_voice_auth(
                               text="Voice not enrolled yet, Boss. "
                                    "Say 'enroll my voice' to set up voice authentication.")
                 return
-            bus.emit_long("response_ready",
-                          text="Voice verification available. Your last speech will be "
-                               "compared against your voice print. "
-                               + security_fortress.voice_auth.get_status_message())
+            audio = _get_audio_from_stt()
+            if audio is not None:
+                result = security_fortress.voice_auth.verify(audio)
+                bus.emit_long("response_ready", text=result.message)
+            else:
+                bus.emit_long("response_ready",
+                              text="Voice verification available. Your last speech will be "
+                                   "compared against your voice print. "
+                                   + security_fortress.voice_auth.get_status_message())
 
     async def _on_voice_auth_status(intent: str = "", **kw) -> None:
         if intent == "voice_auth_status":
@@ -188,6 +243,7 @@ def wire_voice_auth(
 
     bus.on("intent_classified", _on_voice_enroll)
     bus.on("intent_classified", _on_voice_verify)
+    bus.on("speech_final", _on_speech_for_enrollment)
     bus.on("intent_classified", _on_voice_auth_status)
     bus.on("intent_classified", _on_voice_reset)
     bus.on("intent_classified", _on_behavior_auth_status)

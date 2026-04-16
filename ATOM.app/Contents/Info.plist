@@ -2,56 +2,40 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-	<key>CFBundleAllowMixedLocalizations</key>
-	<true/>
-	<key>CFBundleDevelopmentRegion</key>
-	<string>en</string>
-	<key>CFBundleIdentifier</key>
-	<string>com.satyamyadav.atom</string>
-	<key>CFBundleExecutable</key>
-	<string>atom_python</string>
-	<key>CFBundleIconFile</key>
-	<string>applet</string>
-	<key>CFBundleIconName</key>
-	<string>applet</string>
-	<key>CFBundleInfoDictionaryVersion</key>
-	<string>6.0</string>
 	<key>CFBundleName</key>
 	<string>ATOM</string>
+	<key>CFBundleDisplayName</key>
+	<string>ATOM - Personal AI OS</string>
+	<key>CFBundleIdentifier</key>
+	<string>com.satyam.atom</string>
+	<key>CFBundleVersion</key>
+	<string>19.0</string>
+	<key>CFBundleShortVersionString</key>
+	<string>19.0</string>
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
-	<key>CFBundleSignature</key>
-	<string>????</string>
-	<key>LSMinimumSystemVersionByArchitecture</key>
-	<dict>
-		<key>x86_64</key>
-		<string>10.6</string>
-	</dict>
-	<key>NSAppleEventsUsageDescription</key>
-	<string>This script needs to control other applications to run.</string>
-	<key>NSAppleMusicUsageDescription</key>
-	<string>This script needs access to your music to run.</string>
-	<key>NSCalendarsUsageDescription</key>
-	<string>This script needs access to your calendars to run.</string>
-	<key>NSCameraUsageDescription</key>
-	<string>This script needs access to your camera to run.</string>
-	<key>NSContactsUsageDescription</key>
-	<string>This script needs access to your contacts to run.</string>
-	<key>NSHomeKitUsageDescription</key>
-	<string>This script needs access to your HomeKit Home to run.</string>
-	<key>NSMicrophoneUsageDescription</key>
-	<string>This script needs access to your microphone to run.</string>
-	<key>NSPhotoLibraryUsageDescription</key>
-	<string>This script needs access to your photos to run.</string>
-	<key>NSRemindersUsageDescription</key>
-	<string>This script needs access to your reminders to run.</string>
-	<key>NSSiriUsageDescription</key>
-	<string>This script needs access to Siri to run.</string>
+	<key>CFBundleExecutable</key>
+	<string>atom_launcher</string>
+	<key>CFBundleIconFile</key>
+	<string>atom</string>
+	<key>LSMinimumSystemVersion</key>
+	<string>13.0</string>
+	<key>LSUIElement</key>
+	<true/>
+	<key>NSHighResolutionCapable</key>
+	<true/>
+
+	<!-- TCC usage descriptions — required for SFSpeechRecognizer + Mic -->
 	<key>NSSpeechRecognitionUsageDescription</key>
-	<string>ATOM needs Speech Recognition</string>
-	<key>NSSystemAdministrationUsageDescription</key>
-	<string>This script needs access to administer this system to run.</string>
-	<key>OSAAppletShowStartupScreen</key>
-	<false/>
+	<string>ATOM uses on-device speech recognition to understand your voice commands. All processing happens locally on the Neural Engine — nothing is sent to any server.</string>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>ATOM needs microphone access to listen for your voice commands and wake word. Audio is processed entirely on-device.</string>
+
+	<!-- Accessibility for desktop control -->
+	<key>NSAppleEventsUsageDescription</key>
+	<string>ATOM uses AppleScript to control applications and automate tasks on your behalf.</string>
+
+	<key>NSSupportsAutomaticGraphicsSwitching</key>
+	<true/>
 </dict>
 </plist>

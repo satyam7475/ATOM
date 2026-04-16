@@ -25,7 +25,12 @@ _SNAPSHOT_PATH = Path("logs/cold_start_snapshot.json")
 _SNAPSHOT_KEY = "cold_start_snapshot"
 _DEFAULT_TOP_COMMANDS = 24
 _DEFAULT_SESSION_TURNS = 8
-_MAX_RESTORED_CONTEXT_AGE_S = 6 * 3600
+# Keep restored context useful across a long weekend / multi-day break.
+# A 6h window meant Monday mornings always booted blind even though the
+# user's last Friday session was still the freshest signal we had.
+# 72h is long enough to cover a typical time-off gap while still expiring
+# stale snapshots after a real break from the machine.
+_MAX_RESTORED_CONTEXT_AGE_S = 72 * 3600
 _INFO_INTENTS = frozenset({
     "time", "date", "cpu", "ram", "battery", "disk",
     "system_info", "ip", "wifi", "uptime", "top_processes",
@@ -247,7 +252,11 @@ class ColdStartOptimizer:
                 continue
             seen.add(norm)
             try:
-                result = self._intent.classify(text)
+                silent = getattr(self._intent, "classify_silent", None)
+                if callable(silent):
+                    result = silent(text)
+                else:
+                    result = self._intent.classify(text)
             except Exception:
                 logger.debug("Cold start classify failed for '%s'", text[:80], exc_info=True)
                 continue

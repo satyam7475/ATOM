@@ -110,7 +110,7 @@ class SystemScanner:
                 )
                 logger.debug("Loaded cached system scan")
         except Exception:
-            pass
+            logger.debug('JSON state load failed', exc_info=True)
 
     # ── Deep System Scan ──────────────────────────────────────────
 
@@ -243,6 +243,11 @@ class SystemScanner:
         except Exception:
             report["installed_apps_count"] = 0
             report["notable_apps"] = []
+            logger.info(
+                "System scanner: installed-apps enumeration failed — "
+                "reporting 0 apps (platform_adapter.list_installed_apps)",
+                exc_info=True,
+            )
 
         # 10. Services
         try:
@@ -250,6 +255,11 @@ class SystemScanner:
             report["running_services_count"] = len(services)
         except Exception:
             report["running_services_count"] = 0
+            logger.info(
+                "System scanner: services enumeration failed — "
+                "reporting 0 services (platform_adapter.list_services)",
+                exc_info=True,
+            )
 
         self._last_scan = report
         self._scan_count += 1
@@ -343,7 +353,7 @@ class SystemScanner:
                         listening_ports.append(c.laddr.port)
             conn_info["listening_ports"] = sorted(set(listening_ports))[:20]
         except Exception:
-            pass
+            logger.debug('core system scanner optional step failed', exc_info=True)
         return conn_info
 
     def _scan_environment(self) -> EnvironmentProfile:
@@ -377,7 +387,7 @@ class SystemScanner:
                     if lang not in env.detected_languages:
                         env.detected_languages.append(lang)
                 except Exception:
-                    pass
+                    logger.debug('Subprocess run failed', exc_info=True)
 
         env.git_installed = bool(shutil.which("git"))
         env.docker_installed = bool(shutil.which("docker"))
@@ -755,7 +765,7 @@ class SystemScanner:
                     if info.get("maxOutputChannels", 0) > 0:
                         output_count += 1
                 except Exception:
-                    pass
+                    logger.debug('PyAudio device step failed', exc_info=True)
             pa.terminate()
             if input_count > 0:
                 result["status"] = "pass"
@@ -963,7 +973,7 @@ class SystemScanner:
                     result["gpu"] = chip or "Apple Silicon"
                     return result
             except Exception:
-                pass
+                logger.debug('core system scanner optional step failed', exc_info=True)
         try:
             import torch
             if torch.cuda.is_available():

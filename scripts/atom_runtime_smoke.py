@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import logging
+
+logger = logging.getLogger('atom.scripts.atom_runtime_smoke')
+
 import argparse
 import asyncio
 import json
@@ -79,7 +83,7 @@ async def _monitor_process(samples: list[dict[str, float]], stop_event: asyncio.
                 },
             )
         except Exception:
-            pass
+            logger.debug('JSON state load failed', exc_info=True)
         await asyncio.sleep(0.25)
 
 

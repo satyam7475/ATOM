@@ -188,7 +188,7 @@ class PersistenceManager:
                     backup_path.write_bytes(path.read_bytes())
                     self._backup_done.add(key)
                 except Exception:
-                    pass  # Best-effort backup
+                    logger.debug('Directory ensure failed', exc_info=True)
 
             # Write to temp file in same directory (same filesystem for rename)
             fd, tmp_path = tempfile.mkstemp(

@@ -27,7 +27,21 @@ _apps_cache_ts: float = 0.0
 _policy = SecurityPolicy()
 
 
-def open_app(exe: str, args: list[str] | None = None) -> None:
+_IS_MACOS = sys.platform == "darwin"
+
+
+def open_app(exe: str, args: list[str] | None = None, *, name: str = "") -> None:
+    if _IS_MACOS and exe == "open":
+        app_name = ""
+        a = args or []
+        if len(a) >= 2 and a[0] == "-a":
+            app_name = a[1]
+        _policy.audit_log("open_app", f"macOS open -a '{app_name or name}'")
+        subprocess.Popen(["open"] + a,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        logger.info("Opened app (macOS): %s", app_name or name)
+        return
+
     if not _policy.is_safe_executable(exe):
         _policy.audit_log("open_app", f"BLOCKED executable '{exe}'", success=False)
         raise PermissionError(f"Executable '{exe}' is not in the safe allowlist.")
@@ -37,13 +51,20 @@ def open_app(exe: str, args: list[str] | None = None) -> None:
     logger.info("Opened app: %s", exe)
 
 
-def close_app(process_name: str) -> None:
+def close_app(process_name: str, *, name: str = "") -> None:
     if not _policy.is_safe_close_target(process_name):
         _policy.audit_log("close_app", f"BLOCKED process '{process_name}'", success=False)
         raise PermissionError(f"Process '{process_name}' is not in the safe close list.")
     _policy.audit_log("close_app", f"process={process_name}")
-    subprocess.Popen(["taskkill", "/IM", process_name, "/F"],
-                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    if _IS_MACOS:
+        subprocess.Popen(
+            ["osascript", "-e", f'quit app "{process_name}"'],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+    else:
+        subprocess.Popen(["taskkill", "/IM", process_name, "/F"],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     logger.info("Closed app: %s", process_name)
 
 
