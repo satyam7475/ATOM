@@ -33,7 +33,8 @@ _GREETING = re.compile(
     r"^(hi|hello|hey|namaste|howdy|"
     r"good\s+morning|good\s+evening|good\s+afternoon|good\s+night|"
     r"what's\s+up|sup|yo|hola)"
-    r"(\s+(atom|buddy|bro|boss|sir|madam|ma'am|dear|dude|friend|mate|jee))*[\s!.]*$", re.I)
+    r"(\s+(atom|adam|buddy|bro|boss|sir|madam|ma'am|dear|dude|friend|mate|jee))*"
+    r"(\s+(how\s+are\s+you|kaise\s+ho|kya\s+haal|what's\s+up))?[\s!?.]*$", re.I)
 
 _THANKS = re.compile(
     r"^(thanks?|thank\s*you|thx|ty|shukriya|dhanyavaad|nice|good\s+job|well\s+done|great)"
@@ -42,7 +43,7 @@ _THANKS = re.compile(
 _STATUS = re.compile(
     r"(are\s+you\s+(there|alive|ready|listening|awake)|"
     r"you\s+there|atom\s+status|status\s+check|"
-    r"can\s+you\s+hear\s+me|hello.*(there|atom))", re.I)
+    r"can\s+you\s+hear\s+me|^hello\s+there[\s!?.]*$)", re.I)
 
 _USAGE = re.compile(
     r"(how\s+much\s+(llm|brain)|local\s+brain\s+usage|llm\s+usage|"

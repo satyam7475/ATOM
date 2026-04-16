@@ -2280,7 +2280,7 @@ async def main() -> None:
                 switched = await _sync_effective_mode(
                     target,
                     reason=reason,
-                    speak=True,
+                    speak=False,
                 )
                 if switched:
                     _last_switch_time = now

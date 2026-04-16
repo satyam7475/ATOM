@@ -948,8 +948,12 @@ class NativeSTT:
         Called from the audio callback so it runs at capture rate (~60-100 Hz).
         SFSpeechRecognizer in streaming mode often never sets isFinal=True,
         so this is the primary mechanism to emit speech_final events.
+        Only finalizes in LISTENING state to avoid processing ATOM's own TTS output.
         """
         if not self._partial_stable_since:
+            return
+        from core.state_manager import AtomState
+        if self._state.current is not AtomState.LISTENING:
             return
         text = self._last_partial
         if not text or not text.strip():
@@ -1583,9 +1587,10 @@ class NativeSTT:
 
             if old is AtomState.SPEAKING and new is AtomState.LISTENING:
                 self._need_post_tts_cooldown = True
-                if self._listening:
-                    self._restart_recognition_chain()
-                    self._audio_prebuffer.clear()
+                self._last_partial = ""
+                self._partial_stable_since = 0.0
+                self._last_speech_time = time.monotonic()
+                self._audio_prebuffer.clear()
 
             if new is AtomState.SLEEP:
                 self.stop()
