@@ -133,7 +133,11 @@ class EmbeddingEngine:
                     self._model_name,
                     device=self._device,
                 )
-                self._dimension = self._model.get_sentence_embedding_dimension()
+                self._dimension = (
+                    self._model.get_embedding_dimension()
+                    if hasattr(self._model, "get_embedding_dimension")
+                    else self._model.get_sentence_embedding_dimension()
+                )
                 self._zero_vec = None
                 elapsed = (time.monotonic() - t0) * 1000
                 self._loaded = True

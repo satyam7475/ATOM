@@ -591,7 +591,7 @@ class VoicePresenceTracker:
         self._bus.on("speech_partial", self._on_speech)
         self._bus.on("speech_final", self._on_speech)
 
-    def _on_speech(self, *_a: Any, **_kw: Any) -> None:
+    async def _on_speech(self, *_a: Any, **_kw: Any) -> None:
         now = time.monotonic()
         self._event_times.append(now)
         self._last_event = now

@@ -2391,7 +2391,8 @@ async def main() -> None:
     from core.background.proactive_agent import ProactiveDaemon
     from core.cognition.state_graph import SystemStateGraph
     try:
-        convergence_daemon = ProactiveDaemon(state_graph=SystemStateGraph(), tts_engine=tts)
+        convergence_daemon = ProactiveDaemon()
+        convergence_daemon.wire(state_graph=SystemStateGraph(), tts=tts)
         convergence_daemon.start()
         logger.info("V22 Convergence Daemon started.")
     except Exception as e:

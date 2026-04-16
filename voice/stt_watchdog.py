@@ -59,12 +59,12 @@ class STTWatchdog:
     def attach_stt(self, stt: Any) -> None:
         self._stt_ref = stt
 
-    def on_speech_partial(self, text: str = "", **_kw: Any) -> None:
+    async def on_speech_partial(self, text: str = "", **_kw: Any) -> None:
         """Called from bus on every STT partial -- updates liveness."""
         self._last_partial_time = time.monotonic()
         self._consecutive_chain_restarts = 0
 
-    def on_speech_final(self, text: str = "", **_kw: Any) -> None:
+    async def on_speech_final(self, text: str = "", **_kw: Any) -> None:
         """Called from bus on every STT final -- updates liveness."""
         self._last_final_time = time.monotonic()
         self._last_partial_time = time.monotonic()
