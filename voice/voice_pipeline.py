@@ -442,6 +442,7 @@ class VoicePipeline:
 
         if self._wake_word is not None and self._wake_word.is_available:
             self._wake_word.start(loop)
+            self._wire_wake_word_gate()
 
         if self._listening_mode is None:
             self.build_listening_mode()
@@ -479,6 +480,26 @@ class VoicePipeline:
             self.tts_runtime_label,
             "enabled" if (self._wake_word and self._wake_word.is_available) else "disabled",
         )
+
+    def _wire_wake_word_gate(self) -> None:
+        """Pause wake word audio capture while STT has a mic stream open.
+
+        Both use sounddevice; running two streams to the same device
+        simultaneously causes PortAudio conflicts / segfaults on macOS.
+        STT already does wake-phrase detection on partials via WakeWordFilter,
+        so the neural wake word engine only needs to run when STT is idle.
+        """
+        from core.state_manager import AtomState
+
+        ww = self._wake_word
+
+        async def _gate_wake_word(old=None, new=None, **_kw) -> None:
+            if new in (AtomState.LISTENING, AtomState.THINKING, AtomState.SPEAKING):
+                ww.pause()
+            elif new in (AtomState.IDLE, AtomState.SLEEP):
+                ww.resume()
+
+        self._bus.on("state_changed", _gate_wake_word)
 
     def shutdown(self) -> None:
         """Cleanly shut down all voice components."""

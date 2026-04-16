@@ -61,6 +61,8 @@ class WakeWordEngine:
         self._last_detection: float = 0.0
         self._available = False
         self._detection_count = 0
+        self._capture_gate = threading.Event()
+        self._capture_gate.set()
 
     @property
     def is_available(self) -> bool:
@@ -118,15 +120,32 @@ class WakeWordEngine:
         self._thread.start()
         logger.info("Wake word detection started (sensitivity=%.2f)", self._sensitivity)
 
+    def pause(self) -> None:
+        """Pause audio capture (e.g. while STT has its own mic stream)."""
+        if self._capture_gate.is_set():
+            self._capture_gate.clear()
+            logger.debug("Wake word capture paused (STT active)")
+
+    def resume(self) -> None:
+        """Resume audio capture after STT releases the mic."""
+        if not self._capture_gate.is_set():
+            self._capture_gate.set()
+            logger.debug("Wake word capture resumed")
+
     def stop(self) -> None:
         self._running = False
+        self._capture_gate.set()
         if self._thread is not None:
             self._thread.join(timeout=3.0)
             self._thread = None
         logger.info("Wake word detection stopped (%d detections total)", self._detection_count)
 
     def _detection_loop(self) -> None:
-        """Main detection loop -- runs in a dedicated thread."""
+        """Main detection loop -- runs in a dedicated thread.
+
+        Pauses automatically when STT has its own mic stream open
+        (via the _capture_gate event) to avoid PortAudio conflicts.
+        """
         try:
             import sounddevice as sd
             import numpy as np
@@ -137,12 +156,18 @@ class WakeWordEngine:
             logger.info("Wake word listening on microphone (sounddevice %d Hz)...", _RATE)
 
             while self._running:
+                if not self._capture_gate.wait(timeout=1.0):
+                    continue
+
                 try:
                     audio_f32 = sd.rec(
                         _BLOCK, samplerate=_RATE, channels=1,
                         dtype="float32", blocking=True,
                     )
-                    samples = (audio_f32.ravel() * 32767).astype(np.int16)
+                    flat = audio_f32.ravel()
+                    if np.any(np.isnan(flat)):
+                        continue
+                    samples = (flat * 32767).astype(np.int16)
 
                     prediction = self._model.predict(samples)
 
