@@ -180,8 +180,9 @@ class WakeWordEngine:
         if self._loop is not None:
             try:
                 self._loop.call_soon_threadsafe(
-                    self._bus.emit, "wake_word_detected",
-                    {"wake_word": wake_word},
+                    lambda ww=wake_word: self._bus.emit(
+                        "wake_word_detected", wake_word=ww,
+                    ),
                 )
             except RuntimeError:
                 pass

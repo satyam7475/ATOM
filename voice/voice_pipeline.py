@@ -223,12 +223,21 @@ class VoicePipeline:
                 else:
                     self.stt_runtime_error = native_reason or ""
                     self.stt_runtime_fallbacks.append(f"native unavailable: {native_reason}")
-                    self.stt = self._build_disabled_stt(
-                        native_reason
-                        or "Native STT unavailable -- use ATOM.app / Run ATOM.command",
-                    )
-                    self.stt_runtime_label = "Disabled"
-            elif engine_pref in ("faster_whisper", "google_online", "google"):
+                    logger.warning("Native STT unavailable (%s) -- trying Whisper fallback", native_reason)
+                    self.stt = self._build_faster_whisper_stt()
+                    if isinstance(self.stt, _DisabledSTT):
+                        self.stt_runtime_label = "Disabled"
+                    else:
+                        self.stt_runtime_label = "Faster-Whisper (native fallback)"
+                        logger.info("STT: Faster-Whisper (native STT unavailable)")
+            elif engine_pref == "faster_whisper":
+                self.stt = self._build_faster_whisper_stt()
+                self.stt_runtime_label = (
+                    "Disabled"
+                    if isinstance(self.stt, _DisabledSTT)
+                    else "Faster-Whisper (explicit)"
+                )
+            elif engine_pref in ("google_online", "google"):
                 msg = (
                     f"stt.engine={engine_pref} is not used on macOS -- "
                     "use macos_native or auto (SFSpeechRecognizer only)"
@@ -428,6 +437,9 @@ class VoicePipeline:
 
     async def start_voice_loop(self, loop: asyncio.AbstractEventLoop | None = None) -> None:
         """Start the wake word engine, watchdog, and continuous listening loop."""
+        import time as _time
+        _vl_t0 = _time.perf_counter()
+
         if self._wake_word is not None and self._wake_word.is_available:
             self._wake_word.start(loop)
 
@@ -458,6 +470,15 @@ class VoicePipeline:
                 logger.info("Voice loop: always-listen mode (no wake word, STT never blocks)")
             else:
                 logger.info("Voice loop: wake word mode (say 'Hey ATOM')")
+
+        _vl_elapsed = (_time.perf_counter() - _vl_t0) * 1000
+        logger.info(
+            "VOICE_LOOP_READY: %.0fms | stt=%s | tts=%s | wake_word=%s",
+            _vl_elapsed,
+            self.stt_runtime_label,
+            self.tts_runtime_label,
+            "enabled" if (self._wake_word and self._wake_word.is_available) else "disabled",
+        )
 
     def shutdown(self) -> None:
         """Cleanly shut down all voice components."""

@@ -337,8 +337,9 @@
         "max_steps_per_workflow": 30
     },
     "wake_word": {
-        "enabled": false,
-        "sensitivity": 0.6
+        "enabled": true,
+        "sensitivity": 0.5,
+        "model": "hey_jarvis"
     },
     "emotion": {
         "enabled": true

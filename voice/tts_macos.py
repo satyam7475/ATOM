@@ -329,7 +329,17 @@ def _pick_best_voice(requested: str) -> str:
 
     for vid in _PREFERRED_VOICES:
         if vid in available:
+            is_compact = "compact" in vid or "eloquence" in vid
             logger.info("TTS: using preferred bundled voice: %s", vid)
+            if is_compact:
+                logger.warning(
+                    "TTS UPGRADE TIP: You are using a compact voice (%s). "
+                    "For Jarvis-quality neural TTS, open System Settings → "
+                    "Accessibility → Spoken Content → System Voice → Manage Voices "
+                    "and download 'Samantha (Premium)' or 'Zoe (Premium)'. "
+                    "ATOM will auto-detect and use it on next launch.",
+                    vid.split(".")[-1],
+                )
             return vid
 
     return ""

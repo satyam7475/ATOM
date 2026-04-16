@@ -207,7 +207,17 @@ class STTWatchdog:
             t for t in self._restart_times
             if now - t < _RESTART_WINDOW_S
         ]
-        return len(self._restart_times) < _MAX_RESTARTS_PER_WINDOW
+        if len(self._restart_times) >= _MAX_RESTARTS_PER_WINDOW:
+            if not getattr(self, "_circuit_open_logged", False):
+                logger.warning(
+                    "STT Watchdog: circuit breaker OPEN — %d restarts in %.0fs window, "
+                    "suppressing further restarts until window clears",
+                    len(self._restart_times), _RESTART_WINDOW_S,
+                )
+                self._circuit_open_logged = True
+            return False
+        self._circuit_open_logged = False
+        return True
 
     async def _restart_stt(self, stt: Any, reason: str) -> None:
         self._total_restarts += 1
