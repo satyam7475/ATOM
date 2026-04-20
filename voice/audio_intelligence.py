@@ -660,6 +660,7 @@ class AudioIntelligenceEngine:
         "_context_policy", "_device_memory", "_voice_presence",
         "_last_switch_time", "_stt_restart_times",
         "_switch_cooldown_s", "_switch_in_progress",
+        "_last_stt_recovery_t",
     )
 
     def __init__(
@@ -692,6 +693,9 @@ class AudioIntelligenceEngine:
         self._stt_restart_times: deque[float] = deque(maxlen=10)
         self._switch_cooldown_s: float = 8.0
         self._switch_in_progress: bool = False
+        # Tracks the last monotonic time _smart_stt_recovery actually ran
+        # so we can debounce log spam during normal chain rotations.
+        self._last_stt_recovery_t: float = 0.0
 
     def configure(self, *, stt: Any = None, tts: Any = None) -> None:
         """Wire STT/TTS after pipeline construction (needed for switching + feedback)."""
@@ -785,15 +789,40 @@ class AudioIntelligenceEngine:
 
     async def _on_stt_stuck(self, **kw: Any) -> None:
         reason = str(kw.get("reason") or "")
-        if reason == "recognition_starved":
+        # Benign restart reasons that are NOT a device problem. The STT
+        # engine rotates chains every few seconds on idle (kLSRErrorDomain
+        # 301), restarts after a normal silence timeout, or recovers from
+        # a recognition-callback starvation — none of those mean the mic
+        # itself is broken, so don't log-spam "switching device" on them.
+        _BENIGN_REASONS = {
+            "recognition_starved",
+            "reactive_klsr_301",
+            "klsr_301_timeout",
+            "no_speech_timeout",
+            "silent_timeout",
+            "chain_rotation",
+            "idle_restart",
+        }
+        if reason in _BENIGN_REASONS:
             logger.debug(
-                "STT recognizer starved while mic is healthy -- skipping device switch "
-                "(this is a Speech framework issue, not a device-selection issue)",
+                "STT watchdog restart reason=%s -- benign rotation, skipping device switch",
+                reason,
             )
             return
 
         now = time.monotonic()
         self._stt_restart_times.append(now)
+        # Debounce: only run smart recovery when we haven't done one in
+        # the last 15s. Prevents every normal chain rotation from
+        # re-scanning the device list.
+        last_recovery = getattr(self, "_last_stt_recovery_t", 0.0)
+        if (now - last_recovery) < 15.0:
+            logger.debug(
+                "STT stuck event (reason=%s) within 15s of last recovery -- skipping",
+                reason,
+            )
+            return
+        self._last_stt_recovery_t = now
 
         if self._selected_input:
             self._device_memory.record_failure(self._selected_input.name)

@@ -384,6 +384,92 @@ def _looks_like_pure_instruction_leak(text: str) -> bool:
     )
     return cot_opener_only is not None
 
+
+# Declarative reasoning-leak sentences produced by small instruction-tuned
+# models. These don't match the CoT preface regex (they're not "preface +
+# answer"; they're the whole reply being the thought). Observed in logs:
+#
+#   - "Based on the response contract, I should confirm my activity ..."
+#   - "The user previously asked if I was active properly."
+#   - "Now they're asking about what happened to me."
+#   - "First, looking at the conversation history ..."
+#   - "I need to help the user find good wallpaper examples ..."
+#   - "I don't need to use any tools here since it's straightforward."
+#   - "Just respond with the standard message."
+#   - "Wait, looking at the available tools, there's spotlight_search ..."
+#   - "Since I can't browse the internet directly, I should rely on ..."
+#   - "The answer needs to be concise and in plain text."
+#   - '" or similar.'  (dangling quote-tail)
+#
+# We match the whole sentence (not just a prefix). Real JARVIS-style
+# answers don't talk about "the response contract", "the user previously
+# asked", "looking at the conversation history", or "I need to help the
+# user".
+_REASONING_LEAK_SENTENCE_RE = re.compile(
+    r"""
+    ^\s*
+    (?:
+        # Self-referential plan / obligation
+        (?:based\s+on\s+(?:the\s+)?(?:response\s+contract|conversation\s+history|available\s+tools|context|memory|system\s+prompt))\b |
+        (?:according\s+to\s+(?:the\s+)?(?:response\s+contract|conversation\s+history|system\s+prompt|context))\b |
+        # Third-person narration ABOUT the user
+        (?:the\s+user\s+(?:previously\s+)?(?:asked|wants|wanted|requested|said|is\s+asking|is\s+requesting|was\s+asking|has\s+asked))\b |
+        (?:now\s+(?:they|the\s+user)['\u2019]?(?:re|s)?\s+asking)\b |
+        (?:they['\u2019]re\s+asking\s+(?:about|for|if))\b |
+        # Meta-instruction / self-direction
+        (?:i\s+(?:should|need\s+to|have\s+to|must|will|am\s+going\s+to|am\s+supposed\s+to)\s+
+            (?:confirm|help\s+the\s+user|respond|reply|answer|think|consider|check|look\s+at|figure\s+out|
+               provide|give|offer|rely|use|find|suggest|explain|start|begin|acknowledge|keep\s+it|make\s+sure)
+        )\b |
+        (?:i\s+don['\u2019]?t\s+need\s+to\s+use\s+any\s+tools)\b |
+        (?:since\s+i\s+can['\u2019]?t\s+(?:browse|access|use))\b |
+        # "Just respond with X." / "Just stick to ..."
+        (?:just\s+(?:respond|stick|use|go\s+with|keep\s+it|keep\s+the))\b |
+        # "First," / "Second," / "Wait," — stream narration markers
+        (?:first\s*,\s+(?:i|the\s+user|looking\s+at|let|we))\b |
+        (?:wait\s*,\s+(?:looking\s+at|i|the\s+user))\b |
+        # Meta-sentence "The answer needs to be ..."
+        (?:the\s+(?:answer|response|reply)\s+(?:needs\s+to\s+be|should\s+be|must\s+be)\s+
+           (?:concise|brief|short|simple|friendly|warm|professional|polite|casual|natural|in\s+plain\s+text))\b |
+        # Explicit "response contract" mention — always a leak
+        (?:[^.?!]*response\s+contract)\b |
+        # Looking at / based on / referring to ... history/tools/context
+        (?:(?:looking\s+at|referring\s+to)\s+(?:the\s+)?(?:conversation\s+history|available\s+tools|context|memory|system\s+prompt))\b
+    )
+    """,
+    re.IGNORECASE | re.VERBOSE | re.DOTALL,
+)
+
+# Lone-quote tail fragment: "\" or similar.", '"' alone, '" right.' etc.
+# A real answer never starts with a bare closing quote and 1-3 words.
+_LONE_QUOTE_TAIL_RE = re.compile(
+    r"""^\s*["\u201c\u201d\u2018\u2019`]+\s*[A-Za-z][^"\u201c\u201d\u2018\u2019`\n]{0,30}[.?!]?\s*$""",
+    re.IGNORECASE,
+)
+
+
+def _looks_like_reasoning_leak(text: str) -> bool:
+    """Return True when a whole sentence is the model reasoning aloud.
+
+    Drops the sentence before it reaches TTS. Callers ALREADY ran
+    `_strip_cot_preface` first, so only declarative leaks (the ones that
+    are not preface + content) land here.
+    """
+    if not text:
+        return False
+    head = text.strip()
+    if not head:
+        return False
+    # Short sentences (< 3 words) that are just a quoted tail are a leak.
+    if _LONE_QUOTE_TAIL_RE.match(head):
+        word_count = len(head.split())
+        if word_count <= 4:
+            return True
+    if _REASONING_LEAK_SENTENCE_RE.match(head):
+        return True
+    return False
+
+
 MAX_REACT_STEPS = 3
 
 
@@ -561,6 +647,19 @@ class LocalBrainController:
         # strip stray copies of them. This catches cloud-fallback paths and
         # any stale stream that bypasses the MLX-side stop-sequence check.
         raw = self._compact_text(text)
+        # Very first check — BEFORE we strip leading quotes — catch the
+        # "\" or similar." family of fragments. These are short dangling
+        # quote-tails the LLM leaks after a quoted user-echo; if we strip
+        # the leading quote first they become real-looking ("or similar.")
+        # and a declarative-sentence detector won't catch them.
+        if raw and _LONE_QUOTE_TAIL_RE.match(raw):
+            tail_words = len(raw.split())
+            if tail_words <= 4:
+                logger.warning(
+                    "Suppressing lone-quote-tail fragment before TTS: '%s'",
+                    raw[:80],
+                )
+                return ""
         if raw:
             raw = _STRIP_HARD_STOP_TOKENS_RE.split(raw, maxsplit=1)[0]
             raw = _STRIP_SPECIAL_TOKENS_RE.sub("", raw)
@@ -593,6 +692,28 @@ class LocalBrainController:
         # and mid-stream flushes still land here with narration intact).
         cleaned = _strip_cot_preface(cleaned)
         if not cleaned:
+            return ""
+
+        # Reasoning-narration sentences (no CoT preface, but the whole
+        # sentence is the model thinking out loud). These slipped past the
+        # strippers above because they're declarative, not prefaces:
+        #   - "Based on the response contract, I should confirm my activity."
+        #   - "First, looking at the conversation history..."
+        #   - "Now they're asking about what happened to me."
+        #   - "I need to help the user find ..."
+        #   - "I don't need to use any tools here since it's straightforward."
+        #   - "Just respond with the standard message."
+        #   - "Wait, looking at the available tools, ..."
+        #   - "Since I can't browse the internet directly, I should ..."
+        #   - "The user previously asked if I was active properly."
+        #   - "The answer needs to be concise and in plain text."
+        #   - Lone fragments like "\" or similar." — a dangling quote with
+        #     only 1-3 words, usually the tail of a quoted user-echo leak.
+        if _looks_like_reasoning_leak(cleaned):
+            logger.warning(
+                "Suppressing reasoning-leak sentence before TTS: '%s'",
+                cleaned[:120],
+            )
             return ""
 
         label_hits = len(_TRANSCRIPT_LABEL_RE.findall(cleaned))
@@ -668,15 +789,18 @@ class LocalBrainController:
     ) -> int | None:
         budget = str(budget_tier or "").strip().lower()
         requested = str(requested_tier or "").strip().lower()
+        # Short voice-turn path: a JARVIS-style one-liner fits in ~60 tokens
+        # (15-20 words). Anything over 80 is the model starting to narrate.
+        # Cap hard so the stream ends before CoT leaks.
         if response_mode is ResponseMode.SHORT or budget in {"command", "info"}:
-            return 96
+            return 72
         if budget == "simple":
-            return 128
+            return 96
         if response_mode is ResponseMode.DETAIL or budget == "complex" or requested == "complex":
-            return 224
+            return 192
         if response_mode is ResponseMode.REPORT or budget == "creative" or requested == "creative":
             return None
-        return 160
+        return 128
 
     @staticmethod
     def _repair_max_tokens_override(max_tokens_override: int | None) -> int:

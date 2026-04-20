@@ -537,6 +537,11 @@ class MacOSTTSAsync:
         # don't trigger a barge-in on our own voice.
         self._spoken_echo_window: collections.deque[set[str]] = collections.deque(maxlen=6)
         self._last_spoke_t: float = 0.0
+        # True when the last spoken slice was a yes/no confirmation prompt
+        # ("Confirm?", "Proceed?", "Okay?"). The echo guard stops flagging
+        # reply tokens like "yes", "no", "confirm yes" as self-echo while
+        # this is set so a legitimate user reply isn't dropped.
+        self._last_spoken_was_confirmation: bool = False
 
         from voice.speech_enhancer import SpeechEnhancer
         self._enhancer = SpeechEnhancer(base_rate=rate)
@@ -700,6 +705,26 @@ class MacOSTTSAsync:
         if not key:
             return
         words = {w for w in key.split() if len(w) >= 3}
+        # Track whether the most recent TTS chunk was a confirmation
+        # prompt. Used by is_echo() to stop flagging "yes"/"no"/"confirm"
+        # as self-echo when Boss is actually replying to our question.
+        try:
+            head = (text or "").strip()
+            raw_lower = head.lower()
+            word_count = len([w for w in head.split() if w])
+            is_question = head.endswith("?") or "?" in head
+            has_confirm_cue = any(
+                cue in raw_lower
+                for cue in (
+                    "confirm?", "confirm ", "proceed?", "proceed ",
+                    "shall i", "should i", "go ahead?", "okay?", "ok?",
+                    "ready?", "sure?", "continue?", "yes or no",
+                )
+            )
+            short_prompt = word_count <= 5 and is_question
+            self._last_spoken_was_confirmation = bool(short_prompt or has_confirm_cue)
+        except Exception:
+            self._last_spoken_was_confirmation = False
         if not words:
             return
         self._spoken_echo_window.append(words)
@@ -723,6 +748,25 @@ class MacOSTTSAsync:
         key = self._chunk_key(partial_text)
         if not key:
             return False
+        # Confirmation-reply exception: if ATOM's most recent speech was a
+        # short yes/no prompt (e.g. "Confirm?", "Proceed?"), Boss is now
+        # answering us — DO NOT flag his reply as an echo. We check this
+        # FIRST so even partials that fuzzy-match pass through.
+        if self._last_spoken_was_confirmation:
+            reply_norm = key.strip()
+            reply_tokens = [w for w in reply_norm.split() if w]
+            # Short reply (<= 4 words) containing a yes/no/confirm marker
+            # is trusted as a user answer, not echo.
+            if 0 < len(reply_tokens) <= 4:
+                reply_corpus = set(reply_tokens)
+                affirmations = {
+                    "yes", "yeah", "yep", "yup", "sure", "ok", "okay",
+                    "confirm", "confirmed", "proceed", "go", "do",
+                    "no", "nope", "nah", "cancel", "stop", "abort",
+                    "hold",
+                }
+                if reply_corpus & affirmations:
+                    return False
         partial_words = [w for w in key.split() if len(w) >= 3]
         if not partial_words:
             # Single short token (e.g. "the") - treat as echo when speaking
