@@ -38,8 +38,8 @@ def test_local_brain_exports_long_report(tmp_path: Path) -> None:
         _FakePromptBuilder(),
         {
             "brain": {
-                "mlx_primary_model": "models/qwen3-4b-mlx",
-                "mlx_fast_model": "models/qwen3-1.7b-mlx",
+                "mlx_primary_model": "models/qwen3-8b-mlx-4bit",
+                "mlx_fast_model": "models/qwen3-8b-mlx-4bit",
             },
         },
     )

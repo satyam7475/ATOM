@@ -55,7 +55,29 @@ def audit_corporate_alignment(config: dict[str, Any]) -> list[str]:
         warnings.append(
             f"stt.engine is {eng} — supported: auto, macos_native, faster_whisper, google_online, google.",
         )
-    if sys.platform == "darwin" and eng in ("faster_whisper", "google_online", "google"):
+    # Cloud STT engines (Google) ship audio off-machine, so flag them for
+    # ALL profiles -- corporate especially, since that's a privacy / DLP
+    # concern. The "macos_native is the only option here" warning is
+    # different: that's host-specific runtime guidance, only useful when
+    # the deployment profile is actually meant for this Mac.
+    if eng in ("google_online", "google"):
+        warnings.append(
+            f"stt.engine is {eng} — uses Google Cloud Speech (network egress); "
+            "prefer auto/macos_native/faster_whisper for offline-style operation.",
+        )
+    dep_profile_for_stt = (
+        (config.get("deployment", {}) or {}).get("profile") or ""
+    ).strip().lower()
+    is_personal_profile = dep_profile_for_stt in (
+        PROFILE_PERSONAL,
+        PROFILE_PERSONAL_DESKTOP,
+        PROFILE_WORKSTATION,
+    )
+    if (
+        sys.platform == "darwin"
+        and eng in ("faster_whisper",)
+        and is_personal_profile
+    ):
         warnings.append(
             f"stt.engine is {eng} — on macOS only Apple native STT runs; use auto or macos_native.",
         )

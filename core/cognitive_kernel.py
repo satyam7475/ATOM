@@ -9,9 +9,9 @@ and available resources.
 Execution paths (fastest → deepest):
     DIRECT  — Intent/quick-reply match. No LLM. Sub-5ms.
     CACHE   — Cached LLM response. No LLM. Sub-10ms.
-    QUICK   — Fast brain (Qwen3-1.7B). 80-150ms.
-    FULL    — Primary brain (Qwen3-4B thinking OFF). 300-600ms.
-    DEEP    — Primary brain (Qwen3-4B thinking ON) + RAG. 800-2000ms.
+    QUICK   — Shared local brain with the tightest latency budget.
+    FULL    — Shared local brain with a larger response budget.
+    DEEP    — Shared local brain + RAG for longer analytical turns.
 
 System-aware routing:
     - Battery → prefer QUICK, skip RAG
@@ -312,8 +312,8 @@ class CognitiveKernel:
         self._latency = LatencyController(self._config)
 
         ck = self._config.get("cognitive_kernel", {})
-        self._quick_model = ck.get("quick_model", "qwen3-1.7b")
-        self._full_model = ck.get("full_model", "qwen3-4b")
+        self._quick_model = ck.get("quick_model", "qwen3-8b")
+        self._full_model = ck.get("full_model", "qwen3-8b")
         self._deep_query_min_chars = int(ck.get("deep_query_min_chars", 120))
         self._simple_query_max_chars = int(ck.get("simple_query_max_chars", 50))
         self._battery_degrade = bool(ck.get("battery_degrade", True))

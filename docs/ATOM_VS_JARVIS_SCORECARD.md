@@ -8,7 +8,7 @@
 |--------|-----------------------------|-------------|------------------|--------|
 | **Voice I/O** | Reliable STT/TTS, barge-in, permissions | **3–4** | **5** | Native STT needs ATOM.app + TCC; venv → Whisper fallback |
 | **State / lifecycle** | Clear IDLE/LISTENING/THINKING/SPEAKING | **4–5** | **5** | Explicit FSM + [`14_VOICE_PIPELINE.md`](architecture/14_VOICE_PIPELINE.md) |
-| **Reasoning (local)** | MLX dual-model, routing, latency | **4** | **5** | On-device bounded by silicon and prompt size |
+| **Reasoning (local)** | MLX local model, routing, latency | **4** | **5** | On-device bounded by silicon and prompt size |
 | **Cloud / Gemini** | Optional escalation, quotas, safety | **3–4** when enabled | **5** | `cloud.enabled` is the gate; rate limits real |
 | **Memory / RAG** | Graph + vectors, recall quality | **3–4** | **5** | Depends on ingestion and embedding stack |
 | **Tools / OS control** | Security-gated actions, confirmations | **3–4** | **5** | Real safety constraints vs plot armor |

@@ -51,7 +51,7 @@
     },
     "stt": {
         "engine": "macos_native",
-        "locale": "auto",
+        "locale": "en-US",
         "whisper_model_size": "base",
         "bilingual": true,
         "sample_rate": 16000,
@@ -70,7 +70,7 @@
         "native_stop_audio_delay_ms": 120,
         "voice_debug": true,
         "voice_debug_interval_s": 30,
-        "barge_in_during_speak": false,
+        "barge_in_during_speak": true,
         "native_requires_on_device": true,
         "native_voice_processing": true,
         "native_tap_sample_rate": 0,
@@ -79,14 +79,15 @@
     "tts": {
         "engine": "macos_native",
         "max_lines": 4,
-        "macos_voice": "system",
-        "macos_rate": 195,
+        "macos_voice": "jarvis",
+        "macos_rate": 182,
         "edge_voice": "en-GB-SoniaNeural",
         "edge_rate": "+0%",
         "edge_postprocess": true,
         "edge_ack_cache": true
     },
     "voice": {
+        "activation_mode": "always_on",
         "earcons": {
             "enabled": true,
             "volume": 0.45,
@@ -125,18 +126,18 @@
     "brain": {
         "enabled": true,
         "model_path": "models/qwen3-8b-q4_k_m.gguf",
-        "mlx_primary_model": "models/qwen3-4b-mlx",
-        "mlx_fast_model": "models/qwen3-1.7b-mlx",
-        "mlx_default_role": "fast",
+        "mlx_primary_model": "models/qwen3-8b-mlx-4bit",
+        "mlx_fast_model": "models/qwen3-8b-mlx-4bit",
+        "mlx_default_role": "primary",
         "n_ctx": 4096,
         "n_threads": 4,
         "n_gpu_layers": -1,
         "n_batch": 256,
         "max_tokens": 320,
-        "temperature": 0.65,
-        "top_p": 0.9,
+        "temperature": 0.6,
+        "top_p": 0.85,
         "repeat_penalty": 1.1,
-        "timeout_seconds": 22
+        "timeout_seconds": 28
     },
     "assistant_brain": {
         "active_profile": "optimal",
@@ -168,18 +169,18 @@
                 "n_threads": 4,
                 "n_gpu_layers": -1,
                 "n_batch": 256,
-                "timeout_seconds": 16,
+                "timeout_seconds": 24,
                 "temperature": 0.6,
                 "extra_stop_sequences": ["\n\nUser:", "\nUser:", "\n\nBoss:"]
             },
             "full_performance": {
-                "max_tokens": 512,
-                "n_ctx": 10240,
+                "max_tokens": 384,
+                "n_ctx": 8192,
                 "n_threads": 4,
                 "n_gpu_layers": -1,
                 "n_batch": 512,
-                "timeout_seconds": 28,
-                "temperature": 0.65
+                "timeout_seconds": 29,
+                "temperature": 0.62
             }
         }
     },
@@ -363,8 +364,8 @@
         "poll_interval_s": 30
     },
     "cognitive_kernel": {
-        "quick_model": "qwen3-1.7b",
-        "full_model": "qwen3-4b",
+        "quick_model": "qwen3-8b",
+        "full_model": "qwen3-8b",
         "simple_query_max_chars": 48,
         "deep_query_min_chars": 140,
         "battery_degrade": true,

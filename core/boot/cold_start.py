@@ -170,6 +170,19 @@ class ColdStartOptimizer:
         saved_at = float(loaded.get("saved_at", 0.0) or 0.0)
         if saved_at > 0:
             age_s = max(0.0, time.time() - saved_at)
+            # Drop snapshots older than the configured TTL right at load
+            # time. Doing it here keeps the rest of the boot pipeline (and
+            # the "Cold start ready" report) honest -- previously the
+            # staleness check only ran inside ``_build_context_payload``,
+            # so the snapshot still showed up as ``context=True`` for the
+            # whole boot even when it was actually skipped.
+            if age_s > _MAX_RESTORED_CONTEXT_AGE_S:
+                logger.info(
+                    "Cold start snapshot too old (age %.0fs > %.0fs); discarding",
+                    age_s,
+                    _MAX_RESTORED_CONTEXT_AGE_S,
+                )
+                return {}
             logger.info("Cold start snapshot found (age %.0fs)", age_s)
         return loaded
 
@@ -318,7 +331,11 @@ class ColdStartOptimizer:
         if ts > 0:
             age_s = max(0.0, time.time() - ts)
             if age_s > _MAX_RESTORED_CONTEXT_AGE_S:
-                logger.info(
+                # Should already have been filtered in _load_snapshot;
+                # defensive in case a snapshot was injected via another
+                # path. Log at DEBUG to avoid duplicating the load-time
+                # warning seen in production boot logs.
+                logger.debug(
                     "Cold start context snapshot too old (%.0fs); skipping restore",
                     age_s,
                 )

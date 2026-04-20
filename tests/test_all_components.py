@@ -231,14 +231,45 @@ async def test_memory_should_store() -> None:
     print("  PASS: Memory should_store filter")
 
 
-async def test_memory_add_retrieve() -> None:
-    """Add and retrieve by keyword overlap."""
+def _make_test_memory(max_entries: int = 500):
+    """Build a MemoryEngine instance with all modern attrs initialized but
+    vector store disabled. Mirrors the production constructor without
+    triggering embedding/vector load on the test machine.
+    """
+    from collections import defaultdict
+
     from core.memory_engine import MemoryEngine
 
     mem = MemoryEngine.__new__(MemoryEngine)
     mem._entries = []
-    mem._max_entries = 500
+    mem._max_entries = max_entries
+    mem._max_vector_results = 5
     mem._default_top_k = 3
+    mem._pressure_top_k = 2
+    mem._pressure_threshold_pct = 85.0
+    mem._pressure_relief_pct = 75.0
+    mem._semantic_weight = 0.7
+    mem._keyword_weight = 0.3
+    mem._inverted_index = defaultdict(set)
+    mem._interactions = []
+    mem._interactions_dirty = False
+    mem._preferences_cache = None
+    mem._preferences_interaction_count = 0
+    mem._vector_store = None
+    mem._embedding_engine = None
+    mem._vectors_ready = False
+    mem._migration_done = True
+    mem._config = {}
+    mem._memory_pressure_active = False
+    mem._lock = asyncio.Lock()
+    mem._v7_scoring_enabled = False
+    mem._v7_w = {"recency": 0.3, "importance": 0.3, "success_rate": 0.2, "similarity": 0.2}
+    return mem
+
+
+async def test_memory_add_retrieve() -> None:
+    """Add and retrieve by keyword overlap (keyword-only mode)."""
+    mem = _make_test_memory()
 
     await mem.add("spring boot kafka configuration", "Use @KafkaListener annotation")
     assert len(mem._entries) == 1
@@ -251,12 +282,7 @@ async def test_memory_add_retrieve() -> None:
 
 async def test_memory_empty_retrieve() -> None:
     """Retrieve from empty memory returns empty list."""
-    from core.memory_engine import MemoryEngine
-
-    mem = MemoryEngine.__new__(MemoryEngine)
-    mem._entries = []
-    mem._max_entries = 500
-    mem._default_top_k = 3
+    mem = _make_test_memory()
 
     results = await mem.retrieve("anything", k=5)
     assert results == []
@@ -265,13 +291,8 @@ async def test_memory_empty_retrieve() -> None:
 
 async def test_memory_max_entries() -> None:
     """Memory caps at _max_entries."""
-    from core.memory_engine import MemoryEngine
-
     cap = 100
-    mem = MemoryEngine.__new__(MemoryEngine)
-    mem._entries = []
-    mem._max_entries = cap
-    mem._default_top_k = 3
+    mem = _make_test_memory(max_entries=cap)
 
     for i in range(250):
         await mem.add(

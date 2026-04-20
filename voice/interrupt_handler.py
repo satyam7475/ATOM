@@ -29,6 +29,12 @@ _NON_INTERRUPT_STATUSES = _LISTENING_STATUSES | frozenset({
 
 _PARTIAL_BURST_WINDOW_S = 0.5
 _PARTIAL_BURST_THRESHOLD = 3
+# A single 1-token partial like "Dear" while ATOM is SPEAKING is almost
+# always the mic catching ATOM's own voice. Require either the burst
+# threshold or at least this many words before we treat a partial as a
+# real barge-in. A real interruption nearly always crosses 2 tokens
+# within 200ms ("hey atom", "stop please", "no no").
+_PARTIAL_MIN_WORDS_FOR_INTERRUPT = 2
 
 
 class VoiceInterruptHandler:
@@ -100,10 +106,17 @@ class VoiceInterruptHandler:
 
         tts = self._tts
         if tts is not None and hasattr(tts, "is_echo") and tts.is_echo(text):
-            logger.debug(
-                "Echo suppressed in interrupt handler: '%s'", (text or "")[:80],
+            logger.info(
+                "Echo suppressed (TTS self-feedback): '%s'", (text or "")[:80],
             )
             return
+
+        # Defensive floor on single partials. A 1-token partial like "Dear"
+        # captured while we are still SPEAKING is almost always our own
+        # voice; require at least N words before treating it as a real
+        # barge-in. The burst path below still fires when the user really
+        # is talking over us (3 partials in 500ms).
+        word_count = len((text or "").split())
 
         now = time.monotonic()
 
@@ -125,6 +138,14 @@ class VoiceInterruptHandler:
             )
             await self._pause_tts()
             self._partial_timestamps.clear()
+            return
+
+        if (
+            cur is AtomState.SPEAKING
+            and word_count < _PARTIAL_MIN_WORDS_FOR_INTERRUPT
+        ):
+            # Too thin a signal to cut TTS off; wait for the burst path
+            # or a richer partial / final.
             return
 
         if self._emit_cooldown_s > 0 and (now - self._last_resume_emit) < self._emit_cooldown_s:

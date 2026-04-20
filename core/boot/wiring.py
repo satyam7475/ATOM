@@ -99,11 +99,27 @@ def wire_events(
 
     perception = PerceptionEngine(bus)
 
+    async def _perception_partial_guarded(text: str = "", **kw) -> None:
+        # Drop self-echo BEFORE perception decides to predict an interrupt.
+        # This keeps the perception engine's session statistics honest
+        # (echo "interrupts" should never count as user frustration) and
+        # prevents the predicted-interrupt path from firing on our own
+        # voice in the first place.
+        partial = (text or "").strip()
+        if partial:
+            try:
+                check_echo = getattr(tts, "is_echo", None)
+                if callable(check_echo) and check_echo(partial):
+                    return
+            except Exception:
+                logger.debug("perception echo guard failed", exc_info=True)
+        await perception.on_speech_partial(text=text, **kw)
+
     bus.on(
         "speech_partial",
         _guard_handler(
             "speech_partial",
-            perception.on_speech_partial,
+            _perception_partial_guarded,
             source="perception.on_speech_partial",
         ),
     )
@@ -218,7 +234,9 @@ def wire_events(
         concise: bool = False, rate_boost: float = 0.0,
         session_stats: dict | None = None, **_kw,
     ) -> None:
-        router.apply_perception_profile(concise=concise, rate_boost=rate_boost)
+        apply_profile = getattr(router, "apply_perception_profile", None)
+        if callable(apply_profile):
+            apply_profile(concise=concise, rate_boost=rate_boost)
         if session_stats:
             logger.debug(
                 "Session stats: int_rate=%.2f frust=%.2f avg_dur=%.0fms",
@@ -232,7 +250,47 @@ def wire_events(
         source="speech_ctrl.on_perception_adaptive",
     ))
 
+    # Minimum word count before a perception-predicted interrupt is allowed
+    # to cut off TTS. A single mis-heard token like ``Boss`` or ``mad`` is
+    # almost always our own voice spilling into the mic; requiring at least
+    # two real words prevents the SPEAKING -> own-voice -> LISTENING flap
+    # loop that was making conversations feel broken.
+    _PERCEPTION_INTERRUPT_MIN_WORDS = 2
+
     async def _on_interrupt_predicted(**_kw) -> None:
+        # Echo guard: if the predicted-interrupt partial is just our own
+        # TTS bleed, drop it. Without this gate the perception engine
+        # interrupts ATOM's response as soon as the speakers leak any
+        # syllable into the mic.
+        partial_text = str(_kw.get("text", "") or "").strip()
+        if partial_text:
+            try:
+                check_echo = getattr(tts, "is_echo", None)
+                if callable(check_echo) and check_echo(partial_text):
+                    logger.info(
+                        "interrupt_predicted dropped as TTS self-echo: '%s'",
+                        partial_text[:80],
+                    )
+                    return
+            except Exception:
+                logger.debug("interrupt_predicted echo check failed", exc_info=True)
+
+            # Floor: thin partials never cut TTS off via the prediction
+            # path. The burst-based path inside VoiceInterruptHandler still
+            # fires when the user really is talking over us (3 partials in
+            # 500ms), so genuine barge-ins still feel instant.
+            try:
+                if state.current is AtomState.SPEAKING:
+                    word_count = len(partial_text.split())
+                    if word_count < _PERCEPTION_INTERRUPT_MIN_WORDS:
+                        logger.debug(
+                            "interrupt_predicted ignored (only %d word(s) while speaking)",
+                            word_count,
+                        )
+                        return
+            except Exception:
+                logger.debug("interrupt_predicted state check failed", exc_info=True)
+
         await voice_interrupt.interrupt_to_listening(
             trigger="interrupt_predicted",
             reason="perception_predicted",
@@ -290,7 +348,13 @@ def wire_events(
         source="speech_ctrl.on_adaptive_speech_update",
     ))
 
-    router.attach_adaptive_engine(adaptive)
+    attach_adaptive = getattr(router, "attach_adaptive_engine", None)
+    if callable(attach_adaptive):
+        attach_adaptive(adaptive)
+    else:
+        logger.debug(
+            "Router has no attach_adaptive_engine() — skipping adaptive bridge",
+        )
 
     bus.on(
         "state_changed",
@@ -310,11 +374,43 @@ def wire_events(
     )
     _speech_target = command_loop.submit if command_loop is not None else router.on_speech
 
+    def _is_self_echo_final(text: str) -> bool:
+        """True when this speech_final is the mic catching ATOM's own voice.
+
+        ``tts.is_echo`` is the same fuzzy bag-of-words check used to suppress
+        partials, but here we also require that ATOM is currently SPEAKING /
+        THINKING; otherwise a legitimate user follow-up that happens to share
+        words with the previous reply could be wrongly dropped.
+        """
+        try:
+            from core.state_manager import AtomState
+        except Exception:
+            return False
+        try:
+            cur = state.current
+        except Exception:
+            return False
+        if cur not in (AtomState.SPEAKING, AtomState.THINKING):
+            return False
+        try:
+            check = getattr(tts, "is_echo", None)
+            if not callable(check):
+                return False
+            return bool(check(text))
+        except Exception:
+            return False
+
     if priority_sched is not None:
         from core.priority_scheduler import PRIORITY_VOICE
 
         async def _speech_via_priority(text: str, **kw) -> None:
             if shutdown_event.is_set():
+                return
+            if _is_self_echo_final(text):
+                logger.info(
+                    "speech_final dropped as TTS self-echo: '%s'",
+                    str(text or "")[:80],
+                )
                 return
             await voice_interrupt.prepare_for_new_speech(text, **kw)
             if local_brain is not None:
@@ -342,6 +438,12 @@ def wire_events(
     else:
         async def _speech_final_direct(text: str, **kw) -> None:
             if shutdown_event.is_set():
+                return
+            if _is_self_echo_final(text):
+                logger.info(
+                    "speech_final dropped as TTS self-echo: '%s'",
+                    str(text or "")[:80],
+                )
                 return
             await voice_interrupt.prepare_for_new_speech(text, **kw)
             if local_brain is not None:
@@ -398,6 +500,7 @@ def wire_events(
                             context=kw.get("context"),
                             history=kw.get("history"),
                             query_plan=kw.get("query_plan"),
+                            repeat_hint=bool(kw.get("repeat_hint", False)),
                         )
                     else:
                         await local_brain.on_query(text, **kw)
@@ -977,8 +1080,11 @@ def wire_events(
     async def on_cursor_response(query: str, response: str, **_kw) -> None:
         cache.put(query, response)
         await memory.add(query, response)
-        router.record_turn(query, response)
-        follow_up = router._suggest_follow_up(query, response)
+        record_turn = getattr(router, "record_turn", None)
+        if callable(record_turn):
+            record_turn(query, response)
+        suggest_follow_up = getattr(router, "_suggest_follow_up", None)
+        follow_up = suggest_follow_up(query, response) if callable(suggest_follow_up) else None
         if follow_up:
             await asyncio.sleep(0.5)
             indicator.add_log("info", follow_up)

@@ -22,7 +22,9 @@ WARN = "⚠️"
 results = []
 
 
-def test(name, func):
+def _record_test(name, func):
+    """Run a verification step and record pass/fail. Renamed from ``test``
+    so pytest doesn't try to collect this dispatcher as a test case."""
     try:
         result = func()
         if result:
@@ -34,6 +36,11 @@ def test(name, func):
     except Exception as e:
         results.append((FAIL, f"{name}: {e}"))
         print(f"  {FAIL} {name}: {e}")
+
+
+# Back-compat alias for the pre-rename callers below. Underscore prefix
+# keeps it out of pytest's auto-collection net.
+_test = _record_test
 
 
 print("\n" + "=" * 60)
@@ -106,10 +113,10 @@ def test_gateway_rate_limit():
     return True
 
 
-test("Import SecurityGateway", test_gateway_import)
-test("Sanitize sensitive data", test_gateway_sanitize)
-test("Block system commands", test_gateway_block)
-test("Rate limiting", test_gateway_rate_limit)
+_record_test("Import SecurityGateway", test_gateway_import)
+_record_test("Sanitize sensitive data", test_gateway_sanitize)
+_record_test("Block system commands", test_gateway_block)
+_record_test("Rate limiting", test_gateway_rate_limit)
 
 # ── Phase 2: Gemini Client ───────────────────────────────────────
 print("\n☁️  Phase 2: Gemini Client")
@@ -137,9 +144,9 @@ def test_gemini_circuit_breaker():
     return True
 
 
-test("Import GeminiClient", test_gemini_import)
-test("Unavailable without API key", test_gemini_unavailable_without_key)
-test("Circuit breaker opens after failures", test_gemini_circuit_breaker)
+_record_test("Import GeminiClient", test_gemini_import)
+_record_test("Unavailable without API key", test_gemini_unavailable_without_key)
+_record_test("Circuit breaker opens after failures", test_gemini_circuit_breaker)
 
 # ── Phase 3: Cognitive Kernel ────────────────────────────────────
 print("\n🧠 Phase 3: Cognitive Kernel Upgrade")
@@ -164,8 +171,8 @@ def test_kernel_queryplan_fields():
     return True
 
 
-test("CLOUD_REASON + CLOUD_SEARCH paths", test_kernel_cloud_paths)
-test("QueryPlan cloud fields", test_kernel_queryplan_fields)
+_record_test("CLOUD_REASON + CLOUD_SEARCH paths", test_kernel_cloud_paths)
+_record_test("QueryPlan cloud fields", test_kernel_queryplan_fields)
 
 # ── Phase 4: Confidence Engine ───────────────────────────────────
 print("\n📊 Phase 4: Confidence Engine")
@@ -238,10 +245,10 @@ def test_confidence_escalation():
     return True
 
 
-test("Import ConfidenceEngine", test_confidence_import)
-test("Response quality scoring", test_confidence_scoring)
-test("Pre-confidence heuristic", test_confidence_pre_heuristic)
-test("Escalation decision", test_confidence_escalation)
+_record_test("Import ConfidenceEngine", test_confidence_import)
+_record_test("Response quality scoring", test_confidence_scoring)
+_record_test("Pre-confidence heuristic", test_confidence_pre_heuristic)
+_record_test("Escalation decision", test_confidence_escalation)
 
 # ── Phase 5: Decision Engine ────────────────────────────────────
 print("\n🎯 Phase 5: Decision Engine")
@@ -275,9 +282,9 @@ def test_decision_style():
     return True
 
 
-test("Import DecisionEngine", test_decision_import)
-test("Query enrichment", test_decision_enrichment)
-test("Response style control", test_decision_style)
+_record_test("Import DecisionEngine", test_decision_import)
+_record_test("Query enrichment", test_decision_enrichment)
+_record_test("Response style control", test_decision_style)
 
 # ── Phase 6: Search Tool ────────────────────────────────────────
 print("\n🔍 Phase 6: Search Tool")
@@ -298,8 +305,8 @@ def test_search_realtime_detection():
     return True
 
 
-test("Import SearchTool", test_search_import)
-test("Real-time info detection", test_search_realtime_detection)
+_record_test("Import SearchTool", test_search_import)
+_record_test("Real-time info detection", test_search_realtime_detection)
 
 # ── Phase 7: Preference Store ───────────────────────────────────
 print("\n💾 Phase 7: Preference Store")
@@ -345,8 +352,8 @@ def test_preference_crud():
     return True
 
 
-test("Import PreferenceStore", test_preference_import)
-test("Preference CRUD + context block", test_preference_crud)
+_record_test("Import PreferenceStore", test_preference_import)
+_record_test("Preference CRUD + context block", test_preference_crud)
 
 # ── Phase 8: Semantic Cache ─────────────────────────────────────
 print("\n⚡ Phase 8: Semantic Cache")
@@ -372,8 +379,8 @@ def test_semantic_cache_exact_match():
     return True
 
 
-test("Import SemanticCache", test_semantic_cache_import)
-test("Exact match cache", test_semantic_cache_exact_match)
+_record_test("Import SemanticCache", test_semantic_cache_import)
+_record_test("Exact match cache", test_semantic_cache_exact_match)
 
 # ── Summary ─────────────────────────────────────────────────────
 print("\n" + "=" * 60)
@@ -387,4 +394,8 @@ else:
     print(f"\n{FAIL} {failed} test(s) failed — review above")
 print("=" * 60 + "\n")
 
-sys.exit(0 if failed == 0 else 1)
+# Only call sys.exit when this file is run as a standalone script.
+# Pytest collects modules by importing them; calling sys.exit() at import
+# time would crash the entire collection phase and skip every other test.
+if __name__ == "__main__":
+    sys.exit(0 if failed == 0 else 1)

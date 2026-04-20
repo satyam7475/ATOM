@@ -320,6 +320,57 @@ CONFIG_SCHEMA: dict[str, Any] = {
             },
             "additionalProperties": False,
         },
+        "voice": {
+            "type": "object",
+            "properties": {
+                "activation_mode": {
+                    "type": "string",
+                    "enum": ["always_on", "wake_word", "jarvis"],
+                    "description": "Voice command activation policy. 'always_on' keeps STT routed continuously; 'wake_word' preserves passive/active gating. 'jarvis' is accepted as an alias for always_on.",
+                },
+                "earcons": {
+                    "type": "object",
+                    "properties": {
+                        "enabled": {"type": "boolean"},
+                        "volume": {
+                            "type": "number",
+                            "minimum": 0.0,
+                            "maximum": 1.0,
+                        },
+                        "heartbeat_enabled": {"type": "boolean"},
+                        "heartbeat_interval_s": {
+                            "type": "number",
+                            "minimum": 1.0,
+                            "maximum": 3600.0,
+                        },
+                    },
+                    "additionalProperties": False,
+                },
+            },
+            "additionalProperties": False,
+        },
+        "wake_word": {
+            "type": "object",
+            "properties": {
+                "enabled": {"type": "boolean"},
+                "sensitivity": {
+                    "type": "number",
+                    "minimum": 0.0,
+                    "maximum": 1.0,
+                },
+                "model": {
+                    "type": "string",
+                    "description": "Primary OpenWakeWord model name (e.g. hey_jarvis).",
+                },
+                "models": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "minItems": 1,
+                    "description": "Optional list of OpenWakeWord model names to load together.",
+                },
+            },
+            "additionalProperties": False,
+        },
         "context": {
             "type": "object",
             "properties": {

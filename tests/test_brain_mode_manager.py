@@ -45,7 +45,9 @@ def test_legacy_aliases_map_to_canonical_profiles() -> None:
     assert ok is True
     assert mgr.active_profile == "full_performance"
 
-    ok, _ = mgr.set_profile("balanced")
+    # Back-to-back legitimate switch — bypass the spam-debounce cooldown
+    # the way internal recovery / boot restore flows do.
+    ok, _ = mgr.set_profile("balanced", force=True)
     assert ok is True
     assert mgr.active_profile == "optimal"
 

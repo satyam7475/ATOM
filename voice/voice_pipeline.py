@@ -117,6 +117,23 @@ class VoicePipeline:
             self.tts_runtime_label,
         )
 
+    def _voice_activation_mode(self) -> str:
+        """Return the configured voice activation mode.
+
+        ``always_on`` keeps STT in the ACTIVE command path all the time.
+        ``wake_word`` preserves the dual-channel passive/active flow.
+        ``jarvis`` is accepted as a friendly alias for ``always_on``.
+        """
+        voice_cfg = self._config.get("voice", {}) or {}
+        raw = str(voice_cfg.get("activation_mode", "") or "").strip().lower()
+        if raw in {"always_on", "always-on", "alwayson", "jarvis"}:
+            return "always_on"
+        return "wake_word"
+
+    def _wake_word_requested(self) -> bool:
+        wake_cfg = self._config.get("wake_word", {}) or {}
+        return bool(wake_cfg.get("enabled", True))
+
     def _build_disabled_stt(self, reason: str) -> _DisabledSTT:
         logger.error("Voice input unavailable: %s", reason)
         if sys.platform == "darwin" and "NSSpeechRecognitionUsageDescription" in reason:
@@ -388,6 +405,14 @@ class VoicePipeline:
 
     def build_wake_word(self) -> Any:
         """Build and preload the optional wake word engine."""
+        self._wake_word = None
+        if self._voice_activation_mode() == "always_on":
+            logger.info("WakeWordEngine bypassed: voice.activation_mode=always_on")
+            return None
+        if not self._wake_word_requested():
+            logger.info("WakeWordEngine disabled in config")
+            return None
+
         from voice.wake_word import WakeWordEngine
 
         self._wake_word = WakeWordEngine(self._bus, self._state, self._config)
@@ -562,12 +587,17 @@ class VoicePipeline:
         mode-flip handlers.
 
         Flow:
+            always_on                -> ACTIVE permanently
             wake_word_detected       -> ACTIVE (route speech_final to Router)
-            15s idle after tts_done  -> PASSIVE (ignore speech unless wake)
+            idle after tts_done      -> PASSIVE (ignore speech unless wake)
         """
         from voice.listening_modes import ListeningModeController
 
-        always_active = self._wake_word is None or not getattr(self._wake_word, "is_available", False)
+        always_active = (
+            self._voice_activation_mode() == "always_on"
+            or self._wake_word is None
+            or not getattr(self._wake_word, "is_available", False)
+        )
         self._listening_mode = ListeningModeController(always_active=always_active)
 
         self._passive_revert_task: asyncio.Task | None = None
@@ -647,6 +677,31 @@ class VoicePipeline:
             # forwarded for a reply — keep us ACTIVE until TTS completes.
             _cancel_revert_task()
 
+        async def _on_wake_hint(**kw: Any) -> None:
+            # STT noticed the user is clearly trying to address ATOM (3+
+            # suppressed finals in PASSIVE mode within 60s) but no wake
+            # phrase slipped through. Speak a short, warm prompt so the
+            # user knows how to actually call us. Throttled upstream
+            # inside stt_macos._note_passive_suppression so we only get
+            # one of these per minute.
+            sample = str(kw.get("sample_text") or "")[:60]
+            logger.info(
+                "Wake-hint fired — sample='%s' (suppressed_count=%s)",
+                sample, kw.get("suppressed_count"),
+            )
+            try:
+                self._bus.emit_long(
+                    "partial_response",
+                    text=(
+                        "Boss, if you're calling me, say Atom or Hey Atom. "
+                        "I'll listen."
+                    ),
+                    is_first=True,
+                    is_last=True,
+                )
+            except Exception:
+                logger.debug("wake_hint TTS emit failed", exc_info=True)
+
         self._bus.on("wake_word_detected", _on_wake_word)
         self._bus.on("tts_complete", _on_tts_complete)
         self._bus.on("speech_partial", _on_partial_or_final)
@@ -656,6 +711,7 @@ class VoicePipeline:
         self._bus.on("tts_stream", _on_tts_start)
         self._bus.on("cursor_query", _on_user_query)
         self._bus.on("partial_response", _on_user_query)
+        self._bus.on("wake_hint_needed", _on_wake_hint)
 
         # Give the native STT a reference so it can gate speech_final
         # emission while in PASSIVE mode (no wake phrase -> ignore).
@@ -778,7 +834,11 @@ class VoicePipeline:
         import time as _time
         _vl_t0 = _time.perf_counter()
 
-        if self._wake_word is not None and self._wake_word.is_available:
+        if (
+            self._voice_activation_mode() != "always_on"
+            and self._wake_word is not None
+            and self._wake_word.is_available
+        ):
             self._wake_word.start(loop)
             self._wire_wake_word_gate()
 
@@ -809,10 +869,21 @@ class VoicePipeline:
         from core.state_manager import AtomState
 
         if self._state.current is AtomState.IDLE:
-            self._state.always_listen = self._wake_word is None or not self._wake_word.is_available
+            activation_mode = self._voice_activation_mode()
+            wake_available = self._wake_word is not None and self._wake_word.is_available
+            self._state.always_listen = activation_mode == "always_on" or not wake_available
             if self._state.always_listen:
                 await self._state.transition(AtomState.LISTENING)
-                logger.info("Voice loop: always-listen mode (no wake word, STT never blocks)")
+                if activation_mode == "always_on":
+                    logger.info(
+                        "Voice loop: Jarvis always-on mode "
+                        "(continuous STT routing, duplex-ready)",
+                    )
+                else:
+                    logger.info(
+                        "Voice loop: always-listen fallback "
+                        "(wake word unavailable, STT never blocks)",
+                    )
             else:
                 logger.info("Voice loop: wake word mode (say 'Hey ATOM')")
 

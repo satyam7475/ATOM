@@ -30,6 +30,9 @@ models/*.gguf
 models/vosk-*/
 models/*.onnx
 models/*-mlx/
+models/*-mlx-*/
+models/qwen3-*/
+models/Qwen*/
 
 # macOS
 .DS_Store

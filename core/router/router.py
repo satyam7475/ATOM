@@ -281,6 +281,68 @@ class Router:
         polished = personality.polish_response(out, source="router")
         self._bus.emit_long("response_ready", text=polished, **kw)
 
+    # Short, warm acks for bare wake calls. JARVIS doesn't say "Yes, Boss?"
+    # every single time -- he varies between a calm acknowledgement and a
+    # quiet "I'm here" so it sounds present without feeling scripted.
+    _BARE_WAKE_ACKS: tuple[str, ...] = (
+        "Yes, Boss?",
+        "Right here.",
+        "I'm here, Boss.",
+        "Listening.",
+        "Go ahead, Boss.",
+        "Yes?",
+    )
+    _BARE_WAKE_ACK_INDEX: int = 0
+
+    @classmethod
+    def _pick_bare_wake_ack(cls) -> str:
+        """Return the next short ack in the rotation. We rotate
+        deterministically (rather than ``random``) so consecutive wakes
+        never repeat the same phrase yet the sequence stays predictable
+        for log-trace debugging.
+        """
+        idx = cls._BARE_WAKE_ACK_INDEX % len(cls._BARE_WAKE_ACKS)
+        cls._BARE_WAKE_ACK_INDEX = (cls._BARE_WAKE_ACK_INDEX + 1) % len(cls._BARE_WAKE_ACKS)
+        return cls._BARE_WAKE_ACKS[idx]
+
+    @staticmethod
+    def _is_bare_wake_utterance(text: str) -> bool:
+        """True when ``text`` consists ONLY of wake/direct-address tokens.
+
+        Used to short-circuit the LLM on standalone calls like ``atom``,
+        ``hey atom``, ``boss``, ``dear boss`` (the recurring SFSpeech
+        mishearing of ``hey boss``), so the user gets a one-word ack
+        instead of a 5-second LLM narration.
+        """
+        if not text:
+            return False
+        try:
+            from voice.listening_modes import WakeWordFilter
+        except Exception:
+            return False
+        normalized = " ".join(str(text).strip().lower().split())
+        if not normalized:
+            return False
+        # Strip a single trailing punctuation char so "atom?" / "boss." count.
+        if normalized[-1] in "?.!,":
+            normalized = normalized[:-1].strip()
+        if not normalized:
+            return False
+        if normalized in WakeWordFilter.WAKE_PHRASES:
+            return True
+        if normalized in {p.lower() for p in WakeWordFilter.DIRECT_ADDRESS}:
+            return True
+        # Word-bounded match: the utterance is JUST the wake/address phrase
+        # plus optional "please" / "there" filler. Anything longer is a real
+        # command and must keep going through the LLM.
+        words = normalized.split()
+        if len(words) <= 4:
+            for phrase in WakeWordFilter.DIRECT_ADDRESS:
+                p = phrase.lower()
+                if normalized == p or normalized == f"{p} please":
+                    return True
+        return False
+
     # ── LLM output guardrail (hallucinated-action + low-confidence) ─
     _ACTION_PROMISE_PATTERNS = (
         "i'll ", "i will ", "i am going to ", "i'm going to ", "let me ",
@@ -509,6 +571,22 @@ class Router:
                 )
             except Exception:
                 logger.debug('Fast path step failed', exc_info=True)
+
+        # ── Bare wake / direct-address short-circuit ──────────────────
+        # Treat utterances that contain ONLY a wake phrase or direct-address
+        # token (e.g. "atom", "hey atom", "boss", "dear boss" -- the latter
+        # being SFSpeech's recurring mishearing of "hey boss") as a soft
+        # "are you there?" ping. Without this they fall to the LLM where
+        # "dear boss" becomes a 7-second narration about how the user is
+        # greeting you. We answer with a one-word ack and stay LISTENING
+        # so the user's real follow-up is captured cleanly.
+        if self._is_bare_wake_utterance(clean_text):
+            logger.info(
+                "Bare wake/direct-address — short-circuiting LLM ('%s')",
+                clean_text[:60],
+            )
+            self._emit_response(self._pick_bare_wake_ack())
+            return
 
         if self._conv_memory is not None:
             self._conv_memory.on_new_user_query(raw_text)
@@ -1882,13 +1960,12 @@ class Router:
                 memory_k = max(1, int(getattr(query_plan, "memory_limit", 2) or 2))
                 memory_ctx = await self._memory.retrieve(clean_text, k=memory_k)
 
-        if is_repeat:
-            repeat_hint = (
-                "\n\n[SYSTEM NOTE: The user asked this before and wasn't "
-                "satisfied with the previous answer. Provide a different, "
-                "more thorough response.]"
-            )
-            original_text = original_text + repeat_hint
+        # NOTE: do NOT splice a "[SYSTEM NOTE: ...]" string into the user
+        # query. Small models (Qwen3-8B-4bit) sometimes echo the bracketed
+        # instruction back during TTS as quoted analysis like
+        # `"Dear Boss" — the user is greeting you, so respond politely…`.
+        # Instead, signal the repeat through bus metadata so the prompt
+        # builder injects a clean steer in the SYSTEM layer.
 
         if self._assistant_mode_mgr is not None:
             if not self._assistant_mode_mgr.allows_llm_fallback():
@@ -1974,6 +2051,7 @@ class Router:
             context=context_bundle,
             history=history,
             query_plan=query_plan,
+            repeat_hint=bool(is_repeat),
         )
 
     # ── Cloud streaming (token-by-token → TTS) ─────────────────────

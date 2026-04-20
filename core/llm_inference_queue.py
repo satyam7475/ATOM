@@ -85,8 +85,16 @@ class LLMInferenceQueue:
         context: dict[str, str] | None = None,
         history: list[tuple[str, str]] | None = None,
         query_plan: Any | None = None,
+        repeat_hint: bool = False,
     ) -> None:
-        """Enqueue (or replace) one job. Returns immediately."""
+        """Enqueue (or replace) one job. Returns immediately.
+
+        ``repeat_hint`` propagates from the router (set when Boss is asking
+        the same thing again) so the prompt builder can inject a steer in
+        the system layer telling the LLM to reformulate from a fresh angle.
+        Without forwarding this flag the JARVIS-feel "I asked already" loop
+        regresses into ATOM repeating the same wording verbatim.
+        """
         async with self._lock:
             if self._pending is not None and self._metrics is not None:
                 self._metrics.inc("llm_queue_coalesced")
@@ -96,6 +104,7 @@ class LLMInferenceQueue:
                 "context": context,
                 "history": history or [],
                 "query_plan": query_plan,
+                "repeat_hint": repeat_hint,
             }
         self._wake.set()
 
@@ -123,6 +132,7 @@ class LLMInferenceQueue:
                         context=job.get("context"),
                         history=job.get("history") or [],
                         query_plan=job.get("query_plan"),
+                        repeat_hint=bool(job.get("repeat_hint", False)),
                     )
                 except asyncio.CancelledError:
                     raise

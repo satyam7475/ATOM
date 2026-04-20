@@ -245,10 +245,15 @@ class IdentityEngine:
             verbosity = "brief"
         if ctx["preferred_verbosity"] == "short" and verbosity == "normal":
             verbosity = "brief"
+        # When Boss has explicitly set ``preferred_response_length=long`` and
+        # the mood/mode supports a fuller answer, upgrade ``brief`` -> ``normal``.
+        # This fires for ``work`` mode (deep-work) and for ``chill`` mode
+        # (warm/social conversation), so the same preference signal is
+        # honored across both productive and relaxed contexts.
         if (
             ctx["preferred_verbosity"] == "long"
             and verbosity == "brief"
-            and mode_name == "work"
+            and mode_name in {"work", "chill"}
             and emotion not in {"frustrated", "stressed", "tired"}
             and not ctx["in_flow_state"]
         ):

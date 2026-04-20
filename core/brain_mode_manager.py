@@ -134,13 +134,17 @@ class BrainModeManager:
             self._switch_timestamps.popleft()
         return len(self._switch_timestamps) >= self._MAX_SWITCHES_PER_WINDOW
 
-    def set_profile(self, name: str) -> tuple[bool, str]:
+    def set_profile(self, name: str, *, force: bool = False) -> tuple[bool, str]:
         """Validate and switch profile. Returns (ok, message for user).
 
         Guards:
           - Same-state: no-op if already in the requested profile.
           - Cooldown: rejects switches within _COOLDOWN_S of the last one.
           - Rate limit: max _MAX_SWITCHES_PER_WINDOW switches per _RATE_WINDOW_S.
+
+        ``force=True`` bypasses the cooldown + rate-limit guards. Reserved
+        for boot-time restoration, internal recovery flows, and tests; do
+        NOT pass it from user-facing voice commands.
         """
         if not name or not isinstance(name, str):
             return False, "Invalid profile name."
@@ -156,12 +160,16 @@ class BrainModeManager:
                 return True, f"Already in {self.display_name(key)}, Boss."
 
             now = time.monotonic()
-            if self._last_switch_time and (now - self._last_switch_time) < self._COOLDOWN_S:
+            if (
+                not force
+                and self._last_switch_time
+                and (now - self._last_switch_time) < self._COOLDOWN_S
+            ):
                 remaining = self._COOLDOWN_S - (now - self._last_switch_time)
                 logger.debug("Brain profile cooldown (%.1fs remaining)", remaining)
                 return False, "Profile switch on cooldown, Boss. Try again in a moment."
 
-            if self._rate_limited():
+            if not force and self._rate_limited():
                 logger.warning("Brain profile rate limit hit (%d in %.0fs)",
                                self._MAX_SWITCHES_PER_WINDOW, self._RATE_WINDOW_S)
                 return False, "Too many profile switches. Try again in a minute, Boss."

@@ -21,6 +21,7 @@ Owner: Satyam
 from __future__ import annotations
 
 import asyncio
+import collections
 import logging
 import plistlib
 import re
@@ -114,11 +115,30 @@ _SYSTEM_VOICE_ALIASES = frozenset({
     "system", "default", "siri", "apple", "apple_siri", "match_system", "",
 })
 
+# Preset voice requests with a stable quality order. ``jarvis`` intentionally
+# prefers a British voice family, falling back to Daniel compact on a stock macOS
+# install and auto-upgrading to enhanced/premium voices if the user installs them.
+_VOICE_PRESETS: dict[str, tuple[str, ...]] = {
+    "jarvis": (
+        "com.apple.voice.premium.en-GB.Daniel",
+        "com.apple.voice.enhanced.en-GB.Daniel",
+        "com.apple.voice.compact.en-GB.Daniel",
+        "com.apple.voice.premium.en-GB.Serena",
+        "com.apple.voice.enhanced.en-GB.Serena",
+        "com.apple.voice.premium.en-GB.Kate",
+        "com.apple.voice.enhanced.en-GB.Kate",
+        "com.apple.voice.premium.en-GB.Martha",
+        "com.apple.voice.enhanced.en-GB.Martha",
+    ),
+}
+
 # When no explicit voice matches: premium neural first, then compact natural
 # voices, then Eloquence as last resort. Warm feminine voices are preferred
 # for the "Friday" assistant personality.
 _PREFERRED_VOICES = [
     # Premium / enhanced neural (Siri-class, require download from Spoken Content settings)
+    "com.apple.voice.premium.en-GB.Daniel",
+    "com.apple.voice.enhanced.en-GB.Daniel",
     "com.apple.voice.premium.en-US.Samantha",
     "com.apple.voice.enhanced.en-US.Samantha",
     "com.apple.voice.premium.en-GB.Serena",
@@ -144,6 +164,28 @@ _PREFERRED_VOICES = [
     "com.apple.eloquence.en-GB.Shelley",
     "com.apple.eloquence.en-US.Eddy",
 ]
+
+
+def _voice_quality_rank(voice_id: str) -> tuple[int, int]:
+    lower = (voice_id or "").lower()
+    if "premium" in lower or "enhanced" in lower:
+        quality = 0
+    elif "compact" in lower:
+        quality = 1
+    elif "eloquence" in lower:
+        quality = 3
+    else:
+        quality = 2
+    return (quality, len(voice_id or ""))
+
+
+def _preferred_pitch_shift(voice_id: str) -> float:
+    lower = (voice_id or "").lower()
+    if not lower or "eloquence" in lower:
+        return 0.0
+    if any(token in lower for token in ("daniel", "eddy", "reed", "rocko", "grandpa")):
+        return 0.0
+    return 2.0
 
 
 def list_voices_native() -> list[dict]:
@@ -284,7 +326,9 @@ def _pick_best_voice(requested: str) -> str:
 
     For ``system`` / ``siri`` / ``default``: try ``NSSpeechSynthesizer.defaultVoice()``,
     then ``com.apple.speech.voice.prefs`` (Accessibility → Spoken Content), then a
-    neural fallback list.
+    neural fallback list. For preset aliases like ``jarvis``, use a deterministic
+    quality-ordered list rather than whichever matching identifier happens to come
+    first from ``availableVoices()``.
     """
     if not _HAS_NATIVE:
         return requested
@@ -322,10 +366,27 @@ def _pick_best_voice(requested: str) -> str:
         )
 
     if req_raw and req_lower not in _SYSTEM_VOICE_ALIASES:
-        for vid in available:
-            if req_lower in vid.lower():
-                logger.info("TTS: matched requested voice substring '%s' -> %s", req_raw, vid)
-                return vid
+        preset = _VOICE_PRESETS.get(req_lower)
+        if preset is not None:
+            for vid in preset:
+                if vid in available:
+                    logger.info("TTS: using preset voice '%s' -> %s", req_raw, vid)
+                    return vid
+
+        matches = sorted(
+            (vid for vid in available if req_lower in vid.lower()),
+            key=lambda vid: (
+                0 if vid.rsplit(".", 1)[-1].lower() == req_lower else 1,
+                _voice_quality_rank(vid),
+            ),
+        )
+        if matches:
+            chosen = matches[0]
+            logger.info(
+                "TTS: matched requested voice substring '%s' -> %s",
+                req_raw, chosen,
+            )
+            return chosen
 
     for vid in _PREFERRED_VOICES:
         if vid in available:
@@ -336,7 +397,7 @@ def _pick_best_voice(requested: str) -> str:
                     "TTS UPGRADE TIP: You are using a compact voice (%s). "
                     "For Jarvis-quality neural TTS, open System Settings → "
                     "Accessibility → Spoken Content → System Voice → Manage Voices "
-                    "and download 'Samantha (Premium)' or 'Zoe (Premium)'. "
+                    "and download 'Daniel', 'Samantha (Premium)', or 'Zoe (Premium)'. "
                     "ATOM will auto-detect and use it on next launch.",
                     vid.split(".")[-1],
                 )
@@ -451,6 +512,12 @@ class MacOSTTSAsync:
         self._stream_speak_buffer: str = ""
         self._stream_start_t: float = 0.0
         self._tts_interrupt_count: int = 0
+        # Echo guard ring: lowercased, alpha-only word lists from the most
+        # recent spoken slices. Lets ``is_echo()`` answer whether an STT
+        # partial is just the mic catching ATOM's own speakers — so we
+        # don't trigger a barge-in on our own voice.
+        self._spoken_echo_window: collections.deque[set[str]] = collections.deque(maxlen=6)
+        self._last_spoke_t: float = 0.0
 
         from voice.speech_enhancer import SpeechEnhancer
         self._enhancer = SpeechEnhancer(base_rate=rate)
@@ -468,7 +535,7 @@ class MacOSTTSAsync:
             self._voice_id = _pick_best_voice(self._voice_request)
             is_premium = "premium" in self._voice_id or "enhanced" in self._voice_id
             is_eloquence = "eloquence" in self._voice_id
-            pitch_shift = 4.0 if not is_eloquence else 0.0
+            pitch_shift = _preferred_pitch_shift(self._voice_id)
             self._native_synth = _NativeSynth(self._voice_id, float(self._rate), pitch_shift)
             self._backend = "NSSpeechSynthesizer"
 
@@ -497,6 +564,11 @@ class MacOSTTSAsync:
         """Speak a single utterance via the active backend."""
         if self._cancel_requested or not text:
             return
+
+        # Echo-guard bookkeeping must happen BEFORE the audio plays so a
+        # racing STT partial caught by the mic still finds the words in
+        # the recent-spoken window.
+        self._record_spoken(text)
 
         if self._backend == "NSSpeechSynthesizer" and self._native_synth:
             loop = asyncio.get_running_loop()
@@ -600,6 +672,55 @@ class MacOSTTSAsync:
         lowered = re.sub(r"[^a-z0-9\s]", "", (text or "").lower())
         return re.sub(r"\s+", " ", lowered).strip()
 
+    # ── Self-voice / echo guard ────────────────────────────────────
+    def _record_spoken(self, text: str) -> None:
+        """Remember the bag-of-words ATOM just spoke so ``is_echo`` can
+        match noisy partials caught by the mic from our own speakers.
+        """
+        key = self._chunk_key(text)
+        if not key:
+            return
+        words = {w for w in key.split() if len(w) >= 3}
+        if not words:
+            return
+        self._spoken_echo_window.append(words)
+        self._last_spoke_t = time.monotonic()
+
+    def is_echo(self, partial_text: str, *, window_s: float = 6.0) -> bool:
+        """Best-effort echo guard for STT partials.
+
+        Returns ``True`` when the partial looks like the mic catching our
+        own voice during a SPEAKING state — specifically, when every
+        meaningful word in the partial appears in the last few spoken
+        slices and we spoke recently. The interrupt handler uses this to
+        suppress self-feedback barge-ins.
+        """
+        if not partial_text:
+            return False
+        if not self._spoken_echo_window:
+            return False
+        if (time.monotonic() - self._last_spoke_t) > max(0.5, float(window_s)):
+            return False
+        key = self._chunk_key(partial_text)
+        if not key:
+            return False
+        partial_words = [w for w in key.split() if len(w) >= 3]
+        if not partial_words:
+            # Single short token (e.g. "the") - treat as echo when speaking
+            # because such tokens do not carry user intent and we are
+            # confidently talking right now.
+            return True
+        recent_corpus: set[str] = set()
+        for slice_words in self._spoken_echo_window:
+            recent_corpus.update(slice_words)
+        if not recent_corpus:
+            return False
+        hits = sum(1 for w in partial_words if w in recent_corpus)
+        # Require near-total overlap (>= 80%) before declaring echo so a
+        # genuine interrupt that *also* happens to share a stop word
+        # ("ok", "and") still gets through.
+        return hits >= max(1, int(0.8 * len(partial_words)))
+
     def _is_duplicate_chunk(self, text: str) -> bool:
         """Skip only immediate repeats of the same spoken chunk (streaming overlap).
 
@@ -622,12 +743,24 @@ class MacOSTTSAsync:
             self._recent_spoken_chunks = self._recent_spoken_chunks[-3:]
         return False
 
-    def _pop_next_stream_segment(self, force: bool) -> str:
+    # Hold off the eager first-audio flush this long after the very first
+    # streamed chunk arrived so a tight burst of single-token chunks
+    # coalesces into one utterance instead of being chopped at 3 words.
+    # 60ms is well below human-perceptible "first sound" latency yet long
+    # enough to absorb token-at-a-time bursts from a fast LLM stream.
+    _STREAM_FIRST_FLUSH_DEBOUNCE_S: float = 0.06
+
+    def _pop_next_stream_segment(self, force: bool, more_pending: bool = False) -> str:
         """Take the next speakable slice from _stream_speak_buffer.
 
         Complete sentences (ending in . ! ?) flush immediately so latency stays
         low. Unpunctuated fragments wait until we have enough words to avoid
         NSSpeechSynthesizer speaking one token at a time.
+
+        ``more_pending`` is True when the producer queue still has unread
+        items. We also apply a short time-based debounce on the very first
+        flush so a token-at-a-time burst (e.g. an 8-word reply arriving as
+        8 separate chunks) lands as one utterance.
         """
         buf = self._stream_speak_buffer.strip()
         if not buf:
@@ -652,17 +785,42 @@ class MacOSTTSAsync:
             self._stream_speak_buffer = ""
             return buf
 
+        # First-flush debounce: while the very first chunk is still fresh
+        # and nothing has been spoken yet, hold ANY unpunctuated flush so a
+        # token-burst coalesces. The is_last force=True path bypasses this.
+        in_first_flush_window = (
+            self._spoken_word_count == 0
+            and self._stream_start_t > 0.0
+            and (time.perf_counter() - self._stream_start_t)
+            < self._STREAM_FIRST_FLUSH_DEBOUNCE_S
+        )
+
         # Fast first-audio: flush with as few as 3 words when nothing has
-        # been spoken yet so the user hears something immediately.
-        if self._spoken_word_count == 0 and n >= 3:
+        # been spoken yet so the user hears something immediately — but
+        # only when the producer is briefly quiet AND we're past the
+        # initial debounce window.
+        if (
+            self._spoken_word_count == 0
+            and n >= 3
+            and not more_pending
+            and not in_first_flush_window
+        ):
             self._stream_speak_buffer = ""
             return buf
 
-        if n >= self._STREAM_UNPUNCT_BATCH:
+        if (
+            n >= self._STREAM_UNPUNCT_BATCH
+            and not more_pending
+            and not in_first_flush_window
+        ):
             seg = " ".join(words[: self._STREAM_UNPUNCT_BATCH])
             self._stream_speak_buffer = " ".join(words[self._STREAM_UNPUNCT_BATCH :])
             return seg
-        if n >= self._STREAM_UNPUNCT_MIN_WORDS:
+        if (
+            n >= self._STREAM_UNPUNCT_MIN_WORDS
+            and not more_pending
+            and not in_first_flush_window
+        ):
             take = min(n, self._STREAM_UNPUNCT_BATCH)
             seg = " ".join(words[:take])
             self._stream_speak_buffer = " ".join(words[take:])
@@ -709,8 +867,14 @@ class MacOSTTSAsync:
                     )
                     self._stream_speak_buffer = re.sub(r"\s+", " ", merged).strip()
 
+                # When more chunks are already buffered, hold flushes so
+                # tiny per-token streams coalesce into one utterance and
+                # NSSpeechSynthesizer doesn't speak one word at a time.
+                more_pending = queue.qsize() > 0 and not is_last
                 while True:
-                    seg = self._pop_next_stream_segment(force=False)
+                    seg = self._pop_next_stream_segment(
+                        force=False, more_pending=more_pending,
+                    )
                     if not seg:
                         break
                     await self._speak_stream_slice(seg)
@@ -838,6 +1002,7 @@ class MacOSTTSAsync:
                 return
             self._playing = True
             try:
+                self._record_spoken(phrase)
                 await self._speak_one(phrase)
             finally:
                 self._playing = False

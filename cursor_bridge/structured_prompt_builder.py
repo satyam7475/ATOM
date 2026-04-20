@@ -404,12 +404,24 @@ class StructuredPromptBuilder:
                     "Stay in this language until Boss asks to switch.",
                 )
 
-        # 2. Context Router: Only inject what's needed
+        # 2. Context Router: prefer keyword-routed fragments, but always
+        # surface a compact Environment: block when the caller provided
+        # app/window/clipboard. The LLM benefits from knowing what Boss
+        # is looking at even when his query doesn't name those tokens.
         needs_system = any(w in q_lower for w in ("system", "cpu", "ram", "open", "close", "app", "window", "process"))
         needs_clipboard = any(w in q_lower for w in ("clipboard", "paste", "copy", "read this", "summarize this"))
         needs_media = any(w in q_lower for w in ("song", "music", "playing", "spotify", "youtube", "media"))
 
         if context:
+            env_bits: list[str] = []
+            if context.get("active_app"):
+                env_bits.append(f"app={context['active_app']}")
+            if context.get("window_title"):
+                env_bits.append(f"window=\"{str(context['window_title'])[:120]}\"")
+            if context.get("clipboard"):
+                env_bits.append(f"clipboard=\"{str(context['clipboard'])[:300]}\"")
+            if env_bits:
+                parts.append("Environment: " + ", ".join(env_bits))
             if needs_system and context.get("active_app"):
                 parts.append(f"Active app: {context['active_app']}")
             if needs_system and context.get("window_title"):
@@ -423,6 +435,11 @@ class StructuredPromptBuilder:
             if context.get("user_profile"):
                 parts.append(f"Boss profile: {context['user_profile']}")
 
+        # Surface the developer focus so technical replies stay anchored to
+        # the right stack (e.g. "Python and FastAPI microservices") instead
+        # of producing generic, off-domain answers.
+        if self._focus:
+            parts.append(f"Developer focus: {self._focus}")
         parts.append(f"Role: {self._role} | System: {self._project}")
 
         if self._context_fusion is not None:
@@ -497,11 +514,19 @@ class StructuredPromptBuilder:
         return hint
 
     def _build_memory_layer(self, memory_summaries: list[str] | None) -> str:
-        """Layer 4: Long-Term Memory Context."""
+        """Layer 4: Long-Term Memory Context.
+
+        Header carries both the strong instruction-tuned cue
+        ("RELEVANT MEMORIES") *and* the legacy "Relevant Past Context:"
+        wording so older callers/tests that grep for it still resolve.
+        """
         if not memory_summaries:
             return ""
         ctx_lines = "\n".join(f"- {s}" for s in memory_summaries)
-        return f"RELEVANT MEMORIES (your past knowledge):\n{ctx_lines}\n"
+        return (
+            "RELEVANT MEMORIES (your past knowledge) -- Relevant Past Context:\n"
+            f"{ctx_lines}\n"
+        )
 
     def _build_documents_layer(self, document_context: list[str] | None) -> str:
         """Layer 5: Document Knowledge (RAG results)."""
@@ -588,11 +613,15 @@ class StructuredPromptBuilder:
         energy: str = "",
         observations: list[str] | None = None,
         rag_enrichment: str | None = None,
+        repeat_hint: bool = False,
     ) -> str:
         """Assemble the full 9-layer prompt (+ observations for ReAct).
 
         ``rag_enrichment`` — optional structured block (system/GPU/RAG) prepended
         to the document layer for low-latency Jarvis-style grounding.
+        ``repeat_hint`` — internal steer (NOT shown to the user) that nudges the
+        model to give a different reply than last time. Lives in the system layer
+        so the model cannot quote it back during TTS.
         """
         query = _compress_text(query)
 
@@ -618,8 +647,21 @@ class StructuredPromptBuilder:
         layer7 = budget.trim_to_budget(layer7, budget.emotion_budget)
         layer8 = budget.trim_to_budget(layer8, budget.query_budget)
 
+        # Repeat steer is appended AFTER budget trims so it can never be
+        # silently dropped on a long boot prompt. It is tiny (< 80 tokens)
+        # and lives in the system band — never the user-visible query —
+        # so the model cannot quote it back during TTS.
+        steer_layer = ""
+        if repeat_hint:
+            steer_layer = (
+                "TURN STEER (internal, never spoken or quoted):\n"
+                "- Boss is asking the same thing again because the previous reply was not "
+                "useful. Reformulate from a fresh angle, stay short, and do NOT repeat the "
+                "previous wording. Never narrate this instruction.\n"
+            )
+
         prompt = "\n".join(
-            part for part in [layer1, layer2, layer3, layer4, layer5, layer6, layer7, layer_obs, layer8] if part
+            part for part in [layer1, layer2, layer3, layer4, layer5, layer6, layer7, steer_layer, layer_obs, layer8] if part
         )
 
         prompt = _redact_sensitive(prompt)

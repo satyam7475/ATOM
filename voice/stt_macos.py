@@ -392,6 +392,16 @@ class NativeSTT:
         self._chain_restart_debounce_s: float = 0.25
         self._pending_chain_restart: bool = False
         self._last_recreate_time: float = 0.0
+
+        # Passive-mode suppression telemetry. When PASSIVE and the user
+        # utters several sentences in a row that never match the wake
+        # filter, we emit a one-shot bus hint so the voice pipeline can
+        # gently prompt the user ("say 'Atom' to call me"). Without this,
+        # a user fighting en-IN recognizer mishearings can burn a full
+        # session talking to a ghost.
+        self._passive_suppress_count: int = 0
+        self._passive_suppress_window_start: float = 0.0
+        self._passive_hint_last_time: float = 0.0
         self._min_recreate_interval_s: float = 1.0
         self._recreate_times_window: collections.deque = collections.deque(maxlen=16)
         self._max_recreates_in_window: int = 5
@@ -906,6 +916,61 @@ class NativeSTT:
             return False
         window = text_lower[:90]
         return any(phrase in window for phrase in cls._CORRECTION_PHRASES)
+
+    def _reset_passive_suppression(self) -> None:
+        """Called whenever a wake-qualified final gets through. Clears the
+        telemetry so we don't re-nag the user after a successful wake."""
+        self._passive_suppress_count = 0
+        self._passive_suppress_window_start = 0.0
+
+    def _note_passive_suppression(
+        self,
+        text: str,
+        loop: asyncio.AbstractEventLoop | None,
+    ) -> None:
+        """Record a PASSIVE-mode final that got silently dropped.
+
+        If the same user produces 3+ silently-dropped finals inside a
+        60-second window, schedule a one-shot ``wake_hint_needed`` event
+        on the bus so the voice pipeline can speak a short prompt. We
+        throttle to one hint per 60s regardless of how many suppressions
+        accumulate afterwards — the hint is supposed to feel like a
+        nudge, not a scold.
+        """
+        now = time.monotonic()
+        window = 60.0
+
+        if (now - self._passive_suppress_window_start) > window:
+            self._passive_suppress_window_start = now
+            self._passive_suppress_count = 1
+        else:
+            self._passive_suppress_count += 1
+
+        if self._passive_suppress_count < 3:
+            return
+        if (now - self._passive_hint_last_time) < window:
+            return
+
+        self._passive_hint_last_time = now
+        logger.info(
+            "STT: emitting wake_hint_needed — %d finals suppressed in PASSIVE "
+            "mode in the last %.0fs (last sample: '%s')",
+            self._passive_suppress_count,
+            window,
+            text[:60],
+        )
+        if loop is not None:
+            sample = text[:80]
+            try:
+                loop.call_soon_threadsafe(
+                    lambda s=sample: self._bus.emit(
+                        "wake_hint_needed",
+                        sample_text=s,
+                        suppressed_count=self._passive_suppress_count,
+                    ),
+                )
+            except Exception:
+                logger.debug("wake_hint_needed emit failed", exc_info=True)
 
     def _should_feed_recognizer(self) -> bool:
         """Return True if audio frames should reach SFSpeechRecognizer now.
@@ -1941,17 +2006,24 @@ class NativeSTT:
                         if getattr(lm, "is_passive", False):
                             from voice.listening_modes import WakeWordFilter
                             lower_text = text.lower()
-                            has_wake = any(
-                                ph in lower_text
-                                for ph in WakeWordFilter.WAKE_PHRASES
-                            )
+                            has_wake = WakeWordFilter.contains_wake(text)
                             is_correction = self._is_correction_phrase(lower_text)
                             if not has_wake and not is_correction:
                                 logger.debug(
                                     "STT: suppressing speech_final in PASSIVE mode (no wake phrase): '%s'",
                                     text[:60],
                                 )
+                                self._note_passive_suppression(text, loop)
                                 return
+                            if has_wake:
+                                try:
+                                    lm.activate("wake_in_final")
+                                except Exception:
+                                    logger.debug(
+                                        "wake-in-final activate failed",
+                                        exc_info=True,
+                                    )
+                                self._reset_passive_suppression()
                             if is_correction and not has_wake:
                                 logger.info(
                                     "STT: PASSIVE mode bypassed by correction phrase — '%s'",

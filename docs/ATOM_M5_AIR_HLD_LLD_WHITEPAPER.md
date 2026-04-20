@@ -9,7 +9,7 @@
 
 ## 1. Executive Summary
 
-ATOM is a fully local, offline-first personal operating intelligence system designed to run on Apple Silicon laptops. It combines a dual-model MLX LLM pipeline, Apple-native voice I/O, an agentic tool-use loop, conversational memory, and a real-time web dashboard into a single runtime that a user interacts with like a personal Jarvis.
+ATOM is a fully local, offline-first personal operating intelligence system designed to run on Apple Silicon laptops. It combines a shared-role MLX LLM pipeline, Apple-native voice I/O, an agentic tool-use loop, conversational memory, and a real-time web dashboard into a single runtime that a user interacts with like a personal Jarvis.
 
 The system went through a major stabilization pass (April 2026) that addressed seven critical areas:
 
@@ -93,13 +93,12 @@ flowchart TD
 
     CK -->|DIRECT| RA[Router Action Path]
     CK -->|CACHE| CA[LRU Cache]
-    CK -->|QUICK| MF[MLX Fast · Qwen3-1.7B]
-    CK -->|FULL| MP[MLX Primary · Qwen3-4B]
-    CK -->|DEEP| MP
+    CK -->|QUICK| MLX[MLX Shared Brain · Qwen3-8B]
+    CK -->|FULL| MLX
+    CK -->|DEEP| MLX
 
     RA --> SEC[Security Policy + Tool Execution]
-    MF --> LBC[Local Brain Controller]
-    MP --> LBC
+    MLX --> LBC[Local Brain Controller]
     SEC --> LBC
 
     LBC --> SG[Stop Guard + Answer Validator]
@@ -197,7 +196,7 @@ flowchart TD
 
 ### 6.1 MLX Generation Pipeline (`brain/mlx_llm.py`)
 
-**Dual-role architecture**: two MLX model slots (`fast` = Qwen3-1.7B, `primary` = Qwen3-4B) with lazy loading and idle unload.
+**Shared-role architecture**: one MLX model tree backs both `fast` and `primary` roles so ATOM keeps the same routing contract while loading a single production model on disk.
 
 **Stop-sequence enforcement**: every streaming call enforces a set of default stop sequences (`\nUser:`, `\nBoss:`, `\nATOM:`, `\nAssistant:`, `User:`, `Boss:`, `Assistant:`, `ATOM:`) plus any profile-configured extras. Stop matching happens incrementally during token generation.
 
@@ -379,9 +378,9 @@ All of these are gated by `BrainModeManager.feature_enabled()`:
 {
   "brain": {
     "enabled": true,
-    "mlx_primary_model": "models/qwen3-4b-mlx",
-    "mlx_fast_model": "models/qwen3-1.7b-mlx",
-    "mlx_default_role": "fast",
+    "mlx_primary_model": "models/qwen3-8b-mlx-4bit",
+    "mlx_fast_model": "models/qwen3-8b-mlx-4bit",
+    "mlx_default_role": "primary",
     "max_tokens": 384,
     "temperature": 0.7,
     "repeat_penalty": 1.1,
@@ -498,9 +497,9 @@ When ATOM is launched directly from Python (terminal/IDE), macOS speech recognit
 
 `sentence-transformers` and `chromadb` are not installed in the current environment. Memory operates in keyword-only mode. The system is honest about this: RAG routing is disabled, and the LLM is told not to claim retrieval capabilities.
 
-### 9.3 Small Model Quality Ceiling
+### 9.3 Earlier Small-Model Quality Ceiling
 
-The Qwen3-1.7B fast model can produce low-quality or instruction-echoing output on complex prompts. The answer validator catches most of these, but some edge cases may still result in a recovery retry or a "lost that answer" response.
+Earlier experimental fast tiers based on smaller local models could produce low-quality or instruction-echoing output on complex prompts. The answer validator caught most of these, but some edge cases still produced recovery retries or a "lost that answer" response. The production move to a single `Qwen3 8B` model reduces this risk.
 
 ### 9.4 Response Language Drift
 
@@ -515,7 +514,7 @@ ATOM/
 ├── main.py                          # Entry point and orchestration
 ├── config/settings.json             # Runtime configuration
 ├── brain/
-│   ├── mlx_llm.py                   # MLX dual-model inference with stop guards
+│   ├── mlx_llm.py                   # MLX local inference with stop guards
 │   ├── memory_graph.py              # SQLite entity/relationship graph
 │   └── mini_llm.py                  # llama-cpp-python fallback (optional)
 ├── cursor_bridge/
@@ -570,8 +569,7 @@ ATOM/
 | Component | Technology | Why |
 |---|---|---|
 | LLM Inference | MLX (`mlx_lm`) | Apple-native, unified memory efficient |
-| Primary Model | Qwen3-4B-MLX (4-bit) | Best quality/size ratio for 16 GB |
-| Fast Model | Qwen3-1.7B-MLX (4-bit) | Sub-2s responses, minimal RAM |
+| Local Model | Qwen3-8B-MLX (4-bit) | Single production model for both roles on 16 GB |
 | STT | SFSpeechRecognizer | On-device Neural Engine, zero latency |
 | TTS | NSSpeechSynthesizer | Native, zero external dependencies |
 | Web UI | aiohttp + WebSocket | Lightweight, no Electron overhead |

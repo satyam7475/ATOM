@@ -67,11 +67,30 @@ _REPEATED_SPEAKER_RE = re.compile(r"^(?:(?:User|Boss|ATOM|Assistant)\s*:?\s*)+$"
 # a handful of instruction echoes ("direct answer", "strict output recovery");
 # real model leaks include "Okay, let's see …" and "So the user is asking …"
 # which we now catch explicitly.
+# Quoted-prefix tolerance: the leak we keep seeing in the wild looks like
+#   "Dear Boss" — the user is greeting you, so respond politely and warmly.
+# i.e. the model first quotes the user's transcribed text and *then* narrates
+# what it should do. The quoted prefix would otherwise let the leak slip past
+# any anchored "starts-with" check, so this optional group consumes a leading
+# quoted phrase plus a separator (em/en dash, double-dash, colon, comma, etc.)
+# before the actual instruction-echo token.
+_QUOTED_USER_ECHO_PREFIX = (
+    r"(?:[\"'\u201c\u2018`]"        # opening quote (straight, smart, backtick)
+    r"[^\"'\u201c\u201d\u2018\u2019`\n]{1,80}"   # quoted body (single line)
+    r"[\"'\u201d\u2019`]"           # closing quote
+    r"\s*[\u2013\u2014:,\-]+\s*)?"  # optional dash/colon/comma separator + space
+)
 _INSTRUCTION_ECHO_RE = re.compile(
-    r"^(?:"
+    r"^"
+    + _QUOTED_USER_ECHO_PREFIX +
+    r"(?:"
     r"the final answer should|reply with|direct answer|current user request|"
     r"strict output recovery|response contract|the user is asking|this is a|"
     r"boss explicitly asked|"
+    # Direct narration variants seen in production logs.
+    r"the user is\s+(?:greeting|asking|requesting|wanting|saying|trying)\b|"
+    r"the user wants\b|the user said\b|the user just\b|"
+    r"so respond\b|respond politely\b|respond warmly\b|"
     # CoT / stall prefaces below.
     r"okay,?\s+(?:let'?s|lets|let me)\b|"
     r"alright,?\s+(?:so|let'?s|lets|let me)\b|"
@@ -97,6 +116,15 @@ _MEMORY_ACK_RE = re.compile(r'^"?((?:yes,\s*)?i remember (?:it|that))\.?"?$', re
 _COT_PREFACE_STRIP_RE = re.compile(
     r"""
     ^\s*
+    # Optional leading quoted user-text + dash/colon separator. Keeps the
+    # stripper aligned with the rejector so a "Dear Boss" — narration leak
+    # is peeled cleanly even when the rejector decides to keep it.
+    (?:
+        ["'\u201c\u2018`]
+        [^"'\u201c\u201d\u2018\u2019`\n]{1,80}
+        ["'\u201d\u2019`]
+        \s*[\u2013\u2014:,\-]+\s*
+    )?
     (?:
         (?:okay|ok|alright|well|so|hmm+|um+|uh+)\b[,.!]?\s*
         (?:let(?:'|\u2019)?s?\s+(?:see|think|break|try|start|go)\b[^.?!]*[.?!]\s*)?
@@ -105,13 +133,50 @@ _COT_PREFACE_STRIP_RE = re.compile(
       |
         let\s+me\s+(?:think|see|try|consider)\b[^.?!]*[.?!]\s*
       |
-        (?:the\s+user|boss|the\s+speaker)\s+(?:is\s+)?(?:asking|wants|says|said|needs|wondering)[^.?!]*[.?!]\s*
+        (?:the\s+user|boss|the\s+speaker)\s+(?:is\s+)?(?:greeting|asking|wants|says|said|needs|wondering|requesting|trying)[^.?!]*[.?!]\s*
       |
         (?:so\s+)?(?:the\s+)?(?:question|query|request)\s+is\b[^.?!]*[.?!]\s*
       |
         i\s+(?:should|need\s+to|have\s+to|must)\s+(?:think|consider|figure|reason|recall)\b[^.?!]*[.?!]\s*
       |
         (?:hmm+|um+|uh+|er+|ah+)[,.!]?\s+
+      |
+        so\s+respond\s+(?:politely|warmly|briefly|kindly|directly)[^.?!]*[.?!]\s*
+    )+
+    """,
+    re.IGNORECASE | re.VERBOSE | re.DOTALL,
+)
+
+
+# Streaming-safe variant: same patterns but accepts comma OR end-of-string
+# as the terminator. The base stripper above demands sentence-ending
+# punctuation [.?!] which never appears mid-stream when the controller
+# flushes at the FIRST clause boundary (a comma). Without this, a leak
+# like
+#       "Yeah Boss" — the user is greeting you,    <-- emitted at clause
+#       respond politely and warmly.               <-- next slice
+# slips past the sanitiser one fragment at a time and ATOM speaks its own
+# instructions out loud. We run this *only* on text that does NOT end in
+# [.?!] so well-formed responses keep their normal handling.
+_COT_PREFACE_STRIP_PARTIAL_RE = re.compile(
+    r"""
+    ^\s*
+    (?:
+        ["'\u201c\u2018`]
+        [^"'\u201c\u201d\u2018\u2019`\n]{1,80}
+        ["'\u201d\u2019`]
+        \s*[\u2013\u2014:,\-]+\s*
+    )?
+    (?:
+        (?:the\s+user|boss|the\s+speaker)\s+(?:is\s+)?
+        (?:greeting|asking|wants|says|said|needs|wondering|requesting|trying)
+        [^.?!]*(?:[,]\s*|$)
+      |
+        so\s+respond\s+(?:politely|warmly|briefly|kindly|directly)
+        [^.?!]*(?:[,]\s*|$)
+      |
+        respond\s+(?:politely|warmly|briefly|kindly|directly)
+        [^.?!]*(?:[,]\s*|$)
     )+
     """,
     re.IGNORECASE | re.VERBOSE | re.DOTALL,
@@ -121,6 +186,11 @@ _COT_PREFACE_STRIP_RE = re.compile(
 def _strip_cot_preface(text: str) -> str:
     """Peel chain-of-thought / stall prefaces from the head of an emittable
     sentence. Safe on empty input and idempotent across repeated calls.
+
+    Runs the strict (sentence-terminated) stripper first, then a streaming
+    fallback that tolerates comma terminators / end-of-string. Together
+    these catch both the well-formed final-text leak and the per-clause
+    streamed leak that small instruction-tuned models emit.
     """
     if not text:
         return text
@@ -131,7 +201,69 @@ def _strip_cot_preface(text: str) -> str:
             break
         prev = out
         out = _COT_PREFACE_STRIP_RE.sub("", out, count=1).lstrip()
+        # Stream fallback: only run when nothing was stripped above (so we
+        # don't double-process well-formed text) AND the head still looks
+        # like a narration-leak fragment ending mid-clause.
+        if out == prev:
+            cand = _COT_PREFACE_STRIP_PARTIAL_RE.sub("", out, count=1).lstrip()
+            if cand != out:
+                out = cand
     return out
+
+
+def _looks_like_pure_instruction_leak(text: str) -> bool:
+    """Detect responses that are ENTIRELY narration about the user, with
+    no actual answer content. Used as a final ``hard reject`` so we never
+    emit them — even partially — to TTS.
+
+    Also catches *unfinished* narration leaks (no respond-clause yet) when
+    the upstream sanitiser has already started flushing token-streamed
+    clauses and the leak is being shipped one comma at a time.
+    """
+    if not text:
+        return False
+    head = text.strip()
+    if not head:
+        return False
+    # Trim a single leading quoted-prefix if present so we can match the
+    # narration directly: '"Yeah Boss" — the user is greeting you' style.
+    head = re.sub(
+        r'^\s*["\u201c\u2018\'`][^"\u201c\u201d\u2018\u2019\'`\n]{1,80}'
+        r'["\u201d\u2019\'`]\s*[\u2013\u2014:,\-]+\s*',
+        "",
+        head,
+    )
+    # Also tolerate a half-stripped quote (e.g. ``Yeah Boss" — ...``)
+    # produced when an earlier pass called .strip('"').
+    head = re.sub(
+        r'^\s*[A-Za-z][^"\u201c\u201d\u2018\u2019\'`\n]{0,79}'
+        r'["\u201d\u2019\'`]\s*[\u2013\u2014:,\-]+\s*',
+        "",
+        head,
+    )
+    head = head.lstrip(' "\u201c\u2018\'`-:>')
+    full_form = re.match(
+        r"^(?:the\s+user|boss|the\s+speaker)\s+(?:is\s+)?"
+        r"(?:greeting|asking|wants|says|said|needs|wondering|requesting|trying)"
+        r"[^.?!]*?,?\s*"
+        r"(?:so\s+)?respond\s+"
+        r"(?:politely|warmly|briefly|kindly|directly)\b",
+        head,
+        re.IGNORECASE,
+    )
+    if full_form is not None:
+        return True
+    # Unfinished narration ("the user is greeting you" with no
+    # respond-clause yet) is still definitively a leak when it appears at
+    # the start of an emittable clause. Real answers don't open with
+    # third-person narration about Boss.
+    partial_narration = re.match(
+        r"^(?:the\s+user|boss|the\s+speaker)\s+(?:is\s+)?"
+        r"(?:greeting|asking|wants|says|said|needs|wondering|requesting|trying)\b",
+        head,
+        re.IGNORECASE,
+    )
+    return partial_narration is not None
 
 MAX_REACT_STEPS = 3
 
@@ -310,6 +442,18 @@ class LocalBrainController:
         if not cleaned:
             return ""
 
+        # Hard reject: the entire fragment is narration about the user
+        # (e.g. "the user is greeting you, respond politely and warmly").
+        # Small instruction-tuned models still leak this even with strict
+        # system rules; if even a single streamed clause matches, we drop
+        # the whole emission so TTS never speaks our own instructions.
+        if _looks_like_pure_instruction_leak(cleaned):
+            logger.warning(
+                "Suppressing instruction-leak clause before TTS: '%s'",
+                cleaned[:120],
+            )
+            return ""
+
         # Peel any leading chain-of-thought preface (defense-in-depth; the
         # MLX guard should have already stripped these, but non-MLX paths
         # and mid-stream flushes still land here with narration intact).
@@ -433,10 +577,29 @@ class LocalBrainController:
         )
 
     def _reject_low_quality_answer(self, query: str, text: str) -> bool:
-        clean = self._compact_text(text).strip().strip('"')
+        # NOTE: Do NOT call ``.strip('"')`` here. The instruction-echo
+        # rejector requires the *opening* and *closing* quote characters
+        # to remain paired so the leading-quoted-prefix regex can fire on
+        # leaks like ``"Yeah Boss" — the user is greeting you, ...``. If
+        # we strip just one quote, the prefix breaks and the leak slips
+        # straight into TTS as ATOM speaking its own instructions.
+        compact = self._compact_text(text).strip()
+        if not compact:
+            return True
+        if _INSTRUCTION_ECHO_RE.search(compact):
+            return True
+        # Only NOW collapse paired wrapping quotes for the remaining
+        # similarity / question / memory checks.
+        clean = compact
+        if (
+            len(clean) >= 2
+            and clean[0] in '"\u201c\u2018\u2019\u201d`'
+            and clean[-1] in '"\u201c\u2018\u2019\u201d`'
+        ):
+            clean = clean[1:-1].strip()
         if not clean:
             return True
-        if _INSTRUCTION_ECHO_RE.search(clean):
+        if _looks_like_pure_instruction_leak(clean):
             return True
         normalized_query = normalize_query(query)
         normalized_clean = normalize_query(clean)
@@ -719,6 +882,15 @@ class LocalBrainController:
             )
             return
 
+        # Belt-and-braces: in case any caller ever splices a "[SYSTEM NOTE: …]"
+        # block back into the user query (older code paths used to do this
+        # for repeat queries before we moved the steer to a system-layer
+        # ``repeat_hint``), strip it here so the LLM never sees it. If we
+        # leak it, small instruction-tuned models echo the bracketed text
+        # back during TTS as quoted analysis ("Dear Boss" — the user is …).
+        if text and "[SYSTEM NOTE" in text:
+            text = re.sub(r"\[SYSTEM NOTE:[^\]]*\](?:[^\n]*\n?)*", "", text).strip()
+
         self._generation_id += 1
         gen_id = self._generation_id
         # Reset per-turn streaming cascade-break state (see docstring on
@@ -776,6 +948,7 @@ class LocalBrainController:
                 logger.debug('Prediction feedback evaluation failed', exc_info=True)
 
         policy_query = str(_kw.get("policy_query") or text)
+        repeat_hint = bool(_kw.get("repeat_hint", False))
 
         query_plan = _kw.get("query_plan")
         plan_mode = str(getattr(query_plan, "runtime_mode", "") or "").upper()
@@ -1105,6 +1278,7 @@ class LocalBrainController:
                 document_context=rag_document_context if react_step == 0 else None,
                 observations=observations if observations else None,
                 rag_enrichment=rag_enrichment if react_step == 0 else None,
+                repeat_hint=repeat_hint and react_step == 0,
             )
 
             raw_response, first_token_ms, preempted = await self._run_llm_streaming(

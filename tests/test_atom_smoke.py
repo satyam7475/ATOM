@@ -20,7 +20,7 @@ def test_settings_json_validates() -> None:
 
 
 def test_mlx_model_directories_exist() -> None:
-    """Lean profile uses qwen3-1.7b-mlx for both roles — paths must exist."""
+    """Single-model MLX profile uses qwen3-8b-mlx-4bit for both roles."""
     raw = (_ATOM_ROOT / "config" / "settings.json").read_text(encoding="utf-8")
     cfg = json.loads(raw)
     brain = cfg.get("brain", {})
@@ -31,18 +31,35 @@ def test_mlx_model_directories_exist() -> None:
         assert p.is_dir(), f"MLX model directory missing: {p}"
 
 
-def test_mlx_brain_has_distinct_tier_paths() -> None:
-    """Fast and primary tiers should point to distinct model directories.
+def test_mlx_brain_shares_single_model_path() -> None:
+    """Fast and primary roles should reuse the same Qwen3 8B directory.
 
-    Earlier config kept both pointing at qwen3-4b-mlx, which made the
-    cognitive-kernel's fast-path tier pointless. The settings now route
-    fast traffic at qwen3-1.7b-mlx while primary stays on the 4b model.
+    ATOM now runs one stronger local model for both latency tiers. MLXBrain
+    still exposes ``fast`` and ``primary`` roles for routing, but both resolve
+    to the same on-disk model path and can share one in-memory load.
     """
     from brain.mlx_llm import MLXBrain
 
     raw = (_ATOM_ROOT / "config" / "settings.json").read_text(encoding="utf-8")
     cfg = json.loads(raw)
     b = MLXBrain(cfg)
-    assert Path(b._primary_path).resolve() != Path(b._fast_path).resolve()
+    assert Path(b._primary_path).resolve() == Path(b._fast_path).resolve()
     assert Path(b._primary_path).is_dir()
     assert Path(b._fast_path).is_dir()
+
+
+def test_voice_defaults_pin_reliable_stt_and_jarvis_preset() -> None:
+    """Voice defaults should favor reliable always-on handling on this Mac.
+
+    ``en-US`` avoids the recurring en-IN ``atom -> adam`` misrecognition, and
+    the ``jarvis`` TTS preset resolves to the best British voice available on
+    the host (Daniel compact today, premium Daniel later if installed). The
+    voice pipeline now defaults to always-on activation with duplex/barge-in
+    enabled for a more Jarvis-like interaction loop.
+    """
+    raw = (_ATOM_ROOT / "config" / "settings.json").read_text(encoding="utf-8")
+    cfg = json.loads(raw)
+    assert cfg["stt"]["locale"] == "en-US"
+    assert cfg["stt"]["barge_in_during_speak"] is True
+    assert cfg["tts"]["macos_voice"] == "jarvis"
+    assert cfg["voice"]["activation_mode"] == "always_on"

@@ -543,8 +543,7 @@ async def main() -> None:
 
     emotion_detector = EmotionDetector(config)
 
-    if config.get("wake_word", {}).get("enabled", False):
-        voice_pipeline.build_wake_word()
+    voice_pipeline.build_wake_word()
     wake_word_engine = voice_pipeline.wake_word
 
     screen_reader = None

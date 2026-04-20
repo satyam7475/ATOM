@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Install ATOM as a per-user launchd agent (macOS).
-# Uses scripts/atom_run.sh + .venv/bin/python (stable; does not require atom_python).
+# Uses scripts/atom_run.sh, which now prefers the bundle launcher when the
+# ATOM.app self-test passes and otherwise falls back to .venv/bin/python.
 # Usage: from repo root — bash scripts/install_atom_launchagent.sh
 set -euo pipefail
 

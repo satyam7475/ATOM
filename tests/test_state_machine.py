@@ -137,11 +137,11 @@ async def test_illegal_transitions_blocked() -> None:
     - LISTENING -> SPEAKING is **legal** (fast-path local reply, skips THINKING).
     - SLEEP -> LISTENING is **legal** (resume from sleep / silent mode).
     - THINKING -> IDLE is **legal** (cache/cognitive paths with no TTS).
+    - IDLE -> THINKING is **legal** (cold-start cache replies / scheduled jobs).
     """
     bus = FakeEventBus()
 
     illegal_pairs = [
-        (AtomState.IDLE, AtomState.THINKING),       # can't skip LISTENING
         (AtomState.IDLE, AtomState.SPEAKING),       # can't skip LISTENING (+ usually THINKING)
         (AtomState.IDLE, AtomState.ERROR_RECOVERY), # no direct path from idle
         (AtomState.SPEAKING, AtomState.THINKING),   # can't go backwards

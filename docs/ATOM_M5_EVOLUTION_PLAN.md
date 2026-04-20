@@ -38,8 +38,8 @@ Using the OS itself as the intelligence substrate:
 
 This transforms ATOM from "AI project" into an **Operating Intelligence System**.
 
-#### 4. Dual-Model + MLX Strategy
-**Confirmed (2026-04-09): Qwen3-4B + Qwen3-1.7B — best combo for MacBook Air M5.**
+#### 4. Historical Dual-Model + MLX Strategy
+**Historical note:** the 2026-04-09 recommendation was `Qwen3-4B + Qwen3-1.7B`. The current production configuration has been simplified to a single shared `Qwen3 8B MLX 4-bit` model to reduce operational complexity and storage overhead.
 
 | Role | Model | RAM | Speed (M5) | Use |
 |------|-------|-----|-----------|-----|
@@ -802,21 +802,17 @@ class MLXBrain:
 | **Primary brain** | Qwen3-4B-Q4_K_M | ~3.0 GB | 50-70 tok/s | Conversation, reasoning, complex tools |
 | **Total** | | **~4.2 GB** | | **5.8 GB headroom on 16 GB M5** |
 
-Why Qwen3 family: same ChatML prompt template, same tool_call format, zero adaptation to structured_prompt_builder.py or tool_parser.py. Thinking mode on Qwen3-4B toggles deep reasoning (matches 7B quality) vs speed.
+Why Qwen3 family: same ChatML prompt template, same tool_call format, zero adaptation to structured_prompt_builder.py or tool_parser.py.
 
-Download MLX models:
+Current production MLX download:
 ```bash
 pip install huggingface_hub
-huggingface-cli download Qwen/Qwen3-4B-GGUF qwen3-4b-q4_k_m.gguf --local-dir models/
-huggingface-cli download Qwen/Qwen3-1.7B-GGUF qwen3-1.7b-q4_k_m.gguf --local-dir models/
-# MLX format (when Phase 3 MLX migration happens):
-# huggingface-cli download mlx-community/Qwen3-4B-4bit --local-dir models/qwen3-4b-mlx
-# huggingface-cli download mlx-community/Qwen3-1.7B-4bit --local-dir models/qwen3-1.7b-mlx
+huggingface-cli download Qwen/Qwen3-8B-MLX-4bit --local-dir models/qwen3-8b-mlx-4bit
 ```
 
-#### 3.2 — Dual-Model Architecture (plan's Phase 2.2 — ENHANCED)
+#### 3.2 — Historical Dual-Model Architecture (superseded)
 
-The Cognitive Kernel routes queries to the right model:
+The historical dual-model design routed queries to different model sizes:
 
 ```
 FAST path:   Intent match → direct action (skip LLM, sub-5ms)
@@ -825,7 +821,7 @@ SMART path:  Conversation → Qwen3-4B thinking OFF (50-70 tok/s, 300-600ms)
 DEEP path:   Complex reasoning → Qwen3-4B thinking ON + RAG + tools (800-2000ms)
 ```
 
-Both models stay loaded in Unified Memory simultaneously. On Apple Silicon this costs NO extra overhead because there's no GPU↔CPU memory copy. Thinking mode toggle gives two speeds from the same model.
+Current production note: ATOM now keeps one `Qwen3 8B MLX 4-bit` model on disk and maps `fast` / `primary` routing roles to that shared model instead of maintaining separate 1.7B and 4B local trees.
 
 #### 3.3 — Native Apple STT (NEW — not in original plan)
 

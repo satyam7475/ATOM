@@ -13,15 +13,14 @@
 | **BrainModeManager** | `core/brain_mode_manager.py` | Profile switching (atom/balanced/brain) |
 | **AssistantModeManager** | `core/assistant_mode_manager.py` | Mode switching (hybrid/command_only) |
 
-## Dual-Model Routing
+## Role-Based Routing
 
 ```
-Query complexity heuristic:
-  - >20 words → 3B model
-  - Contains complex keywords (explain, compare, analyze, debug) → 3B
-  - ≤8 words + simple keywords (what is, define, who is) → 1B
-  - ≤6 words → 1B
-  - Default (7-20 words) → 3B if >12 words, else 1B
+Current production setup:
+  - DIRECT / CACHE → skip LLM
+  - QUICK → fast role on the shared local model
+  - FULL → primary role on the shared local model
+  - DEEP → primary role + larger budget / RAG when allowed
 ```
 
 ## Brain Contract (any LLM replacement MUST implement)

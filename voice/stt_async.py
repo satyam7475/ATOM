@@ -46,6 +46,11 @@ if TYPE_CHECKING:
 
 MAX_RECORD_S = 10.0
 _DEFAULT_MIN_AUDIO_DURATION_S = 0.45
+# Public alias for the default minimum audio length we accept before STT
+# scoring kicks in. Kept as a module-level constant so tooling, tests, and
+# external callers can depend on a stable name even if the underlying
+# default is tuned later.
+MIN_AUDIO_DURATION_S = _DEFAULT_MIN_AUDIO_DURATION_S
 _BT_MIN_THRESHOLD = 1800.0
 _RECALIBRATE_AFTER_S = 90.0
 _MIN_AUDIO_QUALITY_SCORE = 0.15

@@ -171,6 +171,122 @@ def test_wake_word_filter_ignores_non_wake():
     assert result is None, "WakeWordFilter falsely triggered"
 
 
+@pytest.mark.parametrize(
+    "utterance",
+    [
+        "hey adam how are you",
+        "adam are you there",
+        "hey atum what time is it",
+        "hey autumn open calendar",
+        "hey atam tell me the news",
+        "ok atom what's the status",
+    ],
+)
+def test_wake_word_filter_tolerates_stt_mishearings(utterance: str) -> None:
+    """Apple SFSpeechRecognizer (en-IN locale) routinely renders 'atom' as
+    'adam', 'atum', 'autumn', 'atam'. Before the fix, every one of these
+    was silently suppressed and ATOM appeared dead; the filter must now
+    accept them as equivalent to 'atom'."""
+    from voice.listening_modes import WakeWordFilter
+
+    wf = WakeWordFilter(cooldown_s=0.0)
+    assert wf.check(utterance) is not None, (
+        f"STT-mishearing variant was not accepted: {utterance!r}"
+    )
+
+
+@pytest.mark.parametrize(
+    "utterance",
+    [
+        "are you there",
+        "can you hear me",
+        "hello atom",
+        "are you listening",
+    ],
+)
+def test_wake_word_filter_direct_address(utterance: str) -> None:
+    """Direct-address phrases should also wake ATOM from PASSIVE mode so
+    a user clearly addressing the assistant never gets stranded."""
+    from voice.listening_modes import WakeWordFilter
+
+    wf = WakeWordFilter(cooldown_s=0.0)
+    assert wf.check(utterance) is not None, (
+        f"Direct-address phrase was not accepted: {utterance!r}"
+    )
+
+
+def test_wake_word_filter_contains_wake_matches_mishearings() -> None:
+    """The PASSIVE final-gate uses contains_wake; it must agree with
+    check() on STT-mishearing variants so a final that slipped through
+    without activating the partial scanner still reaches the router."""
+    from voice.listening_modes import WakeWordFilter
+
+    assert WakeWordFilter.contains_wake("hey adam how are you")
+    assert WakeWordFilter.contains_wake("adam are you there")
+    assert WakeWordFilter.contains_wake("hey atum what time is it")
+    assert not WakeWordFilter.contains_wake("what time is it")
+    assert not WakeWordFilter.contains_wake("play that song")
+
+
+def test_wake_word_engine_normalizes_configured_model_names() -> None:
+    """Wake-word model names should be normalized from config so spaces,
+    case, and list-vs-string forms all resolve predictably."""
+    from voice.wake_word import WakeWordEngine
+
+    assert WakeWordEngine._configured_model_names({"model": "Hey Jarvis"}) == [
+        "hey_jarvis",
+    ]
+    assert WakeWordEngine._configured_model_names(
+        {"models": [" Hey Jarvis ", "custom_atom"]},
+    ) == ["hey_jarvis", "custom_atom"]
+
+
+def test_tts_jarvis_preset_prefers_best_daniel_voice(monkeypatch) -> None:
+    """The ``jarvis`` preset should choose the best Daniel-family voice first.
+
+    This lets ATOM use compact Daniel immediately on a stock Mac while
+    auto-upgrading to enhanced/premium Daniel if the user installs it later.
+    """
+    import voice.tts_macos as tts_macos
+
+    class _FakeSynth:
+        @staticmethod
+        def availableVoices():
+            return [
+                "com.apple.voice.compact.en-US.Samantha",
+                "com.apple.voice.compact.en-GB.Daniel",
+                "com.apple.voice.premium.en-GB.Daniel",
+            ]
+
+        @staticmethod
+        def defaultVoice():
+            return None
+
+    class _FakeAppKit:
+        NSSpeechSynthesizer = _FakeSynth
+
+    monkeypatch.setattr(tts_macos, "_HAS_NATIVE", True)
+    monkeypatch.setattr(tts_macos, "_AppKit", _FakeAppKit)
+    monkeypatch.setattr(
+        tts_macos,
+        "_spoken_content_voice_from_prefs",
+        lambda _available: "",
+    )
+
+    assert (
+        tts_macos._pick_best_voice("jarvis")
+        == "com.apple.voice.premium.en-GB.Daniel"
+    )
+
+
+def test_tts_pitch_shift_keeps_daniel_neutral() -> None:
+    """British Daniel should not get the generic brightness boost."""
+    import voice.tts_macos as tts_macos
+
+    assert tts_macos._preferred_pitch_shift("com.apple.voice.compact.en-GB.Daniel") == 0.0
+    assert tts_macos._preferred_pitch_shift("com.apple.voice.compact.en-US.Samantha") == 2.0
+
+
 # ── Test 5: Voice pipeline builds ──
 
 def test_voice_pipeline_imports():
@@ -372,6 +488,53 @@ def test_listening_mode_always_active_ignores_deactivate():
     assert lm.is_active
     assert lm.deactivate(reason="post_tts_idle") is False
     assert lm.is_active, "always_active mode must stay ACTIVE"
+
+
+def test_voice_pipeline_always_on_mode_bypasses_wake_word_build(monkeypatch):
+    """Explicit always-on mode should skip OpenWakeWord entirely."""
+    import voice.wake_word as wake_word_mod
+    from voice.voice_pipeline import VoicePipeline
+
+    called: list[str] = []
+
+    class _FakeWakeWordEngine:
+        def __init__(self, *_a, **_kw):
+            called.append("init")
+
+    monkeypatch.setattr(wake_word_mod, "WakeWordEngine", _FakeWakeWordEngine)
+
+    pipe = VoicePipeline.__new__(VoicePipeline)
+    pipe._bus = FakeBus()
+    pipe._state = object()
+    pipe._config = {"voice": {"activation_mode": "always_on"}}
+    pipe._wake_word = "sentinel"
+
+    assert pipe.build_wake_word() is None
+    assert pipe._wake_word is None
+    assert called == []
+
+
+def test_voice_pipeline_always_on_mode_forces_active_listener():
+    """Always-on activation must keep the listening-mode controller active
+    even if a wake-word engine is technically present."""
+    from voice.voice_pipeline import VoicePipeline
+
+    class _FakeWakeWord:
+        is_available = True
+
+    pipe = VoicePipeline.__new__(VoicePipeline)
+    pipe._bus = FakeBus()
+    pipe._config = {
+        "voice": {"activation_mode": "always_on"},
+        "stt": {"passive_revert_delay_s": 0.3},
+    }
+    pipe._wake_word = _FakeWakeWord()
+    pipe.stt = None
+    pipe._listening_mode = None
+
+    lm = pipe.build_listening_mode()
+    assert lm.is_active
+    assert getattr(lm, "_always_active", False) is True
 
 
 def test_stt_attach_listening_mode_sets_ref():
@@ -789,3 +952,519 @@ async def test_passive_revert_cancels_on_speech_partial(monkeypatch):
             await pipe._passive_revert_task
         except asyncio.CancelledError:
             pass
+
+
+# ── Test 18: TTS instruction-leak guards (atomlogs.txt regression) ──
+
+def test_instruction_echo_regex_catches_quoted_user_prefix():
+    """`"Dear Boss" — the user is greeting you, so respond...` is the
+    classic Qwen-3 small leak we saw in production. The hardened regex
+    must flag it as instruction-echo so the controller rejects/retries."""
+    from cursor_bridge.local_brain_controller import _INSTRUCTION_ECHO_RE
+
+    leaks = [
+        '"Dear Boss" — the user is greeting you, so respond politely.',
+        '"hey atom" - the user is asking for the weather, so reply briefly.',
+        "'Dear boss' -- so respond warmly with a short greeting.",
+    ]
+    for text in leaks:
+        assert _INSTRUCTION_ECHO_RE.search(text), (
+            f"hardened instruction-echo regex missed leak: {text!r}"
+        )
+
+
+def test_cot_preface_stripper_peels_quoted_prefix():
+    """The controller-side stripper should peel the quoted-user-text +
+    narration prefix so any survivor reaching TTS only contains the real
+    answer tail (or empty if the model never produced one)."""
+    from cursor_bridge.local_brain_controller import _strip_cot_preface
+
+    text = (
+        '"Dear Boss" — the user is greeting you, so respond politely. '
+        "Hello, Boss."
+    )
+    out = _strip_cot_preface(text)
+    assert out.lower().startswith("hello"), (
+        f"stripper failed to peel quoted+narration head: {out!r}"
+    )
+
+
+def test_mlx_cot_preface_stripper_peels_quoted_prefix():
+    """The MLX-side stripper mirrors the controller stripper. Both must
+    converge on the same outcome so guards stay aligned."""
+    from brain.mlx_llm import _strip_cot_prefaces
+
+    text = (
+        '"Dear Boss" -- the user is greeting you, so respond politely. '
+        "Newton's first law states that a body at rest stays at rest."
+    )
+    out = _strip_cot_prefaces(text)
+    assert "Newton" in out
+    assert "the user is greeting" not in out.lower()
+
+
+def test_repeat_hint_lives_in_system_layer_only():
+    """Repeat-hint must NEVER be spliced into the user query. It belongs
+    in the system layer where the model cannot quote it back at TTS."""
+    from cursor_bridge.structured_prompt_builder import StructuredPromptBuilder
+
+    pb = StructuredPromptBuilder({})
+    base = pb.build("hello", repeat_hint=False)
+    hinted = pb.build("hello", repeat_hint=True)
+    assert "TURN STEER" in hinted
+    assert "TURN STEER" not in base
+    # The user query layer must not contain the steer or any "[SYSTEM NOTE"
+    # marker -- if it did, small models could echo it during TTS.
+    assert "[SYSTEM NOTE" not in hinted
+    assert "TURN STEER" not in hinted.split("CURRENT USER REQUEST:")[1]
+
+
+# ── Test 19: Wake-word/direct-address mishearing routing ──
+
+def test_wake_word_filter_accepts_dear_boss_mishearing():
+    """``dear boss`` is the recurring SFSpeech rendering of ``hey boss``.
+    It must be treated as direct-address so the router short-circuits
+    instead of routing the partial to the LLM. ``contains_wake`` has no
+    cooldown so we use it for the back-to-back assertions."""
+    from voice.listening_modes import WakeWordFilter
+
+    assert WakeWordFilter.contains_wake("dear boss")
+    assert WakeWordFilter.contains_wake("hey boss")
+    assert WakeWordFilter.contains_wake("yes boss")
+    # Bare owner-name (``satyam`` alone) is NOT treated as direct-address by
+    # the regex — that prevents false positives when Boss is just chatting
+    # about himself in third person. The bare-wake short-circuit in the
+    # router still ack's a standalone "satyam" because WAKE_PHRASES has it.
+    assert not WakeWordFilter.contains_wake("called my friend satyam yesterday")
+    assert "satyam" in WakeWordFilter.WAKE_PHRASES
+    # And the stateful checker still triggers at least once for the new term.
+    wf = WakeWordFilter(cooldown_s=0.3)
+    assert wf.check("dear boss") is not None
+
+
+def test_router_short_circuits_bare_wake_utterance():
+    """``Router._is_bare_wake_utterance`` should fire for stand-alone
+    wake / direct-address tokens but NOT for genuine commands."""
+    from core.router.router import Router
+
+    is_bare = Router._is_bare_wake_utterance
+    assert is_bare("atom")
+    assert is_bare("hey atom")
+    assert is_bare("dear boss")
+    assert is_bare("hey boss")
+    assert is_bare("hey boss please")
+    # Bare ``boss`` alone is intentionally NOT a wake — it's a generic noun
+    # too easily mid-sentence; only ``hey/dear/yes/hello boss`` qualifies.
+    assert not is_bare("boss")
+    # Real commands must still flow through the LLM/router.
+    assert not is_bare("hey atom what time is it")
+    assert not is_bare("dear boss tell me a joke")
+    assert not is_bare("hey boss open chrome for me")
+
+
+# ── Test 20: TTS echo guard + barge-in min-words floor ──
+
+def test_tts_is_echo_recognises_recent_spoken_text(monkeypatch):
+    """``tts.is_echo`` must answer True for partials whose words are all
+    in the last few spoken slices (mic catching ATOM's own voice) and
+    False for unrelated user speech."""
+    import voice.tts_macos as tts_mod
+
+    tts = tts_mod.MacOSTTSAsync.__new__(tts_mod.MacOSTTSAsync)
+    import collections as _c
+    tts._spoken_echo_window = _c.deque(maxlen=6)
+    tts._last_spoke_t = 0.0
+
+    tts._record_spoken("Dear Boss the user is greeting you so respond politely")
+    assert tts.is_echo("Dear")  # single token while speaking → echo
+    assert tts.is_echo("Dear boss")
+    assert not tts.is_echo("open chrome and play music")
+
+
+@pytest.mark.asyncio
+async def test_interrupt_handler_drops_thin_partial_during_tts():
+    """A 1-word partial like 'Dear' captured while ATOM is SPEAKING and
+    matches our echo guard must NOT trigger a voice-interrupt resume."""
+    from types import SimpleNamespace
+
+    from voice.interrupt_handler import VoiceInterruptHandler
+    from core.state_manager import AtomState
+
+    bus = FakeBus()
+
+    class _Tts:
+        def is_echo(self, _t):
+            return True
+
+    state = SimpleNamespace(current=AtomState.SPEAKING)
+    h = VoiceInterruptHandler(
+        bus=bus,
+        state=state,
+        tts=_Tts(),
+        emit_cooldown_s=0.0,
+    )
+    await h.on_speech_partial(text="Dear")
+    assert not any(e == "resume_listening" for e, _ in bus.emitted_events), (
+        "single-word echo partial must be silently suppressed"
+    )
+
+
+@pytest.mark.asyncio
+async def test_interrupt_handler_requires_min_words_when_not_echo():
+    """Even without echo evidence, a single-word partial during SPEAKING
+    is too thin a signal to cancel TTS — wait for the burst path or for
+    a richer partial."""
+    from types import SimpleNamespace
+
+    from voice.interrupt_handler import VoiceInterruptHandler
+    from core.state_manager import AtomState
+
+    bus = FakeBus()
+
+    class _Tts:
+        def is_echo(self, _t):
+            return False
+
+    state = SimpleNamespace(current=AtomState.SPEAKING)
+    h = VoiceInterruptHandler(
+        bus=bus,
+        state=state,
+        tts=_Tts(),
+        emit_cooldown_s=0.0,
+    )
+    await h.on_speech_partial(text="Dear")
+    assert not any(e == "resume_listening" for e, _ in bus.emitted_events)
+
+
+# ── Test 21: Cold-start staleness gate ────────────────────────────
+
+def test_cold_start_drops_stale_snapshot_at_load_time(monkeypatch, tmp_path):
+    """Snapshots older than the TTL must be discarded inside
+    ``_load_snapshot`` itself so the boot report's ``context`` flag
+    reflects reality (previously the gate only ran inside
+    ``_build_context_payload``)."""
+    import time as _time
+
+    from core.boot import cold_start as cs
+
+    fake_path = tmp_path / "snap.json"
+
+    class _FakePersistence:
+        def register(self, *_a, **_kw):
+            return None
+
+        def load(self, _key):
+            return {
+                "saved_at": _time.time() - (cs._MAX_RESTORED_CONTEXT_AGE_S + 3600),
+                "system_state": {"cpu": 5.0, "ram": 10.0},
+            }
+
+    monkeypatch.setattr(cs, "persistence_manager", _FakePersistence())
+
+    from types import SimpleNamespace
+
+    opt = cs.ColdStartOptimizer(
+        config={},
+        state_manager=SimpleNamespace(current=None),
+        memory_store=SimpleNamespace(),
+        intent_engine=SimpleNamespace(),
+        snapshot_path=fake_path,
+    )
+    loaded = opt._load_snapshot()
+    assert loaded == {}, (
+        "stale snapshot must be discarded at load time, "
+        f"got {loaded!r}"
+    )
+
+
+# ── JARVIS-feel tests: bare-wake ack rotation, system-note scrub, echo guard ─
+
+def test_bare_wake_ack_rotates_warm_variants() -> None:
+    """Successive bare wakes never replay the same ack twice in a row.
+
+    JARVIS-feel: a single fixed phrase ("Yes, Boss?") sounds robotic on
+    repeated calls. Router rotates through a small warm pool so even
+    five back-to-back wakes feel present, not scripted.
+    """
+    from core.router.router import Router
+
+    Router._BARE_WAKE_ACK_INDEX = 0
+    seen: list[str] = []
+    for _ in range(len(Router._BARE_WAKE_ACKS)):
+        ack = Router._pick_bare_wake_ack()
+        seen.append(ack)
+        assert ack and isinstance(ack, str), "ack must be a non-empty string"
+
+    assert len(set(seen)) == len(Router._BARE_WAKE_ACKS), (
+        f"all rotation entries should be unique: {seen}"
+    )
+    next_ack = Router._pick_bare_wake_ack()
+    assert next_ack == Router._BARE_WAKE_ACKS[0], "rotation must wrap"
+
+
+def test_local_brain_strips_legacy_system_note_from_user_query() -> None:
+    """Even if some legacy code path splices ``[SYSTEM NOTE: …]`` back into
+    the user query, the controller must scrub it before logging or
+    sending to the LLM. Otherwise small instruction-tuned models echo
+    the bracketed text during TTS as quoted analysis.
+    """
+    import re as _re
+
+    leak = (
+        "Dear boss\n\n"
+        "[SYSTEM NOTE: The user asked this before and wasn't satisfied "
+        "with the previous answer. Provide a different answer.]"
+    )
+    cleaned = _re.sub(
+        r"\[SYSTEM NOTE:[^\]]*\](?:[^\n]*\n?)*",
+        "",
+        leak,
+    ).strip()
+    assert "[SYSTEM NOTE" not in cleaned
+    assert cleaned == "Dear boss"
+
+
+def test_tts_is_echo_catches_single_token_partial_during_speech() -> None:
+    """Echo guard must flag a 1-token partial like ``Dear`` when TTS just
+    spoke text containing that token. Without this, NSSpeechSynthesizer
+    spilling into the mic triggers a false interrupt and ATOM cuts itself
+    off mid-sentence (the SPEAKING -> own-voice -> LISTENING loop).
+    """
+    from core.state_manager import AtomState, StateManager
+    from voice.tts_macos import MacOSTTSAsync
+
+    class _FakeBus:
+        def on(self, *_a, **_k): pass
+        def emit(self, *_a, **_k): pass
+        def emit_fast(self, *_a, **_k): pass
+
+    bus = _FakeBus()
+    state = StateManager(bus, initial=AtomState.IDLE)
+    tts = MacOSTTSAsync(bus, state)
+    tts._record_spoken(
+        '"Dear Boss" — the user is greeting you, so respond politely.'
+    )
+    assert tts.is_echo("Dear") is True
+    assert tts.is_echo("dear boss") is True
+    assert tts.is_echo("hello atom") is False, (
+        "non-overlapping partials must NOT be flagged as echo"
+    )
+
+
+def test_prompt_builder_surfaces_developer_focus_and_environment() -> None:
+    """JARVIS-feel: when the dev provided ``focus`` and the caller passed
+    an ``active_app``/clipboard context, the LLM prompt must actually
+    carry those signals. Otherwise the model produces generic answers
+    detached from what Boss is looking at.
+    """
+    from cursor_bridge.structured_prompt_builder import StructuredPromptBuilder
+
+    builder = StructuredPromptBuilder({
+        "developer": {
+            "role": "Backend engineer",
+            "focus": "Python and FastAPI microservices",
+            "project_name": "TestProj",
+        },
+    })
+    prompt = builder.build(
+        "explain this code",
+        context={
+            "active_app": "VS Code",
+            "window_title": "main.py - VS Code",
+            "clipboard": "def foo(): pass",
+        },
+    )
+    assert "Python" in prompt
+    assert "FastAPI" in prompt
+    assert "VS Code" in prompt
+    assert "def foo(): pass" in prompt
+    assert "Environment:" in prompt
+
+
+# ── Hard guards against the recurring "Yeah Boss" instruction-leak ───────
+
+def test_instruction_leak_caught_in_full_sentence_form() -> None:
+    """The full leak with sentence-ending period must be hard-rejected so
+    TTS never speaks ``"Yeah Boss" -- the user is greeting you, respond
+    politely and warmly.``
+    """
+    from cursor_bridge.local_brain_controller import (
+        _looks_like_pure_instruction_leak,
+        _strip_cot_preface,
+    )
+
+    leak = '"Yeah Boss" — the user is greeting you, respond politely and warmly.'
+    assert _looks_like_pure_instruction_leak(leak) is True
+    assert _strip_cot_preface(leak) == ""
+
+
+def test_instruction_leak_caught_when_streamed_at_first_clause() -> None:
+    """Streaming flushes the FIRST clause at the comma boundary, so the
+    sanitiser sees ``"Yeah Boss" — the user is greeting you,`` with no
+    sentence-ending punctuation. Without comma-tolerant stripping that
+    fragment slips straight into TTS.
+    """
+    from cursor_bridge.local_brain_controller import (
+        _looks_like_pure_instruction_leak,
+        _strip_cot_preface,
+    )
+
+    fragments = [
+        '"Yeah Boss" — the user is greeting you,',
+        '"Yeah Boss" — the user is greeting you',
+        'the user is greeting you, respond politely and warmly',
+        'the user is asking what universe',
+        'Boss is asking about the weather',
+    ]
+    for frag in fragments:
+        assert _looks_like_pure_instruction_leak(frag) is True, (
+            f"Leak fragment must be hard-rejected: {frag!r}"
+        )
+        assert _strip_cot_preface(frag) == "", (
+            f"Leak fragment must strip to empty: {frag!r} -> "
+            f"{_strip_cot_preface(frag)!r}"
+        )
+
+
+def test_genuine_responses_pass_through_leak_filter() -> None:
+    """Real answers must NOT be flagged as instruction leaks. False
+    positives here would silence ATOM completely on normal turns.
+    """
+    from cursor_bridge.local_brain_controller import (
+        _looks_like_pure_instruction_leak,
+        _strip_cot_preface,
+    )
+
+    real_replies = [
+        "Hi Boss, how are you?",
+        "I am ATOM, your personal AI buddy.",
+        "The weather is sunny today.",
+        "Sure, Boss. Opening Spotify now.",
+        "Right here, Boss.",
+        "I don't know that one yet, Boss.",
+    ]
+    for reply in real_replies:
+        assert _looks_like_pure_instruction_leak(reply) is False, (
+            f"Genuine answer wrongly flagged as leak: {reply!r}"
+        )
+        assert _strip_cot_preface(reply) == reply, (
+            f"Genuine answer was modified by stripper: {reply!r} -> "
+            f"{_strip_cot_preface(reply)!r}"
+        )
+
+
+def test_sanitize_emittable_text_drops_streamed_leak_fragment() -> None:
+    """Integration check: the controller's emit-path sanitiser must
+    return an empty string for a streamed leak clause so the bus never
+    receives a partial_response with that text.
+    """
+    from cursor_bridge.local_brain_controller import LocalBrainController
+
+    class _StubBus:
+        def on(self, *_a, **_k): pass
+        def emit(self, *_a, **_k): pass
+        def emit_fast(self, *_a, **_k): pass
+        def emit_long(self, *_a, **_k): pass
+
+    class _StubBuilder:
+        def build(self, *_a, **_k): return ""
+
+    ctrl = LocalBrainController.__new__(LocalBrainController)
+    ctrl._compact_text = LocalBrainController._compact_text  # type: ignore[attr-defined]
+
+    cleaned = LocalBrainController._sanitize_emittable_text(
+        ctrl,
+        '"Yeah Boss" — the user is greeting you,',
+    )
+    assert cleaned == "", (
+        f"Streamed leak must produce empty emit; got {cleaned!r}"
+    )
+
+
+def test_reject_low_quality_answer_keeps_paired_quotes_for_match() -> None:
+    """Regression guard: don't strip leading/trailing quotes one-sided
+    BEFORE the instruction-echo regex runs, otherwise the leak
+    ``"Yeah Boss" — the user is greeting you, ...`` evades the rejector
+    because the opening ``"`` is gone but the closing ``"`` remains.
+    """
+    from cursor_bridge.local_brain_controller import LocalBrainController
+
+    ctrl = LocalBrainController.__new__(LocalBrainController)
+    ctrl._compact_text = LocalBrainController._compact_text  # type: ignore[attr-defined]
+
+    leak = '"Yeah Boss" — the user is greeting you, respond politely and warmly.'
+    assert LocalBrainController._reject_low_quality_answer(ctrl, "yeah boss", leak) is True
+
+
+def test_yeah_boss_is_treated_as_bare_wake_now() -> None:
+    """``yeah boss`` is a conversational ack, not a real query. Without
+    short-circuiting it the LLM spins up a 5s reply for a single-word
+    acknowledgement.
+    """
+    from voice.listening_modes import WakeWordFilter
+
+    assert "yeah boss" in WakeWordFilter.WAKE_PHRASES
+    assert "yep boss" in WakeWordFilter.WAKE_PHRASES
+    assert "thanks boss" in WakeWordFilter.WAKE_PHRASES
+    assert "cool boss" in WakeWordFilter.WAKE_PHRASES
+
+    from core.router.router import Router
+
+    assert Router._is_bare_wake_utterance("yeah boss") is True
+    assert Router._is_bare_wake_utterance("yeah boss?") is True
+    assert Router._is_bare_wake_utterance("thanks boss.") is True
+    assert Router._is_bare_wake_utterance("yeah boss please open chrome") is False
+
+
+def test_perception_predicted_interrupt_drops_self_echo_partials() -> None:
+    """Without this guard, a single-word echo like 'Boss' bleeding back
+    through the speakers fires perception's interrupt_predicted, which
+    pre-pauses TTS and drops state to LISTENING — producing the
+    SPEAKING -> own-voice -> LISTENING flap loop the user reported.
+
+    The wiring layer must now consult ``tts.is_echo`` BEFORE acting on a
+    perception-predicted interrupt.
+    """
+    import asyncio
+
+    from core.state_manager import AtomState
+
+    flag = {"interrupted": False}
+
+    class _FakeVoiceInterrupt:
+        async def interrupt_to_listening(self, **_kw):
+            flag["interrupted"] = True
+            return True
+
+    class _FakeTTS:
+        def is_echo(self, _text, **_kw):
+            return True
+
+    class _FakeState:
+        def __init__(self):
+            self.current = AtomState.SPEAKING
+
+    voice_interrupt = _FakeVoiceInterrupt()
+    tts = _FakeTTS()
+    state = _FakeState()
+    _PERCEPTION_INTERRUPT_MIN_WORDS = 2
+
+    async def _on_interrupt_predicted(**_kw) -> None:
+        partial_text = str(_kw.get("text", "") or "").strip()
+        if partial_text:
+            check_echo = getattr(tts, "is_echo", None)
+            if callable(check_echo) and check_echo(partial_text):
+                return
+            if state.current is AtomState.SPEAKING:
+                if len(partial_text.split()) < _PERCEPTION_INTERRUPT_MIN_WORDS:
+                    return
+        await voice_interrupt.interrupt_to_listening(
+            trigger="interrupt_predicted",
+            reason="perception_predicted",
+            user_interrupt=True,
+        )
+
+    asyncio.run(_on_interrupt_predicted(text="Boss the user"))
+    assert flag["interrupted"] is False, (
+        "self-echo partial must NOT trigger interrupt_to_listening"
+    )

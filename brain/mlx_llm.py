@@ -4,7 +4,7 @@ ATOM -- MLX-native LLM wrapper for Apple Silicon.
 Compatibility goals:
   - Mirrors the current MiniLLM async contract used by LocalBrainController
   - Supports streaming callbacks with preemption
-  - Keeps primary + fast model roles ready for Phase 3 dual-model routing
+  - Supports either shared single-model or split-role MLX routing
 
 This wrapper intentionally stays close to the existing MiniLLM interface so
 the migration step can swap implementations with minimal controller changes.
@@ -89,6 +89,15 @@ _WRAPPER_ONLY_PREFIXES: tuple[str, ...] = (
 _COT_PREFACE_RE = re.compile(
     r"""
     ^\s*                                  # leading whitespace
+    # Optional leading quoted user-text + dash/colon separator. Catches the
+    # 'Dear Boss' — the user is greeting you, so respond politely... pattern
+    # that small instruction-tuned models still leak even with strict V-rules.
+    (?:
+        ["'\u201c\u2018`]
+        [^"'\u201c\u201d\u2018\u2019`\n]{1,80}
+        ["'\u201d\u2019`]
+        \s*[\u2013\u2014:,\-]+\s*
+    )?
     (?:
         # \"Okay(,)? let's/lets see\"  /  \"let me think\"  /  \"alright so\"
         (?:okay|ok|alright|well|so|hmm+|um+|uh+)\b[,.!]?\s*
@@ -98,11 +107,14 @@ _COT_PREFACE_RE = re.compile(
       |
         let\s+me\s+think\b[^.?!]*[.?!]\s*
       |
-        # Third-person narration about the user.
-        (?:the\s+user|boss|the\s+speaker)\s+(?:is\s+)?(?:asking|wants|says|said|needs|wondering)[^.?!]*[.?!]\s*
+        # Third-person narration about the user (greeting/asking/wanting...).
+        (?:the\s+user|boss|the\s+speaker)\s+(?:is\s+)?(?:greeting|asking|wants|says|said|needs|wondering|requesting|trying)[^.?!]*[.?!]\s*
       |
         # Meta narration \"The question is ...\" / \"So, the question is ...\"
         (?:so\s+)?(?:the\s+)?(?:question|query|request)\s+is\b[^.?!]*[.?!]\s*
+      |
+        # Direct-instruction echoes seen in production ("so respond politely...")
+        so\s+respond\s+(?:politely|warmly|briefly|kindly|directly)[^.?!]*[.?!]\s*
       |
         # \"I should / I need to ...\" internal-monologue stems.
         i\s+(?:should|need\s+to|have\s+to|must)\s+(?:think|consider|figure|reason|recall)\b[^.?!]*[.?!]\s*
@@ -177,10 +189,10 @@ class MLXBrain:
         brain_cfg = config.get("brain", {})
 
         self._primary_path = str(
-            Path(brain_cfg.get("mlx_primary_model", "models/qwen3-4b-mlx")).expanduser(),
+            Path(brain_cfg.get("mlx_primary_model", "models/qwen3-8b-mlx-4bit")).expanduser(),
         )
         self._fast_path = str(
-            Path(brain_cfg.get("mlx_fast_model", "models/qwen3-1.7b-mlx")).expanduser(),
+            Path(brain_cfg.get("mlx_fast_model", "models/qwen3-8b-mlx-4bit")).expanduser(),
         )
         default_role = str(brain_cfg.get("mlx_default_role", "primary")).strip().lower()
         self._active_role = default_role if default_role in self._VALID_ROLES else "primary"

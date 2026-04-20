@@ -1,21 +1,14 @@
 """
 ATOM -- Wake Word Detection Engine.
 
-"Hey ATOM" wake word detection using OpenWakeWord for natural activation.
-Runs on CPU with <1% usage. When detected, transitions from passive
-monitoring to active listening.
+Config-driven OpenWakeWord wake detection for the passive listening path.
+Runs on CPU with low overhead and promotes the voice pipeline from passive
+monitoring to active command routing when the configured model triggers.
 
-Replaces always-on STT with efficient wake word detection that only
-activates full speech recognition when the user says "Hey ATOM".
-
-Pipeline:
-    Microphone -> Wake Word Model (always running, <1% CPU)
-    -> Wake word detected -> Transition to LISTENING
-    -> STT processes actual command -> Back to wake word monitoring
-
-Hotkey (Ctrl+Alt+A) bypasses wake word for instant activation.
-
-Falls back to always-listening mode if OpenWakeWord is not installed.
+Text-level wake matching for "Atom" / "Hey Atom" still lives in
+``voice.listening_modes.WakeWordFilter`` so ATOM branding remains stable even
+when the underlying acoustic model is a different built-in OpenWakeWord name
+such as ``hey_jarvis``.
 """
 
 from __future__ import annotations
@@ -34,7 +27,7 @@ if TYPE_CHECKING:
 
 
 class WakeWordEngine:
-    """Wake word detector for 'Hey ATOM' activation.
+    """Wake word detector for passive -> active promotion.
 
     Runs in a dedicated thread, consuming minimal CPU.
     Emits 'wake_word_detected' event when triggered.
@@ -63,6 +56,29 @@ class WakeWordEngine:
         self._detection_count = 0
         self._capture_gate = threading.Event()
         self._capture_gate.set()
+        self._wakeword_models = self._configured_model_names(self._config)
+
+    @staticmethod
+    def _configured_model_names(config: dict | None) -> list[str]:
+        """Normalize configured OpenWakeWord model names.
+
+        Supports either ``wake_word.model`` (string) or ``wake_word.models``
+        (list of strings). Spaces are normalized to underscores so
+        ``"hey jarvis"`` and ``"hey_jarvis"`` resolve identically.
+        """
+        cfg = config or {}
+        raw_models = cfg.get("models")
+        if isinstance(raw_models, (list, tuple)):
+            items = raw_models
+        else:
+            items = [cfg.get("model", "hey_jarvis")]
+
+        normalized: list[str] = []
+        for item in items:
+            name = str(item or "").strip().lower().replace(" ", "_")
+            if name:
+                normalized.append(name)
+        return normalized or ["hey_jarvis"]
 
     @property
     def is_available(self) -> bool:
@@ -85,11 +101,14 @@ class WakeWordEngine:
         try:
             from openwakeword.model import Model
             self._model = Model(
-                wakeword_models=["hey_jarvis"],
+                wakeword_models=self._wakeword_models,
                 inference_framework="onnx",
             )
             self._available = True
-            logger.info("Wake word engine loaded (OpenWakeWord)")
+            logger.info(
+                "Wake word engine loaded (OpenWakeWord: %s)",
+                ", ".join(self._wakeword_models),
+            )
             return True
         except ImportError:
             logger.info(

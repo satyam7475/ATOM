@@ -16,7 +16,7 @@
 |------|-------------|
 | **Owner-first** | Configured in `config/settings.json` (`owner.name`, `owner.title`). |
 | **Instant path** | Intent engine + cache for sub-millisecond command routing. |
-| **Local brain** | MLX dual-model (Qwen3-4B primary + Qwen3-1.7B fast) on Apple Silicon. |
+| **Local brain** | MLX local brain (`Qwen3 8B MLX 4-bit`) with shared fast/primary roles on Apple Silicon. |
 | **Cognitive kernel** | Central routing across DIRECT / CACHE / QUICK / FULL / DEEP execution paths. |
 | **Security** | Fernet-encrypted credentials, SecurityPolicy gating on all actions, audit logging. |
 | **UI** | aiohttp web dashboard + WebSocket on localhost with token auth. |
@@ -70,7 +70,7 @@ python main.py
 ```
 
 - **Finder / double-click:** use **`Run ATOM.command`** in the repo root (venv-first; optional bundle launcher when `ATOM.app/Contents/MacOS/atom_python` passes self-test). Logs: `logs/atom_run_command.log`.
-- **Always-on (optional):** `bash scripts/install_atom_launchagent.sh` installs a **launchd** agent that runs **`scripts/atom_run.sh`** (venv + `main.py`).
+- **Always-on (optional):** `bash scripts/install_atom_launchagent.sh` installs a **launchd** agent that runs **`scripts/atom_run.sh`**, which now prefers the bundle launcher for native macOS STT and falls back to `.venv/bin/python`.
 - **Double-click `ATOM.app`:** launches the embedded **`atom_python`** binary only; if that fails, prefer **`Run ATOM.command`** or rebuild with `bash scripts/build_atom_app_launcher.sh`.
 
 - Dashboard: `http://127.0.0.1:<port>/` (port from `ui.web_port` in settings).
@@ -79,8 +79,10 @@ python main.py
 ### Voice (macOS)
 
 - **Prefer `Run ATOM.command` when the bundle self-test passes** — `ATOM.app`’s `atom_python` is the process that carries **Speech Recognition + Microphone** usage strings for Apple’s on-device STT. Plain `venv` Python often falls back to **Faster-Whisper** (still works; different stack).
+- **Current default voice mode:** `voice.activation_mode` is `always_on`, so ATOM keeps the command path hot instead of waiting for a wake phrase. Set it back to `wake_word` if you want passive gating again.
 - **Permissions:** System Settings → Privacy & Security → **Microphone** and **Speech Recognition** — enable for the app you use to launch ATOM (Terminal, Cursor, or the embedded `atom_python`).
-- **After startup speech:** the engine waits until state is **LISTENING** (not during TTS) and applies **`stt.post_tts_cooldown_ms`** (default 800 ms) before reopening the mic so the greeting does not fight the capture path.
+- **Duplex / interruptibility:** `stt.barge_in_during_speak` is enabled by default, so ATOM can hear you during TTS for real interruption. Headphones are still the cleanest setup to avoid echo.
+- **After startup speech:** the engine waits until state is **LISTENING** (not during TTS) and applies **`stt.post_tts_cooldown_ms`** before reopening the mic so the greeting does not fight the capture path.
 - **Voice health strip** under the top bar shows STT engine, permissions, lifecycle state, tier, and last error (WebSocket `state_diff`).
 
 ### Testing (golden path)
