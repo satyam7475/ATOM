@@ -91,6 +91,7 @@ class ColdStartOptimizer:
             self._preload_embeddings(),
             self._restore_session(),
             self._cache_top_commands(),
+            self._prime_intent_engine(),
             return_exceptions=True,
         )
 
@@ -98,6 +99,11 @@ class ColdStartOptimizer:
         embeddings_ready = self._coerce_bool(results[1], "embeddings")
         restored_turns = self._coerce_int(results[2], "session_restore")
         cached_commands = self._coerce_int(results[3], "command_cache")
+        primed_intents = self._coerce_int(results[4], "intent_warmup")
+        if primed_intents:
+            logger.info(
+                "Cold start: primed %d intent-engine regex paths", primed_intents,
+            )
         elapsed_ms = (time.monotonic() - self._boot_time) * 1000
         restored_context_available = bool(
             (self._restored_snapshot or {}).get("system_state"),
@@ -238,6 +244,77 @@ class ColdStartOptimizer:
             except Exception:
                 logger.debug("Cold start session turn restore failed", exc_info=True)
         return restored
+
+    async def _prime_intent_engine(self) -> int:
+        """Force every intent-engine regex / heavy import to be compiled
+        and resolved before the first real user query.
+
+        The first call to ``IntentEngine.classify`` on a cold process can
+        take 80-200ms because each sub-module compiles its module-level
+        regex tables and resolves lazy imports on demand. The watchdog
+        budgets ``intent_engine`` at 50ms, so the first 5-10 user queries
+        repeatedly trip the budget and trigger the recovery path.
+
+        We synchronously dispatch a small set of priming queries chosen
+        to exercise every category (info, system, app, media, network,
+        memory, productivity, routine, world, file, OS, cognitive, and
+        the runtime-mode/meta paths). All run via ``classify_silent`` so
+        the priming doesn't pollute the boot log.
+        """
+        if self._intent is None:
+            return 0
+        silent = getattr(self._intent, "classify_silent", None)
+        if not callable(silent):
+            return 0
+        priming_queries: tuple[str, ...] = (
+            # Meta / runtime-mode / OS self-check
+            "are you there",
+            "switch to fast mode",
+            "self check",
+            # Routine triggers (D4)
+            "enter focus mode",
+            "exit deep work",
+            # Productivity / memory recall / world / info
+            "what's on my plate",
+            "what did I ask earlier",
+            "what is the weather in mumbai",
+            "what is the time",
+            # System / media / desktop / app
+            "lower the volume",
+            "play some music",
+            "show desktop",
+            "open safari",
+            # File / network / OS
+            "find my notes about meeting",
+            "check my internet speed",
+            "battery status",
+            # Cognitive fallback
+            "explain quantum tunneling in two lines",
+        )
+        loop = asyncio.get_running_loop()
+        primed = 0
+
+        def _do_one(text: str) -> bool:
+            try:
+                silent(text)
+                return True
+            except Exception:
+                logger.debug(
+                    "Intent priming failed for '%s'", text[:60], exc_info=True,
+                )
+                return False
+
+        for query in priming_queries:
+            try:
+                ok = await loop.run_in_executor(None, _do_one, query)
+                if ok:
+                    primed += 1
+            except Exception:
+                logger.debug(
+                    "Intent priming dispatch failed for '%s'", query[:60],
+                    exc_info=True,
+                )
+        return primed
 
     async def _cache_top_commands(self) -> int:
         get_top_commands = getattr(self._memory, "get_top_commands", None)

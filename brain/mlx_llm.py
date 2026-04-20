@@ -73,9 +73,35 @@ _DEFAULT_STOP_SEQUENCES: tuple[str, ...] = (
     "Boss:",
     "Assistant:",
     "ATOM:",
+    # Special / control tokens leaked when the model collapses out of the
+    # ATOM persona. Treating them as hard stop sequences forces generation
+    # to halt before any of the post-leak text reaches TTS.
+    "<|endoftext|>",
+    "<|im_end|>",
+    "<|im_start|>",
+    "<|user|>",
+    "<|assistant|>",
+    "<|system|>",
+    "<|eot_id|>",
+    "<|begin_of_text|>",
+    "<|end_of_text|>",
+    "<|start_header_id|>",
+    "<|end_header_id|>",
+    "<|reserved_special_token_0|>",
+    "Human:",
+    "\nHuman:",
 )
 _LEADING_ASSISTANT_LABEL_RE = re.compile(
     r"^\s*(?:(?:ATOM|Assistant)\s*:\s*)+",
+    re.I,
+)
+# Special / control tokens anywhere in the output. The stop-sequence list
+# halts new generation, but partial token boundaries can still let a few
+# characters of these slip in before the stop fires; strip them defensively.
+_SPECIAL_TOKEN_RE = re.compile(
+    r"<\|(?:endoftext|im_(?:end|start)|user|assistant|system|eot_id|"
+    r"begin_of_text|end_of_text|start_header_id|end_header_id|"
+    r"reserved_special_token_\d+)\|>",
     re.I,
 )
 # Leading quote-wrapped roleplay openers. Small instruction-tuned models
@@ -85,12 +111,23 @@ _LEADING_ASSISTANT_LABEL_RE = re.compile(
 # they start with "Boss," — the model treats the echo as a fresh user turn.
 # Strip the leading quote (both straight and curly) plus any matching
 # trailing quote so TTS speaks the sentence naturally.
+#
+# We also catch a *lone* leading quote that the controller's earlier passes
+# left half-stripped (e.g. ``" haven't set an alarm`` or ``"'m sorry``). Those
+# fragments were responsible for production leaks where TTS spoke the literal
+# quote character followed by a contraction.
 _LEADING_QUOTE_WRAP_RE = re.compile(
-    r"""^\s*[\"“]+\s*(?=(?:Boss|Satyam|Sir|Ma'am|Madam|Hey|OK|Okay|Alright)\b|[A-Z])""",
+    r"""^\s*[\"\u201c\u201d\u2018\u2019]+\s*"""
+    r"""(?="""
+    r"""(?:Boss|Satyam|Sir|Ma'am|Madam|Hey|OK|Okay|Alright)\b"""
+    r"""|[A-Z]"""               # Any normal sentence start
+    r"""|'[a-z]"""              # Lone apostrophe + lowercase: "'m sorry`
+    r"""|[a-z]"""               # Lowercase letter:           " haven't`
+    r""")""",
     re.U,
 )
 # Trailing unclosed quote (with optional trailing punctuation/space).
-_TRAILING_UNCLOSED_QUOTE_RE = re.compile(r"""[\"”]+\s*$""")
+_TRAILING_UNCLOSED_QUOTE_RE = re.compile(r"""[\"\u201c\u201d\u2018\u2019]+\s*$""")
 _ASSISTANT_LABEL_ONLY_RE = re.compile(
     r"^\s*(?:(?:ATOM|Assistant)\s*:\s*){2,}\s*$",
     re.I,
@@ -137,23 +174,47 @@ _COT_PREFACE_RE = re.compile(
     (?:
         # \"Okay(,)? let's/lets see\"  /  \"let me think\"  /  \"alright so\"
         (?:okay|ok|alright|well|so|hmm+|um+|uh+)\b[,.!]?\s*
-        (?:let(?:'|\u2019)?s?\s+(?:see|think|break|try|start|go)\b[^.?!]*[.?!]\s*)?
+        (?:let(?:'|\u2019)?s?\s+(?:see|think|break|try|start|go|check|verify|look|reason|figure)\b[^.?!]*[.?!]\s*)?
       |
-        let(?:'|\u2019)?s?\s+(?:see|think|break|try|start|go)\b[^.?!]*[.?!]\s*
+        let(?:'|\u2019)?s?\s+(?:see|think|break|try|start|go|check|verify|look|reason|figure)\b[^.?!]*[.?!]\s*
       |
-        let\s+me\s+think\b[^.?!]*[.?!]\s*
+        # \"Let me check my memory.\" / \"Let me check that.\" / \"Let me think about that.\"
+        let\s+me\s+(?:think|see|try|consider|check|verify|look|reason|figure)\b[^.?!]*[.?!]\s*
       |
         # Third-person narration about the user (greeting/asking/wanting...).
-        (?:the\s+user|boss|the\s+speaker)\s+(?:is\s+)?(?:greeting|asking|wants|says|said|needs|wondering|requesting|trying)[^.?!]*[.?!]\s*
+        (?:the\s+user|boss|the\s+speaker)\s+(?:is\s+|has\s+|was\s+)?
+        (?:greeting|asking|wants|says|said|needs|wondering|requesting|trying|having|expressing)
+        [^.?!]*[.?!]\s*
       |
         # Meta narration \"The question is ...\" / \"So, the question is ...\"
-        (?:so\s+)?(?:the\s+)?(?:question|query|request)\s+is\b[^.?!]*[.?!]\s*
+        (?:so\s+)?(?:the\s+)?(?:question|query|request|issue|problem)\s+is\b[^.?!]*[.?!]\s*
       |
         # Direct-instruction echoes seen in production ("so respond politely...")
-        so\s+respond\s+(?:politely|warmly|briefly|kindly|directly)[^.?!]*[.?!]\s*
+        so\s+respond\s+(?:politely|warmly|briefly|kindly|directly|gently|empathetically)[^.?!]*[.?!]\s*
       |
-        # \"I should / I need to ...\" internal-monologue stems.
-        i\s+(?:should|need\s+to|have\s+to|must)\s+(?:think|consider|figure|reason|recall)\b[^.?!]*[.?!]\s*
+        # \"Keep it concise and friendly.\" / \"Keep the answer brief.\"
+        keep\s+(?:it|the\s+(?:answer|response|reply|tone))\s+(?:concise|brief|short|simple|friendly|warm|professional|polite|casual|natural)
+        [^.?!]*[.?!]\s*
+      |
+        # \"My role is to respond as ATOM ...\" / \"My job is to ...\"
+        my\s+(?:role|job|task|goal)\s+(?:is|here\s+is)\s+(?:to\s+)?[^.?!]*[.?!]\s*
+      |
+        # \"In the current context, there's no mention of an alarm being set.\"
+        # \"In my memory, ...\"  / \"From the conversation history, ...\"
+        (?:in|from|within)\s+
+        (?:the\s+)?
+        (?:current\s+)?
+        (?:context|conversation(?:\s+history)?|memory|chat\s+history|transcript|history)
+        [,]?\s+[^.?!]*[.?!]\s*
+      |
+        # \"I need to acknowledge their difficulty, show empathy, and offer help.\"
+        # \"I should think about ...\" — generic internal-monologue stem.
+        i\s+(?:should|need\s+to|have\s+to|must|will|am\s+going\s+to)\s+
+        (?:think|consider|figure|reason|recall|acknowledge|show|offer|respond|respond\s+with|focus|make\s+sure|remember|note|check|verify|look|process|prepare)
+        \b[^.?!]*[.?!]\s*
+      |
+        # Mid-stream stall fragment: \"Okay, let me process this.\"
+        (?:okay|ok|alright)[,.!]?\s+let\s+me\s+process\b[^.?!]*[.?!]\s*
       |
         # Fill / stall particles at the very front.
         (?:hmm+|um+|uh+|er+|ah+)[,.!]?\s+
@@ -733,6 +794,21 @@ class MLXBrain:
         guarded = _LEADING_ASSISTANT_LABEL_RE.sub("", text)
         if not guarded:
             return "", None, False
+
+        # Defense-in-depth: cut at first leaked ChatML / HF control token
+        # (the model occasionally emits these even after we add them to the
+        # stop-sequence list because the tokenizer can split them across
+        # streamed chunks). Anything after such a token is a hallucinated
+        # next-turn prompt and must never reach TTS.
+        m = _SPECIAL_TOKEN_RE.search(guarded)
+        if m is not None:
+            guarded = guarded[: m.start()].rstrip()
+        # Also strip any stray copies that the search above missed (e.g.
+        # tokens inside a longer body). Do this after the truncation so we
+        # don't leave half-tokens in place.
+        guarded = _SPECIAL_TOKEN_RE.sub("", guarded)
+        if not guarded:
+            return "", "control_token_only", True
 
         leading_stripped = _LEADING_QUOTE_WRAP_RE.sub("", guarded)
         if leading_stripped != guarded:

@@ -27,6 +27,7 @@ import collections
 import logging
 import os
 import plistlib
+import re
 import sys
 import threading
 import time
@@ -365,7 +366,12 @@ class NativeSTT:
         # Used to escalate to a full SFSpeechRecognizer recreation (the request/task
         # swap is insufficient once Apple's recognizer enters a zombie state).
         self._chain_restart_no_partial_count: int = 0
-        self._max_chain_restarts_before_recreate: int = 2
+        # Higher value than the previous 2 — small bursts of empty restarts
+        # are normal during silence and don't mean the recognizer is zombie.
+        # Recreating SFSpeechRecognizer is expensive (re-allocs the audio
+        # session, often retriggers permission overhead) and itself causes
+        # additional empty-final cycles, so we wait for sustained evidence.
+        self._max_chain_restarts_before_recreate: int = 5
         self._last_chain_restart_time: float = 0.0
         # Tracks whether the CURRENT recognition chain emitted at least one
         # real partial/final with text. Error callbacks (e.g. 1110 "No speech
@@ -410,10 +416,15 @@ class NativeSTT:
         self._passive_suppress_count: int = 0
         self._passive_suppress_window_start: float = 0.0
         self._passive_hint_last_time: float = 0.0
-        self._min_recreate_interval_s: float = 1.0
-        self._recreate_times_window: collections.deque = collections.deque(maxlen=16)
-        self._max_recreates_in_window: int = 5
-        self._recreates_window_s: float = 10.0
+        # Recreating SFSpeechRecognizer is heavy and almost always followed
+        # by another empty isFinal cascade (the fresh instance flushes
+        # whatever stale audio is in the prebuffer). Spread recreates out
+        # so the recognizer has a chance to actually speak before the
+        # circuit-breaker counts another attempt.
+        self._min_recreate_interval_s: float = 3.0
+        self._recreate_times_window: collections.deque = collections.deque(maxlen=8)
+        self._max_recreates_in_window: int = 3
+        self._recreates_window_s: float = 30.0
         self._escalation_requested: bool = False
 
     @property
@@ -1559,6 +1570,39 @@ class NativeSTT:
             self._partial_stable_since = 0.0
             has_text = bool(transcript and transcript.strip())
             if has_text:
+                # Drop trivial finals (single punctuation, lone vowel, etc).
+                # SFSpeechRecognizer occasionally promotes a single "." or
+                # "uh" when the audio path is empty; routing those to the
+                # LLM creates the "ATOM talking to itself" loop.
+                cleaned_final = transcript.strip()
+                stripped_alpha = re.sub(r"[^A-Za-z0-9]", "", cleaned_final)
+                if (
+                    len(cleaned_final) < 2
+                    or len(stripped_alpha) < 2
+                    or cleaned_final in {".", "?", "!", ",", "..", "...", "…"}
+                ):
+                    logger.info(
+                        "STT: dropping trivial final payload (len=%d): %r",
+                        len(cleaned_final), cleaned_final,
+                    )
+                    has_text = False
+            if has_text:
+                # Also gate by state — never emit a final while ATOM is
+                # SPEAKING/THINKING. Those can only be echo / pre-buffer
+                # leftovers from before the state transition.
+                try:
+                    from core.state_manager import AtomState
+                    cur_state = self._state.current
+                    if cur_state is not AtomState.LISTENING:
+                        logger.info(
+                            "STT: dropping final received in state=%s: %r",
+                            cur_state.name if hasattr(cur_state, "name") else cur_state,
+                            transcript[:80],
+                        )
+                        has_text = False
+                except Exception:
+                    pass
+            if has_text:
                 self._got_partial_since_restart = True
                 self._consecutive_recreates_no_partial = 0
                 self._consecutive_empty_finals = 0
@@ -1597,6 +1641,18 @@ class NativeSTT:
                             )
         else:
             now = time.monotonic()
+            # Gate partial emission by ATOM state. The recognizer can keep
+            # producing partials for ~1s after the audio source is muted
+            # (its internal buffer drains); when ATOM is THINKING/SPEAKING
+            # those partials are echo / leftover and cause hundreds of
+            # useless 'STT partial' log entries plus spurious wake-word
+            # checks. Drop them at the source.
+            try:
+                from core.state_manager import AtomState
+                cur_state = self._state.current
+                in_listen_state = cur_state is AtomState.LISTENING
+            except Exception:
+                in_listen_state = True
             if transcript != self._last_partial:
                 self._last_partial = transcript
                 self._partial_stable_since = now
@@ -1607,6 +1663,10 @@ class NativeSTT:
                     # silently zombie-ing.
                     self._got_partial_since_restart = True
                     self._consecutive_recreates_no_partial = 0
+                if not in_listen_state:
+                    # Stay quiet on the log; just record so the stable-
+                    # promotion path can decide later.
+                    return
                 if self._voice_debug:
                     logger.info("STT partial: '%s'", transcript[:200])
                 else:

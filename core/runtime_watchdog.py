@@ -47,7 +47,7 @@ class RuntimeWatchdog:
         "_shutdown", "_cooldown_s", "_last_recovery", "_think_s", "_speak_s",
         "_poll_interval",
         "_intent_s", "_cache_s", "_rag_s", "_llm_s", "_tts_s", "_tool_s",
-        "_tts_started_at", "_local_brain",
+        "_tts_started_at", "_local_brain", "_tts",
     )
 
     def __init__(
@@ -76,6 +76,7 @@ class RuntimeWatchdog:
         self._last_recovery = time.monotonic() - self._cooldown_s
         self._tts_started_at = 0.0
         self._local_brain: Any = None
+        self._tts: Any = None
 
         self._bus.on("response_ready", self._on_tts_started)
         self._bus.on("partial_response", self._on_tts_started)
@@ -84,6 +85,10 @@ class RuntimeWatchdog:
     def attach_local_brain(self, brain: Any) -> None:
         """Attach LocalBrainController so LLM timeouts can preempt/unload it."""
         self._local_brain = brain
+
+    def attach_tts(self, tts: Any) -> None:
+        """Attach TTS engine so a stuck synth can be force-stopped on timeout."""
+        self._tts = tts
 
     def timeout_s(self, stage: str) -> float:
         mapping = {
@@ -259,6 +264,30 @@ class RuntimeWatchdog:
                 self._bus.emit("text_display", text="[Watchdog] TTS timed out; audio skipped.")
             except Exception:
                 logger.debug('Metrics counter emit failed', exc_info=True)
+            # Force-stop the synth so we don't sit in SPEAKING state spinning
+            # the run-loop on a stuck utterance. Without this the audio engine
+            # stays bound and the next reply piles up behind it.
+            tts = self._tts
+            if tts is not None:
+                try:
+                    stop_attr = getattr(tts, "stop", None)
+                    if stop_attr is not None:
+                        result = stop_attr()
+                        if asyncio.iscoroutine(result):
+                            try:
+                                loop = asyncio.get_running_loop()
+                            except RuntimeError:
+                                loop = None
+                            if loop is not None:
+                                loop.create_task(result)
+                            else:
+                                asyncio.run(result)
+                except Exception:
+                    logger.debug("Watchdog TTS stop failed", exc_info=True)
+            try:
+                self._bus.emit("tts_complete", reason="watchdog_timeout")
+            except Exception:
+                logger.debug("tts_complete emit failed", exc_info=True)
             self._maybe_recover(
                 f"TTS synthesis timed out after {timeout_s:.1f}s",
                 schedule_restart=False,

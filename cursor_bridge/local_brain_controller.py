@@ -62,6 +62,45 @@ _INLINE_TRACE_RE = re.compile(r"^(?:[a-z_]+\([^)]{0,200}\)\s*[→:=-]+\s*)+", re
 _TRANSCRIPT_SPLIT_RE = re.compile(r"\b(?:User|Boss|ATOM|Assistant):", re.I)
 _TRANSCRIPT_LABEL_RE = re.compile(r"\b(?:User|Boss|ATOM|Assistant):\s*", re.I)
 _REPEATED_SPEAKER_RE = re.compile(r"^(?:(?:User|Boss|ATOM|Assistant)\s*:?\s*)+$", re.I)
+
+# Hard-stop ChatML / HF tokens that must never reach TTS. We split the text
+# at the first occurrence (truncating everything after) and also separately
+# strip any stray copies anywhere in the body.
+_STRIP_HARD_STOP_TOKENS_RE = re.compile(
+    r"<\|(?:endoftext|im_end|im_start|user|assistant|system|eot_id|"
+    r"begin_of_text|end_of_text|start_header_id|end_header_id|"
+    r"reserved_special_token_\d+)\|>",
+    re.I,
+)
+# Mirror of brain/mlx_llm.py:_LEADING_QUOTE_WRAP_RE — catches lone leading
+# quotes followed by Boss/Sir/lowercase/apostrophe so a streamed clause like
+# `" haven't set an alarm.` or `"'m sorry, Boss.` never reaches TTS.
+_LEADING_QUOTE_WRAP_RE = re.compile(
+    r"""^\s*[\"\u201c\u201d\u2018\u2019`]+\s*"""
+    r"""(?="""
+    r"""(?:Boss|Satyam|Sir|Ma'am|Madam|Hey|OK|Okay|Alright)\b"""
+    r"""|[A-Z]"""
+    r"""|'[a-z]"""
+    r"""|[a-z]"""
+    r""")""",
+    re.U,
+)
+_TRAILING_UNCLOSED_QUOTE_RE = re.compile(r"""[\"\u201c\u201d\u2018\u2019]+\s*$""")
+_STRIP_SPECIAL_TOKENS_RE = re.compile(
+    r"<\|(?:endoftext|im_end|im_start|user|assistant|system|eot_id|"
+    r"begin_of_text|end_of_text|start_header_id|end_header_id|"
+    r"reserved_special_token_\d+)\|>",
+    re.I,
+)
+# Anything after a fresh role header (Human:, User:, Boss:) is the next-turn
+# prompt that the model is hallucinating; truncate at the FIRST occurrence
+# so we keep the assistant's own reply but drop the leaked next-turn turn.
+# We require either a leading newline or a beginning-of-string anchor so we
+# don't accidentally chop mid-sentence references like "the user: said ...".
+_STRIP_TRANSCRIPT_HEADERS_RE = re.compile(
+    r"(?:^|[\r\n])\s*(?:Human|User|Boss):\s",
+    re.I,
+)
 # Broadened: also flag chain-of-thought prefaces and third-person narration so
 # the quality-reject check can drop them. The previous regex only anchored on
 # a handful of instruction echoes ("direct answer", "strict output recovery");
@@ -88,19 +127,26 @@ _INSTRUCTION_ECHO_RE = re.compile(
     r"strict output recovery|response contract|the user is asking|this is a|"
     r"boss explicitly asked|"
     # Direct narration variants seen in production logs.
-    r"the user is\s+(?:greeting|asking|requesting|wanting|saying|trying)\b|"
+    r"the user (?:is|has|was)\s+(?:greeting|asking|requesting|wanting|saying|trying|having|expressing)\b|"
     r"the user wants\b|the user said\b|the user just\b|"
-    r"so respond\b|respond politely\b|respond warmly\b|"
+    r"so respond\b|respond politely\b|respond warmly\b|respond gently\b|respond empathetically\b|"
     # CoT / stall prefaces below.
-    r"okay,?\s+(?:let'?s|lets|let me)\b|"
-    r"alright,?\s+(?:so|let'?s|lets|let me)\b|"
-    r"well,?\s+(?:so|let'?s|lets|let me)\b|"
-    r"let'?s\s+(?:see|think|break|try|start)\b|"
-    r"let\s+me\s+(?:think|see|try|consider)\b|"
+    r"okay,?\s+(?:let'?s|lets|let me|the\s+user)\b|"
+    r"alright,?\s+(?:so|let'?s|lets|let me|the\s+user)\b|"
+    r"well,?\s+(?:so|let'?s|lets|let me|the\s+user)\b|"
+    r"let'?s\s+(?:see|think|break|try|start|check|verify|look|reason|figure)\b|"
+    r"let\s+me\s+(?:think|see|try|consider|check|verify|look|reason|figure|process|recall|prepare)\b|"
     r"hmm+,?|um+,?|uh+,?|"
-    r"(?:so,?\s+)?the\s+(?:question|query|request)\s+is\b|"
-    r"the\s+user\s+(?:is\s+)?(?:asking|wants|says|said)\b|"
-    r"i\s+(?:should|need\s+to|have\s+to|must)\s+(?:think|consider|figure|reason|recall)\b"
+    r"(?:so,?\s+)?the\s+(?:question|query|request|issue|problem)\s+is\b|"
+    r"the\s+user\s+(?:is|has|was)?\s*(?:asking|wants|says|said|greeting|requesting|wanting|trying|having|expressing)\b|"
+    r"i\s+(?:should|need\s+to|have\s+to|must|will|am\s+going\s+to)\s+"
+    r"(?:think|consider|figure|reason|recall|acknowledge|show|offer|respond|focus|make\s+sure|remember|note|check|verify|look|process|prepare)\b|"
+    # \"My role is to respond as ATOM.\" / \"My job is to ...\"
+    r"my\s+(?:role|job|task|goal)\s+(?:is|here\s+is)\s+(?:to\s+)?\b|"
+    # \"In the current context,\" / \"From my memory,\" / \"From the conversation history,\"
+    r"(?:in|from|within)\s+(?:the\s+)?(?:current\s+)?(?:context|conversation(?:\s+history)?|memory|chat\s+history|transcript|history)\b|"
+    # \"Keep it concise / friendly / professional.\"
+    r"keep\s+(?:it|the\s+(?:answer|response|reply|tone))\s+(?:concise|brief|short|simple|friendly|warm|professional|polite|casual|natural)\b"
     r")",
     re.I,
 )
@@ -127,21 +173,40 @@ _COT_PREFACE_STRIP_RE = re.compile(
     )?
     (?:
         (?:okay|ok|alright|well|so|hmm+|um+|uh+)\b[,.!]?\s*
-        (?:let(?:'|\u2019)?s?\s+(?:see|think|break|try|start|go)\b[^.?!]*[.?!]\s*)?
+        (?:let(?:'|\u2019)?s?\s+(?:see|think|break|try|start|go|check|verify|look|reason|figure)\b[^.?!]*[.?!]\s*)?
       |
-        let(?:'|\u2019)?s?\s+(?:see|think|break|try|start|go)\b[^.?!]*[.?!]\s*
+        let(?:'|\u2019)?s?\s+(?:see|think|break|try|start|go|check|verify|look|reason|figure)\b[^.?!]*[.?!]\s*
       |
-        let\s+me\s+(?:think|see|try|consider)\b[^.?!]*[.?!]\s*
+        # \"Let me check my memory.\" / \"Let me reason about this.\"
+        let\s+me\s+(?:think|see|try|consider|check|verify|look|reason|figure|process|recall|prepare)\b[^.?!]*[.?!]\s*
       |
-        (?:the\s+user|boss|the\s+speaker)\s+(?:is\s+)?(?:greeting|asking|wants|says|said|needs|wondering|requesting|trying)[^.?!]*[.?!]\s*
+        (?:the\s+user|boss|the\s+speaker)\s+(?:is\s+|has\s+|was\s+)?
+        (?:greeting|asking|wants|says|said|needs|wondering|requesting|trying|having|expressing)
+        [^.?!]*[.?!]\s*
       |
-        (?:so\s+)?(?:the\s+)?(?:question|query|request)\s+is\b[^.?!]*[.?!]\s*
+        (?:so\s+)?(?:the\s+)?(?:question|query|request|issue|problem)\s+is\b[^.?!]*[.?!]\s*
       |
-        i\s+(?:should|need\s+to|have\s+to|must)\s+(?:think|consider|figure|reason|recall)\b[^.?!]*[.?!]\s*
+        i\s+(?:should|need\s+to|have\s+to|must|will|am\s+going\s+to)\s+
+        (?:think|consider|figure|reason|recall|acknowledge|show|offer|respond|respond\s+with|focus|make\s+sure|remember|note|check|verify|look|process|prepare)
+        \b[^.?!]*[.?!]\s*
+      |
+        # \"My role is to respond as ATOM.\" / \"My job is to ...\"
+        my\s+(?:role|job|task|goal)\s+(?:is|here\s+is)\s+(?:to\s+)?[^.?!]*[.?!]\s*
+      |
+        # \"In the current context, there's no mention of...\"
+        (?:in|from|within)\s+
+        (?:the\s+)?
+        (?:current\s+)?
+        (?:context|conversation(?:\s+history)?|memory|chat\s+history|transcript|history)
+        [,]?\s+[^.?!]*[.?!]\s*
+      |
+        # \"Keep it concise and friendly.\" — instruction echo to self.
+        keep\s+(?:it|the\s+(?:answer|response|reply|tone))\s+(?:concise|brief|short|simple|friendly|warm|professional|polite|casual|natural)
+        [^.?!]*[.?!]\s*
       |
         (?:hmm+|um+|uh+|er+|ah+)[,.!]?\s+
       |
-        so\s+respond\s+(?:politely|warmly|briefly|kindly|directly)[^.?!]*[.?!]\s*
+        so\s+respond\s+(?:politely|warmly|briefly|kindly|directly|gently|empathetically)[^.?!]*[.?!]\s*
     )+
     """,
     re.IGNORECASE | re.VERBOSE | re.DOTALL,
@@ -168,14 +233,33 @@ _COT_PREFACE_STRIP_PARTIAL_RE = re.compile(
         \s*[\u2013\u2014:,\-]+\s*
     )?
     (?:
-        (?:the\s+user|boss|the\s+speaker)\s+(?:is\s+)?
-        (?:greeting|asking|wants|says|said|needs|wondering|requesting|trying)
+        (?:the\s+user|boss|the\s+speaker)\s+(?:is\s+|has\s+|was\s+)?
+        (?:greeting|asking|wants|says|said|needs|wondering|requesting|trying|having|expressing)
         [^.?!]*(?:[,]\s*|$)
       |
-        so\s+respond\s+(?:politely|warmly|briefly|kindly|directly)
+        so\s+respond\s+(?:politely|warmly|briefly|kindly|directly|gently|empathetically)
         [^.?!]*(?:[,]\s*|$)
       |
-        respond\s+(?:politely|warmly|briefly|kindly|directly)
+        respond\s+(?:politely|warmly|briefly|kindly|directly|gently|empathetically)
+        [^.?!]*(?:[,]\s*|$)
+      |
+        # \"Okay, the user is asking ...,\" mid-flush leak.
+        (?:okay|ok|alright|well|so)\b[,.!]?\s+
+        (?:the\s+user|boss|the\s+speaker)\s+(?:is\s+|has\s+|was\s+)?
+        (?:greeting|asking|wants|says|said|needs|wondering|requesting|trying|having|expressing)
+        [^.?!]*(?:[,]\s*|$)
+      |
+        # \"Let me check my memory,\" / \"Let me think about that,\"
+        let\s+me\s+(?:think|see|try|consider|check|verify|look|reason|figure|process|recall|prepare)
+        [^.?!]*(?:[,]\s*|$)
+      |
+        # \"My role is to respond as ATOM,\" mid-flush.
+        my\s+(?:role|job|task|goal)\s+(?:is|here\s+is)\s+(?:to\s+)?
+        [^.?!]*(?:[,]\s*|$)
+      |
+        # \"I need to acknowledge their difficulty,\" mid-flush.
+        i\s+(?:should|need\s+to|have\s+to|must|will|am\s+going\s+to)\s+
+        (?:think|consider|figure|reason|recall|acknowledge|show|offer|respond|focus|make\s+sure|remember|note|check|verify|look|process|prepare)
         [^.?!]*(?:[,]\s*|$)
     )+
     """,
@@ -243,11 +327,11 @@ def _looks_like_pure_instruction_leak(text: str) -> bool:
     )
     head = head.lstrip(' "\u201c\u2018\'`-:>')
     full_form = re.match(
-        r"^(?:the\s+user|boss|the\s+speaker)\s+(?:is\s+)?"
-        r"(?:greeting|asking|wants|says|said|needs|wondering|requesting|trying)"
+        r"^(?:the\s+user|boss|the\s+speaker)\s+(?:is\s+|has\s+|was\s+)?"
+        r"(?:greeting|asking|wants|says|said|needs|wondering|requesting|trying|having|expressing)"
         r"[^.?!]*?,?\s*"
         r"(?:so\s+)?respond\s+"
-        r"(?:politely|warmly|briefly|kindly|directly)\b",
+        r"(?:politely|warmly|briefly|kindly|directly|gently|empathetically)\b",
         head,
         re.IGNORECASE,
     )
@@ -258,12 +342,47 @@ def _looks_like_pure_instruction_leak(text: str) -> bool:
     # the start of an emittable clause. Real answers don't open with
     # third-person narration about Boss.
     partial_narration = re.match(
-        r"^(?:the\s+user|boss|the\s+speaker)\s+(?:is\s+)?"
-        r"(?:greeting|asking|wants|says|said|needs|wondering|requesting|trying)\b",
+        r"^(?:the\s+user|boss|the\s+speaker)\s+(?:is\s+|has\s+|was\s+)?"
+        r"(?:greeting|asking|wants|says|said|needs|wondering|requesting|trying|having|expressing)\b",
         head,
         re.IGNORECASE,
     )
-    return partial_narration is not None
+    if partial_narration is not None:
+        return True
+    # \"My role is to respond as ATOM.\" — only flag when the ENTIRE
+    # head is that single clause. If the model self-narrates and THEN
+    # gives a real answer, we want the stripper to peel the preface and
+    # keep the answer; we should NOT drop the whole emission here.
+    role_narration_only = re.fullmatch(
+        r"\s*my\s+(?:role|job|task|goal)\s+(?:is|here\s+is)\s+(?:to\s+)?"
+        r"[^.?!]*[.?!]?\s*",
+        head,
+        re.IGNORECASE,
+    )
+    if role_narration_only is not None:
+        return True
+    # \"Let me check my memory.\" / \"Let me think about that.\" — only flag
+    # when the ENTIRE response is that CoT clause, not when a real answer
+    # follows. We test this by stripping the CoT preface and checking if
+    # what remains is empty / sub-3-words.
+    let_me_only = re.fullmatch(
+        r"\s*let\s+me\s+(?:think|see|try|consider|check|verify|look|reason|figure|process|recall|prepare)\b"
+        r"[^.?!]*[.?!]?\s*",
+        head,
+        re.IGNORECASE,
+    )
+    if let_me_only is not None:
+        return True
+    # \"Okay, the user is asking ...\" with no actual reply attached — only
+    # flag when the entire head is the CoT opener clause.
+    cot_opener_only = re.fullmatch(
+        r"\s*(?:okay|ok|alright|well|so)\b[,.!]?\s+"
+        r"(?:the\s+user|let\s+me|let'?s|i\s+(?:should|need\s+to|will|am\s+going\s+to))"
+        r"[^.?!]*[.?!]?\s*",
+        head,
+        re.IGNORECASE,
+    )
+    return cot_opener_only is not None
 
 MAX_REACT_STEPS = 3
 
@@ -438,7 +557,22 @@ class LocalBrainController:
         return re.sub(r"\s+", " ", (text or "").strip())
 
     def _sanitize_emittable_text(self, text: str) -> str:
-        cleaned = _INLINE_TRACE_RE.sub("", self._compact_text(text)).strip(" -:>")
+        # Defense-in-depth: cut at any leaked ChatML / HF control token and
+        # strip stray copies of them. This catches cloud-fallback paths and
+        # any stale stream that bypasses the MLX-side stop-sequence check.
+        raw = self._compact_text(text)
+        if raw:
+            raw = _STRIP_HARD_STOP_TOKENS_RE.split(raw, maxsplit=1)[0]
+            raw = _STRIP_SPECIAL_TOKENS_RE.sub("", raw)
+            raw = _STRIP_TRANSCRIPT_HEADERS_RE.split(raw, maxsplit=1)[0]
+            # Strip a leading lone quote-wrap (mirrors MLX-side guard so
+            # cloud-fallback paths and pre-stripped fragments stay clean).
+            stripped = _LEADING_QUOTE_WRAP_RE.sub("", raw, count=1)
+            if stripped != raw:
+                stripped = _TRAILING_UNCLOSED_QUOTE_RE.sub("", stripped).rstrip()
+                raw = stripped
+            raw = raw.strip()
+        cleaned = _INLINE_TRACE_RE.sub("", raw).strip(" -:>")
         if not cleaned:
             return ""
 
@@ -675,6 +809,7 @@ class LocalBrainController:
         query: str,
         full_text: str,
     ) -> tuple[str, str | None]:
+        # Gate 1 — the *raw* response must look long enough.
         if not should_export_report(
             query,
             full_text,
@@ -683,9 +818,41 @@ class LocalBrainController:
         ):
             return self._finalize_inline_text(query, full_text), None
 
+        # Gate 2 — the *sanitized* response (after CoT / quote / token strip)
+        # must STILL be long enough. This prevents 'I saved the full report'
+        # being spoken every time the model leaks a long chain-of-thought
+        # block that gets cut down to a few words by the sanitiser.
+        sanitized = self._sanitize_emittable_text(full_text)
+        if not sanitized:
+            return self._finalize_inline_text(query, full_text), None
+        word_count = len(sanitized.split())
+        char_count = len(sanitized)
+        if (
+            word_count < self._report_export_min_words
+            or char_count < self._report_export_min_chars
+        ):
+            logger.info(
+                "Skipping report export: sanitized=%d words / %d chars "
+                "below threshold (raw=%d chars).",
+                word_count,
+                char_count,
+                len(full_text),
+            )
+            return self._finalize_inline_text(query, full_text), None
+
+        # Gate 3 — sanitiser must not have removed the bulk of the response.
+        # If the sanitised body is < 60% of the raw length, the raw was mostly
+        # CoT/garbage and not a real long-form answer worth saving as a file.
+        if len(full_text) > 0 and (len(sanitized) / float(len(full_text))) < 0.60:
+            logger.info(
+                "Skipping report export: sanitiser removed %.1f%% of raw response.",
+                100.0 * (1.0 - len(sanitized) / float(len(full_text))),
+            )
+            return self._finalize_inline_text(query, full_text), None
+
         try:
-            path = self._write_report_file(query, full_text)
-            summary = summarize_report(full_text, max_sentences=2, max_chars=200)
+            path = self._write_report_file(query, sanitized)
+            summary = summarize_report(sanitized, max_sentences=2, max_chars=200)
             self._remember_report(query, summary, path)
             self._bus.emit("report_saved", query=query, path=path.as_posix(), summary=summary)
             self._bus.emit("text_display", text=f"Full report saved: {path.as_posix()}")

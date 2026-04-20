@@ -1705,6 +1705,7 @@ async def main() -> None:
 
     runtime_watchdog = RuntimeWatchdog(bus, state, config)
     runtime_watchdog.attach_local_brain(local_brain)
+    runtime_watchdog.attach_tts(tts)
     router.attach_runtime_watchdog(runtime_watchdog)
     local_brain.attach_runtime_watchdog(runtime_watchdog)
     bus.on("state_changed", runtime_watchdog.on_state_changed)
