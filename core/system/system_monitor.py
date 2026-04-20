@@ -89,7 +89,11 @@ def get_system_state() -> dict[str, Any]:
         "ts": __import__("time").time(),
     }
     try:
-        logger.info(
+        # Demoted from INFO to DEBUG: this fires every 2--5 seconds from the
+        # snapshot / dashboard / prompt-building call sites and was the single
+        # biggest contributor to log volume (~40 lines/3min). Turn-level INFO
+        # (state transitions, router decisions) is enough for prod diagnostics.
+        logger.debug(
             "v7_system_state cpu=%.1f ram=%.1f fg=%s apps=%d",
             cpu_pct,
             ram_pct,

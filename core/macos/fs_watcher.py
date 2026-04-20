@@ -65,11 +65,31 @@ _FLAG_MODIFIED = 0x00001000  # kFSEventStreamEventFlagItemModified
 _FLAG_IS_DIR = 0x00020000    # kFSEventStreamEventFlagItemIsDir
 _FLAG_IS_FILE = 0x00010000   # kFSEventStreamEventFlagItemIsFile
 
-# Directories to ignore (noisy system writes)
+# Directories / basenames to ignore (noisy system writes)
 _IGNORE_PATTERNS = {
     ".DS_Store", ".Spotlight-V100", ".fseventsd", ".Trashes",
     "__pycache__", ".git", "node_modules", ".venv",
 }
+
+# Security: paths under these substrings are *never* forwarded to the bus even
+# if the user happens to point a watch root at their home dir. They are held
+# in a tuple of case-insensitive substrings because FSEvents gives us real
+# (symlink-resolved) paths and we want to catch the keychain regardless of the
+# user name (e.g. /Users/foo/Library/Keychains/...).
+_SENSITIVE_PATH_SUBSTRINGS: tuple[str, ...] = (
+    "/.ssh/",
+    "/.aws/",
+    "/.gnupg/",
+    "/.kube/",
+    "/.docker/config.json",
+    "/.netrc",
+    "/.pgpass",
+    "/library/keychains/",
+    "/library/cookies/",
+    "/library/application support/atom/secrets",
+    "/.config/gh/hosts.yml",
+    "/.atom_secrets",
+)
 
 
 def _classify_event(flags: int) -> str:
@@ -85,10 +105,33 @@ def _classify_event(flags: int) -> str:
     return "changed"
 
 
+def _is_sensitive_path(path: str) -> bool:
+    """True if ``path`` touches a credential / secret store we must never surface.
+
+    Kept as a module-level helper so the policy can be imported and unit-tested
+    without standing up an actual FSEvents stream.
+    """
+    if not path:
+        return False
+    needle = path.lower()
+    # Always normalise trailing slash so exact-file matches (e.g. "/.netrc")
+    # still match when FSEvents hands us the directory form.
+    if not needle.endswith("/"):
+        needle_dir = needle + "/"
+    else:
+        needle_dir = needle
+    for sub in _SENSITIVE_PATH_SUBSTRINGS:
+        if sub in needle or sub in needle_dir:
+            return True
+    return False
+
+
 def _should_ignore(path: str) -> bool:
-    """Skip noisy system files."""
+    """Skip noisy system files *and* any credential path."""
     basename = os.path.basename(path)
-    return basename in _IGNORE_PATTERNS
+    if basename in _IGNORE_PATTERNS:
+        return True
+    return _is_sensitive_path(path)
 
 
 class FSWatcher:

@@ -1102,6 +1102,48 @@ class LocalBrainController:
         """V7: release model memory (next query will reload)."""
         self._llm.shutdown()
 
+    def request_profile_demote(self, *, reason: str = "watchdog") -> bool:
+        """Drop the brain to a lighter profile after repeated timeouts.
+
+        Called by :class:`core.runtime_watchdog.RuntimeWatchdog` once the
+        consecutive-timeout threshold trips. We force ``runtime_mode=FAST``
+        (skips late-RAG, heavy memory-graph prefetch, reflection loops) AND
+        unload the model so the next turn rehydrates a clean session. This is
+        idempotent: the controller flips only if it's not already demoted.
+        """
+        already_fast = str(self._current_runtime_mode or "").upper() == "FAST"
+        if already_fast:
+            logger.debug(
+                "request_profile_demote skipped -- brain already in FAST (reason=%s)",
+                reason,
+            )
+            return False
+        try:
+            self._current_runtime_mode = "FAST"
+            self._last_mode_info = {
+                "runtime_mode": "FAST",
+                "reason": f"watchdog_demote:{reason}",
+                "source": "runtime_watchdog",
+            }
+        except Exception:
+            logger.debug(
+                "request_profile_demote could not stamp mode info",
+                exc_info=True,
+            )
+        try:
+            self._llm.shutdown()
+        except Exception:
+            logger.debug(
+                "request_profile_demote LLM shutdown failed",
+                exc_info=True,
+            )
+        logger.warning(
+            "LocalBrainController: runtime mode demoted to FAST (reason=%s). "
+            "RAG/reflection skipped until operator flips back to SMART.",
+            reason,
+        )
+        return True
+
     async def warm_up(
         self,
         *,

@@ -48,6 +48,8 @@ class RuntimeWatchdog:
         "_poll_interval",
         "_intent_s", "_cache_s", "_rag_s", "_llm_s", "_tts_s", "_tool_s",
         "_tts_started_at", "_local_brain", "_tts",
+        "_consecutive_llm_timeouts", "_consecutive_tts_timeouts",
+        "_timeout_demote_threshold", "_profile_demoted",
     )
 
     def __init__(
@@ -77,10 +79,21 @@ class RuntimeWatchdog:
         self._tts_started_at = 0.0
         self._local_brain: Any = None
         self._tts: Any = None
+        # Stability: track *consecutive* budget timeouts per stage so we can
+        # escalate to a profile demotion (instead of silently looping). Reset
+        # on the first successful response/turn.
+        self._consecutive_llm_timeouts = 0
+        self._consecutive_tts_timeouts = 0
+        self._timeout_demote_threshold = int(
+            perf.get("watchdog_timeout_demote_threshold", 2),
+        )
+        self._profile_demoted = False
 
         self._bus.on("response_ready", self._on_tts_started)
         self._bus.on("partial_response", self._on_tts_started)
         self._bus.on("tts_complete", self._on_tts_complete)
+        self._bus.on("response_complete", self._on_successful_turn)
+        self._bus.on("response_emitted", self._on_successful_turn)
 
     def attach_local_brain(self, brain: Any) -> None:
         """Attach LocalBrainController so LLM timeouts can preempt/unload it."""
@@ -217,6 +230,66 @@ class RuntimeWatchdog:
     async def _on_tts_complete(self, **_kw: Any) -> None:
         self._tts_started_at = 0.0
 
+    async def _on_successful_turn(self, **_kw: Any) -> None:
+        """Clear consecutive-timeout counters when a turn actually lands."""
+        if self._consecutive_llm_timeouts or self._consecutive_tts_timeouts:
+            logger.debug(
+                "Watchdog: clearing consecutive timeouts after successful turn "
+                "(llm=%d tts=%d)",
+                self._consecutive_llm_timeouts,
+                self._consecutive_tts_timeouts,
+            )
+        self._consecutive_llm_timeouts = 0
+        self._consecutive_tts_timeouts = 0
+
+    def _maybe_demote_profile(self, trigger: str) -> None:
+        """Ask local-brain to drop to a lighter profile after repeated timeouts.
+
+        Safe to call multiple times; demotes only once per session unless
+        someone explicitly reverts profile via router/CLI.
+        """
+        if self._profile_demoted:
+            return
+        brain = self._local_brain
+        if brain is None:
+            return
+        demote_fn = getattr(brain, "request_profile_demote", None)
+        if not callable(demote_fn):
+            # Fall back to the legacy unload path; better than nothing when
+            # the brain doesn't expose an explicit demote hook.
+            try:
+                brain.unload_llm_for_power()
+            except Exception:
+                logger.debug("Watchdog fallback demote failed", exc_info=True)
+            self._profile_demoted = True
+            return
+        try:
+            demote_fn(reason=trigger)
+            self._profile_demoted = True
+            logger.warning(
+                "Watchdog: demoted brain profile after %d consecutive %s "
+                "timeouts (trigger=%s). ATOM is in lite mode; say "
+                "\"go fast mode\" to keep it, or \"go smart mode\" to retry.",
+                self._timeout_demote_threshold,
+                "LLM" if "llm" in trigger else "TTS",
+                trigger,
+            )
+            try:
+                self._bus.emit(
+                    "text_display",
+                    text=(
+                        "I've dropped to a lighter model because responses "
+                        "were timing out. Ready when you are, Boss."
+                    ),
+                )
+            except Exception:
+                logger.debug("Demote notification emit failed", exc_info=True)
+        except Exception:
+            logger.warning(
+                "Watchdog: profile demote request failed",
+                exc_info=True,
+            )
+
     def _handle_budget_timeout(
         self,
         stage: str,
@@ -242,6 +315,7 @@ class RuntimeWatchdog:
             logger.debug('Fast bus emit failed', exc_info=True)
 
         if stage == "llm_inference":
+            self._consecutive_llm_timeouts += 1
             if self._local_brain is not None:
                 try:
                     self._local_brain.request_preempt()
@@ -255,10 +329,13 @@ class RuntimeWatchdog:
                 self._bus.emit("llm_error", source="watchdog", error="llm_timeout")
             except Exception:
                 logger.debug('Metrics counter emit failed', exc_info=True)
+            if self._consecutive_llm_timeouts >= self._timeout_demote_threshold:
+                self._maybe_demote_profile("llm_timeout_streak")
             self._maybe_recover(f"LLM inference timed out after {timeout_s:.1f}s")
             return
 
         if stage == "tts_synthesis":
+            self._consecutive_tts_timeouts += 1
             self._tts_started_at = 0.0
             try:
                 self._bus.emit("text_display", text="[Watchdog] TTS timed out; audio skipped.")
@@ -288,6 +365,8 @@ class RuntimeWatchdog:
                 self._bus.emit("tts_complete", reason="watchdog_timeout")
             except Exception:
                 logger.debug("tts_complete emit failed", exc_info=True)
+            if self._consecutive_tts_timeouts >= self._timeout_demote_threshold:
+                self._maybe_demote_profile("tts_timeout_streak")
             self._maybe_recover(
                 f"TTS synthesis timed out after {timeout_s:.1f}s",
                 schedule_restart=False,

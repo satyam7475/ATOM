@@ -89,6 +89,17 @@ async def main() -> None:
         "ATOM owner binding: %s — access control via core/owner_gate.py",
         owner_display_name(),
     )
+    try:
+        # Security: ATOM has already loaded the dashboard token into the
+        # owner gate's in-memory state; everything else (HF_TOKEN, OPENAI_API_KEY,
+        # GEMINI_API_KEY, ...) gets snapshotted by the secret scrub and blanked
+        # in ``os.environ`` so child processes / crash dumps don't leak them.
+        from core.security_secret_scrub import scrub_sensitive_env
+
+        _secret_snapshot = scrub_sensitive_env(preserve=("ATOM_DASHBOARD_TOKEN",))
+    except Exception:
+        _secret_snapshot = {}
+        logger.debug("Secret scrub skipped or failed", exc_info=True)
 
     from core.deployment_profile import (
         deployment_dashboard_badge,
