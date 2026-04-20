@@ -78,6 +78,19 @@ _LEADING_ASSISTANT_LABEL_RE = re.compile(
     r"^\s*(?:(?:ATOM|Assistant)\s*:\s*)+",
     re.I,
 )
+# Leading quote-wrapped roleplay openers. Small instruction-tuned models
+# often break from the system rule and emit things like:
+#     "Boss, I'm showing you your active goals. Here they are:"
+# Those quotes leak into TTS verbatim, get heard by the mic, and — because
+# they start with "Boss," — the model treats the echo as a fresh user turn.
+# Strip the leading quote (both straight and curly) plus any matching
+# trailing quote so TTS speaks the sentence naturally.
+_LEADING_QUOTE_WRAP_RE = re.compile(
+    r"""^\s*[\"“]+\s*(?=(?:Boss|Satyam|Sir|Ma'am|Madam|Hey|OK|Okay|Alright)\b|[A-Z])""",
+    re.U,
+)
+# Trailing unclosed quote (with optional trailing punctuation/space).
+_TRAILING_UNCLOSED_QUOTE_RE = re.compile(r"""[\"”]+\s*$""")
 _ASSISTANT_LABEL_ONLY_RE = re.compile(
     r"^\s*(?:(?:ATOM|Assistant)\s*:\s*){2,}\s*$",
     re.I,
@@ -718,6 +731,15 @@ class MLXBrain:
             return "", "speaker_label_loop", True
 
         guarded = _LEADING_ASSISTANT_LABEL_RE.sub("", text)
+        if not guarded:
+            return "", None, False
+
+        leading_stripped = _LEADING_QUOTE_WRAP_RE.sub("", guarded)
+        if leading_stripped != guarded:
+            guarded = leading_stripped
+            trailing_stripped = _TRAILING_UNCLOSED_QUOTE_RE.sub("", guarded).rstrip()
+            if trailing_stripped:
+                guarded = trailing_stripped
         if not guarded:
             return "", None, False
 

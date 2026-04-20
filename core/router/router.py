@@ -150,6 +150,11 @@ class Router:
         # Routine engine (wired via attach_routine_engine, Sprint D4)
         self._routine_engine: Any = None
 
+        # TTS echo guard (wired via attach_tts_echo_guard). Returns True
+        # when an incoming finalized text matches ATOM's own recent TTS,
+        # letting us drop echoed user_queries before LLM dispatch.
+        self._tts_echo_guard: Any = None
+
         # v22: Cloud intelligence components (wired via attach_cloud_intelligence)
         self._gemini_client: Any = None
         self._search_tool: Any = None
@@ -199,6 +204,14 @@ class Router:
         """Wire the Phase 2 Adaptive Intelligence Engine."""
         self._adaptive = adaptive
         logger.info("AdaptiveEngine attached to Router")
+
+    def attach_tts_echo_guard(self, echo_guard: Any) -> None:
+        """Wire a callable ``(text) -> bool`` that returns True when ``text``
+        looks like ATOM's own recently-spoken TTS. Used by ``_route`` to
+        silently drop finalized partials that slipped past STT's guard.
+        """
+        self._tts_echo_guard = echo_guard
+        logger.info("Router: TTS echo guard wired")
 
     def attach_routine_engine(self, routine_engine: Any) -> None:
         """Wire the user-defined routine engine (Sprint D4)."""
@@ -571,6 +584,18 @@ class Router:
         raw_text = compress_query(text)
         if not raw_text:
             return
+
+        if self._tts_echo_guard is not None:
+            try:
+                if bool(self._tts_echo_guard(raw_text)):
+                    logger.info(
+                        "Router: echoed final dropped (matches recent TTS): '%s'",
+                        raw_text[:80],
+                    )
+                    return
+            except Exception:
+                logger.debug("TTS echo guard raised", exc_info=True)
+
         normalized_text = normalize_query(raw_text)
         if normalized_text and normalized_text != raw_text.lower().strip():
             logger.info("Input normalized: '%s' -> '%s'", raw_text[:80], normalized_text[:80])

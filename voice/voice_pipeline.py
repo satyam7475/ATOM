@@ -111,11 +111,29 @@ class VoicePipeline:
         """Construct STT and TTS engines based on config + platform."""
         self._build_stt()
         self._build_tts()
+        self._wire_echo_guard()
         logger.info(
             "VoicePipeline built: stt=%s tts=%s",
             self.stt_runtime_label,
             self.tts_runtime_label,
         )
+
+    def _wire_echo_guard(self) -> None:
+        """Connect TTS.is_echo() to STT so stable partials that match
+        ATOM's own voice cannot be promoted to finals (Jarvis-loop fix).
+        """
+        try:
+            stt = self.stt
+            tts = self.tts
+            if stt is None or tts is None:
+                return
+            attach = getattr(stt, "attach_echo_guard", None)
+            is_echo = getattr(tts, "is_echo", None)
+            if callable(attach) and callable(is_echo):
+                attach(lambda text: bool(is_echo(text, window_s=12.0)))
+                logger.info("Voice pipeline: echo guard wired (TTS.is_echo -> STT finalization)")
+        except Exception:
+            logger.debug("echo guard wiring failed", exc_info=True)
 
     def _voice_activation_mode(self) -> str:
         """Return the configured voice activation mode.

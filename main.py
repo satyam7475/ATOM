@@ -646,10 +646,11 @@ async def main() -> None:
 
     try:
         from core.observability.error_rate_monitor import get_error_rate_monitor
+        _obs_cfg = (config.get("observability") or {}) if isinstance(config, dict) else {}
         _error_monitor = get_error_rate_monitor(
-            window_s=float(cfg.get("observability", {}).get("error_rate_window_s", 60.0)),
-            threshold=int(cfg.get("observability", {}).get("error_rate_threshold", 5)),
-            poll_interval_s=float(cfg.get("observability", {}).get("error_rate_poll_s", 10.0)),
+            window_s=float(_obs_cfg.get("error_rate_window_s", 60.0)),
+            threshold=int(_obs_cfg.get("error_rate_threshold", 5)),
+            poll_interval_s=float(_obs_cfg.get("error_rate_poll_s", 10.0)),
         )
         _error_monitor.start(bus)
     except Exception:
@@ -1716,6 +1717,15 @@ async def main() -> None:
         _routine_intents.set_routine_engine(routine_engine)
     except Exception:
         logger.info("Routine engine wiring failed", exc_info=True)
+
+    try:
+        _is_echo = getattr(tts, "is_echo", None)
+        if callable(_is_echo):
+            router.attach_tts_echo_guard(
+                lambda _t: bool(_is_echo(_t, window_s=12.0)),
+            )
+    except Exception:
+        logger.info("Router TTS echo guard wiring failed", exc_info=True)
 
     # ── System State Engine: real-time awareness ───────────────────
     from core.system_state_engine import SystemStateEngine

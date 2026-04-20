@@ -309,6 +309,14 @@ class NativeSTT:
         self._on_partial: Callable[[str], None] | None = None
         self._partial_stable_since: float = 0.0
         self._partial_finalize_s: float = 1.8
+        # Echo guard: an optional callable that answers whether a partial
+        # looks like ATOM's own TTS leaking back into the mic. Wired from
+        # the VoicePipeline so STT does not have to import tts_macos.
+        # Signature: (text: str) -> bool
+        self._echo_guard: Callable[[str], bool] | None = None
+        # Deduplicate repeated "echo-suppressed finalization" warnings so
+        # the log does not flood at capture-rate while TTS is speaking.
+        self._last_echo_suppressed_log_t: float = 0.0
         # After TTS, wait before reopening mic (avoids AVAudioEngine vs output conflict).
         self._need_post_tts_cooldown: bool = False
         self._audio_prebuffer: collections.deque = collections.deque(maxlen=12)
@@ -893,6 +901,25 @@ class NativeSTT:
         ``speech_final`` emission. Safe to call multiple times."""
         self._listening_mode_ref = controller
 
+    def attach_echo_guard(self, guard: Callable[[str], bool] | None) -> None:
+        """Wire a callable that returns True when a text looks like TTS echo.
+
+        Called just before a stable partial is promoted to a final. If the
+        guard returns True, the promotion is dropped so ATOM does not start
+        answering its own voice. Safe to call with ``None`` to detach.
+        """
+        self._echo_guard = guard
+
+    def _is_self_echo(self, text: str) -> bool:
+        """Ask the injected guard whether this text is ATOM's own TTS."""
+        guard = self._echo_guard
+        if guard is None or not text:
+            return False
+        try:
+            return bool(guard(text))
+        except Exception:
+            return False
+
     # Phrases that must always pass through the PASSIVE gate so user
     # corrections / interruptions of a bad reply aren't silently dropped.
     # Kept small (10 entries) so scanning cost stays negligible.
@@ -1189,6 +1216,16 @@ class NativeSTT:
         now = time.monotonic()
         elapsed = now - self._partial_stable_since
         if elapsed < self._partial_finalize_s:
+            return
+        if self._is_self_echo(text):
+            if (now - self._last_echo_suppressed_log_t) > 1.5:
+                logger.info(
+                    "STT: self-echo detected on stable partial — promotion suppressed: '%s'",
+                    text[:80],
+                )
+                self._last_echo_suppressed_log_t = now
+            self._last_partial = ""
+            self._partial_stable_since = 0.0
             return
         logger.info(
             "STT: partial stable for %.1fs — promoting to final: '%s'",
@@ -1595,18 +1632,28 @@ class NativeSTT:
                 and self._partial_stable_since > 0
                 and (now - self._partial_stable_since) >= self._partial_finalize_s
             ):
-                logger.info(
-                    "STT: partial stable for %.1fs — treating as final: '%s'",
-                    now - self._partial_stable_since, transcript,
-                )
-                self._last_final = transcript
-                self._last_error = None
-                self._last_partial = ""
-                self._partial_stable_since = 0.0
-                self._got_partial_since_restart = True
-                self._consecutive_recreates_no_partial = 0
-                if self._on_final:
-                    self._emit_threadsafe(self._on_final, transcript)
+                if self._is_self_echo(transcript):
+                    if (now - self._last_echo_suppressed_log_t) > 1.5:
+                        logger.info(
+                            "STT: self-echo detected on stable partial — treating as non-final: '%s'",
+                            transcript[:80],
+                        )
+                        self._last_echo_suppressed_log_t = now
+                    self._last_partial = ""
+                    self._partial_stable_since = 0.0
+                else:
+                    logger.info(
+                        "STT: partial stable for %.1fs — treating as final: '%s'",
+                        now - self._partial_stable_since, transcript,
+                    )
+                    self._last_final = transcript
+                    self._last_error = None
+                    self._last_partial = ""
+                    self._partial_stable_since = 0.0
+                    self._got_partial_since_restart = True
+                    self._consecutive_recreates_no_partial = 0
+                    if self._on_final:
+                        self._emit_threadsafe(self._on_final, transcript)
                 self._restart_recognition_chain()
 
     def _flush_prebuffer_to_request(self, req: Any) -> int:
