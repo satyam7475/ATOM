@@ -758,6 +758,32 @@ class LocalBrainController:
             except Exception:
                 logger.info("Local brain MemoryGraph pressure hook failed", exc_info=True)
 
+    def drop_prompt_caches(self, reason: str = "pressure") -> None:
+        """Forward the KV-cache drop request to the underlying MLX brain.
+        Falls back silently when the active backend (e.g. GGUF fallback)
+        has no prompt cache implementation.
+        """
+        llm = self._llm
+        fn = getattr(llm, "drop_prompt_caches", None)
+        if callable(fn):
+            try:
+                fn(reason=reason)
+            except Exception:
+                logger.info("Local brain prompt-cache drop failed", exc_info=True)
+
+    def set_thermal_clamp(self, ratio: float, *, reason: str = "") -> None:
+        """Forward a thermal ``max_tokens`` multiplier to the backend.
+
+        Ignored silently for backends without a thermal hook.
+        """
+        llm = self._llm
+        fn = getattr(llm, "set_thermal_clamp", None)
+        if callable(fn):
+            try:
+                fn(ratio, reason=reason)
+            except Exception:
+                logger.info("Local brain thermal clamp failed", exc_info=True)
+
     def set_action_executor(self, executor: "ActionExecutor") -> None:
         """Inject the ActionExecutor after Router initialization."""
         self._action_executor = executor

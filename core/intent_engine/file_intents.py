@@ -34,8 +34,35 @@ _FIND_ON_MAC = re.compile(
     re.I,
 )
 
+_SMART_FIND = re.compile(
+    r"\b(?:find|locate|pull\s+up|dig\s+up|show\s+me)\b"
+    r"[^?.]{2,120}?\b"
+    r"(?:pdf|pdfs|photo|photos|image|images|picture|pictures|"
+    r"screenshot|screenshots|video|videos|movie|movies|"
+    r"document|documents|doc|docs|word|excel|spreadsheet|"
+    r"spreadsheets|powerpoint|slides|presentation|presentations|"
+    r"audio|music|mp3|mp3s|zip|archive)\b",
+    re.I,
+)
+
+_SMART_FIND_TIME = re.compile(
+    r"\b(?:find|locate|pull\s+up|dig\s+up|show\s+me)\b"
+    r"[^?.]{2,120}?\b"
+    r"(?:today|yesterday|this\s+week|last\s+week|this\s+month|last\s+month|"
+    r"this\s+year|\d+\s+(?:day|days|week|weeks|month|months|year|years)\s+ago|"
+    r"(?:past|last|previous)\s+\d+\s+(?:day|days|week|weeks|month|months))\b",
+    re.I,
+)
+
 
 def check(text: str) -> IntentResult | None:
+    if _SMART_FIND.search(text) or _SMART_FIND_TIME.search(text):
+        return IntentResult(
+            "smart_find_file",
+            action="smart_find_file",
+            action_args={"query": text.strip()},
+        )
+
     m = _SEARCH_MY_MAC.search(text) or _SPOTLIGHT_FOR.search(text)
     if not m:
         m = _FIND_ON_MAC.search(text)

@@ -33,6 +33,9 @@ from . import (
     cognitive_intents,
     runtime_mode_intents,
     world_intents,
+    memory_recall_intents,
+    productivity_intents,
+    routine_intents,
 )
 
 logger = logging.getLogger("atom.intent")
@@ -90,6 +93,9 @@ class IntentEngine:
             meta_intents.check(text)
             or runtime_mode_intents.check(text)
             or os_intents.check_self_check(text)
+            or routine_intents.check(text)
+            or memory_recall_intents.check(text)
+            or productivity_intents.check(text)
             or info_intents.check(text)
             or world_intents.check(text)
             or system_intents.check(text)

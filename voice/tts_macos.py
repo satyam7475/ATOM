@@ -500,6 +500,25 @@ class MacOSTTSAsync:
         self._ack_idx = 0
         self._available = sys.platform == "darwin"
 
+        # ── Deadman timer (Sprint C2) ──────────────────────────────
+        # Every speak start records a budget derived from text length;
+        # a background task kills the current utterance if the budget
+        # is exceeded so the SPEAKING state can never pin ATOM forever
+        # (stuck NSSpeechSynthesizer / wedged audio queue / runaway
+        # streaming stall). When force-stop triggers, a bus event
+        # ``tts_deadman_fired`` is emitted so the state machine + UI
+        # can react (e.g. transition back to LISTENING).
+        self._speak_start_t: float = 0.0
+        self._speak_budget_s: float = 0.0
+        self._speak_text_preview: str = ""
+        self._deadman_task: asyncio.Task | None = None
+        self._deadman_shutdown: asyncio.Event | None = None
+        self._deadman_fired_count: int = 0
+        # Absolute upper bound for a single utterance regardless of
+        # text length. 120s is generous — even a 300-word reply at the
+        # slowest configurable rate finishes inside this window.
+        self._speak_max_s: float = 120.0
+
         self._active_source: str | None = None
         self._active_stream_id: str | None = None
         self._chunk_buffer: list[str] = []
@@ -894,6 +913,11 @@ class MacOSTTSAsync:
             if generation != self._stream_generation:
                 return
 
+            # The streaming utterance ended cleanly (or via stop/force-
+            # stop that already reset the deadman). Best-effort cancel
+            # to be sure we never leak a pending check.
+            self._stop_deadman()
+
             overflow_text = " ".join(self._screen_buffer).strip()
             self._chunk_buffer.clear()
             self._screen_buffer.clear()
@@ -948,6 +972,7 @@ class MacOSTTSAsync:
                 return
             self._cancel_requested = False
             self._playing = True
+            self._start_deadman(text)
 
             if self._native_synth:
                 self._native_synth._rate = float(dynamic_rate)
@@ -981,6 +1006,7 @@ class MacOSTTSAsync:
                     "text_display", text=f"[Response on screen] {text}",
                 )
             finally:
+                self._stop_deadman()
                 self._playing = False
                 if self._native_synth:
                     self._native_synth._rate = float(self._enhancer._base_rate)
@@ -1001,10 +1027,12 @@ class MacOSTTSAsync:
             if self._cancel_requested:
                 return
             self._playing = True
+            self._start_deadman(phrase)
             try:
                 self._record_spoken(phrase)
                 await self._speak_one(phrase)
             finally:
+                self._stop_deadman()
                 self._playing = False
 
     def set_emotion(self, emotion: str) -> None:
@@ -1039,6 +1067,119 @@ class MacOSTTSAsync:
         self._ack_idx += 1
         return phrase
 
+    # ── Deadman timer helpers (Sprint C2) ──────────────────────────
+
+    @staticmethod
+    def _estimate_speak_budget_s(text: str) -> float:
+        """Estimate a safe time budget for speaking ``text``.
+
+        Rough model: ~3 words/s at the slowest sane rate, with a 3s
+        setup grace for NSSpeechSynthesizer. Also honors a floor for
+        short utterances so an ack like "yes, boss" still gets ~6s.
+        """
+        if not text:
+            return 6.0
+        words = max(1, len(text.split()))
+        # 3 wps at slow-end; give 2× that as a comfortable cap.
+        base = words / 3.0
+        return max(6.0, base * 2.5 + 3.0)
+
+    def _start_deadman(self, text: str) -> None:
+        """Record the expected finish time and spawn the watchdog task."""
+        self._speak_start_t = time.monotonic()
+        budget = self._estimate_speak_budget_s(text)
+        # Clamp to the absolute max to protect against runaway budgets
+        # (e.g. very long RAG answers). The deadman is safety-net, not
+        # pacing — ATOM's UX layer already limits answer length.
+        self._speak_budget_s = min(budget, self._speak_max_s)
+        self._speak_text_preview = (text or "")[:80]
+        existing = self._deadman_task
+        if existing is not None and not existing.done():
+            existing.cancel()
+
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        self._deadman_shutdown = asyncio.Event()
+        self._deadman_task = loop.create_task(self._deadman_loop())
+
+    def _stop_deadman(self) -> None:
+        """Cancel any pending deadman check (speak finished cleanly)."""
+        evt = self._deadman_shutdown
+        if evt is not None:
+            evt.set()
+        task = self._deadman_task
+        if task is not None and not task.done():
+            task.cancel()
+        self._deadman_task = None
+        self._deadman_shutdown = None
+        self._speak_start_t = 0.0
+        self._speak_budget_s = 0.0
+        self._speak_text_preview = ""
+
+    async def _deadman_loop(self) -> None:
+        """Force-stop any utterance that outruns its budget."""
+        evt = self._deadman_shutdown
+        # 1s floor is a safety net against misconfigured budgets — any
+        # realistic utterance budget is much larger (see
+        # ``_estimate_speak_budget_s``). The floor also stops us from
+        # flapping when a zero budget is passed during tests.
+        budget = max(1.0, self._speak_budget_s)
+        try:
+            try:
+                if evt is not None:
+                    await asyncio.wait_for(evt.wait(), timeout=budget)
+                else:
+                    await asyncio.sleep(budget)
+                return  # clean finish
+            except asyncio.TimeoutError:
+                pass
+
+            if not self._playing:
+                return
+            elapsed = time.monotonic() - self._speak_start_t
+            self._deadman_fired_count += 1
+            logger.error(
+                "TTS deadman: utterance exceeded budget (%.1fs > %.1fs) — "
+                "force-stopping '%s...' [fire #%d]",
+                elapsed, budget, self._speak_text_preview,
+                self._deadman_fired_count,
+            )
+            try:
+                await self.force_stop()
+            except Exception:
+                logger.exception("TTS deadman: force_stop failed")
+            try:
+                self._bus.emit_fast(
+                    "tts_deadman_fired",
+                    elapsed_s=round(elapsed, 1),
+                    budget_s=round(budget, 1),
+                    preview=self._speak_text_preview,
+                    total_fires=self._deadman_fired_count,
+                )
+                # ``tts_complete`` is the standard protocol for "speaking
+                # ended"; emit it so the state machine + listener return
+                # to LISTENING even when the normal finally-path was
+                # blocked.
+                self._bus.emit("tts_complete")
+            except Exception:
+                logger.debug("TTS deadman: emit failed", exc_info=True)
+        except asyncio.CancelledError:
+            pass
+
+    def tts_deadman_stats(self) -> dict[str, Any]:
+        now = time.monotonic()
+        elapsed = (now - self._speak_start_t) if self._speak_start_t > 0 else 0.0
+        return {
+            "enabled": True,
+            "playing": self._playing,
+            "fired_count": self._deadman_fired_count,
+            "current_elapsed_s": round(elapsed, 1),
+            "current_budget_s": round(self._speak_budget_s, 1),
+            "preview": self._speak_text_preview,
+        }
+
     async def force_stop(self) -> None:
         """Hard stop: immediate silence, cancel stream, kill processes.
 
@@ -1056,6 +1197,7 @@ class MacOSTTSAsync:
         self._stream_speak_buffer = ""
         self._chunk_buffer.clear()
         self._screen_buffer.clear()
+        self._stop_deadman()
         queue = self._stream_queue
         if queue is not None:
             try:
@@ -1076,6 +1218,7 @@ class MacOSTTSAsync:
         self._chunk_buffer.clear()
         self._screen_buffer.clear()
         self._stream_speak_buffer = ""
+        self._stop_deadman()
         queue = self._stream_queue
         self._stream_queue = None
         if queue is not None:
@@ -1181,6 +1324,12 @@ class MacOSTTSAsync:
             self._stream_task = asyncio.create_task(
                 self._play_stream_chunks(self._stream_generation)
             )
+            # Streaming replies can be longer than the budget we'd
+            # compute from a single chunk, so seed the deadman with the
+            # absolute cap. Chunks keep extending the playing window;
+            # the deadman only kicks in if the WHOLE stream is stuck.
+            self._start_deadman("streaming utterance")
+            self._speak_budget_s = self._speak_max_s
         elif source and self._active_source and source != self._active_source:
             return
         elif stream_id and self._active_stream_id and stream_id != self._active_stream_id:

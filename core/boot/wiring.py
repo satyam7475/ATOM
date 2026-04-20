@@ -1209,6 +1209,7 @@ def wire_events(
         "proactive_state": _proactive_state,
         "didnt_catch_count": _didnt_catch_count,
         "last_perceived_ms": _last_perceived_ms,
+        "adaptive": adaptive,
     }
 
 

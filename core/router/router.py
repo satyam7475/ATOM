@@ -147,6 +147,9 @@ class Router:
         # Phase 2 Adaptive Intelligence Engine (wired via attach_adaptive_engine)
         self._adaptive: Any = None
 
+        # Routine engine (wired via attach_routine_engine, Sprint D4)
+        self._routine_engine: Any = None
+
         # v22: Cloud intelligence components (wired via attach_cloud_intelligence)
         self._gemini_client: Any = None
         self._search_tool: Any = None
@@ -196,6 +199,18 @@ class Router:
         """Wire the Phase 2 Adaptive Intelligence Engine."""
         self._adaptive = adaptive
         logger.info("AdaptiveEngine attached to Router")
+
+    def attach_routine_engine(self, routine_engine: Any) -> None:
+        """Wire the user-defined routine engine (Sprint D4)."""
+        self._routine_engine = routine_engine
+        try:
+            routine_engine.set_dispatcher(self._routine_step_dispatch)
+        except Exception:
+            logger.info("routine engine set_dispatcher failed", exc_info=True)
+        logger.info(
+            "RoutineEngine attached to Router (routines=%d)",
+            len(routine_engine.list_routines()) if hasattr(routine_engine, "list_routines") else 0,
+        )
 
     def attach_context_layer(
         self,
@@ -995,7 +1010,8 @@ class Router:
         "list_apps", "resource_report", "resource_trend",
         "system_analyze", "research_topic", "self_check",
         "self_diagnostic", "behavior_report",
-        "spotlight_search",
+        "spotlight_search", "smart_find_file",
+        "whats_on_my_plate",
     })
 
     def _dispatch_action(self, action: str, args: dict) -> str | None:
@@ -1075,6 +1091,32 @@ class Router:
             body = body[:4000] + "\n…(truncated)"
         intro = personality.action_done("spotlight_search", q[:80])
         return f"{intro}\n{body}"
+
+    def _do_smart_find_file(self, _action: str, args: dict) -> str:
+        import sys
+
+        if sys.platform != "darwin":
+            return "File search only runs on macOS, Boss."
+        q = (args.get("query") or "").strip()
+        if not q:
+            return "What should I look for, Boss?"
+        try:
+            limit = int(args.get("limit", 5))
+        except (TypeError, ValueError):
+            limit = 5
+        limit = max(1, min(limit, 20))
+        try:
+            from core.proactive.file_finder import find_files_for_text
+            summary, paths = find_files_for_text(q, limit=limit)
+        except Exception as exc:
+            logger.info("smart_find_file failed", exc_info=True)
+            return f"File search hit an error, Boss. ({exc.__class__.__name__})"
+        if paths:
+            extras = paths[1:4]
+            if extras:
+                nice = "\n".join(f"  • {p}" for p in extras)
+                return f"{summary}\n{nice}"
+        return summary
 
     def _do_play_youtube(self, _action: str, args: dict) -> str:
         query = args.get("query", "music")
@@ -1209,6 +1251,22 @@ class Router:
         if self._scheduler is None:
             return "Reminder system is not active."
         return self._scheduler.format_pending()
+
+    def _do_whats_on_my_plate(self, _action: str, _args: dict) -> str:
+        try:
+            from core.proactive.whats_on_plate import generate_plate_summary_sync
+            feats = (self._config or {}).get("morning_briefing") or {}
+            timeout_s = float(feats.get("calendar_timeout_s", 3.0))
+            return generate_plate_summary_sync(
+                task_scheduler=self._scheduler,
+                calendar_timeout_s=timeout_s,
+            )
+        except Exception as exc:
+            logger.info("whats_on_my_plate failed", exc_info=True)
+            return (
+                "I couldn't pull your schedule right now, Boss. "
+                f"({exc.__class__.__name__})"
+            )
 
     def _do_cancel_reminders(self, _action: str, _args: dict) -> str:
         if self._scheduler is None:
@@ -1367,6 +1425,38 @@ class Router:
             )
         return msg
 
+    def _do_run_routine(self, _action: str, args: dict) -> str:
+        name = (args.get("name") or "").strip().lower()
+        phase = (args.get("phase") or "enter").strip().lower()
+        engine = getattr(self, "_routine_engine", None)
+        if engine is None:
+            return "Routines aren't active, Boss."
+        if not name:
+            return "Which routine should I run?"
+        try:
+            return engine.execute(name, phase)
+        except Exception as exc:
+            logger.info("run_routine failed", exc_info=True)
+            return f"Routine {name.replace('_', ' ')} hit an error. ({exc.__class__.__name__})"
+
+    def _routine_step_dispatch(self, kind: str, args: dict) -> str:
+        """Map routine steps to existing router handlers."""
+        try:
+            if kind == "volume":
+                return self._do_set_volume("set_volume", args)
+            if kind == "mute":
+                return self._do_mute("mute", {})
+            if kind == "unmute":
+                return self._do_unmute("unmute", {})
+            if kind == "brain_profile":
+                return self._do_set_brain_profile("set_brain_profile", args)
+            if kind == "assistant_mode":
+                return self._do_set_assistant_mode("set_assistant_mode", args)
+        except Exception as exc:
+            logger.info("routine step '%s' failed", kind, exc_info=True)
+            return f"step '{kind}' errored: {exc.__class__.__name__}"
+        return f"unknown step '{kind}'"
+
     # ── v22: Advanced System & UI Tools ───────────────────────────────
 
     def _get_system_control(self) -> Any:
@@ -1498,6 +1588,7 @@ class Router:
         "list_apps": _do_list_apps,
         "search": _do_search,
         "spotlight_search": _do_spotlight_search,
+        "smart_find_file": _do_smart_find_file,
         "play_youtube": _do_play_youtube,
         "stop_music": _do_stop_music,
         "set_volume": _do_set_volume,
@@ -1525,6 +1616,7 @@ class Router:
         "wifi_status": _do_wifi_status,
         "set_reminder": _do_set_reminder,
         "show_reminders": _do_show_reminders,
+        "whats_on_my_plate": _do_whats_on_my_plate,
         "cancel_reminders": _do_cancel_reminders,
         "kill_process": _do_kill_process,
         "resource_report": _do_resource_report,
@@ -1548,6 +1640,7 @@ class Router:
         "set_performance_mode": _do_set_performance_mode,
         "set_brain_profile": _do_set_brain_profile,
         "set_assistant_mode": _do_set_assistant_mode,
+        "run_routine": _do_run_routine,
         
         # v22: Advanced System Control
         "describe_focused_element": _do_describe_focused_element,

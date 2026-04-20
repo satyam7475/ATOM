@@ -112,6 +112,12 @@
         "max_graph_nodes": 1000,
         "pressure_threshold_pct": 82,
         "pressure_relief_pct": 72,
+        "pressure_tiers": {
+            "warn_pct": 78,
+            "warn_relief_pct": 70,
+            "critical_pct": 90,
+            "critical_relief_pct": 82
+        },
         "pressure_top_k": 2,
         "pressure_query_limit": 3,
         "semantic_weight": 0.7,
@@ -137,7 +143,10 @@
         "temperature": 0.6,
         "top_p": 0.85,
         "repeat_penalty": 1.1,
-        "timeout_seconds": 28
+        "timeout_seconds": 28,
+        "prompt_cache_enabled": true,
+        "prompt_cache_max_size": 4,
+        "prompt_cache_max_mb": 512
     },
     "assistant_brain": {
         "active_profile": "optimal",
@@ -320,10 +329,27 @@
     "conversation_memory": {
         "max_turns": 20
     },
+    "morning_briefing": {
+        "enabled": true,
+        "wake_hour_start": 6,
+        "wake_hour_end": 11,
+        "include_battery": true,
+        "include_weather": true,
+        "include_calendar": true,
+        "include_news": true,
+        "news_count": 3,
+        "calendar_timeout_s": 3.0,
+        "state_path": "data/morning_briefing.json"
+    },
     "embedding": {
         "model": "all-MiniLM-L6-v2",
         "dimension": 384,
-        "device": "auto"
+        "device": "auto",
+        "warm_file": {
+            "enabled": true,
+            "path": "data/embeddings_warm.npz",
+            "max_entries": 1024
+        }
     },
     "vector_store": {
         "path": "data/vector_db",
@@ -551,9 +577,13 @@
         "timeout_seconds": 8
     },
     "semantic_cache": {
-        "enabled": false,
+        "enabled": true,
         "max_size": 256,
         "ttl_seconds": 600,
-        "threshold": 0.92
+        "threshold": 0.92,
+        "persistent": true,
+        "persistent_max": 10000,
+        "persistent_ttl_seconds": 604800,
+        "db_path": "data/semantic_cache.db"
     }
 }

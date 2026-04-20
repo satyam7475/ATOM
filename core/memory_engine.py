@@ -167,6 +167,7 @@ class MemoryEngine:
 
     def _init_vectors(self) -> None:
         """Initialize vector store and embedding engine (lazy, non-blocking)."""
+        self._batch_writer = None
         try:
             from core.embedding_engine import get_embedding_engine
             from core.vector_store import VectorStore
@@ -177,6 +178,60 @@ class MemoryEngine:
         except Exception:
             logger.info("Memory engine: keyword-only mode (vectors unavailable)")
             self._vectors_ready = False
+            return
+
+        # Sprint B2: off-loop batch writer so the conversation path
+        # doesn't block on embedding + vector-store writes.
+        batch_cfg = (self._config.get("memory") or {}).get("batch_writer") or {}
+        if bool(batch_cfg.get("enabled", True)):
+            try:
+                from core.memory.embedding_batch_writer import EmbeddingBatchWriter
+                self._batch_writer = EmbeddingBatchWriter(
+                    self._embedding_engine,
+                    self._vector_store,
+                    batch_size=int(batch_cfg.get("batch_size", 4)),
+                    max_queue=int(batch_cfg.get("max_queue", 128)),
+                    drain_idle_s=float(batch_cfg.get("drain_idle_s", 0.75)),
+                )
+                logger.info(
+                    "Memory engine: embedding batch writer ready (batch_size=%d, max_queue=%d)",
+                    self._batch_writer._batch_size,
+                    self._batch_writer._max_queue,
+                )
+            except Exception:
+                logger.info("Memory engine: batch writer disabled (fallback to inline)", exc_info=True)
+                self._batch_writer = None
+
+    def start_background_writers(self) -> None:
+        """Start the embedding batch writer (must be called on a running loop)."""
+        if self._batch_writer is not None:
+            try:
+                self._batch_writer.start()
+            except Exception:
+                logger.info("Memory engine: batch writer start failed", exc_info=True)
+
+    async def shutdown_writers(self) -> None:
+        if self._batch_writer is not None:
+            try:
+                await self._batch_writer.stop()
+            except Exception:
+                logger.info("Memory engine: batch writer stop failed", exc_info=True)
+
+    def batch_writer_diagnostics(self) -> dict[str, Any]:
+        if self._batch_writer is None:
+            return {"enabled": False}
+        d = self._batch_writer.diagnostics()
+        d["enabled"] = True
+        return d
+
+    def diagnostics(self) -> dict[str, Any]:
+        """Composite memory-engine diagnostics for /health."""
+        return {
+            "entries": len(self._entries),
+            "vectors_ready": bool(self._vectors_ready),
+            "pressure_active": bool(self._memory_pressure_active),
+            "batch_writer": self.batch_writer_diagnostics(),
+        }
 
     def _effective_top_k(self, k: int) -> int:
         limit = max(1, min(int(k), self._default_top_k, self._max_vector_results))
@@ -305,26 +360,55 @@ class MemoryEngine:
             and self._embedding_engine is not None
             and not self._memory_pressure_active
         ):
-            try:
-                combined = f"{clean_query} {clean_summary}"
-                emb = await self._embedding_engine.embed(combined)
-                doc_id = f"mem_{int(time.time())}_{len(self._entries)}"
-                self._vector_store.add(
-                    "conversations",
-                    text=f"Q: {clean_query} A: {clean_summary}",
-                    embedding=emb,
-                    metadata={
-                        "query": clean_query[:200],
-                        "summary": clean_summary[:300],
-                        "source": "conversation",
-                        "importance": 0.5,
-                        "success_rate": 1.0,
-                    },
-                    doc_id=doc_id,
-                )
-                entry["embedding"] = True
-            except Exception:
-                logger.debug("Vector add failed, keyword-only", exc_info=True)
+            combined = f"{clean_query} {clean_summary}"
+            doc_id = f"mem_{int(time.time())}_{len(self._entries)}"
+            doc_text = f"Q: {clean_query} A: {clean_summary}"
+            metadata = {
+                "query": clean_query[:200],
+                "summary": clean_summary[:300],
+                "source": "conversation",
+                "importance": 0.5,
+                "success_rate": 1.0,
+            }
+            if self._batch_writer is not None:
+                # Sprint B2: queue off the hot path. The writer will
+                # embed + index in the background so the user-facing
+                # turn is not blocked on vector I/O.
+                try:
+                    self._batch_writer.enqueue(
+                        "conversations",
+                        doc_text,
+                        metadata,
+                        doc_id,
+                    )
+                    entry["embedding"] = True
+                except Exception:
+                    logger.debug("Batch enqueue failed, falling back to inline", exc_info=True)
+                    try:
+                        emb = await self._embedding_engine.embed(combined)
+                        self._vector_store.add(
+                            "conversations",
+                            text=doc_text,
+                            embedding=emb,
+                            metadata=metadata,
+                            doc_id=doc_id,
+                        )
+                        entry["embedding"] = True
+                    except Exception:
+                        logger.debug("Inline vector add failed, keyword-only", exc_info=True)
+            else:
+                try:
+                    emb = await self._embedding_engine.embed(combined)
+                    self._vector_store.add(
+                        "conversations",
+                        text=doc_text,
+                        embedding=emb,
+                        metadata=metadata,
+                        doc_id=doc_id,
+                    )
+                    entry["embedding"] = True
+                except Exception:
+                    logger.debug("Vector add failed, keyword-only", exc_info=True)
 
         idx = len(self._entries)
         self._entries.append(entry)

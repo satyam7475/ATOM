@@ -240,6 +240,15 @@ class AsyncEventBus(PriorityEventBus):
         return result
 
     @staticmethod
+    def _record_handler_error(event: str, handler: EventHandler, detail: str) -> None:
+        """Bump the global error-rate monitor. Safe if monitor not wired."""
+        try:
+            from core.observability.error_rate_monitor import record_error
+            record_error(f"bus.{event}", f"{handler.__qualname__}: {detail}"[:200])
+        except Exception:
+            logger.debug('error-rate record failed', exc_info=True)
+
+    @staticmethod
     async def _long_call(handler: EventHandler, event: str,
                          data: dict[str, Any]) -> None:
         try:
@@ -251,9 +260,11 @@ class AsyncEventBus(PriorityEventBus):
                 "Long handler %s TIMED OUT on '%s' (>%.0fs)",
                 handler.__qualname__, event, LONG_HANDLER_TIMEOUT_S,
             )
-        except Exception:
+            AsyncEventBus._record_handler_error(event, handler, "timeout")
+        except Exception as exc:
             logger.exception("Handler %s failed on event '%s'",
                              handler.__qualname__, event)
+            AsyncEventBus._record_handler_error(event, handler, repr(exc))
 
     @staticmethod
     async def _fast_call(handler: EventHandler, event: str,
@@ -262,9 +273,10 @@ class AsyncEventBus(PriorityEventBus):
             result = handler(**data)
             if asyncio.iscoroutine(result):
                 await result
-        except Exception:
+        except Exception as exc:
             logger.exception("Handler %s failed on event '%s'",
                              handler.__qualname__, event)
+            AsyncEventBus._record_handler_error(event, handler, repr(exc))
 
     @staticmethod
     async def _fast_call_single(handler: EventHandler, event: str,
@@ -274,9 +286,10 @@ class AsyncEventBus(PriorityEventBus):
             result = handler(**data)
             if asyncio.iscoroutine(result):
                 await result
-        except Exception:
+        except Exception as exc:
             logger.exception("Handler %s failed on event '%s'",
                              handler.__qualname__, event)
+            AsyncEventBus._record_handler_error(event, handler, repr(exc))
 
     @staticmethod
     async def _safe_call(handler: EventHandler, event: str, data: dict[str, Any]) -> None:
@@ -290,8 +303,10 @@ class AsyncEventBus(PriorityEventBus):
                 "Handler %s TIMED OUT on event '%s' (>%.0fs) -- cancelled",
                 handler.__qualname__, event, HANDLER_TIMEOUT_S,
             )
-        except Exception:
+            AsyncEventBus._record_handler_error(event, handler, "timeout")
+        except Exception as exc:
             logger.exception("Handler %s failed on event '%s'", handler.__qualname__, event)
+            AsyncEventBus._record_handler_error(event, handler, repr(exc))
         finally:
             elapsed = time.perf_counter() - t0
             if elapsed > SLOW_HANDLER_WARN_S:

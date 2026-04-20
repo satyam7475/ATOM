@@ -1404,7 +1404,18 @@ class NativeSTT:
         if error is not None:
             err_desc = _format_ns_error(error)
             is_no_speech = "1110" in err_desc or "No speech detected" in err_desc
-            is_cancel = "216" in err_desc or "kLSRErrorDomain" in err_desc
+            # Split kLSRErrorDomain errors into actionable buckets:
+            #  - 216 is the ``recognition task was cancelled`` signal that
+            #    fires when *we* called ``cancel()`` (normal stop path).
+            #    Do NOT restart — ``start_listening`` owns the next turn.
+            #  - 301 is the ``recognition session expired`` idle timeout;
+            #    Apple silently freezes the task even though we still want
+            #    to listen. Restart the chain IMMEDIATELY so we don't have
+            #    to wait for the watchdog's ``stuck_timeout`` (15s).
+            is_klsr = "kLSRErrorDomain" in err_desc
+            is_klsr_216 = is_klsr and "code=216" in err_desc
+            is_klsr_301 = is_klsr and "code=301" in err_desc
+            is_cancel = is_klsr_216
             is_expected = "kAFAssistantErrorDomain" in err_desc or is_cancel
 
             if is_no_speech:
@@ -1427,6 +1438,51 @@ class NativeSTT:
                     self._restart_recognition_chain()
                 except Exception:
                     self._listening = False
+            elif is_klsr_301:
+                # Idle-session timeout fired while the mic is still open —
+                # proactively refresh the recognition chain so the next
+                # utterance isn't lost during the watchdog's stuck window.
+                # We throttle with ``_last_klsr_301_restart`` so a storm of
+                # 301s (rare but possible) can't tight-loop chain
+                # recreates.
+                now = time.monotonic()
+                last_restart = float(getattr(self, "_last_klsr_301_restart", 0.0))
+                if now - last_restart < 1.5:
+                    logger.debug(
+                        "STT: kLSRErrorDomain 301 suppressed (throttled, "
+                        "last chain-restart %.2fs ago)",
+                        now - last_restart,
+                    )
+                    self._last_error = err_desc
+                    return
+                self._last_klsr_301_restart = now
+                self._last_error = err_desc
+                logger.info(
+                    "STT: kLSRErrorDomain 301 (idle timeout) — "
+                    "reactive soft chain restart",
+                )
+                try:
+                    self._restart_recognition_chain()
+                except Exception:
+                    logger.warning(
+                        "STT: reactive 301 chain restart failed — leaving "
+                        "watchdog to recover",
+                        exc_info=True,
+                    )
+                    self._listening = False
+                # Tell the watchdog the reactive path handled it so it
+                # doesn't double-fire a few seconds later.
+                try:
+                    bus = getattr(self, "_bus", None)
+                    if bus is not None:
+                        bus.emit_fast(
+                            "stt_watchdog_restart",
+                            reason="reactive_klsr_301",
+                            restart_count=int(getattr(self, "_reactive_301_count", 0) + 1),
+                        )
+                        self._reactive_301_count = int(getattr(self, "_reactive_301_count", 0)) + 1
+                except Exception:
+                    logger.debug("STT: reactive 301 bus emit failed", exc_info=True)
             elif is_expected:
                 logger.debug("Recognition (cancel/expected): %s", err_desc)
                 self._last_error = err_desc

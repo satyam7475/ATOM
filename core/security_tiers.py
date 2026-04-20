@@ -13,7 +13,8 @@ _TIER_1: frozenset[str] = frozenset({
     "system_info", "ip", "wifi", "uptime", "top_processes",
     "greeting", "thanks", "status", "self_check", "self_diagnostic",
     "resource_report", "resource_trend", "app_history",
-    "show_reminders", "system_analyze", "confirm", "deny",
+    "show_reminders", "whats_on_my_plate", "smart_find_file",
+    "system_analyze", "confirm", "deny",
     "exit", "go_silent", "calculate", "list_apps",
     "set_volume", "mute", "unmute", "stop_music",
     "read_clipboard", "timer",
@@ -22,6 +23,7 @@ _TIER_1: frozenset[str] = frozenset({
 # Tier 2 — session / light UX (still low risk)
 _TIER_2: frozenset[str] = frozenset({
     "set_brain_profile", "set_assistant_mode",
+    "run_routine",
 })
 
 # Tier 4 — power, irreversible system, or high-impact

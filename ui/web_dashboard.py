@@ -99,6 +99,7 @@ class WebDashboard:
         self._activity_log: list[dict] = []
         self._conv_log: list[dict] = []
         self._v7_health_provider: Optional[Callable[[], dict[str, Any]]] = None
+        self._health_provider: Optional[Callable[[], dict[str, Any]]] = None
 
     # ── Security ──────────────────────────────────────────────────────
 
@@ -127,6 +128,7 @@ class WebDashboard:
         self._app.router.add_post("/api/auth/session", self._api_auth_session)
         self._app.router.add_get("/", self._serve_dashboard)
         self._app.router.add_get("/v7/health", self._v7_health)
+        self._app.router.add_get("/health", self._health_endpoint)
         self._app.router.add_static("/static", _DASHBOARD_DIR, show_index=False)
 
         self._port = _find_free_port(self._port)
@@ -186,6 +188,32 @@ class WebDashboard:
     def set_v7_health_provider(self, provider: Callable[[], dict[str, Any]]) -> None:
         """Callable returns JSON-serializable dict (health + metrics + warnings + snapshot)."""
         self._v7_health_provider = provider
+
+    async def _health_endpoint(self, request: web.Request) -> web.StreamResponse:
+        """Per-subsystem health: simple JSON for curl / dashboard."""
+        if self._health_provider is None:
+            return web.json_response(
+                {
+                    "ok": False,
+                    "status": "unknown",
+                    "error": "health_provider_not_registered",
+                },
+                status=503,
+            )
+        try:
+            payload = self._health_provider()
+            status = 200 if bool(payload.get("ok", False)) else 503
+            return web.json_response(payload, status=status)
+        except Exception as e:
+            logger.warning("health handler failed: %s", e)
+            return web.json_response(
+                {"ok": False, "status": "down", "error": "health_failed"},
+                status=500,
+            )
+
+    def set_health_provider(self, provider: Callable[[], dict[str, Any]]) -> None:
+        """Callable returns per-subsystem health snapshot JSON."""
+        self._health_provider = provider
 
     async def _api_auth_session(self, request: web.Request) -> web.StreamResponse:
         """Mint a session after dashboard token validation."""

@@ -13,10 +13,64 @@
 	<string>@@@ATOM_REPO@@@</string>
 	<key>RunAtLoad</key>
 	<true/>
+	<!--
+		KeepAlive with AfterInitialDemand=false + SuccessfulExit=false means:
+		  - Restart ATOM unconditionally on crash / non-zero exit.
+		  - Do NOT restart after a clean graceful shutdown (exit 0).
+		This stops runaway restart loops from an explicit user-initiated
+		quit while preserving the always-on "Jarvis daemon" behaviour for
+		crashes, segfaults, OOMs, or watchdog force-exits.
+	-->
 	<key>KeepAlive</key>
-	<true/>
+	<dict>
+		<key>SuccessfulExit</key>
+		<false/>
+		<key>Crashed</key>
+		<true/>
+	</dict>
+	<!--
+		30s throttle gives the system room to recover (audio subsystem
+		reset, GPU memory flush) between consecutive restarts so we
+		don't hammer CoreAudio during a crash loop.
+	-->
 	<key>ThrottleInterval</key>
-	<integer>15</integer>
+	<integer>30</integer>
+	<!--
+		ProcessType=Interactive tells launchd this is a user-facing
+		service (gives it fair CPU/IO, not background priority), while
+		Nice=5 keeps ATOM slightly below foreground apps so typing
+		never stutters when the LLM is thinking.
+	-->
+	<key>ProcessType</key>
+	<string>Interactive</string>
+	<key>Nice</key>
+	<integer>5</integer>
+	<key>LimitLoadToSessionType</key>
+	<string>Aqua</string>
+	<!--
+		Prevent accidental OOM kills by the kernel: raise ATOM's file
+		descriptor ceiling (MLX + Chroma + SQLite + audio + web dashboard
+		can easily cross the default 256).
+	-->
+	<key>SoftResourceLimits</key>
+	<dict>
+		<key>NumberOfFiles</key>
+		<integer>4096</integer>
+	</dict>
+	<key>HardResourceLimits</key>
+	<dict>
+		<key>NumberOfFiles</key>
+		<integer>8192</integer>
+	</dict>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>ATOM_HOME</key>
+		<string>@@@ATOM_REPO@@@</string>
+		<key>ATOM_LAUNCHED_BY</key>
+		<string>launchd</string>
+		<key>PYTHONUNBUFFERED</key>
+		<string>1</string>
+	</dict>
 	<key>StandardOutPath</key>
 	<string>@@@ATOM_REPO@@@/logs/launchagent.stdout.log</string>
 	<key>StandardErrorPath</key>

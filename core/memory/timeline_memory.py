@@ -26,6 +26,49 @@ _PERSIST_INTERVAL_S = 300.0
 _PERSIST_MAX_EVENTS = 200
 
 
+def _count_phrase(n: int) -> str:
+    if n <= 1:
+        return "once"
+    if n == 2:
+        return "twice"
+    if n == 3:
+        return "three times"
+    if n <= 10:
+        return f"{n} times"
+    return "a bunch of times"
+
+
+def _relative_time(ts: float) -> str:
+    """Short, human-friendly relative description of a UNIX timestamp."""
+    now = time.time()
+    delta = max(0.0, now - float(ts))
+    if delta < 60:
+        return "just now"
+    if delta < 3600:
+        mins = int(delta // 60)
+        return "a minute ago" if mins <= 1 else f"{mins} minutes ago"
+    if delta < 6 * 3600:
+        hrs = int(delta // 3600)
+        return "an hour ago" if hrs <= 1 else f"{hrs} hours ago"
+
+    try:
+        now_d = __import__("datetime").datetime.fromtimestamp(now).date()
+        then = __import__("datetime").datetime.fromtimestamp(ts)
+        then_d = then.date()
+        day_diff = (now_d - then_d).days
+        clock = then.strftime("%-I:%M %p").lstrip("0")
+        if day_diff == 0:
+            return f"earlier today at {clock}"
+        if day_diff == 1:
+            return f"yesterday at {clock}"
+        if day_diff < 7:
+            return f"{day_diff} days ago at {clock}"
+        return then.strftime("on %b %-d at %-I:%M %p")
+    except Exception:
+        mins = int(delta // 60)
+        return f"{mins} minutes ago"
+
+
 @dataclass
 class TimelineEvent:
     type: str
@@ -231,6 +274,81 @@ class TimelineMemory:
             logger.info("Timeline restored (%d events from disk)", len(raw))
         except Exception:
             logger.debug("Timeline load failed", exc_info=True)
+
+    def search_user_queries(
+        self,
+        keyword: str,
+        *,
+        since_ts: float | None = None,
+        until_ts: float | None = None,
+        limit: int = 20,
+    ) -> list[TimelineEvent]:
+        """Return user_query events whose text contains ``keyword``.
+
+        ``since_ts``/``until_ts`` are absolute UNIX timestamps; either may
+        be ``None`` for an open-ended bound. Results are returned in
+        chronological order (oldest first) and capped at ``limit``.
+        Case-insensitive, whitespace-normalised match against the query
+        text; empty keyword matches any query.
+        """
+        kw = (keyword or "").strip().lower()
+        matches: list[TimelineEvent] = []
+        with self._lock:
+            for ev in self._events:
+                if ev.type != "user_query":
+                    continue
+                ts = ev.timestamp
+                if since_ts is not None and ts < float(since_ts):
+                    continue
+                if until_ts is not None and ts > float(until_ts):
+                    continue
+                text = (ev.data.get("text") or "").strip().lower()
+                if not text:
+                    continue
+                if kw and kw not in text:
+                    continue
+                matches.append(ev)
+        return matches[-int(max(1, limit)):]
+
+    def recall_user_queries_summary(
+        self,
+        keyword: str,
+        *,
+        since_ts: float | None = None,
+        until_ts: float | None = None,
+        max_examples: int = 3,
+    ) -> str:
+        """Natural-language summary of a timeline recall query.
+
+        Example output::
+
+            "Yeah — you asked me about 'billing' twice yesterday. Most
+            recent was: \"can you find last month's invoice?\""
+
+        Returns a short friendly message the TTS layer can speak directly.
+        """
+        events = self.search_user_queries(
+            keyword, since_ts=since_ts, until_ts=until_ts, limit=50,
+        )
+        if not events:
+            kw_txt = f" about \"{keyword.strip()}\"" if keyword.strip() else ""
+            return f"I don't see any recent questions{kw_txt} in my memory."
+        n = len(events)
+        latest = events[-1]
+        latest_text = (latest.data.get("text") or "").strip()
+        if len(latest_text) > 140:
+            latest_text = latest_text[:137] + "..."
+
+        rel = _relative_time(latest.timestamp)
+        count_word = _count_phrase(n)
+        kw = keyword.strip()
+        lead = (
+            f"You asked me about \"{kw}\" {count_word}"
+            if kw
+            else f"You've asked me {count_word} recent questions"
+        )
+        detail = f" Most recent was {rel}: \"{latest_text}\"." if latest_text else "."
+        return f"{lead}.{detail}"
 
     def summarize_session(self, window_sec: float = 3600.0) -> str:
         """Generate a cross-session recall summary.

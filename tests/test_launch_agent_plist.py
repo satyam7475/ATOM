@@ -28,8 +28,22 @@ def test_plist_template_substitutes_and_loads() -> None:
     assert args == ["/bin/bash", f"{repo}/scripts/atom_run.sh"]
     assert data["WorkingDirectory"] == repo
     assert data["RunAtLoad"] is True
-    assert data["KeepAlive"] is True
-    assert data["ThrottleInterval"] == 15
+    # Sprint C3 hardening: KeepAlive is now conditional — restart on
+    # crash, do NOT restart after a clean graceful exit.
+    keep_alive = data["KeepAlive"]
+    assert isinstance(keep_alive, dict)
+    assert keep_alive["SuccessfulExit"] is False
+    assert keep_alive["Crashed"] is True
+    assert data["ThrottleInterval"] == 30
+    assert data["ProcessType"] == "Interactive"
+    assert data["Nice"] == 5
+    assert data["LimitLoadToSessionType"] == "Aqua"
+    assert data["SoftResourceLimits"]["NumberOfFiles"] >= 4096
+    assert data["HardResourceLimits"]["NumberOfFiles"] >= 8192
+    env = data["EnvironmentVariables"]
+    assert env["ATOM_HOME"] == repo
+    assert env["ATOM_LAUNCHED_BY"] == "launchd"
+    assert env["PYTHONUNBUFFERED"] == "1"
     assert "launchagent.stdout.log" in data["StandardOutPath"]
     print("  PASS: plist template parses after substitution")
 

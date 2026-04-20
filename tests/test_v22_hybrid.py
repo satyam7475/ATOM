@@ -365,16 +365,31 @@ def test_semantic_cache_import():
 
 
 def test_semantic_cache_exact_match():
+    import tempfile
+    from pathlib import Path
+
     from core.semantic_cache import SemanticCache
-    cache = SemanticCache({"semantic_cache": {"enabled": True, "ttl_seconds": 60}})
 
-    # Miss
-    assert cache.get("hello world") is None
+    # Sprint A1: the semantic cache now persists to SQLite. Use a unique
+    # temp DB per test invocation so the "miss" assertion doesn't hit
+    # entries from a prior session (or another test run).
+    with tempfile.TemporaryDirectory() as td:
+        db_path = str(Path(td) / "semantic_cache_test.sqlite")
+        cfg = {
+            "semantic_cache": {
+                "enabled": True,
+                "ttl_seconds": 60,
+                "persistent": True,
+                "db_path": db_path,
+            },
+        }
+        cache = SemanticCache(cfg)
 
-    # Put and hit
-    cache.put("hello world", "Hi there!")
-    result = cache.get("hello world")
-    assert result == "Hi there!", f"Expected 'Hi there!', got '{result}'"
+        assert cache.get("hello world") is None
+
+        cache.put("hello world", "Hi there!")
+        result = cache.get("hello world")
+        assert result == "Hi there!", f"Expected 'Hi there!', got '{result}'"
 
     return True
 

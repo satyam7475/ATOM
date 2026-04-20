@@ -400,6 +400,51 @@ CONFIG_SCHEMA: dict[str, Any] = {
             },
             "additionalProperties": False,
         },
+        "semantic_cache": {
+            "type": "object",
+            "properties": {
+                "enabled": {"type": "boolean"},
+                "max_size": {
+                    "type": "integer",
+                    "minimum": 16,
+                    "maximum": 4096,
+                    "description": "In-memory hot-set size (LRU).",
+                },
+                "ttl_seconds": {
+                    "type": "number",
+                    "minimum": 10,
+                    "maximum": 86400,
+                    "description": "Session-level TTL for cached answers.",
+                },
+                "threshold": {
+                    "type": "number",
+                    "minimum": 0.5,
+                    "maximum": 1.0,
+                    "description": "Minimum cosine similarity for a semantic hit.",
+                },
+                "persistent": {
+                    "type": "boolean",
+                    "description": "Persist cache to SQLite so it survives restarts.",
+                },
+                "persistent_max": {
+                    "type": "integer",
+                    "minimum": 100,
+                    "maximum": 1000000,
+                    "description": "Max entries in the on-disk store (LRU-evicted).",
+                },
+                "persistent_ttl_seconds": {
+                    "type": "number",
+                    "minimum": 60,
+                    "maximum": 30 * 24 * 3600,
+                    "description": "TTL for on-disk entries (default 7 days).",
+                },
+                "db_path": {
+                    "type": "string",
+                    "description": "SQLite file for the durable cache.",
+                },
+            },
+            "additionalProperties": False,
+        },
         "memory": {
             "type": "object",
             "properties": {
@@ -440,6 +485,37 @@ CONFIG_SCHEMA: dict[str, Any] = {
                     "minimum": 40,
                     "maximum": 95,
                     "description": "Unified-memory usage percent below which memory pressure mode clears.",
+                },
+                "pressure_tiers": {
+                    "type": "object",
+                    "description": "Per-tier pressure thresholds used by the main orchestrator (warn -> active -> critical).",
+                    "properties": {
+                        "warn_pct": {
+                            "type": "number",
+                            "minimum": 40,
+                            "maximum": 99,
+                            "description": "Memory usage that triggers tier 1 (drop MLX prompt-prefix KV cache).",
+                        },
+                        "warn_relief_pct": {
+                            "type": "number",
+                            "minimum": 30,
+                            "maximum": 95,
+                            "description": "Memory usage that clears tier 1.",
+                        },
+                        "critical_pct": {
+                            "type": "number",
+                            "minimum": 70,
+                            "maximum": 99,
+                            "description": "Memory usage that triggers tier 3 (unload sentence-transformer weights, fall back to warm-file/keyword search).",
+                        },
+                        "critical_relief_pct": {
+                            "type": "number",
+                            "minimum": 40,
+                            "maximum": 95,
+                            "description": "Memory usage that drops the pressure tier back below 3.",
+                        },
+                    },
+                    "additionalProperties": False,
                 },
                 "pressure_top_k": {
                     "type": "integer",
@@ -549,6 +625,22 @@ CONFIG_SCHEMA: dict[str, Any] = {
                     "minimum": 1,
                     "maximum": 300,
                     "description": "Timeout for local LLM inference.",
+                },
+                "prompt_cache_enabled": {
+                    "type": "boolean",
+                    "description": "Reuse the KV state of the constant system prefix across turns for lower first-token latency.",
+                },
+                "prompt_cache_max_size": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 64,
+                    "description": "Max number of turns kept in the LRU prompt-prefix KV cache.",
+                },
+                "prompt_cache_max_mb": {
+                    "type": "integer",
+                    "minimum": 64,
+                    "maximum": 8192,
+                    "description": "Upper bound on memory used by the prompt-prefix KV cache (per MLX role).",
                 },
             },
             "additionalProperties": False,
@@ -978,6 +1070,23 @@ CONFIG_SCHEMA: dict[str, Any] = {
                     "minimum": 2,
                     "maximum": 30,
                 },
+            },
+            "additionalProperties": False,
+        },
+        "morning_briefing": {
+            "type": "object",
+            "description": "First-wake-of-the-day briefing (battery + weather + calendar + news).",
+            "properties": {
+                "enabled": {"type": "boolean"},
+                "wake_hour_start": {"type": "integer", "minimum": 0, "maximum": 23},
+                "wake_hour_end": {"type": "integer", "minimum": 0, "maximum": 23},
+                "include_battery": {"type": "boolean"},
+                "include_weather": {"type": "boolean"},
+                "include_calendar": {"type": "boolean"},
+                "include_news": {"type": "boolean"},
+                "news_count": {"type": "integer", "minimum": 1, "maximum": 10},
+                "calendar_timeout_s": {"type": "number", "minimum": 0.5, "maximum": 15.0},
+                "state_path": {"type": "string"},
             },
             "additionalProperties": False,
         },

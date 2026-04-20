@@ -143,3 +143,10 @@ class AdaptiveEngine:
             "last_perception": self._last_perception,
             "history_size": len(self._memory._history),
         }
+
+    def flush(self) -> None:
+        """Force-persist the learned behavior profile (Sprint D5)."""
+        try:
+            self._memory.flush()
+        except Exception:
+            logger.debug("AdaptiveEngine flush failed", exc_info=True)

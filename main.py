@@ -162,6 +162,10 @@ async def main() -> None:
         metrics=metrics,
     )
     memory = MemoryEngine(config)
+    try:
+        memory.start_background_writers()
+    except Exception:
+        logger.info("Memory engine background writer failed to start", exc_info=True)
     intent_engine = IntentEngine()
     context_engine = ContextEngine(config)
 
@@ -191,6 +195,12 @@ async def main() -> None:
         max_events=_tl_max,
         summarize_on_prune=bool(v7i_cfg.get("timeline_summarize_on_prune", False)),
     )
+
+    try:
+        from core.intent_engine import memory_recall_intents as _mri
+        _mri.set_timeline(timeline_memory)
+    except Exception:
+        logger.info("Memory-recall intent wiring failed", exc_info=True)
     mode_resolver = RuntimeModeResolver(config)
     feedback_engine = FeedbackEngine(config)
     system_monitor = SystemMonitor(config)
@@ -347,10 +357,59 @@ async def main() -> None:
             max(0.0, _memory_pressure_threshold - 10.0),
         ),
     )
+
+    # Tiered memory-pressure orchestrator (Sprint B1):
+    #  Level 1 (warn)     -> drop KV prefix cache         [cheap, fully recoverable]
+    #  Level 2 (active)   -> + shrink RAG top_k / clear RAG caches
+    #  Level 3 (critical) -> + unload sentence-transformer weights (keyword fallback)
+    #
+    # Each level uses hysteresis (10% below trigger) so we don't flap,
+    # and higher tiers also imply lower tiers — the cheapest action is
+    # released last when pressure clears.
+    _pressure_cfg = (config.get("memory") or {}).get("pressure_tiers") or {}
+    _warn_threshold = float(
+        _pressure_cfg.get("warn_pct", max(0.0, _memory_pressure_threshold - 4.0)),
+    )
+    _warn_relief = float(
+        _pressure_cfg.get("warn_relief_pct", max(0.0, _warn_threshold - 6.0)),
+    )
+    _critical_threshold = float(
+        _pressure_cfg.get("critical_pct", min(100.0, _memory_pressure_threshold + 6.0)),
+    )
+    _critical_relief = float(
+        _pressure_cfg.get(
+            "critical_relief_pct",
+            max(0.0, _critical_threshold - 8.0),
+        ),
+    )
     _embedding_pressure_unloaded = False
+    _prompt_kv_cache_dropped = False
+    _last_pressure_tier = 0
+    # Thermal clamp bookkeeping (Sprint C4). We apply a multiplier to
+    # the LLM's max_tokens budget so sustained heat doesn't pin the CPU
+    # at 100°C. ``_last_thermal_tier`` lets us only emit/act when the
+    # tier actually changes.
+    _last_thermal_tier = "nominal"
+    # Poll counter to require ``N`` consecutive hot samples before we
+    # actually clamp — a one-off spike shouldn't trim answers mid-turn.
+    _thermal_hot_streak = 0
+    _THERMAL_HOT_STREAK_REQUIRED = 2
+
+    # B3: auto-demote the brain profile under sustained memory pressure.
+    # ``_pressure_hot_streak`` counts consecutive samples at tier>=2.
+    # ``_pressure_clear_streak`` counts consecutive tier=0 samples.
+    # ``_pre_pressure_profile`` remembers what to restore to.
+    _pressure_hot_streak = 0
+    _pressure_clear_streak = 0
+    _pre_pressure_profile: str | None = None
+    _PRESSURE_HOT_STREAK_REQUIRED = 3
+    _PRESSURE_CLEAR_STREAK_REQUIRED = 4
 
     async def _on_silicon_stats_update(stats=None, **_kw) -> None:
-        nonlocal _embedding_pressure_unloaded
+        nonlocal _embedding_pressure_unloaded, _prompt_kv_cache_dropped
+        nonlocal _last_pressure_tier
+        nonlocal _last_thermal_tier, _thermal_hot_streak
+        nonlocal _pressure_hot_streak, _pressure_clear_streak, _pre_pressure_profile
         if not isinstance(stats, dict):
             return
         try:
@@ -369,18 +428,280 @@ async def main() -> None:
             except Exception:
                 logger.info("Local brain pressure hook failed", exc_info=True)
 
+        # Decide current tier with per-tier hysteresis. We ratchet up as
+        # soon as a threshold is crossed, but only ratchet down when the
+        # relief point is reached — this keeps the system from flapping
+        # in and out of the critical tier while MLX is still running hot.
+        prev_tier = _last_pressure_tier
+        tier = prev_tier
+        if memory_pct >= _critical_threshold:
+            tier = 3
+        elif memory_pct >= _memory_pressure_threshold:
+            tier = max(tier, 2)
+        elif memory_pct >= _warn_threshold:
+            tier = max(tier, 1)
+
+        if prev_tier == 3 and memory_pct <= _critical_relief:
+            tier = 2 if memory_pct > _memory_pressure_relief else (
+                1 if memory_pct > _warn_relief else 0
+            )
+        elif prev_tier == 2 and memory_pct <= _memory_pressure_relief:
+            tier = 1 if memory_pct > _warn_relief else 0
+        elif prev_tier == 1 and memory_pct <= _warn_relief:
+            tier = 0
+
+        if tier != prev_tier:
+            logger.warning(
+                "Memory pressure tier %d -> %d (memory_pct=%.1f%%)",
+                prev_tier, tier, memory_pct,
+            )
+            try:
+                bus.emit_fast(
+                    "memory_pressure_tier_changed",
+                    previous=prev_tier,
+                    current=tier,
+                    memory_pct=round(memory_pct, 1),
+                )
+            except Exception:
+                logger.debug("pressure tier emit failed", exc_info=True)
+            _last_pressure_tier = tier
+
+        # Level 1+: drop MLX prompt-prefix KV cache. Cheapest action, 100-500MB back.
+        if tier >= 1:
+            if (
+                not _prompt_kv_cache_dropped
+                and local_brain is not None
+                and hasattr(local_brain, "drop_prompt_caches")
+            ):
+                try:
+                    local_brain.drop_prompt_caches(reason=f"memory_pressure_tier{tier}")
+                    _prompt_kv_cache_dropped = True
+                except Exception:
+                    logger.info("Prompt cache drop failed", exc_info=True)
+        else:
+            _prompt_kv_cache_dropped = False
+
+        # Level 3: unload sentence-transformer weights and fall back
+        # to the keyword/warm-file path for memory + RAG. The warm
+        # file keeps the hot-set answering queries, so user-visible
+        # latency only grows for never-seen queries.
         if inference_guard is None:
             return
 
-        if memory_pct >= _memory_pressure_threshold:
+        if tier >= 3:
             if not _embedding_pressure_unloaded:
                 inference_guard.mark_loaded("embeddings", False)
-                inference_guard.request_unload("embeddings", "memory_pressure")
+                inference_guard.request_unload(
+                    "embeddings", f"memory_pressure_tier{tier}",
+                )
                 _embedding_pressure_unloaded = True
-        elif memory_pct <= _memory_pressure_relief:
+        elif tier <= 1:
             _embedding_pressure_unloaded = False
 
+        # Sprint B3: auto-demote brain profile under sustained pressure.
+        # We wait for ``_PRESSURE_HOT_STREAK_REQUIRED`` consecutive tier>=2
+        # samples so brief spikes don't trigger a switch. Restoring is
+        # symmetric — tier=0 must hold for ``_PRESSURE_CLEAR_STREAK_REQUIRED``
+        # samples before we reinstate the prior profile. Only ever demote
+        # from ``full_performance`` → ``optimal`` to keep the behaviour
+        # reversible; optimal already disables the high-cost background
+        # subsystems (dream, curiosity, prediction_prefetch, autonomy).
+        if brain_mode_mgr is not None:
+            if tier >= 2:
+                _pressure_hot_streak += 1
+                _pressure_clear_streak = 0
+            elif tier == 0:
+                _pressure_clear_streak += 1
+                _pressure_hot_streak = 0
+            else:
+                _pressure_hot_streak = max(0, _pressure_hot_streak - 1)
+                _pressure_clear_streak = 0
+
+            try:
+                active = brain_mode_mgr.active_profile
+            except Exception:
+                active = "optimal"
+
+            if (
+                _pressure_hot_streak >= _PRESSURE_HOT_STREAK_REQUIRED
+                and active == "full_performance"
+                and _pre_pressure_profile is None
+            ):
+                _pre_pressure_profile = active
+                try:
+                    ok, _msg = brain_mode_mgr.set_profile("optimal", force=True)
+                    if ok:
+                        logger.warning(
+                            "Auto-demoted brain profile under sustained pressure: "
+                            "%s -> optimal (memory_pct=%.1f%%, streak=%d)",
+                            active, memory_pct, _pressure_hot_streak,
+                        )
+                        try:
+                            bus.emit_fast(
+                                "brain_profile_auto_demoted",
+                                previous=active,
+                                current="optimal",
+                                reason="memory_pressure_sustained",
+                                memory_pct=round(memory_pct, 1),
+                            )
+                        except Exception:
+                            logger.debug("auto-demote emit failed", exc_info=True)
+                except Exception:
+                    logger.info("Brain profile auto-demote failed", exc_info=True)
+
+            elif (
+                _pre_pressure_profile is not None
+                and _pressure_clear_streak >= _PRESSURE_CLEAR_STREAK_REQUIRED
+                and active == "optimal"
+            ):
+                restored_target = _pre_pressure_profile
+                _pre_pressure_profile = None
+                try:
+                    ok, _msg = brain_mode_mgr.set_profile(restored_target, force=True)
+                    if ok:
+                        logger.info(
+                            "Brain profile auto-restored after pressure cleared: "
+                            "optimal -> %s (memory_pct=%.1f%%, streak=%d)",
+                            restored_target, memory_pct, _pressure_clear_streak,
+                        )
+                        try:
+                            bus.emit_fast(
+                                "brain_profile_auto_restored",
+                                previous="optimal",
+                                current=restored_target,
+                                reason="memory_pressure_cleared",
+                            )
+                        except Exception:
+                            logger.debug("auto-restore emit failed", exc_info=True)
+                except Exception:
+                    logger.info("Brain profile auto-restore failed", exc_info=True)
+
+        # Thermal clamp (Sprint C4). Map macOS thermal pressure states
+        # + throttled flag to a max_tokens multiplier and a friendly
+        # reason string. Require ``_THERMAL_HOT_STREAK_REQUIRED``
+        # consecutive hot samples before engaging so a one-off spike
+        # doesn't trim answers mid-turn.
+        thermal_pressure_raw = str(stats.get("thermal_pressure") or "").lower()
+        is_throttled = bool(stats.get("is_throttled") or stats.get("throttled"))
+        if thermal_pressure_raw in {"critical"} or is_throttled:
+            thermal_tier_now = "critical"
+        elif thermal_pressure_raw in {"heavy", "hot"}:
+            thermal_tier_now = "hot"
+        elif thermal_pressure_raw in {"fair", "warm"}:
+            thermal_tier_now = "warm"
+        else:
+            thermal_tier_now = "nominal"
+
+        if thermal_tier_now in {"hot", "critical"}:
+            _thermal_hot_streak += 1
+        else:
+            _thermal_hot_streak = 0
+
+        # We only flip the active clamp tier once the streak is met.
+        # Cooling is immediate — once thermals drop back to nominal we
+        # restore full token budget right away.
+        target_tier = _last_thermal_tier
+        if thermal_tier_now == "nominal":
+            target_tier = "nominal"
+        elif thermal_tier_now == "warm":
+            target_tier = "warm"
+        elif (
+            thermal_tier_now in {"hot", "critical"}
+            and _thermal_hot_streak >= _THERMAL_HOT_STREAK_REQUIRED
+        ):
+            target_tier = thermal_tier_now
+
+        if target_tier != _last_thermal_tier:
+            ratio_map = {
+                "nominal": 1.0,
+                "warm": 0.85,
+                "hot": 0.6,
+                "critical": 0.4,
+            }
+            reason_map = {
+                "nominal": "thermal_nominal",
+                "warm": "thermal_warm",
+                "hot": "thermal_hot",
+                "critical": "thermal_critical",
+            }
+            ratio = ratio_map.get(target_tier, 1.0)
+            reason = reason_map.get(target_tier, "thermal")
+            if local_brain is not None and hasattr(local_brain, "set_thermal_clamp"):
+                try:
+                    local_brain.set_thermal_clamp(ratio, reason=reason)
+                except Exception:
+                    logger.info("Thermal clamp dispatch failed", exc_info=True)
+            try:
+                bus.emit_fast(
+                    "thermal_derate_update",
+                    previous=_last_thermal_tier,
+                    current=target_tier,
+                    ratio=ratio,
+                )
+            except Exception:
+                logger.debug("thermal derate emit failed", exc_info=True)
+            _last_thermal_tier = target_tier
+
     bus.on("silicon_stats_update", _on_silicon_stats_update)
+
+    try:
+        from core.observability.error_rate_monitor import get_error_rate_monitor
+        _error_monitor = get_error_rate_monitor(
+            window_s=float(cfg.get("observability", {}).get("error_rate_window_s", 60.0)),
+            threshold=int(cfg.get("observability", {}).get("error_rate_threshold", 5)),
+            poll_interval_s=float(cfg.get("observability", {}).get("error_rate_poll_s", 10.0)),
+        )
+        _error_monitor.start(bus)
+    except Exception:
+        logger.info("Error-rate monitor wiring failed", exc_info=True)
+        _error_monitor = None
+
+    _last_error_burst_spoken: dict[str, float] = {"t": 0.0}
+
+    async def _on_error_burst_detected(
+        rate: int = 0,
+        threshold: int = 0,
+        window_s: float = 60.0,
+        top_sources: list | None = None,
+        **_kw: Any,
+    ) -> None:
+        try:
+            if not shutdown_event.is_set():
+                try:
+                    from core.state_manager import AtomState
+                    # Don't step on an active conversation.
+                    if state.current in (AtomState.THINKING, AtomState.SPEAKING, AtomState.LISTENING):
+                        return
+                except Exception:
+                    pass
+            now = time.monotonic()
+            # Self-alert cooldown even though the monitor also enforces one.
+            if now - float(_last_error_burst_spoken.get("t", 0.0)) < 180.0:
+                return
+            _last_error_burst_spoken["t"] = now
+            top_str = ""
+            if top_sources:
+                try:
+                    top_str = ", ".join(str(s[0]) for s in top_sources[:2])
+                except Exception:
+                    top_str = ""
+            msg = (
+                f"Heads up, Boss — I spotted {rate} handler errors in the last minute."
+                + (f" Mostly around {top_str}." if top_str else "")
+                + " I'm still up, just flagging it."
+            )
+            speaker = tts if tts is not None and hasattr(tts, "speak_ack") else None
+            if speaker is not None:
+                try:
+                    await speaker.speak_ack(msg)
+                    return
+                except Exception:
+                    logger.info("error-burst TTS ack failed", exc_info=True)
+            logger.warning("[error-burst] %s", msg)
+        except Exception:
+            logger.info("error-burst handler failed", exc_info=True)
+
+    bus.on("atom_error_burst_detected", _on_error_burst_detected)
 
     from core.llm_inference_queue import LLMInferenceQueue
     from core.priority_scheduler import PriorityScheduler
@@ -1387,6 +1708,15 @@ async def main() -> None:
     local_brain.attach_runtime_watchdog(runtime_watchdog)
     bus.on("state_changed", runtime_watchdog.on_state_changed)
 
+    try:
+        from core.proactive.routine_engine import RoutineEngine
+        from core.intent_engine import routine_intents as _routine_intents
+        routine_engine = RoutineEngine(config)
+        router.attach_routine_engine(routine_engine)
+        _routine_intents.set_routine_engine(routine_engine)
+    except Exception:
+        logger.info("Routine engine wiring failed", exc_info=True)
+
     # ── System State Engine: real-time awareness ───────────────────
     from core.system_state_engine import SystemStateEngine
     system_state_engine = SystemStateEngine(bus, poll_interval_s=0.5)
@@ -1888,6 +2218,33 @@ async def main() -> None:
             }
 
         web_dashboard.set_v7_health_provider(_v7_health_payload)
+
+        try:
+            from core.observability.health_snapshot import HealthSnapshotBuilder
+            _embedding_engine = None
+            try:
+                if local_brain is not None:
+                    _embedding_engine = getattr(local_brain, "_embedding_engine", None)
+            except Exception:
+                _embedding_engine = None
+            health_builder = HealthSnapshotBuilder(
+                bus=bus,
+                state=state,
+                stt=stt,
+                tts=tts,
+                local_brain=local_brain,
+                embedding_engine=_embedding_engine,
+                semantic_cache=semantic_cache,
+                memory=memory,
+                silicon_governor=silicon_governor,
+                health_monitor=health_monitor,
+                error_monitor=_error_monitor,
+                mic_manager=mic_manager,
+            )
+            web_dashboard.set_health_provider(health_builder.build)
+        except Exception:
+            logger.info("Health snapshot wiring failed", exc_info=True)
+
         await web_dashboard.start()
     else:
         indicator.start()
@@ -1951,6 +2308,46 @@ async def main() -> None:
         "Intelligence layer started: SystemScanner + OwnerUnderstanding + "
         "JarvisCore + RealWorldIntel + ProactiveEngine"
     )
+
+    # ── Morning briefing service (Sprint D1) ─────────────────────────
+    morning_briefing = None
+    try:
+        from core.proactive.morning_briefing import MorningBriefingService
+        morning_briefing = MorningBriefingService(
+            config,
+            bus=bus,
+            real_world_intel=real_world_intel,
+        )
+        if morning_briefing.enabled:
+            logger.info(
+                "Morning briefing service armed (window %s, last=%s)",
+                morning_briefing.diagnostics().get("wake_window"),
+                morning_briefing.last_briefed_date or "never",
+            )
+
+            async def _on_speech_final_for_briefing(**_kw: Any) -> None:
+                if morning_briefing is None:
+                    return
+                try:
+                    await morning_briefing.maybe_trigger("speech_final")
+                except Exception:
+                    logger.info("morning briefing trigger failed", exc_info=True)
+
+            bus.on("speech_final", _on_speech_final_for_briefing)
+
+            async def _maybe_startup_briefing() -> None:
+                if morning_briefing is None:
+                    return
+                try:
+                    await asyncio.sleep(3.0)
+                    await morning_briefing.maybe_trigger("startup")
+                except Exception:
+                    logger.info("morning briefing startup trigger failed", exc_info=True)
+
+            asyncio.create_task(_maybe_startup_briefing())
+    except Exception:
+        logger.info("Morning briefing wiring failed", exc_info=True)
+        morning_briefing = None
 
     # ── Wire extracted event handlers ─────────────────────────────────
     from core.wiring.feature_handlers import (
@@ -2522,7 +2919,17 @@ async def main() -> None:
             snap.get("perceived_avg_ms", "—"),
         )
         log_health(metrics)
+        try:
+            await memory.shutdown_writers()
+        except Exception:
+            logger.info("Memory engine writer shutdown failed", exc_info=True)
         memory.persist()
+        try:
+            _adaptive = _wiring_ctx.get("adaptive") if isinstance(_wiring_ctx, dict) else None
+            if _adaptive is not None and hasattr(_adaptive, "flush"):
+                _adaptive.flush()
+        except Exception:
+            logger.info("Adaptive engine flush failed", exc_info=True)
         executor.shutdown(wait=False)
         logger.info("ATOM stopped.")
 

@@ -18,6 +18,14 @@ v20 optimizations over v18:
   - Pre-normalized vectors skip norm computation in similarity
   - Zero-copy numpy path when sentence-transformers returns ndarray
 
+v21 persistence upgrade (Sprint A2):
+  - Durable ``data/embeddings_warm.npz`` warm-file for the hot set.
+  - On boot, restores the most recently used vectors BEFORE the heavy
+    SentenceTransformer/torch import -- repeat queries (wake words,
+    common commands, boot-time semantic-cache lookups) are answered
+    in <1ms with zero model load.
+  - Periodic auto-persist after N inserts and a final save on shutdown.
+
 Interface Contract:
     embed(text) -> list[float]         # Single text -> 384-dim vector
     embed_batch(texts) -> list[list[float]]  # Batch embedding
@@ -29,11 +37,14 @@ Interface Contract:
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import math
+import os
 import threading
 import time
 from collections import OrderedDict
+from pathlib import Path
 from typing import Any
 
 logger = logging.getLogger("atom.embedding")
@@ -86,11 +97,15 @@ class EmbeddingEngine:
     _DEFAULT_MODEL = "all-MiniLM-L6-v2"
     _DIMENSION = 384
     _CACHE_SIZE = 512
+    _WARM_FILE_VERSION = 1
+    _WARM_AUTOSAVE_INTERVAL = 64  # persist every N cache puts
 
     __slots__ = (
         "_model_name", "_dimension", "_device", "_model",
         "_load_lock", "_loaded", "_load_failed",
         "_cache", "_zero_vec",
+        "_warm_path", "_warm_enabled", "_warm_max",
+        "_warm_dirty_count", "_warm_lock", "_warm_restored",
     )
 
     def __init__(self, config: dict | None = None) -> None:
@@ -104,6 +119,21 @@ class EmbeddingEngine:
         self._load_failed: bool = False
         self._cache: OrderedDict[str, list[float]] = OrderedDict()
         self._zero_vec: list[float] | None = None
+
+        warm_cfg = cfg.get("warm_file", {}) if isinstance(cfg.get("warm_file"), dict) else {}
+        if isinstance(cfg.get("warm_file"), str):
+            warm_cfg = {"path": cfg["warm_file"]}
+        self._warm_enabled: bool = bool(warm_cfg.get("enabled", True)) and _np is not None
+        self._warm_path: Path = Path(
+            warm_cfg.get("path", "data/embeddings_warm.npz"),
+        )
+        self._warm_max: int = int(warm_cfg.get("max_entries", 1024))
+        self._warm_dirty_count: int = 0
+        self._warm_lock = threading.Lock()
+        self._warm_restored: bool = False
+
+        if self._warm_enabled:
+            self._restore_warm_file()
 
     @property
     def dimension(self) -> int:
@@ -167,6 +197,179 @@ class EmbeddingEngine:
         self._cache[text] = vec
         while len(self._cache) > self._CACHE_SIZE:
             self._cache.popitem(last=False)
+
+        if self._warm_enabled:
+            self._warm_dirty_count += 1
+            if self._warm_dirty_count >= self._WARM_AUTOSAVE_INTERVAL:
+                try:
+                    self._persist_warm_file()
+                except Exception:
+                    logger.debug("warm-file autosave failed", exc_info=True)
+
+    # ────────────── Warm-file persistence (Sprint A2) ──────────────
+
+    def _restore_warm_file(self) -> None:
+        """Load persisted vectors into the in-memory cache.
+
+        Runs synchronously in ``__init__`` because the whole point is to
+        have vectors available BEFORE any embed() call triggers the heavy
+        torch/sentence-transformers import path.
+        """
+        path = self._warm_path
+        if _np is None or not path.is_file():
+            return
+        try:
+            t0 = time.monotonic()
+            with _np.load(str(path), allow_pickle=False) as archive:
+                try:
+                    texts = archive["texts"]
+                    vectors = archive["vectors"]
+                except KeyError:
+                    logger.info("Warm-file missing required arrays; ignoring")
+                    return
+                meta_raw = archive["meta"].tolist() if "meta" in archive else "{}"
+            if isinstance(meta_raw, bytes):
+                meta_raw = meta_raw.decode("utf-8", errors="ignore")
+            try:
+                meta = json.loads(meta_raw) if isinstance(meta_raw, str) else {}
+            except Exception:
+                meta = {}
+
+            saved_model = meta.get("model_name")
+            saved_dim = int(meta.get("dimension", 0) or 0)
+            if saved_model and saved_model != self._model_name:
+                logger.info(
+                    "Warm-file model mismatch (have=%s want=%s); ignoring",
+                    saved_model, self._model_name,
+                )
+                return
+            if saved_dim and vectors.shape[1] != saved_dim:
+                logger.info(
+                    "Warm-file dim mismatch (have=%d want=%d); ignoring",
+                    vectors.shape[1], saved_dim,
+                )
+                return
+            if saved_dim and saved_dim != self._dimension:
+                self._dimension = saved_dim
+                self._zero_vec = None
+
+            restored = 0
+            # Oldest first so the most recent entries stay at the tail of
+            # the LRU, matching how we persisted them.
+            for txt, row in zip(texts.tolist(), vectors):
+                if not isinstance(txt, str) or not txt:
+                    continue
+                vec = row.astype(_np.float32, copy=False).tolist()
+                if len(vec) != self._dimension:
+                    continue
+                self._cache[txt] = vec
+                restored += 1
+                if len(self._cache) > self._CACHE_SIZE:
+                    self._cache.popitem(last=False)
+
+            if restored:
+                self._warm_restored = True
+            elapsed = (time.monotonic() - t0) * 1000
+            logger.info(
+                "Embedding warm-file restored: %d entries from %s in %.0fms",
+                restored, path, elapsed,
+            )
+        except Exception:
+            logger.debug("warm-file restore failed", exc_info=True)
+
+    def _persist_warm_file(self) -> bool:
+        """Write the in-memory cache to disk atomically."""
+        if not self._warm_enabled or _np is None:
+            return False
+        if not self._cache:
+            return False
+        with self._warm_lock:
+            path = self._warm_path
+            try:
+                path.parent.mkdir(parents=True, exist_ok=True)
+            except Exception:
+                logger.debug("warm-file dir create failed", exc_info=True)
+                return False
+
+            items = list(self._cache.items())
+            # Keep the most-recent ``_warm_max`` entries (tail of LRU).
+            if len(items) > self._warm_max:
+                items = items[-self._warm_max:]
+
+            texts: list[str] = []
+            rows: list[list[float]] = []
+            for txt, vec in items:
+                if not isinstance(txt, str) or not txt:
+                    continue
+                if not vec or len(vec) != self._dimension:
+                    continue
+                texts.append(txt)
+                rows.append(vec)
+            if not texts:
+                return False
+
+            try:
+                arr = _np.asarray(rows, dtype=_np.float32)
+                meta_blob = _np.asarray(
+                    json.dumps(
+                        {
+                            "version": self._WARM_FILE_VERSION,
+                            "model_name": self._model_name,
+                            "dimension": self._dimension,
+                            "saved_at": time.time(),
+                            "count": len(texts),
+                        }
+                    ),
+                    dtype="U",
+                )
+                # ``np.savez`` appends its own ``.npz`` suffix when the
+                # path doesn't already end with ``.npz``. To keep atomic
+                # writes simple, use a sibling tmp WITH the ``.npz``
+                # suffix, then rename to the final target in one step.
+                tmp_path = path.with_name(path.name + ".tmp")
+                _np.savez(
+                    str(tmp_path),
+                    texts=_np.asarray(texts, dtype="U"),
+                    vectors=arr,
+                    meta=meta_blob,
+                )
+                # Account for numpy's silent ``.npz`` extension logic: if
+                # the tmp path didn't end with .npz it will be renamed
+                # with one appended. Pick whichever file actually landed.
+                written = tmp_path
+                if not written.is_file():
+                    alt = Path(str(tmp_path) + ".npz")
+                    if alt.is_file():
+                        written = alt
+                os.replace(str(written), str(path))
+                self._warm_dirty_count = 0
+                logger.debug(
+                    "Embedding warm-file persisted: %d entries -> %s",
+                    len(texts), path,
+                )
+                return True
+            except Exception:
+                logger.debug("warm-file persist failed", exc_info=True)
+                return False
+
+    def warm_file_info(self) -> dict[str, Any]:
+        """Diagnostic snapshot of warm-file state."""
+        exists = self._warm_path.is_file()
+        size = 0
+        if exists:
+            try:
+                size = self._warm_path.stat().st_size
+            except Exception:
+                size = 0
+        return {
+            "enabled": self._warm_enabled,
+            "path": str(self._warm_path),
+            "exists": exists,
+            "size_bytes": size,
+            "restored_on_boot": self._warm_restored,
+            "in_memory_entries": len(self._cache),
+            "dirty_count": self._warm_dirty_count,
+        }
 
     def embed_sync(self, text: str) -> list[float]:
         """Synchronous embedding -- safe to call from any thread."""
@@ -310,7 +513,12 @@ class EmbeddingEngine:
         return self._ensure_loaded()
 
     def shutdown(self) -> None:
-        """Release model memory."""
+        """Release model memory (and flush warm-file to disk)."""
+        if self._warm_enabled:
+            try:
+                self._persist_warm_file()
+            except Exception:
+                logger.debug("warm-file final persist failed", exc_info=True)
         self._model = None
         self._loaded = False
         self._cache.clear()
