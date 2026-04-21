@@ -102,7 +102,12 @@ _CREATIVE_HINTS = re.compile(
     r"brainstorm|idea|ideas|write|draft|rewrite|compose|story|poem|"
     r"lyrics|script|creative|imagine|invent|design|outline|pitch|proposal|"
     r"solve|explain|how\s+to|code|refactor|debug|summarize|propose|plan|"
-    r"analyze|thought|reason|thinking|deep\s+dive|complex|hard\s+task|logic|math"
+    r"analyze|thought|reason|thinking|deep\s+dive|complex|hard\s+task|logic|math|"
+    # v3 explicit cloud triggers (plan Phase 3.2): when Boss says
+    # "explain properly", "deep analysis", "research this", route to
+    # cloud for grounded, current answers.
+    r"explain\s+properly|deep\s+analysis|deep\s+research|research\s+this|"
+    r"research\s+the|do\s+research|full\s+report|in\s+detail"
     r")\b",
     re.I,
 )
@@ -312,8 +317,8 @@ class CognitiveKernel:
         self._latency = LatencyController(self._config)
 
         ck = self._config.get("cognitive_kernel", {})
-        self._quick_model = ck.get("quick_model", "qwen3-8b")
-        self._full_model = ck.get("full_model", "qwen3-8b")
+        self._quick_model = ck.get("quick_model", "phi-3.5-mini")
+        self._full_model = ck.get("full_model", "phi-3.5-mini")
         self._deep_query_min_chars = int(ck.get("deep_query_min_chars", 120))
         self._simple_query_max_chars = int(ck.get("simple_query_max_chars", 50))
         self._battery_degrade = bool(ck.get("battery_degrade", True))
@@ -337,8 +342,25 @@ class CognitiveKernel:
         self._search_tool: Any = None
         self._gemini_client: Any = None
         self._semantic_cache: Any = None
-        self._cloud_enabled = bool(
-            self._config.get("cloud", {}).get("enabled", True)
+        cloud_cfg = self._config.get("cloud", {}) or {}
+        self._cloud_enabled = bool(cloud_cfg.get("enabled", True))
+        # v3 daily cloud-call cost guard. Once exhausted, cloud paths
+        # are denied and we fall back to local Phi (or local deep Qwen
+        # for explicit deep requests). Counter resets at local midnight.
+        self._cloud_daily_budget = int(cloud_cfg.get("daily_budget_calls", 200))
+        self._cloud_calls_today: int = 0
+        self._cloud_budget_day: str = ""  # YYYY-MM-DD of current bucket
+        # v3 smart-route knobs (for the new Path 2.65 / 2.7).
+        self._cloud_smart_keywords: tuple[str, ...] = tuple(
+            (kw or "").strip().lower()
+            for kw in cloud_cfg.get("smart_route_keywords", []) or ()
+            if (kw or "").strip()
+        )
+        self._cloud_smart_min_query_words = int(
+            cloud_cfg.get("smart_route_min_query_words", 25),
+        )
+        self._cloud_smart_local_conf_floor = float(
+            cloud_cfg.get("smart_route_local_confidence_floor", 0.5),
         )
 
         self._routing_counts: dict[str, int] = {p.value: 0 for p in ExecPath}
@@ -377,6 +399,60 @@ class CognitiveKernel:
             confidence_engine is not None, search_tool is not None,
             gemini_client is not None, semantic_cache is not None,
         )
+
+    # ── v3 cloud cost guard + smart routing helpers ────────────────────
+
+    def _cloud_budget_today(self) -> str:
+        """Local-date bucket key (YYYY-MM-DD) for the daily call counter."""
+        return time.strftime("%Y-%m-%d", time.localtime())
+
+    def _cloud_budget_available(self) -> bool:
+        """True iff we have at least one Gemini call left in today's budget.
+
+        The bucket auto-rolls at local midnight. Setting
+        ``cloud.daily_budget_calls = 0`` disables the guard entirely.
+        """
+        if self._cloud_daily_budget <= 0:
+            return True
+        today = self._cloud_budget_today()
+        if today != self._cloud_budget_day:
+            self._cloud_budget_day = today
+            self._cloud_calls_today = 0
+        return self._cloud_calls_today < self._cloud_daily_budget
+
+    def note_cloud_call(self) -> None:
+        """Record one cloud call against today's budget. Idempotent at
+        the second granularity -- the router calls this when it actually
+        dispatches a Gemini request."""
+        today = self._cloud_budget_today()
+        if today != self._cloud_budget_day:
+            self._cloud_budget_day = today
+            self._cloud_calls_today = 0
+        self._cloud_calls_today += 1
+        if self._cloud_daily_budget > 0:
+            remaining = max(0, self._cloud_daily_budget - self._cloud_calls_today)
+            if remaining <= 10:
+                logger.warning(
+                    "Cloud daily budget low: %d/%d calls used, %d left today",
+                    self._cloud_calls_today, self._cloud_daily_budget, remaining,
+                )
+
+    def _cloud_smart_match(self, query: str) -> bool:
+        """Phase 3.2 v3 smart-route triggers (configurable in
+        ``cloud.smart_route_keywords``). True when the query contains
+        any of the keywords or exceeds the long-form word threshold."""
+        q = (query or "").lower()
+        if not q:
+            return False
+        for kw in self._cloud_smart_keywords:
+            if kw and kw in q:
+                return True
+        if (
+            self._cloud_smart_min_query_words > 0
+            and len(q.split()) > self._cloud_smart_min_query_words
+        ):
+            return True
+        return False
 
     # ── Public API ───────────────────────────────────────────────────
 
@@ -492,6 +568,7 @@ class CognitiveKernel:
         # Path 2.6: CLOUD_SEARCH — real-time info needed (v22)
         if (
             self._cloud_enabled
+            and self._cloud_budget_available()
             and not self._circuits["cloud_search"].is_open
             and _REALTIME_HINTS.search(query)
             and self._search_tool is not None
@@ -519,11 +596,53 @@ class CognitiveKernel:
             self._record(plan, t0)
             return plan
 
+        # Path 2.65: v3 explicit smart-route triggers ("explain properly",
+        # "research this", "deep analysis", or any long-form question
+        # over the configured word threshold). These are the cases where
+        # Phi will give a weak answer but Gemini gives a grounded one.
+        if (
+            self._cloud_enabled
+            and self._cloud_budget_available()
+            and not self._circuits["cloud_reason"].is_open
+            and self._gemini_client is not None
+            and hasattr(self._gemini_client, "is_available")
+            and self._gemini_client.is_available
+            and self._cloud_smart_match(query)
+        ):
+            plan = QueryPlan(
+                path=ExecPath.CLOUD_REASON,
+                model="gemini",
+                model_role="reasoning",
+                runtime_mode="REASONING",
+                use_rag=True,
+                use_memory=True,
+                thinking=True,
+                reason="v3_smart_route_keyword_or_longform",
+                cloud_augmented=True,
+                budget_ms=_PATH_BUDGETS[ExecPath.CLOUD_REASON] * 1.5,
+                prompt_hint=(
+                    "Boss explicitly asked for depth or research. Lead "
+                    "with the bottom line, then give a grounded, current "
+                    "explanation. Cite sources from search results when "
+                    "relevant."
+                ),
+            )
+            requested_tier = self._classify_requested_tier(
+                query, complexity=complexity,
+            )
+            plan = self._apply_budget_profile(plan, requested_tier=requested_tier)
+            plan = self._apply_latency_policy(
+                plan, query, ctx, complexity=complexity,
+            )
+            self._record(plan, t0)
+            return plan
+
         # Path 2.7: Pre-confidence cloud routing (v22)
         # Check if the query is likely to produce a weak local response
         # or if it's a specific "buddy talk" or "hard reasoning" request.
         if (
             self._cloud_enabled
+            and self._cloud_budget_available()
             and not self._circuits["cloud_reason"].is_open
             and self._gemini_client is not None
             and hasattr(self._gemini_client, "is_available")

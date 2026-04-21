@@ -133,6 +133,8 @@ class Router:
         self._runtime_watchdog: RuntimeWatchdog | None = None
         self._task_manager: Any = None
 
+        self._local_brain_controller: Any = None
+
         self._system_state_engine: Any = None
         self._session_memory: Any = None
         self._user_memory: Any = None
@@ -194,6 +196,14 @@ class Router:
         """Wire RuntimeWatchdog so hot router stages use active budgets."""
         self._runtime_watchdog = watchdog
         logger.info("RuntimeWatchdog attached to Router")
+
+    def attach_local_brain_controller(self, controller: Any) -> None:
+        """Wire LocalBrainController so cloud-streamed text passes
+        through the SAME sanitiser used for local LLM streams. This is
+        what stops Gemini's CoT preface, prompt-leak fragments, and
+        ChatML control tokens from reaching TTS."""
+        self._local_brain_controller = controller
+        logger.info("LocalBrainController attached to Router for cloud sanitisation")
 
     def attach_task_manager(self, task_manager: Any) -> None:
         """Wire the centralized background task manager."""
@@ -2218,6 +2228,15 @@ class Router:
             batch.clear()
             if not text and not is_last:
                 return
+            # v3 Phase 3.3: cloud stream chunks must go through the SAME
+            # sanitiser as local-brain chunks. Catches CoT preface,
+            # reasoning-narration, prompt-text leak, lone-quote tail,
+            # ChatML/HF special tokens. _sanitize_cloud_chunk lives on
+            # this router (defined below) and uses the LocalBrainController
+            # sanitiser when wired, otherwise a thin local fallback.
+            text = self._sanitize_cloud_chunk(text)
+            if not text and not is_last:
+                return
             is_first = first_token[0]
             first_token[0] = False
             last_flush[0] = time.perf_counter()
@@ -2272,9 +2291,27 @@ class Router:
                 "keep this response very brief (1-2 sentences max)."
             )
 
+        # v3 Phase 3.4: redact PII / file paths / secrets from anything
+        # we ship off-device. ``redact()`` is idempotent and cheap.
+        try:
+            from context.privacy_filter import redact as _privacy_redact
+            outbound_text = _privacy_redact(original_text)
+        except Exception:
+            logger.debug("Privacy filter unavailable; sending raw query", exc_info=True)
+            outbound_text = original_text
+
+        # Charge the daily cloud budget. The cognitive kernel decided we
+        # were allowed to come here; this just logs the actual call so
+        # subsequent route() decisions see the correct count.
+        if self._cognitive_kernel is not None:
+            try:
+                self._cognitive_kernel.note_cloud_call()
+            except Exception:
+                logger.debug("note_cloud_call failed", exc_info=True)
+
         try:
             full_text, ok = await self._gemini_client.ask_streaming(
-                original_text,
+                outbound_text,
                 on_token=_on_token,
                 system_instruction=default_system,
             )
@@ -2287,6 +2324,35 @@ class Router:
             logger.exception("Cloud streaming failed — emitting error response")
             if my_generation == self._cloud_stream_generation:
                 self._emit_response("Cloud request failed, Boss. Try again.")
+
+    def _sanitize_cloud_chunk(self, text: str) -> str:
+        """Run cloud-streamed text through the local-brain sanitiser so
+        the same CoT / reasoning-leak / prompt-leak / control-token
+        guards apply to Gemini output. Falls back to a thin local
+        cleanup when the local brain isn't wired."""
+        if not text:
+            return text
+        try:
+            ctrl = getattr(self, "_local_brain_controller", None)
+            if ctrl is None:
+                # Some wirings expose it under a different name.
+                ctrl = getattr(self, "_local_brain", None)
+            if ctrl is not None and hasattr(ctrl, "_sanitize_emittable_text"):
+                cleaned = ctrl._sanitize_emittable_text(text)
+                # Sanitiser may suppress entire fragments (returns "").
+                # That is the point -- TTS gets nothing rather than a
+                # CoT line.
+                return cleaned or ""
+        except Exception:
+            logger.debug("Cloud sanitiser delegation failed", exc_info=True)
+        # Fallback: at minimum drop ChatML / HF control tokens that some
+        # cloud providers leak when the prompt template is sloppy.
+        # Matches <|im_end|>, <|im_start|>, <|endoftext|>, <|end_of_text|>,
+        # <|user|>, <|assistant|>, <|system|>, <|eot_id|>, etc.
+        try:
+            return re.sub(r"<\|[^|>]{1,32}\|>", "", text)
+        except Exception:
+            return text
 
     # ── Perception adaptive profile ─────────────────────────────────
 

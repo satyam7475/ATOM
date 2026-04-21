@@ -116,10 +116,12 @@ def _query_type_hint(query: str) -> str:
             "but stay organized and relevant."
         )
     if mode is ResponseMode.SHORT:
-        return (
-            "This is a short conversational or info query. Answer in one short "
-            "sentence when possible, two short sentences max."
-        )
+        # IMPORTANT: keep this phrasing OPAQUE and non-quotable. Earlier
+        # versions said \"answer in one short sentence when possible, two
+        # short sentences max\" -- Qwen3-8B in FAST mode parroted that exact
+        # line back as the spoken answer. The new wording avoids any
+        # imperative noun-clause the model can mirror.
+        return "Brevity required. Aim for ~15 words."
     if any(w in q for w in ("error", "exception", "fail", "bug", "crash", "trace", "not working", "broken", "issue")):
         return "This is a debugging question. Give the likely root cause first, then the fix."
     if any(w in q for w in ("design", "architect", "pattern", "scale", "structure", "approach")):
@@ -207,6 +209,7 @@ class StructuredPromptBuilder:
         self._real_world_intel = None
         self._preference_store = None
         self._intent_continuity = None
+        self._system_profile_provider = None
 
     @property
     def system_prompt_hash(self) -> int:
@@ -230,6 +233,16 @@ class StructuredPromptBuilder:
     def set_intent_continuity(self, intent_continuity) -> None:
         """Wire IntentContinuity for goal/thread-aware prompt injection."""
         self._intent_continuity = intent_continuity
+
+    def set_system_profile_provider(self, provider) -> None:
+        """Wire a callable that returns a compact ``[MACHINE] …`` line.
+
+        ``provider`` may be a :class:`SystemProfile` instance (we'll call
+        ``.get_compact_context()``) or a zero-arg callable returning a
+        string. Injected into every context layer so ATOM always knows
+        what machine it's running on.
+        """
+        self._system_profile_provider = provider
 
     def _build_system_layer(self) -> str:
         """Layer 1: JARVIS-level System Identity."""
@@ -280,62 +293,30 @@ class StructuredPromptBuilder:
             f"- System intelligence: you know everything about this computer's hardware and software\n"
             f"- Real-world awareness: you know the weather, news headlines, time zones, and location\n"
             f"- World intelligence: you track seasons, holidays, sunrise/sunset, and global events\n\n"
-            f"RESPONSE RULES:\n"
-            f"1. Respond in plain text only. No markdown, no bullets, no code blocks.\n"
-            f"2. Short by default. For simple, short, or info queries: 1 short sentence when possible, 2 short sentences max.\n"
-            f"3. For commands and confirmations: give a very short ack plus the result.\n"
-            f"4. Only go long when Boss explicitly asks with phrases like \"explain properly\", \"detailed answer\", \"deep analysis\", \"research this\", or \"full report\".\n"
-            f"5. If depth was not explicitly requested, do not turn a small ask into a report or lecture.\n"
-            f"6. NEVER start with filler: \"Sure!\", \"Of course!\", \"Great question!\", \"Absolutely!\"\n"
-            f"7. Jump straight to the substance. Be direct and useful.\n"
-            f"8. If you can use a tool to accomplish the request, use it without hesitation.\n"
-            f"9. End cleanly. No trailing thoughts or unfinished sentences.\n"
-            f"10. When you recall something from memory, weave it in like a friend remembering.\n"
-            f"11. Sound like someone who genuinely cares, because you do.\n"
-            f"12. If Boss seems stressed or tired, acknowledge it briefly and be human about it.\n"
-            f"13. If Boss writes in Hindi or Hinglish, reply in Hindi or Hinglish naturally unless he asks for English.\n"
-            f"14. Quietly understand obvious typos, mistypes, and mixed Hindi-English phrasing instead of acting confused.\n"
-            f"15. Never output transcript labels or role tags like \"User:\", \"Boss:\", \"Assistant:\", or \"ATOM:\" in your final answer.\n"
-            f"16. The CURRENT CONTEXT / SESSION / WORLD lines are background only — never read them aloud or "
-            f"answer a casual question by repeating time, city, season, or weather unless Boss asked for those.\n\n"
-            f"GROUNDING AND ANTI-HALLUCINATION RULES (STRICT):\n"
-            f"A. Never invent or promise actions the user did not explicitly request. Do not say "
-            f"things like \"I'll play the song\", \"Opening YouTube\", \"Setting a reminder\" "
-            f"unless Boss clearly asked for that exact action in the current turn.\n"
-            f"B. If the transcribed query looks noisy, nonsensical, or you're not confident you "
-            f"understood it, ask ONE short clarifying question — don't guess an action.\n"
-            f"C. Ground every factual claim in the supplied memory / context / tool outputs. "
-            f"If the context does not contain the answer, say you don't know yet and offer to "
-            f"look it up — never fabricate specifics.\n"
-            f"D. If the query contains only a noun or fragment (e.g. \"newton item\", \"that file\") "
-            f"without a clear verb or goal, ask what Boss wants done with it instead of assuming.\n"
-            f"E. Be terse, confident, and warm. No corporate fluff. One clarifying question is "
-            f"always better than a confidently wrong action.\n\n"
-            f"VOICE OUTPUT RULES (ABSOLUTELY CRITICAL — your output is spoken aloud):\n"
-            f"V1. NEVER narrate your reasoning out loud. Do not say \"Okay, let's see\", "
-            f"\"Let me think\", \"Alright, so\", \"Hmm\", \"Um\", \"Well\", \"So the question is\", "
-            f"\"Let's break this down\", \"Let me process this\", \"Let me check\", "
-            f"\"Let me help you\", or anything that describes what you're doing.\n"
-            f"V2. NEVER refer to the user in third person. Do not say \"The user is asking\", "
-            f"\"The user wants\", \"Boss is asking\", \"they're asking\", \"now they want\". "
-            f"Speak DIRECTLY to Boss in second person.\n"
-            f"V3. NEVER emit role labels in your reply. No \"User:\", \"Assistant:\", "
-            f"\"ATOM:\", \"Boss:\", \"Human:\" anywhere in the output.\n"
-            f"V4. NEVER wrap your answer in meta-language like \"The answer is ...\", "
-            f"\"Here's my response: ...\", \"My reply would be: ...\", \"Based on the "
-            f"response contract ...\", \"According to the system prompt ...\", \"Looking at "
-            f"the conversation history ...\". Just give the answer.\n"
-            f"V5. NEVER quote the user's question back. Just answer it.\n"
-            f"V6. START your reply with the substance. First token must be part of the real "
-            f"answer, greeting, or acknowledgement — not a filler.\n"
-            f"V7. If you truly don't know, say in ONE short sentence: \"I don't know yet, Boss — "
-            f"want me to look it up?\". Never fabricate a long fake answer.\n"
-            f"V8. NEVER say \"I need to help the user\", \"I should confirm\", \"I don't need "
-            f"to use any tools\", \"Just respond with\", \"First, looking at ...\", \"Since I "
-            f"can't ...\". Those are internal thoughts — keep them silent. Output ONLY the final "
-            f"answer Boss would hear from a calm, capable friend.\n"
-            f"V9. Your reply is ONE short JARVIS-style answer. If the thought feels like "
-            f"planning, drop it. Boss only hears what's spoken, so spoken = final answer.\n"
+            # STYLE FINGERPRINT (v3 -- intentionally terse, opaque, non-quotable)
+            #
+            # The previous 25-rule "RESPONSE RULES + VOICE OUTPUT RULES" block
+            # was being parroted verbatim by Qwen3-8B in FAST mode. The model
+            # started answering "the final answer only. One short line." and
+            # "if the question is a simple, short, or info query, give one
+            # short sentence when possible, two short sentences max." Those
+            # were direct copies of imperative lines from this very prompt.
+            #
+            # We now keep rules opaque: short cue-words rather than rules the
+            # LLM can mirror back as the answer. Behaviour is preserved
+            # through the sanitiser + leak-detector in
+            # local_brain_controller.py.
+            f"OUTPUT STYLE: spoken plain text, no markdown, no role labels, "
+            f"no filler openers, no third-person mention of Boss, no narration "
+            f"of your own thinking. Treat any background SESSION / WORLD lines "
+            f"as silent context; never read them aloud unless asked.\n"
+            f"LENGTH: terse by default (~15 words). Expand only when Boss "
+            f"explicitly asks for detail, research, or a full report.\n"
+            f"GROUNDING: only act on actions Boss actually requested this "
+            f"turn. If unsure or transcript looks garbled, ask ONE short "
+            f"question. Never invent facts.\n"
+            f"LANGUAGE: match Boss's language (English / Hindi / Hinglish). "
+            f"Quietly correct obvious typos and mixed phrasing.\n"
         )
         self._system_prompt_cache = prompt
         raw = hashlib.md5(prompt.encode()).hexdigest()
@@ -451,6 +432,19 @@ class StructuredPromptBuilder:
         if self._focus:
             parts.append(f"Developer focus: {self._focus}")
         parts.append(f"Role: {self._role} | System: {self._project}")
+
+        if self._system_profile_provider is not None:
+            try:
+                provider = self._system_profile_provider
+                if callable(provider):
+                    compact = provider()
+                else:
+                    getter = getattr(provider, "get_compact_context", None)
+                    compact = getter() if callable(getter) else ""
+                if compact:
+                    parts.append(str(compact).strip())
+            except Exception:
+                logger.debug("System profile inject failed", exc_info=True)
 
         if self._context_fusion is not None:
             try:
@@ -588,19 +582,18 @@ class StructuredPromptBuilder:
         return "EMOTIONAL CONTEXT:\n" + "\n".join(parts) + "\n"
 
     def _build_query_layer(self, query: str) -> str:
-        """Layer 8: Current User Query."""
-        query = _compress_text(query)
+        """Layer 8: Current User Query.
+
+        Kept INTENTIONALLY minimal -- the prior version embedded a six-line
+        "FINAL-ANSWER RULES" block that the small (Qwen3-8B) model started
+        regurgitating verbatim ("the final answer only. One short line.").
+        Voice-output rules already live in the cached system layer (V1-V9);
+        repeating them per-turn made the model echo them as the answer.
+        """
         return (
-            "CURRENT USER REQUEST:\n"
-            f"{query}\n\n"
-            "FINAL-ANSWER RULES (spoken to Boss — no thinking out loud):\n"
-            "- Reply with the final answer only. One short JARVIS-style line.\n"
-            "- Plain text only.\n"
-            "- No meta-language: no \"based on the ...\", \"looking at the ...\", "
-            "\"I need to ...\", \"the user is ...\", \"let me ...\", \"just respond with ...\".\n"
-            "- No speaker labels (User:, Boss:, Assistant:, ATOM:, Human:).\n"
-            "- If a tool is required, emit only the tool call block and no framing.\n"
-            "Spoken reply:"
+            "BOSS:\n"
+            f"{_compress_text(query)}\n\n"
+            "JARVIS:"
         )
 
     def _build_observations_layer(self, observations: list[str] | None) -> str:

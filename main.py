@@ -256,6 +256,30 @@ async def main() -> None:
     stt_runtime_fallbacks = voice_pipeline.stt_runtime_fallbacks
     tts_runtime_label = voice_pipeline.tts_runtime_label
 
+    # v3 Phase 4: WhisperConfirmer for second-pass STT on suspect finals.
+    # Opt-in via config["stt"]["whisper_confirm"]["enabled"]=true. Lazy
+    # model load so cold boot stays fast. Wired only if the active STT
+    # backend supports attach_whisper_confirmer (currently macOS native).
+    try:
+        _stt_cfg = config.get("stt") or {}
+        if (_stt_cfg.get("whisper_confirm") or {}).get("enabled", False):
+            if hasattr(stt, "attach_whisper_confirmer"):
+                from voice.whisper_confirmer import WhisperConfirmer
+                _wc = WhisperConfirmer(_stt_cfg)
+                stt.attach_whisper_confirmer(_wc)
+                logger.info(
+                    "WhisperConfirmer attached to STT (model=%s, ring=%.1fs, decode=%.1fs)",
+                    _wc._model_size, _wc._ring_seconds, _wc._decode_seconds,
+                )
+            else:
+                logger.info(
+                    "WhisperConfirmer enabled in config but %s STT does not "
+                    "expose attach_whisper_confirmer -- skipping wiring",
+                    type(stt).__name__,
+                )
+    except Exception:
+        logger.warning("WhisperConfirmer wiring failed (non-fatal)", exc_info=True)
+
     # ── Boot order (runtime truth) ─────────────────────────────────
     # InferenceGuard + SiliconGovernor before CognitiveKernel so routing sees
     # VRAM/hardware state. CognitiveKernel before LocalBrain/RAG so semantic
@@ -318,6 +342,10 @@ async def main() -> None:
             brain_mode_manager=brain_mode_mgr,
         )
         local_brain.set_action_executor(router.action_executor)
+        # v3 Phase 3.3: cloud-stream chunks reuse this controller's
+        # sanitiser so Gemini output is cleaned with the same rules as
+        # the local brain (CoT preface, prompt-leak, ChatML tokens).
+        router.attach_local_brain_controller(local_brain)
         local_brain.attach_feedback_engine(feedback_engine)
         local_brain.attach_system_monitor(system_monitor)
         local_brain.attach_suggester(suggester_engine)
@@ -1010,6 +1038,16 @@ async def main() -> None:
     system_scanner = SystemScanner(bus, config)
     owner_understanding = OwnerUnderstanding(bus, config)
     system_control = SystemControl(config)
+
+    from core.system_profile import SystemProfile
+    system_profile = SystemProfile(config, scanner=system_scanner)
+    prompt_builder.set_system_profile_provider(system_profile)
+
+    async def _on_system_intelligence_profile_refresh(*_a, **_k) -> None:
+        system_profile.on_scanner_update()
+
+    bus.on("system_intelligence", _on_system_intelligence_profile_refresh)
+    bus.on("system_light_scan", _on_system_intelligence_profile_refresh)
     
     # Start background indexers
     system_indexer.start()
@@ -2901,6 +2939,11 @@ async def main() -> None:
         owner_understanding.stop()
         system_scanner.stop()
         system_scanner.persist()
+        try:
+            system_profile.refresh_from_scanner()
+            system_profile.persist()
+        except Exception:
+            logger.debug("System profile shutdown persist failed", exc_info=True)
         system_indexer.stop()
         media_watcher.stop()
         if fs_watcher is not None:

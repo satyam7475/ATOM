@@ -74,7 +74,17 @@
         "native_requires_on_device": true,
         "native_voice_processing": true,
         "native_tap_sample_rate": 0,
-        "passive_revert_delay_s": 30.0
+        "passive_revert_delay_s": 30.0,
+        "whisper_confirm": {
+            "enabled": false,
+            "model_size": "tiny",
+            "ring_seconds": 5.0,
+            "decode_seconds": 4.0,
+            "min_confidence": 0.55,
+            "max_confirm_ms": 250.0,
+            "language": null,
+            "min_text_chars": 3
+        }
     },
     "tts": {
         "engine": "macos_native",
@@ -132,8 +142,8 @@
     "brain": {
         "enabled": true,
         "model_path": "models/qwen3-8b-q4_k_m.gguf",
-        "mlx_primary_model": "models/qwen3-8b-mlx-4bit",
-        "mlx_fast_model": "models/qwen3-8b-mlx-4bit",
+        "mlx_primary_model": "models/phi-3.5-mini-mlx-4bit",
+        "mlx_fast_model": "models/phi-3.5-mini-mlx-4bit",
         "mlx_default_role": "primary",
         "n_ctx": 4096,
         "n_threads": 4,
@@ -544,17 +554,26 @@
         "simulation_mode": "hybrid"
     },
     "cloud": {
-        "enabled": false,
+        "enabled": true,
         "provider": "gemini",
         "use_secure_credentials": true,
         "buddy_model": "gemini-2.0-flash",
         "reasoning_model": "gemini-2.5-flash",
+        "deep_model": "gemini-2.5-pro",
         "timeout_seconds": 8,
         "timeout_reasoning_seconds": 30,
         "max_tokens": 1024,
         "max_tokens_reasoning": 8192,
         "temperature": 0.7,
-        "max_requests_per_minute": 15
+        "max_requests_per_minute": 15,
+        "daily_budget_calls": 200,
+        "smart_route_keywords": [
+            "latest", "news", "current", "today", "right now",
+            "who won", "explain properly", "deep analysis", "research",
+            "recent", "current events"
+        ],
+        "smart_route_min_query_words": 25,
+        "smart_route_local_confidence_floor": 0.5
     },
     "security_gateway": {
         "block_system_paths": true,

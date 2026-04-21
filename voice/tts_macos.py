@@ -38,6 +38,48 @@ if TYPE_CHECKING:
     from core.async_event_bus import AsyncEventBus
     from core.state_manager import StateManager
 
+
+# v3 prompt-text-leak fingerprint (mirror of
+# cursor_bridge.local_brain_controller._PROMPT_LEAK_FINGERPRINT_RE).
+#
+# This is the FINAL audio guard. The controller already drops these but
+# the network of code paths that reach TTS (cloud streaming, ack engine,
+# direct text_display fallback, recovery prompts) is wide enough that a
+# defensive check here is cheap insurance. If we ever speak our own
+# system-prompt rules out loud again, this is the last fence.
+_PROMPT_LEAK_FINGERPRINT_RE = re.compile(
+    r"""
+    ^\s*
+    (?:
+        the\s+final\s+answer\s+only\b |
+        reply\s+with\s+the\s+final\s+answer\b |
+        one\s+short\s+(?:jarvis-style\s+)?line\b |
+        plain\s+text\s+only\b |
+        if\s+the\s+question\s+is\s+a\s+simple,?\s+short,?\s+or\s+info\s+query\b |
+        give\s+one\s+short\s+sentence\s+when\s+possible\b |
+        two\s+short\s+sentences\s+max\b |
+        output\s+only\s+the\s+final\s+answer\b |
+        spoken\s*=\s*final\s+answer\b |
+        if\s+the\s+thought\s+feels\s+like\s+planning\b |
+        boss\s+only\s+hears\s+what'?s\s+spoken\b |
+        respond\s+in\s+plain\s+text\b |
+        no\s+markdown,?\s+no\s+bullets\b |
+        output\s+style\s*:\s+spoken\s+plain\s+text\b |
+        brevity\s+required\.\s+aim\s+for\s+~?\s*15\s+words\b
+    )
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
+
+
+def _is_prompt_leak(text: str) -> bool:
+    if not text:
+        return False
+    head = text.strip()
+    if not head:
+        return False
+    return bool(_PROMPT_LEAK_FINGERPRINT_RE.match(head))
+
 # ── Try to import pyobjc for native synthesis ─────────────────────────
 _HAS_NATIVE = False
 _AppKit: Any = None
@@ -894,6 +936,14 @@ class MacOSTTSAsync:
         """Apply word-cap + duplicate filtering, then speak one slice."""
         speak_text, overflow_text = self._split_stream_chunk(raw_segment)
         if speak_text and not self._cancel_requested:
+            if _is_prompt_leak(speak_text):
+                logger.warning(
+                    "TTS stream slice suppressed (prompt-leak guard): '%s'",
+                    speak_text[:100],
+                )
+                if overflow_text:
+                    self._screen_buffer.append(overflow_text)
+                return
             if self._is_duplicate_chunk(speak_text):
                 logger.info("TTS stream duplicate chunk skipped: '%s'", speak_text[:100])
                 if overflow_text:
@@ -1059,12 +1109,25 @@ class MacOSTTSAsync:
 
     async def speak(self, text: str, emotion: str | None = None) -> None:
         """Speak text. Emits tts_complete when done."""
+        if _is_prompt_leak(text):
+            logger.warning(
+                "TTS suppressed prompt-leak text (final guard): '%s'",
+                (text or "")[:80],
+            )
+            self._bus.emit("tts_complete")
+            return
         await self._speak_internal(text, emotion)
         self._bus.emit("tts_complete")
 
     async def speak_ack(self, phrase: str) -> None:
         """Speak a short acknowledgement phrase."""
         if not phrase or not self._available:
+            return
+        if _is_prompt_leak(phrase):
+            logger.warning(
+                "TTS suppressed prompt-leak ack (final guard): '%s'",
+                phrase[:80],
+            )
             return
         logger.info("TTS ack [%s]: '%s'", self._backend, phrase)
         async with self._speak_lock:

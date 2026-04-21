@@ -63,6 +63,51 @@ _TERMINAL_EXPLICIT = re.compile(
     re.I,
 )
 
+# ── System Control v1: storage, network discovery, atom optimization ─
+
+_OPEN_PORTS = re.compile(
+    r"\b(?:(?:show|list|scan|get|check)\s+(?:me\s+)?(?:the\s+)?(?:open|listening|active)\s+ports?|"
+    r"what\s+ports\s+(?:are\s+)?(?:open|listening|in\s+use)|"
+    r"port\s+scan|network\s+connections|listening\s+sockets|"
+    r"who(?:'s|\s+is)\s+listening\s+on\s+(?:a\s+)?port)\b",
+    re.I,
+)
+
+_WIFI_SCAN = re.compile(
+    r"\b(?:(?:scan|show|list|get)\s+(?:me\s+)?(?:the\s+|nearby\s+|available\s+)?"
+    r"(?:wifi|wi[-\s]?fi|wireless)\s+(?:networks?|ssids?|signals?)|"
+    r"(?:wifi|wi[-\s]?fi)\s+scan|"
+    r"(?:nearby|available|around\s+me)\s+wifi|"
+    r"networks?\s+around\s+me)\b",
+    re.I,
+)
+
+_FIND_LARGE_FILES = re.compile(
+    r"\b(?:find\s+(?:me\s+)?(?:the\s+)?(?:biggest|largest|huge|large|big)\s+files?|"
+    r"(?:what|which)\s+files?\s+(?:are\s+)?(?:taking|using|eating|hogging)\s+"
+    r"(?:up\s+)?(?:my\s+|the\s+)?(?:space|storage|disk)|"
+    r"(?:show|list)\s+(?:me\s+)?(?:the\s+)?(?:biggest|largest|large|huge|big)\s+files?|"
+    r"what(?:'s|\s+is)\s+taking\s+up\s+(?:my\s+)?(?:space|storage|disk))\b",
+    re.I,
+)
+
+_ANALYZE_TEMP = re.compile(
+    r"\b(?:(?:analyze|scan|check)\s+(?:my\s+|the\s+)?(?:temp|temporary|junk|cache)\s+files?|"
+    r"how\s+much\s+(?:temp|junk|cache)\s+(?:do\s+(?:i|we)\s+have|is\s+there)|"
+    r"temp\s+files?\s+(?:report|analysis|scan|summary)|"
+    r"junk\s+(?:scan|report)|"
+    r"(?:can\s+i\s+|should\s+i\s+)?(?:clean|clear|free)\s+(?:up\s+)?(?:temp|junk|cache))\b",
+    re.I,
+)
+
+_OPTIMIZE_FOR_ATOM = re.compile(
+    r"\b(?:optimize\s+(?:for\s+)?(?:atom|yourself)|"
+    r"free\s+(?:up\s+)?(?:some\s+)?(?:ram|memory|resources?)\s+for\s+(?:atom|yourself)|"
+    r"(?:boost|tune|tune\s+up)\s+(?:atom|yourself)|"
+    r"give\s+(?:atom|yourself)\s+(?:more|all)\s+(?:the\s+)?(?:ram|memory|power|resources?))\b",
+    re.I,
+)
+
 
 def check(text: str) -> IntentResult | None:
     if _LOCK_SCREEN.search(text):
@@ -94,6 +139,33 @@ def check(text: str) -> IntentResult | None:
         return IntentResult("empty_recycle_bin", action="empty_recycle_bin", action_args={})
     if _FLUSH_DNS.search(text):
         return IntentResult("flush_dns", action="flush_dns", action_args={})
+
+    if _OPEN_PORTS.search(text):
+        return IntentResult("get_open_ports", action="get_open_ports",
+                            action_args={})
+    if _WIFI_SCAN.search(text):
+        return IntentResult("get_wifi_networks", action="get_wifi_networks",
+                            action_args={})
+    if _ANALYZE_TEMP.search(text):
+        return IntentResult("analyze_temp_files", action="analyze_temp_files",
+                            action_args={})
+    if _OPTIMIZE_FOR_ATOM.search(text):
+        return IntentResult("optimize_for_atom", action="optimize_for_atom",
+                            action_args={})
+    if _FIND_LARGE_FILES.search(text):
+        args: dict = {}
+        mnums = re.search(r"over\s+(\d+)\s*(gb|mb)?|bigger\s+than\s+(\d+)\s*(gb|mb)?",
+                          text, re.I)
+        if mnums:
+            val = mnums.group(1) or mnums.group(3)
+            unit = (mnums.group(2) or mnums.group(4) or "mb").lower()
+            try:
+                mb = int(val) * (1024 if unit == "gb" else 1)
+                args["min_size_mb"] = mb
+            except ValueError:
+                pass
+        return IntentResult("find_large_files", action="find_large_files",
+                            action_args=args)
 
     m = _TERMINAL_CMD.search(text)
     if m:

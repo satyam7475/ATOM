@@ -470,6 +470,67 @@ def _looks_like_reasoning_leak(text: str) -> bool:
     return False
 
 
+# v3 prompt-text-leak fingerprint detector.
+#
+# The Qwen3-8B model (and any small instruction-tuned model under tight
+# max_tokens) sometimes regurgitates literal lines from its own system
+# prompt as the answer. The atomlogs.txt session showed it speaking
+# verbatim: "the final answer only.", "One short line.",
+# "if the question is a simple, short, or info query, give one short
+#  sentence when possible, two short sentences max."
+#
+# Phase 1 of the v3 plan slimmed the prompt so those phrases no longer
+# exist in the prompt -- but we keep this detector as defence-in-depth
+# in case (a) a stale prompt is in flight, (b) the model hallucinates a
+# similar structural template, or (c) any future cloud fallback emits
+# the same shape.
+_PROMPT_LEAK_FINGERPRINT_RE = re.compile(
+    r"""
+    ^\s*
+    (?:
+        # v3-removed FINAL-ANSWER RULES block
+        the\s+final\s+answer\s+only\b |
+        reply\s+with\s+the\s+final\s+answer\b |
+        one\s+short\s+(?:jarvis-style\s+)?line\b |
+        plain\s+text\s+only\b |
+        # v3-removed RESPONSE RULES block
+        if\s+the\s+question\s+is\s+a\s+simple,?\s+short,?\s+or\s+info\s+query\b |
+        give\s+one\s+short\s+sentence\s+when\s+possible\b |
+        two\s+short\s+sentences\s+max\b |
+        # v3-removed VOICE OUTPUT RULES (V1-V9) verbatim leaks
+        output\s+only\s+the\s+final\s+answer\b |
+        spoken\s*=\s*final\s+answer\b |
+        if\s+the\s+thought\s+feels\s+like\s+planning\b |
+        boss\s+only\s+hears\s+what'?s\s+spoken\b |
+        # Any reply that opens with "respond in plain text" or
+        # "no markdown, no bullets" is the model echoing OUTPUT STYLE.
+        respond\s+in\s+plain\s+text\b |
+        no\s+markdown,?\s+no\s+bullets\b |
+        # Catches the v3 STYLE FINGERPRINT being parroted (would be a
+        # regression but cheap to guard against).
+        output\s+style\s*:\s+spoken\s+plain\s+text\b |
+        brevity\s+required\.\s+aim\s+for\s+~?\s*15\s+words\b
+    )
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
+
+
+def _looks_like_prompt_leak(text: str) -> bool:
+    """Return True when a fragment matches a known prompt-text fingerprint.
+
+    These are imperative phrases that should only ever appear inside the
+    system prompt -- never in a spoken reply. If we see them in the LLM
+    output, the model has confused the rules for the answer.
+    """
+    if not text:
+        return False
+    head = text.strip()
+    if not head:
+        return False
+    return bool(_PROMPT_LEAK_FINGERPRINT_RE.match(head))
+
+
 MAX_REACT_STEPS = 3
 
 
@@ -716,6 +777,16 @@ class LocalBrainController:
             )
             return ""
 
+        # v3 prompt-text-leak fingerprint check. Catches the case where the
+        # LLM regurgitated a literal line from its own system prompt as the
+        # spoken answer (see _looks_like_prompt_leak docstring for context).
+        if _looks_like_prompt_leak(cleaned):
+            logger.warning(
+                "Suppressing prompt-leak fragment before TTS: '%s'",
+                cleaned[:120],
+            )
+            return ""
+
         label_hits = len(_TRANSCRIPT_LABEL_RE.findall(cleaned))
         if label_hits >= 2:
             assistant_segments = [
@@ -789,18 +860,21 @@ class LocalBrainController:
     ) -> int | None:
         budget = str(budget_tier or "").strip().lower()
         requested = str(requested_tier or "").strip().lower()
-        # Short voice-turn path: a JARVIS-style one-liner fits in ~60 tokens
-        # (15-20 words). Anything over 80 is the model starting to narrate.
-        # Cap hard so the stream ends before CoT leaks.
+        # v3 brain: Phi-3.5-mini-instruct generates ~30% fewer wasted
+        # tokens per answer than Qwen3-8B (less CoT preamble, less role
+        # narration). The previous Qwen-tuned 72/96/128 caps cut Phi off
+        # mid-sentence on legitimately short answers, so we lift them
+        # ~30% to match. Anything over ~110 SHORT tokens is still the
+        # model starting to narrate -- cap remains tight.
         if response_mode is ResponseMode.SHORT or budget in {"command", "info"}:
-            return 72
-        if budget == "simple":
             return 96
+        if budget == "simple":
+            return 128
         if response_mode is ResponseMode.DETAIL or budget == "complex" or requested == "complex":
-            return 192
+            return 256
         if response_mode is ResponseMode.REPORT or budget == "creative" or requested == "creative":
             return None
-        return 128
+        return 160
 
     @staticmethod
     def _repair_max_tokens_override(max_tokens_override: int | None) -> int:

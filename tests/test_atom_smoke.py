@@ -20,7 +20,7 @@ def test_settings_json_validates() -> None:
 
 
 def test_mlx_model_directories_exist() -> None:
-    """Single-model MLX profile uses qwen3-8b-mlx-4bit for both roles."""
+    """Single-model MLX profile uses phi-3.5-mini-mlx-4bit for both roles."""
     raw = (_ATOM_ROOT / "config" / "settings.json").read_text(encoding="utf-8")
     cfg = json.loads(raw)
     brain = cfg.get("brain", {})
@@ -32,11 +32,13 @@ def test_mlx_model_directories_exist() -> None:
 
 
 def test_mlx_brain_shares_single_model_path() -> None:
-    """Fast and primary roles should reuse the same Qwen3 8B directory.
+    """Fast and primary roles reuse the same Phi-3.5-mini directory.
 
-    ATOM now runs one stronger local model for both latency tiers. MLXBrain
-    still exposes ``fast`` and ``primary`` roles for routing, but both resolve
-    to the same on-disk model path and can share one in-memory load.
+    ATOM v3 runs ONE local model (Phi-3.5-mini-MLX-4bit) for both
+    latency tiers. MLXBrain still exposes ``fast`` and ``primary``
+    roles for routing, but both resolve to the same on-disk model path
+    and share one in-memory load. Heavy reasoning is delegated to
+    Gemini cloud via cognitive_kernel Path 2.65.
     """
     from brain.mlx_llm import MLXBrain
 

@@ -50,6 +50,7 @@ class RuntimeWatchdog:
         "_tts_started_at", "_local_brain", "_tts",
         "_consecutive_llm_timeouts", "_consecutive_tts_timeouts",
         "_timeout_demote_threshold", "_profile_demoted",
+        "_boot_time_s", "_intent_boot_grace_s",
     )
 
     def __init__(
@@ -89,6 +90,18 @@ class RuntimeWatchdog:
         )
         self._profile_demoted = False
 
+        # Phase 1.4: boot grace for the intent_engine budget. The very first
+        # turn after a cold boot has to JIT-compile every regex group AND
+        # warm a cold cache; the configured 50 ms budget is too tight and
+        # specialised intents (time, date, battery, cpu, ram) get killed
+        # before they fire, falling back to the LLM. We disable the
+        # intent_engine budget for the first N seconds after construction,
+        # then revert to the configured value.
+        self._boot_time_s = time.monotonic()
+        self._intent_boot_grace_s = float(
+            perf.get("watchdog_intent_boot_grace_s", 8.0),
+        )
+
         self._bus.on("response_ready", self._on_tts_started)
         self._bus.on("partial_response", self._on_tts_started)
         self._bus.on("tts_complete", self._on_tts_complete)
@@ -104,6 +117,15 @@ class RuntimeWatchdog:
         self._tts = tts
 
     def timeout_s(self, stage: str) -> float:
+        # Phase 1.4: intent_engine boot grace -- return 0.0 (= no budget,
+        # run synchronously to completion) for the first
+        # _intent_boot_grace_s seconds after construction. After that the
+        # configured budget kicks in. This avoids killing the very first
+        # specialised-intent classification on a cold boot.
+        if stage == "intent_engine" and self._intent_boot_grace_s > 0:
+            elapsed = time.monotonic() - self._boot_time_s
+            if elapsed < self._intent_boot_grace_s:
+                return 0.0
         mapping = {
             "intent_engine": self._intent_s,
             "cache_lookup": self._cache_s,

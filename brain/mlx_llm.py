@@ -279,18 +279,29 @@ def _looks_like_wrapper_preface(text: str) -> bool:
 class MLXBrain:
     """Lazy-loading MLX wrapper with MiniLLM-compatible behavior."""
 
-    _VALID_ROLES = frozenset({"primary", "fast"})
+    # v3 brain: "primary" + "fast" are the hot, always-warm light-weight
+    # local models (Phi-3.5-mini); "deep" is the heavyweight on-device
+    # fallback for offline deep-reasoning when cloud is down. Loaded
+    # lazily on first use, unloaded after _DEEP_IDLE_UNLOAD_S idle.
+    _VALID_ROLES = frozenset({"primary", "fast", "deep"})
+    _DEEP_IDLE_UNLOAD_S = 300.0  # 5 min
 
     def __init__(self, config: dict) -> None:
         self._config = config
         brain_cfg = config.get("brain", {})
 
         self._primary_path = str(
-            Path(brain_cfg.get("mlx_primary_model", "models/qwen3-8b-mlx-4bit")).expanduser(),
+            Path(brain_cfg.get("mlx_primary_model", "models/phi-3.5-mini-mlx-4bit")).expanduser(),
         )
         self._fast_path = str(
-            Path(brain_cfg.get("mlx_fast_model", "models/qwen3-8b-mlx-4bit")).expanduser(),
+            Path(brain_cfg.get("mlx_fast_model", "models/phi-3.5-mini-mlx-4bit")).expanduser(),
         )
+        # Heavy on-device deep-reasoning fallback (used when cloud is
+        # unreachable and the user explicitly asked for analysis). May
+        # be empty -- if so, "deep" requests fall back to "primary".
+        self._deep_path = str(
+            Path(brain_cfg.get("mlx_deep_model", "")).expanduser(),
+        ) if brain_cfg.get("mlx_deep_model") else ""
         default_role = str(brain_cfg.get("mlx_default_role", "primary")).strip().lower()
         self._active_role = default_role if default_role in self._VALID_ROLES else "primary"
 
@@ -299,11 +310,15 @@ class MLXBrain:
         self._top_p = float(brain_cfg.get("top_p", 0.9))
         self._timeout = float(brain_cfg.get("timeout_seconds", 30))
 
-        self._models: dict[str, Any | None] = {"primary": None, "fast": None}
-        self._tokenizers: dict[str, Any | None] = {"primary": None, "fast": None}
-        self._fingerprints: dict[str, str | None] = {"primary": None, "fast": None}
-        self._loaded_roles: dict[str, bool] = {"primary": False, "fast": False}
-        self._load_failed: dict[str, bool] = {"primary": False, "fast": False}
+        self._models: dict[str, Any | None] = {"primary": None, "fast": None, "deep": None}
+        self._tokenizers: dict[str, Any | None] = {"primary": None, "fast": None, "deep": None}
+        self._fingerprints: dict[str, str | None] = {"primary": None, "fast": None, "deep": None}
+        self._loaded_roles: dict[str, bool] = {"primary": False, "fast": False, "deep": False}
+        self._load_failed: dict[str, bool] = {"primary": False, "fast": False, "deep": False}
+        # Track last-used timestamp so deep model can be unloaded when idle.
+        self._role_last_used: dict[str, float] = {
+            "primary": 0.0, "fast": 0.0, "deep": 0.0,
+        }
 
         self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="mlx")
         self._load_lock = threading.RLock()
@@ -355,7 +370,11 @@ class MLXBrain:
     def is_available(self) -> bool:
         if not _HAS_MLX:
             return False
-        return Path(self._primary_path).is_dir() or Path(self._fast_path).is_dir()
+        return (
+            Path(self._primary_path).is_dir()
+            or Path(self._fast_path).is_dir()
+            or (bool(self._deep_path) and Path(self._deep_path).is_dir())
+        )
 
     def _normalize_role(self, role: str | None) -> str:
         key = (role or self._active_role or "primary").strip().lower()
@@ -367,7 +386,35 @@ class MLXBrain:
         key = self._normalize_role(role)
         if key == "fast":
             return self._fast_path
+        if key == "deep":
+            # Deep falls back to primary when no dedicated heavy model
+            # is configured -- caller still gets a sensible answer.
+            return self._deep_path or self._primary_path
         return self._primary_path
+
+    def _maybe_unload_idle_deep(self) -> None:
+        """Unload the heavy deep model after _DEEP_IDLE_UNLOAD_S of inactivity.
+
+        Called opportunistically from _ensure_loaded; cheap (just a clock
+        check) and avoids a second timer thread.
+        """
+        if not self._loaded_roles.get("deep"):
+            return
+        last = self._role_last_used.get("deep", 0.0)
+        if last <= 0:
+            return
+        idle = time.monotonic() - last
+        if idle < self._DEEP_IDLE_UNLOAD_S:
+            return
+        with self._load_lock:
+            if not self._loaded_roles.get("deep"):
+                return
+            logger.info(
+                "MLX: unloading deep model after %.0fs idle (frees ~5GB)",
+                idle,
+            )
+            self._unload_role_unlocked("deep")
+            self._clear_mlx_cache()
 
     def _effective_inference(self, model_role: str | None = None) -> dict[str, Any]:
         role = self._normalize_role(model_role)
@@ -443,6 +490,11 @@ class MLXBrain:
         if not _HAS_MLX or load is None:
             return False
 
+        # Cheap opportunistic GC: if the heavyweight deep model has been
+        # idle for a while, drop it before doing anything else so we
+        # don't hold ~5GB resident for a query that doesn't need it.
+        self._maybe_unload_idle_deep()
+
         eff = self._effective_inference(model_role)
         role = eff["model_role"]
         model_path = Path(eff["model_path"])
@@ -453,26 +505,36 @@ class MLXBrain:
 
         with self._load_lock:
             if self._loaded_roles[role] and self._fingerprints[role] == str(model_path):
+                self._role_last_used[role] = time.monotonic()
                 return True
 
-            # When primary and fast point to the same directory, reuse one load (RAM + stability).
-            other = "fast" if role == "primary" else "primary"
-            other_path = Path(self._path_for_role(other))
-            if (
-                other_path.resolve() == model_path.resolve()
-                and self._loaded_roles[other]
-                and self._fingerprints[other] == str(model_path)
-                and self._models[other] is not None
-            ):
-                self._models[role] = self._models[other]
-                self._tokenizers[role] = self._tokenizers[other]
-                self._fingerprints[role] = str(model_path)
-                self._loaded_roles[role] = True
-                self._load_failed[role] = False
-                logger.info(
-                    "MLX: sharing loaded weights for role=%s with %s (%s)",
-                    role, other, model_path.name,
-                )
+            # When two roles point to the same directory, reuse one load
+            # (RAM + stability). For primary/fast this is the common case
+            # (both -> Phi). For deep this almost never matches because
+            # it points at qwen3-8b, but we still check.
+            other_candidates = [r for r in self._VALID_ROLES if r != role]
+            shared = False
+            for other in other_candidates:
+                other_path = Path(self._path_for_role(other))
+                if (
+                    other_path.resolve() == model_path.resolve()
+                    and self._loaded_roles[other]
+                    and self._fingerprints[other] == str(model_path)
+                    and self._models[other] is not None
+                ):
+                    self._models[role] = self._models[other]
+                    self._tokenizers[role] = self._tokenizers[other]
+                    self._fingerprints[role] = str(model_path)
+                    self._loaded_roles[role] = True
+                    self._load_failed[role] = False
+                    self._role_last_used[role] = time.monotonic()
+                    logger.info(
+                        "MLX: sharing loaded weights for role=%s with %s (%s)",
+                        role, other, model_path.name,
+                    )
+                    shared = True
+                    break
+            if shared:
                 return True
 
             self._load_failed[role] = False
@@ -490,6 +552,7 @@ class MLXBrain:
                 self._tokenizers[role] = tokenizer
                 self._fingerprints[role] = str(model_path)
                 self._loaded_roles[role] = True
+                self._role_last_used[role] = time.monotonic()
                 elapsed = (time.monotonic() - t0) * 1000
                 logger.info("MLX model role=%s loaded in %.0fms", role, elapsed)
                 return True
@@ -503,6 +566,9 @@ class MLXBrain:
     def preload(self, *, model_role: str | None = None, load_all: bool = False) -> bool:
         if load_all:
             ok = True
+            # Deep is intentionally NOT preloaded -- it's heavyweight and
+            # only needed for offline deep-reasoning. Lazy-loaded on
+            # first use, idle-unloaded after _DEEP_IDLE_UNLOAD_S.
             for role in ("primary", "fast"):
                 ok = self._ensure_loaded(role) and ok
             return ok
@@ -870,6 +936,10 @@ class MLXBrain:
         tokenizer = self._tokenizers[role]
         if model is None or tokenizer is None or stream_generate is None:
             return "", False
+
+        # Stamp last-used so the deep-model idle-unloader knows when this
+        # role was actually busy.
+        self._role_last_used[role] = time.monotonic()
 
         with self._gen_lock:
             self._streaming_depth += 1

@@ -271,6 +271,24 @@ CONFIG_SCHEMA: dict[str, Any] = {
                     "maximum": 120.0,
                     "description": "Seconds of silence after TTS completion before the dual-channel listening mode reverts to PASSIVE (wake-word gated). Reset on every TTS reply and user utterance.",
                 },
+                "whisper_confirm": {
+                    "type": "object",
+                    "description": "v3 Phase 4 second-pass STT. Re-decodes suspect streaming finals with faster-whisper for materially lower WER on short, low-confidence utterances.",
+                    "properties": {
+                        "enabled": {"type": "boolean"},
+                        "model_size": {
+                            "type": "string",
+                            "enum": ["tiny", "tiny.en", "base", "base.en", "small", "small.en"],
+                        },
+                        "ring_seconds": {"type": "number", "minimum": 1.0, "maximum": 15.0},
+                        "decode_seconds": {"type": "number", "minimum": 1.0, "maximum": 10.0},
+                        "min_confidence": {"type": "number", "minimum": 0.0, "maximum": 1.0},
+                        "max_confirm_ms": {"type": "number", "minimum": 50.0, "maximum": 2000.0},
+                        "language": {"type": ["string", "null"]},
+                        "min_text_chars": {"type": "integer", "minimum": 0, "maximum": 20},
+                    },
+                    "additionalProperties": False,
+                },
             },
             "additionalProperties": False,
         },
@@ -567,9 +585,17 @@ CONFIG_SCHEMA: dict[str, Any] = {
                     "type": "string",
                     "description": "Path to the fast MLX model directory.",
                 },
+                "mlx_deep_model": {
+                    "type": "string",
+                    "description": (
+                        "Path to the heavyweight on-device deep-reasoning "
+                        "MLX model directory (lazy-loaded fallback used when "
+                        "cloud is unreachable)."
+                    ),
+                },
                 "mlx_default_role": {
                     "type": "string",
-                    "enum": ["primary", "fast"],
+                    "enum": ["primary", "fast", "deep"],
                     "description": "Default MLX role to load first.",
                 },
                 "n_ctx": {

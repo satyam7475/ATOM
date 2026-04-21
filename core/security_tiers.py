@@ -18,6 +18,11 @@ _TIER_1: frozenset[str] = frozenset({
     "exit", "go_silent", "calculate", "list_apps",
     "set_volume", "mute", "unmute", "stop_music",
     "read_clipboard", "timer",
+    # System Control v1 — read-only inspection handlers
+    "find_process_by_name", "get_process_details",
+    "get_open_ports", "get_wifi_networks",
+    "find_large_files", "analyze_temp_files",
+    "describe_focused_element", "read_focused_text",
 })
 
 # Tier 2 — session / light UX (still low risk)
@@ -31,6 +36,9 @@ _TIER_4: frozenset[str] = frozenset({
     "shutdown_pc", "restart_pc", "logoff", "sleep_pc",
     "kill_process", "empty_recycle_bin",
     "flush_dns",
+    # System Control v1 — power operations that affect OS scheduling/security
+    "set_process_priority", "optimize_for_atom",
+    "security_lockdown",
 })
 
 # Everything else gated by allow_action (open_app, file ops, desktop, URLs, …) → tier 3
@@ -91,6 +99,9 @@ def escalation_prompt(action: str) -> str:
         "kill_process": "force-kill a process",
         "empty_recycle_bin": "empty the trash",
         "flush_dns": "flush the DNS cache",
+        "set_process_priority": "change a process's priority",
+        "optimize_for_atom": "reconfigure the OS for ATOM",
+        "security_lockdown": "enter security lockdown mode",
     }
     desc = labels.get(action, action.replace("_", " "))
     return f"That needs elevated permission to {desc}, Boss. Should I go ahead?"

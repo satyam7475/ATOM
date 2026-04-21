@@ -322,6 +322,10 @@ class NativeSTT:
         self._need_post_tts_cooldown: bool = False
         self._audio_prebuffer: collections.deque = collections.deque(maxlen=12)
 
+        # v3 Phase 4: optional WhisperConfirmer for second-pass STT on
+        # low-confidence / suspect finals. Wired via attach_whisper_confirmer.
+        self._whisper_confirmer: Any = None
+
         self._voice_debug: bool = bool(self._config.get("voice_debug", False))
         self._voice_debug_interval_s: float = max(
             8.0, float(self._config.get("voice_debug_interval_s", 25) or 25),
@@ -921,6 +925,17 @@ class NativeSTT:
         """
         self._echo_guard = guard
 
+    def attach_whisper_confirmer(self, confirmer: Any) -> None:
+        """Wire a v3 WhisperConfirmer for second-pass re-decode of
+        suspect finals (low confidence, blank, single-noise-token, etc).
+        Safe to call with ``None`` to detach.
+
+        When attached, the audio-tap callback also feeds the confirmer's
+        rolling ring buffer so a high-accuracy decode is always one
+        method call away.
+        """
+        self._whisper_confirmer = confirmer
+
     def _is_self_echo(self, text: str) -> bool:
         """Ask the injected guard whether this text is ATOM's own TTS."""
         guard = self._echo_guard
@@ -1090,10 +1105,39 @@ class NativeSTT:
         if not self._should_feed_recognizer():
             return
 
+        # v3 Phase 4: tee the same audio into the WhisperConfirmer ring
+        # buffer so a second-pass re-decode is one method call away.
+        # No-op when no confirmer is wired or it is disabled.
+        self._feed_whisper_confirmer_from_avbuffer(buffer)
+
         with self._recognition_lock:
             req = self._recognition_request
             if req is not None:
                 req.appendAudioPCMBuffer_(buffer)
+
+    def _feed_whisper_confirmer_from_avbuffer(self, buffer: Any) -> None:
+        """Copy the float32 channel-0 PCM out of an AVAudioPCMBuffer
+        and push it into the WhisperConfirmer ring buffer. No-op when
+        no confirmer is wired or it has been disabled."""
+        wc = self._whisper_confirmer
+        if wc is None or not getattr(wc, "is_enabled", lambda: False)():
+            return
+        try:
+            data = buffer.floatChannelData()
+            if data is None:
+                return
+            count = int(buffer.frameLength())
+            if count <= 0:
+                return
+            raw = data[0].as_buffer(count * 4)
+            wc.feed_audio(bytes(raw))
+        except Exception:
+            # Audio-tap failures must NEVER take down recognition.
+            if not getattr(self, "_logged_wc_feed_fail", False):
+                self._logged_wc_feed_fail = True
+                logger.debug(
+                    "WhisperConfirmer feed (AV path) failed", exc_info=True,
+                )
 
     # ── sounddevice capture (bypasses AVAudioEngine input tap) ──
 
@@ -1133,6 +1177,12 @@ class NativeSTT:
             )
             self._sd_stream.start()
             self._sd_sample_rate = sr
+            wc = self._whisper_confirmer
+            if wc is not None and hasattr(wc, "set_sample_rate"):
+                try:
+                    wc.set_sample_rate(int(sr))
+                except Exception:
+                    logger.debug("WhisperConfirmer set_sample_rate failed", exc_info=True)
             logger.info(
                 "Native STT: using sounddevice capture (PortAudio/CoreAudio) — "
                 "%d Hz (native), 1 ch, blocksize=%d — bypassing AVAudioEngine input tap",
@@ -1194,6 +1244,19 @@ class NativeSTT:
 
         import numpy as np
         self._audio_prebuffer.append(np.array(indata, copy=True))
+
+        # v3 Phase 4: tee into the WhisperConfirmer ring buffer.
+        wc = self._whisper_confirmer
+        if wc is not None and getattr(wc, "is_enabled", lambda: False)():
+            try:
+                arr = np.ascontiguousarray(indata[:, 0] if indata.ndim > 1 else indata, dtype=np.float32)
+                wc.feed_audio(arr.tobytes())
+            except Exception:
+                if not getattr(self, "_logged_wc_feed_fail_sd", False):
+                    self._logged_wc_feed_fail_sd = True
+                    logger.debug(
+                        "WhisperConfirmer feed (sd path) failed", exc_info=True,
+                    )
 
         with self._recognition_lock:
             req = self._recognition_request
@@ -2149,6 +2212,35 @@ class NativeSTT:
         self._ensure_speech_runloop_pump()
 
         def _on_final(text: str) -> None:
+            # v3 Phase 4: ask the WhisperConfirmer (if wired) to inspect
+            # this final. Suspect cases (low confidence, blank, single
+            # noise token) are re-decoded from the rolling audio buffer.
+            # Runs synchronously here -- we are off the audio thread --
+            # and is bounded by max_confirm_ms.
+            wc = self._whisper_confirmer
+            if wc is not None and getattr(wc, "is_enabled", lambda: False)():
+                try:
+                    result = wc.confirm(
+                        text or "", float(self._last_confidence),
+                    )
+                    new_text = result.text or ""
+                    if result.used_whisper:
+                        # The confirmer may legitimately collapse a
+                        # noise final to "" -- honour that by exiting
+                        # before the streaming text reaches the bus.
+                        if not new_text.strip():
+                            logger.debug(
+                                "WhisperConfirmer collapsed noise final '%s' to empty",
+                                (text or "")[:60],
+                            )
+                            return
+                        text = new_text
+                except Exception:
+                    logger.debug(
+                        "WhisperConfirmer.confirm raised; using streaming text",
+                        exc_info=True,
+                    )
+
             if text and text.strip():
                 self._last_error = None
                 # PASSIVE-mode gate: if the ListeningModeController is in

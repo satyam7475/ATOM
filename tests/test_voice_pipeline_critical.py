@@ -1016,7 +1016,18 @@ def test_repeat_hint_lives_in_system_layer_only():
     # The user query layer must not contain the steer or any "[SYSTEM NOTE"
     # marker -- if it did, small models could echo it during TTS.
     assert "[SYSTEM NOTE" not in hinted
-    assert "TURN STEER" not in hinted.split("CURRENT USER REQUEST:")[1]
+    # The v3 query layer is "BOSS:\n{query}\n\nJARVIS:" (the old
+    # "CURRENT USER REQUEST:" header was removed because Qwen3-8B was
+    # mirroring the per-turn rule block back at TTS). The TURN STEER
+    # block must still appear before the BOSS: marker so the model
+    # cannot quote it as part of a reply.
+    assert "BOSS:" in hinted
+    boss_pos = hinted.rindex("BOSS:")
+    steer_pos = hinted.index("TURN STEER")
+    assert steer_pos < boss_pos, (
+        "TURN STEER must live BEFORE the BOSS:/JARVIS: query layer, "
+        "not inside it -- otherwise the model echoes it out loud."
+    )
 
 
 # ── Test 19: Wake-word/direct-address mishearing routing ──

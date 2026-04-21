@@ -151,7 +151,12 @@ def test_system_prompt_does_not_contain_response_contract_header() -> None:
     )
 
 
-def test_system_prompt_forbids_narration_phrases() -> None:
+def test_system_prompt_v3_uses_opaque_style_fingerprint() -> None:
+    """v3 prompt slim: the long quoted-example RESPONSE/VOICE OUTPUT RULES
+    block was the source of the verbatim parroting in production logs.
+    The new prompt uses opaque, non-quotable phrasing -- assert the new
+    STYLE FINGERPRINT block is present and the old quotable headers are
+    gone."""
     from cursor_bridge.structured_prompt_builder import StructuredPromptBuilder
 
     b = StructuredPromptBuilder.__new__(StructuredPromptBuilder)
@@ -163,21 +168,37 @@ def test_system_prompt_forbids_narration_phrases() -> None:
     b._system_prompt_hash = 0
     b._logged_system_prompt = True
     prompt = b._build_system_layer()
-    # The prompt must EXPLICITLY tell the model not to narrate itself.
-    assert "Based on the response contract" in prompt
-    assert "Looking at the conversation history" in prompt
-    assert "I need to help the user" in prompt
-    assert 'they\'re asking' in prompt or "they're asking" in prompt
+    # New v3 STYLE FINGERPRINT block must be present.
+    assert "OUTPUT STYLE" in prompt
+    assert "LENGTH" in prompt
+    assert "GROUNDING" in prompt
+    # Old quotable rule headers must be GONE -- they were the source of
+    # the verbatim parroting in production.
+    assert "RESPONSE RULES:" not in prompt
+    assert "VOICE OUTPUT RULES" not in prompt
+    assert "RESPONSE CONTRACT" not in prompt
+    # The parroted phrases from atomlogs.txt must not appear verbatim.
+    assert "the final answer only" not in prompt.lower()
+    assert "one short jarvis-style line" not in prompt.lower()
+    assert "two short sentences max" not in prompt.lower()
 
 
-def test_query_layer_header_renamed() -> None:
+def test_query_layer_v3_is_minimal() -> None:
+    """v3 query layer: the per-turn FINAL-ANSWER RULES block was being
+    mirrored. The new layer is just BOSS:/JARVIS: with no rule text."""
     from cursor_bridge.structured_prompt_builder import StructuredPromptBuilder
 
     b = StructuredPromptBuilder.__new__(StructuredPromptBuilder)
     b._owner_name = "Satyam"
     out = b._build_query_layer("are you active properly atom")
-    assert "FINAL-ANSWER RULES" in out
+    assert "BOSS:" in out
+    assert "JARVIS:" in out
+    assert "are you active properly atom" in out
+    # All previously-parroted scaffolding gone.
+    assert "FINAL-ANSWER RULES" not in out
     assert "RESPONSE CONTRACT" not in out
+    assert "the final answer only" not in out.lower()
+    assert "one short" not in out.lower()
 
 
 # ── TTS echo guard: confirmation-reply exception ────────────────────

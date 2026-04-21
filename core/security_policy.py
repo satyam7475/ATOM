@@ -158,6 +158,11 @@ _SAFE_ALWAYS_INTENTS: frozenset[str] = frozenset({
     "exit", "go_silent", "calculate", "list_apps",
     "set_volume", "mute", "unmute", "stop_music",
     "read_clipboard", "timer",
+    # System Control v1 — read-only system inspection (no side-effects)
+    "find_process_by_name", "get_process_details",
+    "get_open_ports", "get_wifi_networks",
+    "find_large_files", "analyze_temp_files",
+    "describe_focused_element", "read_focused_text",
 })
 
 _DANGEROUS_INPUT_RE = re.compile(

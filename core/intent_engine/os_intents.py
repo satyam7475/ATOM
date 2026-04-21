@@ -45,6 +45,33 @@ _KILL_PROCESS = re.compile(
     r"\b(?:kill\s+(?:the\s+)?process|force\s+(?:close|quit|stop)|"
     r"end\s+task|terminate)\s+(?P<name>.+?)[\s.!]*$", re.I)
 
+# ── Process introspection (find / details / priority) ────────────────
+# Distinct from _KILL_PROCESS: these inspect/adjust rather than terminate.
+
+_FIND_PROCESS = re.compile(
+    r"\b(?:is\s+(?P<n1>[\w\s.-]+?)\s+running|"
+    r"find\s+(?:the\s+)?process\s+(?:called\s+|named\s+)?(?P<n2>[\w\s.-]+?)|"
+    r"locate\s+(?:the\s+)?process\s+(?P<n3>[\w\s.-]+?)|"
+    r"which\s+process(?:es)?\s+(?:is\s+|are\s+)?(?P<n4>[\w\s.-]+?))"
+    r"[\s.!?]*$",
+    re.I,
+)
+
+_PROCESS_DETAILS = re.compile(
+    r"\b(?:(?:show|tell|give)\s+(?:me\s+)?(?:process|pid)\s+details?\s+(?:for\s+)?(?:pid\s+)?(?P<pid1>\d+)|"
+    r"details?\s+(?:for\s+|of\s+|on\s+)?pid\s+(?P<pid2>\d+)|"
+    r"info\s+(?:for\s+|on\s+|about\s+)?pid\s+(?P<pid3>\d+)|"
+    r"inspect\s+pid\s+(?P<pid4>\d+))\b",
+    re.I,
+)
+
+_SET_PROCESS_PRIORITY = re.compile(
+    r"\b(?:(?:make|set)\s+(?:process\s+)?(?:pid\s+)?(?P<pid_a>\d+)\s+(?P<pr_a>high|low|normal|realtime|above\s*normal|below\s*normal)\s*(?:priority)?|"
+    r"(?:slow\s+down|deprioritize|lower\s+priority\s+(?:of|for))\s+(?:pid\s+)?(?P<pid_b>\d+)|"
+    r"(?:boost|speed\s+up|prioritize)\s+(?:pid\s+)?(?P<pid_c>\d+))\b",
+    re.I,
+)
+
 _RESOURCE_REPORT = re.compile(
     r"\b(resource\s+(?:report|summary)|full\s+(?:system\s+)?report|"
     r"detailed\s+(?:system\s+)?status|system\s+resource|"
@@ -379,6 +406,46 @@ def check(text: str) -> IntentResult | None:
         if name:
             return IntentResult("kill_process", action="kill_process",
                                 action_args={"name": name})
+
+    m = _SET_PROCESS_PRIORITY.search(text)
+    if m:
+        pid_str = m.group("pid_a") or m.group("pid_b") or m.group("pid_c")
+        if pid_str:
+            if m.group("pid_a"):
+                raw_pr = (m.group("pr_a") or "normal").lower().replace(" ", "_")
+                priority = raw_pr
+            elif m.group("pid_b"):
+                priority = "low"
+            else:
+                priority = "high"
+            return IntentResult(
+                "set_process_priority", action="set_process_priority",
+                action_args={"pid": int(pid_str), "priority": priority},
+            )
+
+    m = _PROCESS_DETAILS.search(text)
+    if m:
+        pid_str = (
+            m.group("pid1") or m.group("pid2")
+            or m.group("pid3") or m.group("pid4")
+        )
+        if pid_str:
+            return IntentResult(
+                "get_process_details", action="get_process_details",
+                action_args={"pid": int(pid_str)},
+            )
+
+    m = _FIND_PROCESS.search(text)
+    if m:
+        name = (
+            m.group("n1") or m.group("n2")
+            or m.group("n3") or m.group("n4") or ""
+        ).strip().rstrip("?.!")
+        if name and name.lower() not in {"running", "active", "open"}:
+            return IntentResult(
+                "find_process_by_name", action="find_process_by_name",
+                action_args={"name": name},
+            )
 
     if _RESOURCE_REPORT.search(text):
         return IntentResult("resource_report", action="resource_report", action_args={})

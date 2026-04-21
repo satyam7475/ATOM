@@ -1,13 +1,21 @@
 """
 ATOM -- Tool Call Parser (LLM Response -> Action Execution).
 
-Parses LLM responses for tool call instructions in multiple formats:
-  1. ATOM native / Qwen3: <tool_call>{"name": "...", "arguments": {...}}</tool_call>
-  2. Legacy Qwen function calling: ✿FUNCTION✿ format
-  3. Simple inline: <tool>tool_name(arg1, arg2)</tool>
+v3 Phase 5 redesign
+-------------------
+The parser is now a thin recovery layer in front of the constrained
+decoding path in ``core.reasoning.tool_grammar``. We accept TWO
+formats only -- everything else was historical noise that produced
+more false-positives than wins:
 
-Handles multiple tool calls in a single response.
-Separates text response from tool invocations.
+  1. Canonical:  <tool_call>{"name": "...", "arguments": {...}}</tool_call>
+  2. Naked JSON: {"name": "...", "arguments": {...}}    (recovery path)
+
+The simple ``<tool>name(args)</tool>`` form is kept for tiny models
+that occasionally fall back to it. The dead ✿FUNCTION✿ Qwen-legacy
+matcher and the bare ``"name":...,"arguments":..."`` regex were both
+removed -- they never fired in production logs and routinely matched
+prose JSON that wasn't a tool call.
 
 Returns a ToolCallResult with:
   - tool_calls: list of parsed tool invocations
@@ -61,74 +69,43 @@ _SIMPLE_TOOL_PATTERN = re.compile(
     r'<tool>\s*(\w+)\s*\(([^)]*)\)\s*</tool>',
 )
 
-_QWEN_FUNCTION_PATTERN = re.compile(
-    r'✿FUNCTION✿\s*:\s*(\w+)\s*\n(.*?)(?=✿|$)',
+# v3: a tool-call-shaped naked JSON object: requires BOTH "name" and
+# "arguments" keys. The check is intentionally strict so prose JSON
+# (e.g. {"city": "Mumbai", "temp": 32}) does NOT get misclassified.
+_NAKED_JSON_HINT_RE = re.compile(
+    r'\{[^{}]*"name"\s*:\s*"\w+"[^{}]*"arguments"\s*:\s*\{',
     re.DOTALL,
-)
-
-_JSON_TOOL_CALL_PATTERN = re.compile(
-    r'\{"name"\s*:\s*"(\w+)"\s*,\s*"arguments"\s*:\s*(\{[^}]*\})\s*\}',
 )
 
 
 def parse_tool_calls(response: str) -> ToolCallResult:
     """Parse an LLM response for tool call instructions.
 
-    Tries multiple formats in order of specificity:
-    1. <tool_call>{JSON}</tool_call> (ATOM native / Qwen3)
-    2. ✿FUNCTION✿ (legacy Qwen format)
-    3. <tool>name(args)</tool> (simple format)
-    4. Bare JSON tool call patterns
+    Order:
+      1. ``<tool_call>{JSON}</tool_call>``       -- canonical
+      2. ``<tool>name(args)</tool>``             -- tiny-model fallback
+      3. Naked ``{"name": ..., "arguments": ...}`` -- recovery
     """
     result = ToolCallResult(raw_response=response)
     text_parts: list[str] = []
-    remaining = response
+    remaining = response or ""
 
-    tool_call_matches = list(_TOOL_CALL_PATTERN.finditer(remaining))
-    if tool_call_matches:
-        for match in tool_call_matches:
-            try:
-                data = json.loads(match.group(1))
-                name = data.get("name", "")
-                arguments = data.get("arguments", {})
-                if name:
-                    result.tool_calls.append(ToolCall(
-                        name=name,
-                        arguments=arguments if isinstance(arguments, dict) else {},
-                        raw=match.group(0),
-                    ))
-            except json.JSONDecodeError:
-                logger.debug("Failed to parse tool_call JSON: %s", match.group(1)[:100])
-
+    canonical_matches = list(_TOOL_CALL_PATTERN.finditer(remaining))
+    if canonical_matches:
+        for match in canonical_matches:
+            call = _parse_json_tool_blob(match.group(1), raw=match.group(0))
+            if call is not None:
+                result.tool_calls.append(call)
         remaining = _TOOL_CALL_PATTERN.sub("", remaining).strip()
         if remaining:
             text_parts.append(remaining)
-
-    if not result.tool_calls:
-        qwen_matches = list(_QWEN_FUNCTION_PATTERN.finditer(remaining))
-        if qwen_matches:
-            for match in qwen_matches:
-                name = match.group(1).strip()
-                args_str = match.group(2).strip()
-                try:
-                    arguments = json.loads(args_str) if args_str.startswith("{") else {}
-                except json.JSONDecodeError:
-                    arguments = {"raw": args_str}
-                if name:
-                    result.tool_calls.append(ToolCall(
-                        name=name, arguments=arguments, raw=match.group(0),
-                    ))
-            remaining = _QWEN_FUNCTION_PATTERN.sub("", remaining).strip()
-            if remaining:
-                text_parts.append(remaining)
 
     if not result.tool_calls:
         simple_matches = list(_SIMPLE_TOOL_PATTERN.finditer(remaining))
         if simple_matches:
             for match in simple_matches:
                 name = match.group(1)
-                args_str = match.group(2).strip()
-                arguments = _parse_simple_args(args_str)
+                arguments = _parse_simple_args(match.group(2).strip())
                 result.tool_calls.append(ToolCall(
                     name=name, arguments=arguments, raw=match.group(0),
                 ))
@@ -137,27 +114,17 @@ def parse_tool_calls(response: str) -> ToolCallResult:
                 text_parts.append(remaining)
 
     if not result.tool_calls:
-        json_matches = list(_JSON_TOOL_CALL_PATTERN.finditer(remaining))
-        if json_matches:
-            for match in json_matches:
-                name = match.group(1)
-                try:
-                    arguments = json.loads(match.group(2))
-                except json.JSONDecodeError:
-                    arguments = {}
-                result.tool_calls.append(ToolCall(
-                    name=name, arguments=arguments, raw=match.group(0),
-                ))
-            remaining = _JSON_TOOL_CALL_PATTERN.sub("", remaining).strip()
-            if remaining:
-                text_parts.append(remaining)
+        for blob, raw in _scan_naked_json_blobs(remaining):
+            call = _parse_json_tool_blob(blob, raw=raw)
+            if call is not None:
+                result.tool_calls.append(call)
+                remaining = remaining.replace(raw, "", 1).strip()
+        if not result.tool_calls:
+            text_parts = [response or ""]
+        elif remaining:
+            text_parts.append(remaining)
 
-    if not result.tool_calls:
-        text_parts = [response]
-
-    result.text_response = " ".join(text_parts).strip()
-
-    result.text_response = _clean_response_text(result.text_response)
+    result.text_response = _clean_response_text(" ".join(text_parts).strip())
 
     if result.tool_calls:
         logger.info(
@@ -167,6 +134,59 @@ def parse_tool_calls(response: str) -> ToolCallResult:
         )
 
     return result
+
+
+def _parse_json_tool_blob(blob: str, *, raw: str) -> ToolCall | None:
+    """Parse a JSON object that should look like {"name":..,"arguments":..}.
+
+    Returns ``None`` when the blob is invalid JSON or lacks a name; the
+    parser silently drops the candidate rather than raising. This keeps
+    a malformed candidate from corrupting the rest of the response text.
+    """
+    try:
+        data = json.loads(blob)
+    except json.JSONDecodeError:
+        logger.debug("Tool-call JSON decode failed: %s", blob[:120])
+        return None
+    if not isinstance(data, dict):
+        return None
+    name = data.get("name", "")
+    if not name or not isinstance(name, str):
+        return None
+    arguments = data.get("arguments", {})
+    if not isinstance(arguments, dict):
+        return None
+    return ToolCall(name=name, arguments=arguments, raw=raw)
+
+
+def _scan_naked_json_blobs(text: str) -> list[tuple[str, str]]:
+    """Locate top-level JSON objects that look like tool calls.
+
+    Walks the string with a brace-depth counter so nested objects in
+    ``arguments`` don't confuse us. Returns ``[(json_blob, raw_blob)]``;
+    raw_blob is identical to json_blob (kept for symmetry with the
+    matched-pattern path).
+    """
+    if not text or "{" not in text:
+        return []
+    if not _NAKED_JSON_HINT_RE.search(text):
+        return []
+    out: list[tuple[str, str]] = []
+    depth = 0
+    start = -1
+    for i, ch in enumerate(text):
+        if ch == "{":
+            if depth == 0:
+                start = i
+            depth += 1
+        elif ch == "}" and depth > 0:
+            depth -= 1
+            if depth == 0 and start >= 0:
+                blob = text[start: i + 1]
+                if '"name"' in blob and '"arguments"' in blob:
+                    out.append((blob, blob))
+                start = -1
+    return out
 
 
 def _parse_simple_args(args_str: str) -> dict:
