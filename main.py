@@ -2083,6 +2083,24 @@ async def main() -> None:
     suggestion_engine = SuggestionEngine()
     command_loop.attach_suggestion_engine(suggestion_engine)
 
+    # ── Proactive idle-gate: don't let "Boss, new file landed..."
+    #     interrupt mid-turn. Wire state + command_loop so insights
+    #     get buffered while ATOM is thinking/speaking, then drained
+    #     on the next listening transition. (atom_log.txt L308 fix.)
+    try:
+        proactive_intel.attach_idle_gate(state, command_loop)
+
+        async def _drain_proactive_on_listening(event_data: dict) -> None:
+            new_state = str(event_data.get("new", "") or "").lower()
+            if new_state in ("listening", "idle"):
+                drained = proactive_intel.drain_pending()
+                if drained:
+                    logger.debug("Proactive: drained %d deferred insights", drained)
+
+        bus.on("state_changed", _drain_proactive_on_listening)
+    except Exception as exc:
+        logger.warning("Proactive idle-gate wiring failed: %s", exc)
+
     # ── Task Manager: centralized background task tracking ─────────
     from core.task_manager import TaskManager
     task_manager = TaskManager()

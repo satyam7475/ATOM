@@ -224,6 +224,39 @@ _COT_PREFACE_RE = re.compile(
 )
 
 
+# Bare stage-direction parenthetical describing voice/tone/manner. Smaller
+# instruction-tuned models (Qwen3-4B in particular) parrot persona-adjective
+# phrases back as a stage direction. Length-capped + mood-keyword-anchored
+# so that legitimate parentheticals like "(see line 12)" survive.
+_STAGE_DIRECTION_LEAK_RE = re.compile(
+    r"""
+    ^\s*
+    \(\s*
+    [^()\n]{0,80}?
+    \b(?:tone|voice|manner|composed|composedly|calm(?:ly)?|softly|
+        warmly|gently|firmly|politely|brief(?:ly)?|professional(?:ly)?|
+        chief\s+of\s+staff|friday[-\s]?style|jarvis[-\s]?style)\b
+    [^()\n]{0,80}?
+    \)
+    \s*[\.,;:\-\u2013\u2014]?\s*
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
+
+
+def _strip_stage_direction_leak(text: str) -> str:
+    """Peel a leading bare parenthetical describing voice/tone/manner."""
+    if not text or "(" not in text[:120]:
+        return text
+    out = text
+    for _ in range(2):
+        new = _STAGE_DIRECTION_LEAK_RE.sub("", out, count=1).lstrip()
+        if new == out:
+            break
+        out = new
+    return out
+
+
 def _strip_cot_prefaces(text: str) -> str:
     """Remove chain-of-thought / stall preface sentences from the head of a
     reply. Idempotent and safe on empty strings — returns the trimmed tail
@@ -231,8 +264,8 @@ def _strip_cot_prefaces(text: str) -> str:
     """
     if not text:
         return text
+    out = _strip_stage_direction_leak(text)
     prev = None
-    out = text
     # Loop until fixed point (each run peels at most one preface sentence
     # thanks to the outer `+`, so two passes are usually enough).
     for _ in range(3):
@@ -240,6 +273,7 @@ def _strip_cot_prefaces(text: str) -> str:
             break
         prev = out
         out = _COT_PREFACE_RE.sub("", out, count=1).lstrip()
+        out = _strip_stage_direction_leak(out)
     return out
 
 

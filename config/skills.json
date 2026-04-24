@@ -52,7 +52,7 @@
         },
         {
             "id": "whats_up",
-            "triggers": ["whats up atom", "status report", "give me a summary"],
+            "triggers": ["whats up atom", "status report", "atom self check", "self check please"],
             "expand_to": "self check"
         }
     ]

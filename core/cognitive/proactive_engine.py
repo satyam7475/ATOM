@@ -89,6 +89,15 @@ class ProactiveIntelligenceEngine:
         # safe -- cost is just iterating internal data structures.
         "_snapshot_scan_interval",
         "_last_snapshot_scan",
+        # Idle-state gate: insights emitted while ATOM is mid-turn
+        # (state == thinking/speaking, or command_loop is busy) get
+        # buffered and re-emitted on the next listening transition.
+        # Without this, proactive notifications arrive AS the LLM
+        # answer and shatter the conversation (atom_log.txt L308).
+        "_state_provider",
+        "_busy_provider",
+        "_pending_insights",
+        "_max_pending",
     )
 
     def __init__(
@@ -129,6 +138,62 @@ class ProactiveIntelligenceEngine:
         self._last_scan: dict[str, Any] | None = None
         self._quota = proactive_quota
 
+        self._state_provider: Any = None
+        self._busy_provider: Any = None
+        self._pending_insights: list[dict[str, Any]] = []
+        self._max_pending: int = 3
+
+    def attach_idle_gate(
+        self,
+        state_provider: Any,
+        busy_provider: Any | None = None,
+    ) -> None:
+        """Wire a state-provider (StateManager-like, exposing ``current``)
+        and an optional busy-provider (CommandLoop-like, exposing
+        ``is_busy()``). When both report idle, buffered insights drain.
+        """
+        self._state_provider = state_provider
+        self._busy_provider = busy_provider
+
+    def _is_owner_idle(self) -> bool:
+        sp = self._state_provider
+        if sp is None:
+            return True
+        try:
+            current = getattr(sp, "current", None)
+            if callable(current):
+                current = current()
+            current_str = str(current or "").lower()
+        except Exception:
+            return True
+        if current_str and current_str not in ("idle", "listening"):
+            return False
+        bp = self._busy_provider
+        if bp is None:
+            return True
+        try:
+            is_busy = bp.is_busy() if callable(getattr(bp, "is_busy", None)) else False
+        except Exception:
+            is_busy = False
+        return not bool(is_busy)
+
+    def drain_pending(self) -> int:
+        """Re-emit buffered insights. Caller (state-transition wiring)
+        invokes this on every listening transition. Returns count drained.
+        """
+        if not self._pending_insights or not self._is_owner_idle():
+            return 0
+        drained = 0
+        pending = list(self._pending_insights)
+        self._pending_insights.clear()
+        for insight in pending:
+            try:
+                self._bus.emit_long("jarvis_insight", **insight)
+                drained += 1
+            except Exception:
+                logger.debug("drain_pending emit failed", exc_info=True)
+        return drained
+
     def _emit_insight(self, insight_data: dict[str, Any]) -> None:
         cat = str(insight_data.get("category", ""))
         src = str(insight_data.get("source", "proactive_intel"))
@@ -139,6 +204,20 @@ class ProactiveIntelligenceEngine:
             p = None
         q = self._quota
         if q is not None and not q.allow_emit(src, cat, p):
+            return
+        if not self._is_owner_idle():
+            # Buffer instead of speaking over the active turn.
+            if len(self._pending_insights) < self._max_pending:
+                self._pending_insights.append(insight_data)
+                logger.debug(
+                    "ProactiveEngine: deferred insight (cat=%s, pending=%d)",
+                    cat, len(self._pending_insights),
+                )
+            else:
+                logger.debug(
+                    "ProactiveEngine: dropped insight (buffer full, cat=%s)",
+                    cat,
+                )
             return
         self._bus.emit_long("jarvis_insight", **insight_data)
 

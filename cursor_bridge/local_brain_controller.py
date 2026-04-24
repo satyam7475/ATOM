@@ -267,6 +267,46 @@ _COT_PREFACE_STRIP_PARTIAL_RE = re.compile(
 )
 
 
+# Bare stage-direction parentheticals leaked by smaller instruction-tuned
+# models (Qwen3-4B in particular) when the system prompt mentions tone/
+# manner adjectives. Length-capped + mood-keyword-anchored so that
+# legitimate parentheticals like "(see line 12)" or "(2 of 3)" survive.
+_STAGE_DIRECTION_LEAK_RE = re.compile(
+    r"""
+    ^\s*
+    \(\s*
+    [^()\n]{0,80}?
+    \b(?:tone|voice|manner|composed|composedly|calm(?:ly)?|softly|
+        warmly|gently|firmly|politely|brief(?:ly)?|professional(?:ly)?|
+        chief\s+of\s+staff|friday[-\s]?style|jarvis[-\s]?style)\b
+    [^()\n]{0,80}?
+    \)
+    \s*[\.,;:\-\u2013\u2014]?\s*
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
+
+
+def _strip_stage_direction_leak(text: str) -> str:
+    """Peel a leading bare parenthetical describing voice/tone/manner.
+
+    Defense-in-depth against models that parrot persona-adjective phrases
+    back as a stage direction (e.g. "(in a calm, composed tone). Boss…").
+    Anchored at the very head of the string and only fires when the
+    parenthetical contains a tone/manner keyword, so factual asides
+    like "(see line 12)" pass through untouched.
+    """
+    if not text or "(" not in text[:120]:
+        return text
+    out = text
+    for _ in range(2):
+        new = _STAGE_DIRECTION_LEAK_RE.sub("", out, count=1).lstrip()
+        if new == out:
+            break
+        out = new
+    return out
+
+
 def _strip_cot_preface(text: str) -> str:
     """Peel chain-of-thought / stall prefaces from the head of an emittable
     sentence. Safe on empty input and idempotent across repeated calls.
@@ -278,8 +318,8 @@ def _strip_cot_preface(text: str) -> str:
     """
     if not text:
         return text
+    out = _strip_stage_direction_leak(text)
     prev = None
-    out = text
     for _ in range(3):
         if out == prev:
             break
@@ -292,6 +332,9 @@ def _strip_cot_preface(text: str) -> str:
             cand = _COT_PREFACE_STRIP_PARTIAL_RE.sub("", out, count=1).lstrip()
             if cand != out:
                 out = cand
+        # Re-run stage-direction strip in case CoT removal exposed a
+        # nested leak like "Okay. (calmly) Boss, …".
+        out = _strip_stage_direction_leak(out)
     return out
 
 

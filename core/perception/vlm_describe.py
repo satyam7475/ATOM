@@ -181,6 +181,35 @@ class VLMCaptioner:
             logger.debug("VLMCaptioner: %s", message)
         self._load_warn_count += 1
 
+    @staticmethod
+    def _manual_idefics3_load(load_source: str | Path) -> tuple[object | None, object | None]:
+        """Defensive fallback when ``mlx_vlm.load`` blows up on the
+        AutoProcessor path (e.g. transformers' Idefics3 image-processor
+        auto-route fails because torchvision is missing or the
+        preprocessor_config.json is shaped unexpectedly).
+
+        Returns (model, processor) on success or (None, None) on failure.
+        Best-effort only: never raises — caller treats None as load
+        failure and falls back through its own degraded path.
+        """
+        try:
+            from mlx_vlm.utils import load_model as _mlx_load_model  # type: ignore
+            from transformers import (
+                Idefics3ImageProcessor,
+                Idefics3Processor,
+                AutoTokenizer,
+            )
+            img = Idefics3ImageProcessor.from_pretrained(str(load_source))
+            tok = AutoTokenizer.from_pretrained(str(load_source))
+            processor = Idefics3Processor(image_processor=img, tokenizer=tok)
+            model = _mlx_load_model(str(load_source))
+            return model, processor
+        except Exception as exc:
+            logger.warning(
+                "VLMCaptioner manual Idefics3 fallback failed: %s", exc,
+            )
+            return None, None
+
     def _load(self) -> bool:
         if self.is_loaded:
             return True
@@ -237,15 +266,27 @@ class VLMCaptioner:
             try:
                 model, processor = mlx_vlm_load(load_source)
             except Exception as exc:
-                self._load_failed = True
-                self._load_error = (
-                    f"mlx_vlm.load failed for {load_source}: {exc}"
-                )
+                # mlx-vlm 0.4.x sometimes routes SmolVLM through an
+                # AutoProcessor path that fails when transformers can't
+                # find an Idefics3 image processor (typically when
+                # torchvision is missing). Fall back to a manual load
+                # so vision stays available even on a thin venv.
                 logger.warning(
-                    "VLMCaptioner load failed for %s: %s",
-                    load_source, exc, exc_info=True,
+                    "VLMCaptioner: mlx_vlm.load failed for %s (%s); "
+                    "attempting manual Idefics3 fallback",
+                    load_source, exc,
                 )
-                return False
+                model, processor = self._manual_idefics3_load(load_source)
+                if model is None or processor is None:
+                    self._load_failed = True
+                    self._load_error = (
+                        f"mlx_vlm.load failed for {load_source}: {exc}"
+                    )
+                    logger.warning(
+                        "VLMCaptioner load failed for %s: %s",
+                        load_source, exc,
+                    )
+                    return False
 
             # ``load_config`` is what ``apply_chat_template`` consults
             # to figure out which architecture-specific template to use

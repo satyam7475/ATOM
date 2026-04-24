@@ -1003,6 +1003,76 @@ def test_mlx_cot_preface_stripper_peels_quoted_prefix():
     assert "the user is greeting" not in out.lower()
 
 
+# Stage-direction leak regression — exact six strings observed in
+# atom_log.txt (lines 323, 456, 489, 536, 572, 655) when Qwen3-4B parroted
+# the persona-adjective phrases back as a parenthetical.
+_STAGE_DIRECTION_LEAKS = [
+    "(in a calm, composed tone)",
+    "(in a calm, composed tone).",
+    "(calm, composed tone)",
+    "(calm, composed tone).",
+    "(in a composed, friendly tone). On it, Boss.",
+    "(softly) Right away, Boss.",
+    "(warmly, but professionally) Understood.",
+]
+
+
+def test_controller_strips_bare_stage_direction_leaks():
+    """The controller-side stripper must peel any leading parenthetical
+    that describes voice/tone/manner — those reached TTS six times in
+    atom_log.txt and broke every conversational reply."""
+    from cursor_bridge.local_brain_controller import _strip_cot_preface
+
+    for raw in _STAGE_DIRECTION_LEAKS:
+        out = _strip_cot_preface(raw)
+        # Either the whole thing was a stage direction (and out is empty
+        # or just trailing punctuation), or the actual reply survived.
+        leftover = out.lower()
+        assert "tone)" not in leftover and "calm" not in leftover and \
+               "composed" not in leftover and "softly" not in leftover and \
+               "warmly" not in leftover, (
+            f"stage-direction leak survived stripper: {raw!r} -> {out!r}"
+        )
+
+
+def test_mlx_strips_bare_stage_direction_leaks():
+    """MLX-side stripper mirrors the controller — both layers must catch
+    the leak so we have defense-in-depth before TTS."""
+    from brain.mlx_llm import _strip_cot_prefaces
+
+    for raw in _STAGE_DIRECTION_LEAKS:
+        out = _strip_cot_prefaces(raw)
+        leftover = out.lower()
+        assert "tone)" not in leftover and "calm" not in leftover and \
+               "composed" not in leftover and "softly" not in leftover and \
+               "warmly" not in leftover, (
+            f"stage-direction leak survived MLX stripper: {raw!r} -> {out!r}"
+        )
+
+
+def test_stage_direction_strip_preserves_factual_parentheticals():
+    """Length-cap + mood-keyword anchor means factual parentheticals
+    like '(see line 12)' and '(2 of 3)' must pass through untouched."""
+    from cursor_bridge.local_brain_controller import _strip_cot_preface
+    from brain.mlx_llm import _strip_cot_prefaces
+
+    safe_inputs = [
+        "(see line 12) Boss, the file is at /tmp/foo.",
+        "(2 of 3) Continuing the briefing, Boss.",
+        "Boss, that's the third one (after the first two).",
+        "(updated) Done, Boss.",
+    ]
+    for raw in safe_inputs:
+        c_out = _strip_cot_preface(raw)
+        m_out = _strip_cot_prefaces(raw)
+        assert c_out == raw, (
+            f"controller stripper false-positive on {raw!r} -> {c_out!r}"
+        )
+        assert m_out == raw, (
+            f"mlx stripper false-positive on {raw!r} -> {m_out!r}"
+        )
+
+
 def test_repeat_hint_lives_in_system_layer_only():
     """Repeat-hint must NEVER be spliced into the user query. It belongs
     in the system layer where the model cannot quote it back at TTS."""
