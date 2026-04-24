@@ -32,7 +32,13 @@ models/*.onnx
 models/*-mlx/
 models/*-mlx-*/
 models/qwen3-*/
+models/qwen2*/
 models/Qwen*/
+models/smolvlm-*/
+models/*-vlm-*/
+models/*-instruct-*/
+models/*.safetensors
+models/*.npz
 
 # macOS
 .DS_Store
@@ -75,3 +81,11 @@ password_backup*
 .DS_Store
 *.pem
 *.p12
+
+# Cross-device pairing tokens (iPhone bridge etc.) — runtime-rotated secrets
+config/bridge_token
+data/trusted_iphone.json
+
+# macOS app bundle codesigning churn (rebuilt by `scripts/build_atom_app_launcher.sh`)
+ATOM.app/Contents/_CodeSignature/
+ATOM.app/Contents/MacOS/atom_python
