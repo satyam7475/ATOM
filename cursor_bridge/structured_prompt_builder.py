@@ -28,8 +28,10 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import os
 import re
 from datetime import datetime
+from pathlib import Path
 
 from context.privacy_filter import redact as _redact_sensitive
 from core.query_policy import ResponseMode, classify_response_mode
@@ -37,6 +39,36 @@ from core.query_policy import ResponseMode, classify_response_mode
 logger = logging.getLogger("atom.prompt")
 
 _APPROX_CHARS_PER_TOKEN = 4
+
+_PERSONA_CACHE: dict[str, tuple[float, str]] = {}
+_PERSONA_MAX_CHARS = 4500
+
+
+def _load_persona_file(path: str | Path) -> str:
+    """Read ``config/atom_persona.md`` (or override) with mtime caching.
+
+    Returns "" on any failure so the prompt builder degrades gracefully
+    to its baked-in identity layer. The cache key is the absolute path;
+    the cache value is ``(mtime, contents)`` so the prompt re-builds
+    automatically when Boss edits the persona."""
+    if not path:
+        return ""
+    p = Path(path).expanduser()
+    if not p.exists() or not p.is_file():
+        return ""
+    try:
+        mtime = p.stat().st_mtime
+        cached = _PERSONA_CACHE.get(str(p))
+        if cached and cached[0] == mtime:
+            return cached[1]
+        text = p.read_text(encoding="utf-8")
+        if len(text) > _PERSONA_MAX_CHARS:
+            text = text[:_PERSONA_MAX_CHARS].rsplit("\n", 1)[0] + "\n... [persona truncated]"
+        _PERSONA_CACHE[str(p)] = (mtime, text)
+        return text
+    except Exception:
+        logger.debug("persona load failed for %s", p, exc_info=True)
+        return ""
 
 
 def _estimate_tokens(text: str) -> int:
@@ -210,6 +242,19 @@ class StructuredPromptBuilder:
         self._preference_store = None
         self._system_profile_provider = None
 
+        persona_cfg = config.get("persona", {}) if isinstance(config, dict) else {}
+        default_persona_path = str(
+            Path(__file__).resolve().parent.parent / "config" / "atom_persona.md"
+        )
+        self._persona_path: str = str(
+            persona_cfg.get("path")
+            or os.environ.get("ATOM_PERSONA_PATH")
+            or default_persona_path
+        )
+        self._persona_enabled: bool = bool(persona_cfg.get("enabled", True))
+        self._persona_text_cache: str | None = None
+        self._persona_path_cache: str | None = None
+
     @property
     def system_prompt_hash(self) -> int:
         if self._system_prompt_hash is None:
@@ -239,8 +284,38 @@ class StructuredPromptBuilder:
         """
         self._system_profile_provider = provider
 
+    def set_persona_path(self, path: str | Path | None) -> None:
+        """Override the persona file location (e.g. for tests / live reloads).
+
+        Setting the path also clears the cached system layer so the
+        next prompt build picks up the new persona text immediately.
+        """
+        self._persona_path = str(path) if path else ""
+        self._persona_text_cache = None
+        self._persona_path_cache = None
+        self._system_prompt_cache = None
+        self._system_prompt_hash = None
+
+    def reload_persona(self) -> str:
+        """Force-reload the persona file from disk and reset caches."""
+        self._persona_text_cache = None
+        self._persona_path_cache = None
+        self._system_prompt_cache = None
+        self._system_prompt_hash = None
+        return self._load_persona()
+
+    def _load_persona(self) -> str:
+        enabled = getattr(self, "_persona_enabled", False)
+        path = getattr(self, "_persona_path", "")
+        if not enabled or not path:
+            return ""
+        text = _load_persona_file(path)
+        self._persona_text_cache = text
+        self._persona_path_cache = path
+        return text
+
     def _build_system_layer(self) -> str:
-        """Layer 1: JARVIS-level System Identity."""
+        """Layer 1: JARVIS-level System Identity (+ runtime persona)."""
         if self._system_prompt_cache is not None:
             return self._system_prompt_cache
 
@@ -316,6 +391,16 @@ class StructuredPromptBuilder:
             f"LANGUAGE: match Boss's language (English / Hindi / Hinglish). "
             f"Quietly correct obvious typos and mixed phrasing.\n"
         )
+
+        persona_text = self._load_persona()
+        if persona_text:
+            prompt = (
+                prompt
+                + "\n# RUNTIME PERSONA (Boss-authored, edit config/atom_persona.md to change):\n"
+                + persona_text.strip()
+                + "\n"
+            )
+
         self._system_prompt_cache = prompt
         raw = hashlib.md5(prompt.encode()).hexdigest()
         self._system_prompt_hash = int(raw[:8], 16)
