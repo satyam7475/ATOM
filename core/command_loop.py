@@ -53,6 +53,8 @@ class CommandLoop:
         "_ack_engine", "_pipeline_metrics",
         "_parallel_pipeline",
         "_suggestion_engine",
+        "_pending_turn", "_last_response_text",
+        "_turn_attached", "_turn_complete_count",
     )
 
     def __init__(
@@ -80,6 +82,10 @@ class CommandLoop:
         self._pipeline_metrics: Any = None
         self._parallel_pipeline: Any = None
         self._suggestion_engine: Any = None
+        self._pending_turn: dict[str, Any] | None = None
+        self._last_response_text: str = ""
+        self._turn_attached: bool = False
+        self._turn_complete_count: int = 0
 
     def attach_system_state(self, engine: Any) -> None:
         self._system_state_engine = engine
@@ -98,6 +104,27 @@ class CommandLoop:
 
     def attach_suggestion_engine(self, engine: Any) -> None:
         self._suggestion_engine = engine
+
+    def attach_turn_emitter(self) -> None:
+        """Subscribe to bus events that drive ``turn_complete``.
+
+        Idempotent. After this call the loop will:
+
+        * latch the response text from ``response_ready`` so that the
+          per-turn payload carries both sides of the exchange;
+        * emit ``turn_complete`` exactly once per user turn after the
+          matching ``tts_complete`` (the reflective loop in G1 keys
+          off this signal);
+        * cancel a pending ``turn_complete`` when a new ``speech_final``
+          arrives -- this is the *short-circuit* guard that prevents
+          ATOM from advising/clarifying about a stale turn.
+        """
+        if self._turn_attached:
+            return
+        self._bus.on("response_ready", self._on_response_ready)
+        self._bus.on("tts_complete", self._on_tts_complete)
+        self._bus.on("speech_final", self._on_speech_final_short_circuit)
+        self._turn_attached = True
 
     @property
     def execution_lock(self) -> ExecutionLock:
@@ -245,6 +272,12 @@ class CommandLoop:
                     logger.debug("Suggestion engine failed", exc_info=True)
 
             elapsed_ms = (time.perf_counter() - t0) * 1000
+            self._pending_turn = {
+                "trace_id": trace_id,
+                "user_text": text,
+                "elapsed_ms": round(elapsed_ms, 1),
+                "ts": time.monotonic(),
+            }
             self._bus.emit_fast(
                 "command_loop_trace",
                 trace_id=trace_id,
@@ -348,7 +381,56 @@ class CommandLoop:
             "total_errors": self._total_errors,
             "lock": self._lock.get_diagnostics(),
             "current_trace_id": self._current_trace_id,
+            "turn_complete_count": self._turn_complete_count,
         }
         if self._pipeline_metrics is not None:
             diag["pipeline_metrics"] = self._pipeline_metrics.get_diagnostics()
         return diag
+
+    # ── turn lifecycle (G6) ─────────────────────────────────────
+
+    async def _on_response_ready(self, text: str = "", **_kw: Any) -> None:
+        """Latch the most recent assistant utterance for ``turn_complete``."""
+        if text:
+            self._last_response_text = text
+
+    async def _on_tts_complete(self, **_kw: Any) -> None:
+        """Emit ``turn_complete`` once per fully-flushed turn.
+
+        Skipped when:
+          * the loop is busy (still processing the next turn),
+          * there is no pending turn (the TTS belonged to a system
+            insight or proactive nudge),
+          * the user has already started a new turn -- the short-circuit
+            guard in ``_on_speech_final_short_circuit`` cleared it.
+        """
+        pending = self._pending_turn
+        if pending is None:
+            return
+        if self._lock.is_busy:
+            return
+        self._pending_turn = None
+        self._turn_complete_count += 1
+        try:
+            self._bus.emit_fast(
+                "turn_complete",
+                trace_id=pending.get("trace_id"),
+                user_text=pending.get("user_text", ""),
+                response_text=self._last_response_text,
+                elapsed_ms=pending.get("elapsed_ms"),
+            )
+        except Exception:
+            logger.debug("turn_complete emit failed", exc_info=True)
+
+    async def _on_speech_final_short_circuit(
+        self, text: str = "", **_kw: Any,
+    ) -> None:
+        """Drop any pending turn-complete the moment a new utterance lands.
+
+        The reflective loop also subscribes to ``speech_final`` and
+        will abandon its in-flight LLM call -- this guard prevents the
+        *next* tts_complete from re-emitting a now-stale turn."""
+        if not text:
+            return
+        if self._pending_turn is not None:
+            self._pending_turn = None
