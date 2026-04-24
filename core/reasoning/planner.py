@@ -92,9 +92,10 @@ _PLAN_TEMPLATES: dict[str, list[dict]] = {
         {"desc": "Show active goals", "tool": "show_goals"},
     ],
     "focus_mode": [
-        {"desc": "Mute notifications", "tool": "mute"},
-        {"desc": "Set low volume", "tool": "set_volume", "args": {"percent": 10}},
-        {"desc": "Minimize distractions", "tool": "minimize_window"},
+        {"desc": "Turn on macOS Focus / Do Not Disturb", "tool": "focus_on"},
+        {"desc": "Soften system volume", "tool": "set_volume",
+         "args": {"percent": 25}},
+        {"desc": "Pause music if anything is playing", "tool": "music_pause"},
     ],
     "end_of_day": [
         {"desc": "Show goal progress", "tool": "show_goals"},

@@ -55,8 +55,42 @@ _MAXIMIZE_WINDOW = re.compile(
     r"bada\s+karo)\b", re.I)
 
 _SWITCH_WINDOW = re.compile(
-    r"\b(switch\s+window|alt\s+tab|next\s+window|toggle\s+window|"
+    r"\b(switch\s+(?:window|app|application)|alt\s+tab|cmd\s+tab|"
+    r"toggle\s+window|switch\s+to\s+(?:next|previous)\s+app|"
     r"dusri\s+window)\b", re.I)
+
+# Cmd+` -- cycle windows of the *current* app (e.g. two Chrome windows).
+_NEXT_WINDOW_IN_APP = re.compile(
+    r"\b("
+    r"next\s+window(?:\s+(?:in|of)\s+(?:this|the\s+current)\s+app)?|"
+    r"previous\s+window(?:\s+(?:in|of)\s+(?:this|the\s+current)\s+app)?|"
+    r"cycle\s+windows?|"
+    r"flip\s+window|"
+    r"other\s+window"
+    r")\b",
+    re.I,
+)
+
+# macOS Mission Control space switch (Ctrl+→/Ctrl+←).
+_SWITCH_SPACE_NEXT = re.compile(
+    r"\b("
+    r"next\s+(?:space|desktop|workspace)|"
+    r"switch\s+to\s+(?:the\s+)?next\s+(?:space|desktop|workspace)|"
+    r"go\s+to\s+(?:the\s+)?(?:next|right)\s+(?:space|desktop|workspace)|"
+    r"move\s+(?:to\s+)?(?:the\s+)?next\s+(?:space|desktop|workspace)"
+    r")\b",
+    re.I,
+)
+
+_SWITCH_SPACE_PREV = re.compile(
+    r"\b("
+    r"previous\s+(?:space|desktop|workspace)|"
+    r"prev\s+(?:space|desktop|workspace)|"
+    r"switch\s+to\s+(?:the\s+)?(?:previous|left)\s+(?:space|desktop|workspace)|"
+    r"go\s+(?:to\s+)?(?:the\s+)?(?:previous|left)\s+(?:space|desktop|workspace)"
+    r")\b",
+    re.I,
+)
 
 # ── v22 Accessibility / UI element control ───────────────────────────
 
@@ -101,6 +135,15 @@ def check(text: str) -> IntentResult | None:
         return IntentResult("minimize_window", action="minimize_window", action_args={})
     if _MAXIMIZE_WINDOW.search(text):
         return IntentResult("maximize_window", action="maximize_window", action_args={})
+    if _SWITCH_SPACE_PREV.search(text):
+        return IntentResult("switch_space", action="switch_space",
+                            action_args={"direction": "left"})
+    if _SWITCH_SPACE_NEXT.search(text):
+        return IntentResult("switch_space", action="switch_space",
+                            action_args={"direction": "right"})
+    if _NEXT_WINDOW_IN_APP.search(text):
+        return IntentResult("next_window_in_app", action="next_window_in_app",
+                            action_args={})
     if _SWITCH_WINDOW.search(text):
         return IntentResult("switch_window", action="switch_window", action_args={})
 
@@ -204,6 +247,10 @@ def quick_match(text: str) -> str | None:
         return "minimize_window"
     if _MAXIMIZE_WINDOW.search(text):
         return "maximize_window"
+    if _SWITCH_SPACE_PREV.search(text) or _SWITCH_SPACE_NEXT.search(text):
+        return "switch_space"
+    if _NEXT_WINDOW_IN_APP.search(text):
+        return "next_window_in_app"
     if _SWITCH_WINDOW.search(text):
         return "switch_window"
     return None

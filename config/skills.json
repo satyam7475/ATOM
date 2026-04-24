@@ -43,7 +43,7 @@
         {
             "id": "focus_mode",
             "triggers": ["focus mode", "do not disturb", "deep work mode"],
-            "expand_to": "go silent"
+            "expand_to": "focus mode on"
         },
         {
             "id": "lock_and_go",

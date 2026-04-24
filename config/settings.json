@@ -262,7 +262,6 @@
         "require_confirmation_for": [
             "shutdown_pc", "restart_pc", "logoff", "sleep_pc",
             "empty_recycle_bin", "kill_process", "close_app",
-            "open_url", "play_youtube", "lock_screen", "screenshot",
             "move_path", "copy_path", "create_folder"
         ]
     },

@@ -38,8 +38,10 @@ from core.security_policy import SecurityPolicy
 from . import (
     app_actions,
     file_actions,
+    focus_actions,
     media_actions,
     network_actions,
+    spotify_actions,
     system_actions,
     utility_actions,
 )
@@ -1135,7 +1137,9 @@ class Router:
     _FIRE_AND_FORGET_ACTIONS = frozenset({
         "open_app", "play_youtube", "search", "lock_screen", "screenshot",
         "minimize_window", "maximize_window", "switch_window",
+        "next_window_in_app", "switch_space",
         "flush_dns", "open_url",
+        "music_play", "music_pause", "music_next", "music_prev",
     })
 
     _SLOW_ACTIONS = frozenset({
@@ -1279,6 +1283,91 @@ class Router:
     def _do_unmute(self, _action: str, _args: dict) -> str:
         media_actions.send_mute_toggle()
         return personality.action_done("unmute")
+
+    # ── Spotify transport ──────────────────────────────────────────────
+
+    def _do_music_play(self, _action: str, _args: dict) -> str:
+        ok = spotify_actions.play()
+        if not ok:
+            return personality.error_response("music_play")
+        self._bus.emit_fast("media_started")
+        return personality.action_done("music_play")
+
+    def _do_music_pause(self, _action: str, _args: dict) -> str:
+        ok = spotify_actions.pause()
+        if not ok:
+            return personality.error_response("music_pause")
+        return personality.action_done("music_pause")
+
+    def _do_music_next(self, _action: str, _args: dict) -> str:
+        ok = spotify_actions.next_track()
+        if not ok:
+            return personality.error_response("music_next")
+        return personality.action_done("music_next")
+
+    def _do_music_prev(self, _action: str, _args: dict) -> str:
+        ok = spotify_actions.previous_track()
+        if not ok:
+            return personality.error_response("music_prev")
+        return personality.action_done("music_prev")
+
+    def _do_music_current(self, _action: str, _args: dict) -> str:
+        track = spotify_actions.current_track()
+        if not track:
+            return "Nothing's playing right now, Boss."
+        name = track.get("name") or "this track"
+        artist = track.get("artist") or ""
+        state = track.get("state") or "stopped"
+        if artist:
+            base = f"{name} by {artist}"
+        else:
+            base = name
+        if state == "paused":
+            return f"Paused on {base}."
+        if state == "stopped":
+            return f"Loaded {base} -- not playing."
+        return f"Playing {base}."
+
+    def _do_music_play_specific(self, _action: str, args: dict) -> str:
+        query = (args.get("query") or "").strip()
+        kind = (args.get("kind") or "track").strip().lower()
+        if not query:
+            return "I didn't catch the song name, Boss."
+        ok = spotify_actions.play_search(query, kind=kind)
+        if not ok:
+            return personality.error_response("music_play_specific")
+        self._bus.emit_fast("media_started")
+        return personality.action_done("music_play_specific", query)
+
+    # ── macOS Focus / Do Not Disturb ───────────────────────────────────
+
+    def _do_focus_on(self, _action: str, args: dict) -> str:
+        duration = args.get("duration_minutes") if isinstance(args, dict) else None
+        try:
+            minutes = int(duration) if duration is not None else None
+        except (TypeError, ValueError):
+            minutes = None
+        ok, message = focus_actions.enable_focus(duration_minutes=minutes)
+        if ok:
+            self._bus.emit_fast("focus_changed", state="on",
+                                duration_minutes=minutes)
+        return message
+
+    def _do_focus_off(self, _action: str, _args: dict) -> str:
+        ok, message = focus_actions.disable_focus()
+        if ok:
+            self._bus.emit_fast("focus_changed", state="off",
+                                duration_minutes=None)
+        return message
+
+    def _do_focus_state(self, _action: str, _args: dict) -> str:
+        state = focus_actions.focus_state()
+        if state == "on":
+            return "Focus is on, Boss."
+        if state == "off":
+            return "Focus is off."
+        return ("I can't read the focus state without an 'ATOM Focus "
+                "Status' shortcut, Boss. See docs/FOCUS_SETUP.md.")
 
     def _do_create_folder(self, _action: str, args: dict) -> str:
         created = file_actions.create_folder(args.get("name", "").strip(),
@@ -1473,6 +1562,19 @@ class Router:
     def _do_switch_window(self, _action: str, _args: dict) -> str:
         utility_actions.switch_active_window()
         return personality.action_done("switch_window")
+
+    def _do_next_window_in_app(self, _action: str, _args: dict) -> str:
+        utility_actions.next_window_in_app()
+        return personality.action_done("switch_window")
+
+    def _do_switch_space(self, _action: str, args: dict) -> str:
+        direction = (args.get("direction") if isinstance(args, dict) else None) or "right"
+        direction = str(direction).lower()
+        if direction not in ("left", "right"):
+            direction = "right"
+        utility_actions.switch_space(direction)
+        return f"Switched space {direction}." if direction == "right" \
+            else "Went back a space."
 
     def _do_timer(self, _action: str, args: dict) -> str:
         seconds = int(args.get("seconds", 30))
@@ -1927,6 +2029,15 @@ class Router:
         "set_volume": _do_set_volume,
         "mute": _do_mute,
         "unmute": _do_unmute,
+        "music_play": _do_music_play,
+        "music_pause": _do_music_pause,
+        "music_next": _do_music_next,
+        "music_prev": _do_music_prev,
+        "music_current": _do_music_current,
+        "music_play_specific": _do_music_play_specific,
+        "focus_on": _do_focus_on,
+        "focus_off": _do_focus_off,
+        "focus_state": _do_focus_state,
         "create_folder": _do_create_folder,
         "move_path": _do_move_path,
         "copy_path": _do_copy_path,
@@ -1944,6 +2055,8 @@ class Router:
         "minimize_window": _do_minimize_window,
         "maximize_window": _do_maximize_window,
         "switch_window": _do_switch_window,
+        "next_window_in_app": _do_next_window_in_app,
+        "switch_space": _do_switch_space,
         "timer": _do_timer,
         "read_clipboard": _do_read_clipboard,
         "open_url": _do_open_url,

@@ -37,26 +37,49 @@ def risk_label(level: ActionRisk) -> str:
 
 
 def default_risk_for_action(action: str) -> ActionRisk:
-    """Conservative defaults aligned with router confirmation lists."""
+    """Conservative defaults aligned with router confirmation lists.
+
+    Phase F5 ("Jarvis-grade frictionless control"): media playback,
+    focus toggling, and screen lock are demoted to LOW so the
+    assistant *acts* instead of asking. Anything that mutates files,
+    powers down the machine, or drives arbitrary keystrokes stays at
+    HIGH+ and still requires confirmation.
+    """
     critical = {
         "shutdown_pc", "restart_pc", "logoff", "sleep_pc",
         "empty_recycle_bin", "kill_process", "format_disk",
     }
     high = {
         "move_path", "copy_path", "delete_path", "close_app",
-        "create_folder", "play_youtube", "type_text",
-        
-        # v22 Advanced Control
-        "set_focused_text", "click_ui_element", 
+        "create_folder", "type_text",
+        # v22 Advanced Control -- still need confirmation because
+        # they synthesise arbitrary input on the user's behalf.
+        "set_focused_text", "click_ui_element",
         "set_process_priority", "optimize_for_atom",
     }
-    medium = {"open_app", "open_url", "set_reminder", "spotlight_search"}
+    medium = {
+        "open_app", "open_url", "set_reminder", "spotlight_search",
+    }
+    # Frictionless tools (Phase F5): explicit allow-list of
+    # high-frequency conversational actions that must NEVER prompt.
+    low_frictionless = {
+        "lock_screen", "screenshot", "set_brightness", "set_volume",
+        "mute", "unmute", "stop_music",
+        "play_youtube",
+        "music_play", "music_pause", "music_next", "music_prev",
+        "music_current", "music_play_specific",
+        "focus_on", "focus_off", "focus_state",
+        "minimize_window", "maximize_window", "switch_window",
+        "next_window_in_app", "switch_space",
+    }
     if action in critical:
         return ActionRisk.CRITICAL
     if action in high:
         return ActionRisk.HIGH
     if action in medium:
         return ActionRisk.MEDIUM
+    if action in low_frictionless:
+        return ActionRisk.LOW
     return ActionRisk.LOW
 
 

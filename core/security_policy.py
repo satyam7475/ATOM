@@ -157,6 +157,10 @@ _SAFE_ALWAYS_INTENTS: frozenset[str] = frozenset({
     "system_analyze", "confirm", "deny",
     "exit", "go_silent", "calculate", "list_apps",
     "set_volume", "mute", "unmute", "stop_music",
+    "music_play", "music_pause", "music_next", "music_prev",
+    "music_current", "music_play_specific",
+    "focus_on", "focus_off", "focus_state",
+    "next_window_in_app", "switch_space",
     "read_clipboard", "timer",
     # System Control v1 — read-only system inspection (no side-effects)
     "find_process_by_name", "get_process_details",

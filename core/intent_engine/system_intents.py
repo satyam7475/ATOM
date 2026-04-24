@@ -9,8 +9,10 @@ import re
 from .base import IntentResult
 
 _LOCK_SCREEN = re.compile(
-    r"\b(lock\s+(screen|pc|computer|system|laptop)|screen\s+lock|"
-    r"lock\s+it|tala\s+lagao|lock\s+karo)\b", re.I)
+    r"\b(lock\s+(?:the\s+|my\s+)?(?:screen|pc|computer|system|laptop|mac|macbook)|"
+    r"screen\s+lock|lock\s+it(?:\s+up)?|tala\s+lagao|lock\s+karo)\b",
+    re.I,
+)
 
 _SCREENSHOT = re.compile(
     r"\b(take\s+(a\s+)?screenshot|screenshot|screen\s+capture|capture\s+screen|"

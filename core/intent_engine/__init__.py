@@ -24,6 +24,8 @@ from . import (
     meta_intents,
     info_intents,
     app_intents,
+    music_intents,
+    focus_intents,
     media_intents,
     system_intents,
     desktop_intents,
@@ -65,8 +67,13 @@ class IntentEngine:
         return (
             meta_intents.quick_match(t)
             or info_intents.quick_match(t)
-            or media_intents.quick_match(t)
+            or focus_intents.quick_match(t)
+            # Desktop precedes music for the same reason as ``check()``:
+            # bare "next" / "previous" must mean spaces / windows when
+            # the rest of the phrase contains "space" or "window".
             or desktop_intents.quick_match(t)
+            or music_intents.quick_match(t)
+            or media_intents.quick_match(t)
             or system_intents.quick_match(t)
             or app_intents.quick_match(t)
         )
@@ -99,8 +106,13 @@ class IntentEngine:
             or info_intents.check(text)
             or world_intents.check(text)
             or system_intents.check(text)
-            or media_intents.check(text)
+            or focus_intents.check(text)
+            # Desktop must run *before* music_intents so that
+            # "next space" / "previous workspace" do not get hijacked
+            # by music_next ("next") / music_prev ("previous").
             or desktop_intents.check(text)
+            or music_intents.check(text)
+            or media_intents.check(text)
             or file_intents.check(text)
             or network_intents.check(text)
             or os_intents.check(text)
