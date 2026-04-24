@@ -69,6 +69,7 @@ _restart_requested = False
 
 
 from core.boot.wiring import wire_events
+from core.boot.cognitive_loop_wiring import wire_cognitive_loop
 
 
 async def main() -> None:
@@ -2127,6 +2128,30 @@ async def main() -> None:
     )
     _last_perceived_ms = _wiring_ctx["last_perceived_ms"]
 
+    # ── Phase G: cognitive loop ──────────────────────────────────
+    # Wires the always-on subsystems that turn ATOM from a chatbox
+    # into a continuous OS:
+    #   - turn_complete emitter on CommandLoop
+    #   - ReflectiveLoop (post-TTS think pass)
+    #   - PresenceSampler (camera-driven presence ticks)
+    #   - SceneContextEngine (VLM captions on scene change)
+    #   - MoodInferenceEngine (rules-based mood fusion)
+    #   - JarvisSuggester (cadence-gated proactive nudges)
+    # Each is independently togglable via config["cognitive_loop"].
+    cognitive_handles = wire_cognitive_loop(
+        bus=bus,
+        state=state,
+        command_loop=command_loop,
+        config=config,
+        local_brain=local_brain,
+        vision_engine=vision_engine,
+        captioner=_captioner,
+    )
+    logger.info(
+        "Cognitive loop ready: %s",
+        cognitive_handles.enabled_summary,
+    )
+
     if llm_queue is not None:
         llm_queue.start()
     if priority_sched is not None:
@@ -3445,6 +3470,10 @@ async def main() -> None:
                 await iphone_bridge.stop()
             except Exception:
                 logger.debug("iPhone bridge stop failed", exc_info=True)
+        try:
+            cognitive_handles.stop()
+        except Exception:
+            logger.debug("cognitive_handles.stop failed", exc_info=True)
         bus.clear()
         stt.shutdown()
         await tts.shutdown()

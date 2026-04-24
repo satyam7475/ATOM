@@ -1497,6 +1497,71 @@ CONFIG_SCHEMA: dict[str, Any] = {
             },
             "additionalProperties": False,
         },
+        "cognitive_loop": {
+            "type": "object",
+            "description": "Phase G runtime cognitive loop (reflective/presence/scene/mood/suggester).",
+            "properties": {
+                "enabled": {"type": "boolean"},
+                "reflective": {
+                    "type": "object",
+                    "properties": {
+                        "enabled": {"type": "boolean"},
+                        "cooldown_s": {"type": "number"},
+                        "min_user_chars": {"type": "integer"},
+                        "max_tokens": {"type": "integer"},
+                    },
+                    "additionalProperties": False,
+                },
+                "presence": {
+                    "type": "object",
+                    "properties": {
+                        "enabled": {"type": "boolean"},
+                        "interval_s": {"type": "number"},
+                        "min_interval_s": {"type": "number"},
+                    },
+                    "additionalProperties": False,
+                },
+                "scene": {
+                    "type": "object",
+                    "properties": {
+                        "enabled": {"type": "boolean"},
+                        "cooldown_s": {"type": "number"},
+                        "significance_min_seconds": {"type": "number"},
+                    },
+                    "additionalProperties": False,
+                },
+                "mood": {
+                    "type": "object",
+                    "properties": {
+                        "enabled": {"type": "boolean"},
+                        "min_consecutive": {"type": "integer"},
+                    },
+                    "additionalProperties": False,
+                },
+                "suggester": {
+                    "type": "object",
+                    "properties": {
+                        "enabled": {"type": "boolean"},
+                        "cooldown_s": {"type": "number"},
+                        "category_cooldown_s": {"type": "number"},
+                        "daily_cap": {"type": "integer"},
+                        "relevance_threshold": {"type": "number"},
+                        "quiet_hours": {
+                            "type": "array",
+                            "items": {"type": "integer"},
+                            "minItems": 2,
+                            "maxItems": 2,
+                        },
+                        "suppress_moods": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                        },
+                    },
+                    "additionalProperties": False,
+                },
+            },
+            "additionalProperties": False,
+        },
         "cognitive": {
             "type": "object",
             "properties": {
@@ -1885,14 +1950,6 @@ CONFIG_SCHEMA: dict[str, Any] = {
                 "gpu_state_ttl_s": {"type": "number", "minimum": 0.05},
                 "feedback_ewma_alpha": {"type": "number", "minimum": 0.01, "maximum": 1},
                 "exec_log_max": {"type": "integer", "minimum": 16},
-            },
-            "additionalProperties": False,
-        },
-        "cognitive_loop": {
-            "type": "object",
-            "description": "Jarvis-style observe/predict/decide/act interval.",
-            "properties": {
-                "interval_s": {"type": "number", "minimum": 5, "maximum": 3600},
             },
             "additionalProperties": False,
         },

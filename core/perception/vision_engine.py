@@ -157,6 +157,22 @@ class VisionEngine:
         """Allow runtime toggling (e.g. user says "stop watching")."""
         self._enabled = bool(enabled)
 
+    def is_capturing(self) -> bool:
+        """Best-effort check: True when a ``look()`` is actively holding
+        the AVCapture lock.  Used by Phase G presence/scene samplers
+        so they can back off when the user just asked ATOM to look at
+        something themselves -- avoids the dual-open AVFoundation
+        error.  The check is non-blocking; a stale ``True`` is only
+        possible during the sub-millisecond window between
+        ``acquire(blocking=False)`` and ``release()``.
+        """
+        if self._capture_lock.acquire(blocking=False):
+            try:
+                return False
+            finally:
+                self._capture_lock.release()
+        return True
+
     def disabled_reason(self) -> str:
         """Return why the engine is offline; empty string when ready."""
         if not self._enabled:

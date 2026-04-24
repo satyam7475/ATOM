@@ -321,6 +321,38 @@
         "check_interval_s": 90,
         "log_all_decisions": true
     },
+    "cognitive_loop": {
+        "enabled": true,
+        "reflective": {
+            "enabled": true,
+            "cooldown_s": 60.0,
+            "min_user_chars": 5,
+            "max_tokens": 220
+        },
+        "presence": {
+            "enabled": true,
+            "interval_s": 30.0,
+            "min_interval_s": 8.0
+        },
+        "scene": {
+            "enabled": true,
+            "cooldown_s": 300.0,
+            "significance_min_seconds": 30.0
+        },
+        "mood": {
+            "enabled": true,
+            "min_consecutive": 2
+        },
+        "suggester": {
+            "enabled": true,
+            "cooldown_s": 720.0,
+            "category_cooldown_s": 2700.0,
+            "daily_cap": 4,
+            "relevance_threshold": 0.7,
+            "quiet_hours": [23, 6],
+            "suppress_moods": ["frustrated", "focused", "idle"]
+        }
+    },
     "cognitive": {
         "enabled": true,
         "goals_enabled": true,
