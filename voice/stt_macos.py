@@ -431,6 +431,21 @@ class NativeSTT:
         self._recreates_window_s: float = 30.0
         self._escalation_requested: bool = False
 
+        # Promotion gate: bare 1-3 char finals like "Ali", "Tom", "ok" arrive
+        # as standalone speech_finals from SFSpeechRecognizer when the user
+        # is silent and the recognizer commits a noise spike. Without this
+        # gate, those leak straight into the LLM and waste a turn. We only
+        # block promotion when there is no recent wake-phrase context — if
+        # the user just said "atom" we want even a one-syllable follow-up
+        # ("yes", "no", "go") to land.
+        self._promotion_min_alpha_chars: int = int(
+            self._config.get("promotion_min_alpha_chars", 4) or 4,
+        )
+        self._promotion_wake_grace_s: float = float(
+            self._config.get("promotion_wake_grace_s", 3.0) or 3.0,
+        )
+        self._last_wake_seen_t: float = 0.0
+
     @property
     def is_available(self) -> bool:
         return self._available
@@ -980,6 +995,41 @@ class NativeSTT:
         except Exception:
             return False
 
+    def _is_recent_wake_context(self, now: float | None = None) -> bool:
+        """True when a wake phrase was matched in the last
+        ``_promotion_wake_grace_s`` seconds.
+
+        Used to *allow* short follow-up utterances ("yes", "no", "go") that
+        only make sense as a reply to ATOM. Without this gate any single-
+        syllable noise spike would also slip through.
+        """
+        if self._last_wake_seen_t <= 0.0:
+            return False
+        t = now if now is not None else time.monotonic()
+        return (t - self._last_wake_seen_t) <= self._promotion_wake_grace_s
+
+    def _should_block_short_promotion(self, text: str) -> bool:
+        """Reject finals that are too short to be a real command unless we
+        just heard a wake phrase.
+
+        Apple's SFSpeechRecognizer occasionally promotes bare single
+        tokens ("Ali", "Tom", "ok") to ``isFinal`` when the audio path is
+        empty. In a personal-assistant context those are almost never
+        intentional commands; routing them to the LLM creates a "ghost
+        turn" where ATOM answers a noise spike.
+        """
+        if not text:
+            return False
+        cleaned = text.strip()
+        if not cleaned:
+            return False
+        stripped_alpha = re.sub(r"[^A-Za-z0-9]", "", cleaned)
+        if len(stripped_alpha) >= self._promotion_min_alpha_chars:
+            return False
+        if self._is_recent_wake_context():
+            return False
+        return True
+
     # Phrases that must always pass through the PASSIVE gate so user
     # corrections / interruptions of a bad reply aren't silently dropped.
     # Kept small (10 entries) so scanning cost stays negligible.
@@ -1335,6 +1385,16 @@ class NativeSTT:
             self._last_partial = ""
             self._partial_stable_since = 0.0
             return
+        if self._should_block_short_promotion(text):
+            logger.info(
+                "STT: dropping short stable partial without wake context "
+                "(min=%d): '%s'",
+                self._promotion_min_alpha_chars,
+                text,
+            )
+            self._last_partial = ""
+            self._partial_stable_since = 0.0
+            return
         logger.info(
             "STT: partial stable for %.1fs — promoting to final: '%s'",
             elapsed, text,
@@ -1683,6 +1743,15 @@ class NativeSTT:
                         len(cleaned_final), cleaned_final,
                     )
                     has_text = False
+                elif self._should_block_short_promotion(transcript):
+                    logger.info(
+                        "STT: dropping short final without wake context "
+                        "(alpha=%d, min=%d): %r",
+                        len(stripped_alpha),
+                        self._promotion_min_alpha_chars,
+                        cleaned_final,
+                    )
+                    has_text = False
             if has_text:
                 # Also gate by state — never emit a final while ATOM is
                 # SPEAKING/THINKING. Those can only be echo / pre-buffer
@@ -1775,6 +1844,7 @@ class NativeSTT:
                 wake_match = self._wake_filter.check(transcript)
                 if wake_match:
                     logger.info("Wake phrase detected in partial: '%s'", wake_match)
+                    self._last_wake_seen_t = time.monotonic()
                     self._emit_threadsafe(
                         lambda p=wake_match: self._bus.emit(
                             "wake_word_detected", wake_word=p,
@@ -1796,6 +1866,15 @@ class NativeSTT:
                             transcript[:80],
                         )
                         self._last_echo_suppressed_log_t = now
+                    self._last_partial = ""
+                    self._partial_stable_since = 0.0
+                elif self._should_block_short_promotion(transcript):
+                    logger.info(
+                        "STT: dropping short stable partial without wake context "
+                        "(min=%d): '%s'",
+                        self._promotion_min_alpha_chars,
+                        transcript,
+                    )
                     self._last_partial = ""
                     self._partial_stable_since = 0.0
                 else:

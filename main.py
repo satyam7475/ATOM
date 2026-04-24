@@ -1733,6 +1733,10 @@ async def main() -> None:
         # hits the hot path (~1.7s) instead of paying the ~2s cold-load
         # latency on the wake-word executor thread.
         vlm_captioner=_captioner,
+        # Pre-classify every skill expansion target so the second
+        # intent-engine pass after a skill match (atom_log.txt
+        # L597-599) lands on a hot cache instead of paying ~150 ms.
+        skills_registry=skills_reg,
     )
 
     await tts.init_voice()
@@ -2996,27 +3000,45 @@ async def main() -> None:
                 logger.debug("boot face check await failed", exc_info=True)
                 face_result = None
             if face_result is not None:
-                if face_result.ok and face_result.faces > 0:
-                    cam_label = (
-                        face_result.camera.name if face_result.camera else "camera"
-                    )
-                    logger.info(
-                        "Boot face check: detected %d face(s) via %s in %.0fms",
-                        face_result.faces, cam_label, face_result.detection_ms,
-                    )
-                    if _vision_cfg.get("boot_face_check_announce", False):
-                        # Prepend, not append -- "I see you, Boss." should
-                        # be the first thing the user hears.
-                        greeting = f"I see you, Boss. {greeting}".strip()
-                elif face_result.ok:
-                    logger.info(
-                        "Boot face check: camera ready (%s) but no face yet",
-                        face_result.camera.name if face_result.camera else "?",
-                    )
-                else:
-                    logger.info(
-                        "Boot face check: %s",
-                        face_result.error or "no detail",
+                try:
+                    if face_result.ok and face_result.faces > 0:
+                        cam_label = (
+                            face_result.camera.name if face_result.camera else "camera"
+                        )
+                        logger.info(
+                            "Boot face check: detected %d face(s) via %s in %.0fms",
+                            face_result.faces, cam_label, face_result.detection_ms,
+                        )
+                        if _vision_cfg.get("boot_face_check_announce", False):
+                            # Prepend, not append -- "I see you, Boss." should
+                            # be the first thing the user hears.
+                            greeting = f"I see you, Boss. {greeting}".strip()
+                    elif face_result.ok:
+                        # Camera came up, no face in frame — the user just
+                        # isn't looking at the lens. This is the common case
+                        # and used to land at INFO; log at DEBUG so the boot
+                        # log only shows the positive (face seen) signal.
+                        logger.debug(
+                            "Boot face check: camera ready (%s) but no face yet",
+                            face_result.camera.name if face_result.camera else "?",
+                        )
+                    else:
+                        # Optional feature failed (Continuity Camera dozed
+                        # off, video delegate raised, AVCapture session
+                        # never produced a frame). The user said it
+                        # explicitly: "don't make startup noise about an
+                        # optional feature." Demote to DEBUG so it shows
+                        # up only when explicitly debugging vision.
+                        logger.debug(
+                            "Boot face check unavailable: %s",
+                            face_result.error or "no detail",
+                        )
+                except Exception:
+                    # Defensive guard so a malformed face_result (e.g.
+                    # missing .ok / .camera attrs after a future refactor)
+                    # cannot crash the greeting path.
+                    logger.debug(
+                        "Boot face check result handling raised", exc_info=True,
                     )
 
         logger.info("Startup greeting: %s", greeting[:200])

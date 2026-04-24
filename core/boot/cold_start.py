@@ -67,6 +67,7 @@ class ColdStartOptimizer:
         conversation_memory: Any = None,
         system_monitor: Any = None,
         vlm_captioner: Any = None,
+        skills_registry: Any = None,
         snapshot_path: str | Path | None = None,
     ) -> None:
         self._config = config or {}
@@ -82,6 +83,11 @@ class ColdStartOptimizer:
         # other warmup tasks so the first wake-word fire doesn't pay
         # the ~2s mlx-vlm cold-load latency on its critical path.
         self._vlm_captioner = vlm_captioner
+        # Optional SkillsRegistry. When wired, ``warm_up`` pre-classifies
+        # every skill expansion target into the command cache so the
+        # second intent pass after a skill match (atom_log.txt L597-599
+        # — "self check" classify cost ~150 ms) lands on a hot cache.
+        self._skills_registry = skills_registry
         self._snapshot_path = Path(snapshot_path or _SNAPSHOT_PATH)
         self._boot_time = 0.0
         self._restored_snapshot: dict[str, Any] = {}
@@ -145,6 +151,7 @@ class ColdStartOptimizer:
             self._restore_session(),
             self._cache_top_commands(),
             self._prime_intent_engine(),
+            self._cache_skill_expansions(),
             return_exceptions=True,
         )
         try:
@@ -156,12 +163,19 @@ class ColdStartOptimizer:
         restored_turns = self._coerce_int(cpu_results[0], "session_restore")
         cached_commands = self._coerce_int(cpu_results[1], "command_cache")
         primed_intents = self._coerce_int(cpu_results[2], "intent_warmup")
+        cached_skills = self._coerce_int(cpu_results[3], "skill_expansions")
         vlm_ready = bool(vlm_payload[0])
         vlm_ms = float(vlm_payload[1])
         if primed_intents:
             logger.info(
                 "Cold start: primed %d intent-engine regex paths", primed_intents,
             )
+        if cached_skills:
+            logger.info(
+                "Cold start: pre-classified %d skill expansion target(s)",
+                cached_skills,
+            )
+        cached_commands += cached_skills
         elapsed_ms = (time.monotonic() - self._boot_time) * 1000
         restored_context_available = bool(
             (self._restored_snapshot or {}).get("system_state"),
@@ -510,6 +524,78 @@ class ColdStartOptimizer:
                 continue
             cmd_cache.put(text, result)
             cached += 1
+        return cached
+
+    async def _cache_skill_expansions(self) -> int:
+        """Pre-classify every distinct skill expansion target.
+
+        Live evidence (atom_log.txt L597-599): when a skill expands
+        ("yeah give me a summary" -> "self check"), the router runs a
+        SECOND ``intent_engine.classify`` over the expansion text and
+        on a cold cache that pass costs ~150 ms — pushing the
+        ``intent_classify`` budget past 250 ms and missing the
+        fast-path SLA. Skill expansion targets are bounded (~30 today)
+        and identical across boots, so we classify them all up front
+        and store them in the same command cache the router checks
+        before re-classifying. Result: every future skill expansion
+        lands on a hot cache (sub-ms).
+        """
+        registry = self._skills_registry
+        if registry is None:
+            return 0
+        targets_fn = getattr(registry, "expansion_targets", None)
+        if not callable(targets_fn):
+            return 0
+        try:
+            targets = list(targets_fn())
+        except Exception:
+            logger.debug("Cold start: skill targets lookup failed", exc_info=True)
+            return 0
+        if not targets:
+            return 0
+
+        cmd_cache = get_command_cache()
+        loop = asyncio.get_running_loop()
+        silent = getattr(self._intent, "classify_silent", None)
+
+        def _classify_one(text: str) -> Any:
+            try:
+                if callable(silent):
+                    return silent(text)
+                return self._intent.classify(text)
+            except Exception:
+                logger.debug(
+                    "Cold start skill classify failed for '%s'",
+                    text[:80],
+                    exc_info=True,
+                )
+                return None
+
+        cached = 0
+        for text in targets:
+            try:
+                result = await loop.run_in_executor(None, _classify_one, text)
+            except Exception:
+                logger.debug(
+                    "Cold start skill classify dispatch failed for '%s'",
+                    text[:80],
+                    exc_info=True,
+                )
+                continue
+            if result is None:
+                continue
+            intent = str(getattr(result, "intent", "") or "")
+            if intent in {"", "fallback"}:
+                continue
+            try:
+                cmd_cache.put(text, result, force=True)
+                cached += 1
+            except Exception:
+                logger.debug(
+                    "Cold start skill cache put failed for '%s'",
+                    text[:80],
+                    exc_info=True,
+                )
         return cached
 
     def _capture_conversation_pairs(self) -> list[list[str]]:

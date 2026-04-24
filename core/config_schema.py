@@ -1221,7 +1221,19 @@ CONFIG_SCHEMA: dict[str, Any] = {
                     "type": "number",
                     "minimum": 3,
                     "maximum": 120,
-                    "description": "RuntimeWatchdog: TTS synthesis timeout before audio skip.",
+                    "description": "RuntimeWatchdog: TTS synthesis static-floor timeout before audio skip.",
+                },
+                "watchdog_tts_per_word_s": {
+                    "type": "number",
+                    "minimum": 0.0,
+                    "maximum": 5.0,
+                    "description": "RuntimeWatchdog: Per-word TTS budget multiplier; effective budget = max(floor, words * this).",
+                },
+                "watchdog_tts_max_dynamic_s": {
+                    "type": "number",
+                    "minimum": 5.0,
+                    "maximum": 600.0,
+                    "description": "RuntimeWatchdog: Hard cap for the dynamic per-utterance TTS budget.",
                 },
                 "watchdog_tool_timeout_s": {
                     "type": "number",

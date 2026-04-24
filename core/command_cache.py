@@ -67,9 +67,18 @@ class CommandCache:
         logger.info("Command cache HIT: '%s'", key[:40])
         return result
 
-    def put(self, text: str, result: object) -> None:
-        """Cache an IntentResult when it is safe to reuse."""
-        if not _should_cache_result(result):
+    def put(self, text: str, result: object, *, force: bool = False) -> None:
+        """Cache an IntentResult when it is safe to reuse.
+
+        ``force=True`` bypasses the ``_should_cache_result`` filter so
+        the cold-start optimizer can pre-cache *intent classifications*
+        for dynamic-info intents (``self_check``, ``time``, ...). This
+        is safe because the router treats ``IntentResult`` as a pure
+        classification — the actual response is rendered fresh each
+        turn by the dispatch handler — so caching ``self_check`` skips
+        the ~150 ms re-classify pass without serving a stale answer.
+        """
+        if not force and not _should_cache_result(result):
             return
         key = text.lower().strip()
         self._store[key] = (time.monotonic(), result)

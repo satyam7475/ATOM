@@ -296,6 +296,8 @@
         "watchdog_rag_timeout_ms": 750,
         "watchdog_llm_timeout_s": 14,
         "watchdog_tts_timeout_s": 15,
+        "watchdog_tts_per_word_s": 0.5,
+        "watchdog_tts_max_dynamic_s": 45,
         "watchdog_tool_timeout_s": 10,
         "supervisor_restart_cooldown_s": 8,
         "watchdog_poll_interval_s": 2,

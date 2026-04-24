@@ -51,6 +51,8 @@ class RuntimeWatchdog:
         "_consecutive_llm_timeouts", "_consecutive_tts_timeouts",
         "_timeout_demote_threshold", "_profile_demoted",
         "_boot_time_s", "_intent_boot_grace_s",
+        "_tts_per_word_s", "_tts_active_word_count",
+        "_tts_max_dynamic_s",
     )
 
     def __init__(
@@ -70,6 +72,15 @@ class RuntimeWatchdog:
         self._rag_s = float(perf.get("watchdog_rag_timeout_ms", 500)) / 1000.0
         self._llm_s = float(perf.get("watchdog_llm_timeout_s", 30))
         self._tts_s = float(perf.get("watchdog_tts_timeout_s", 15))
+        # Dynamic TTS budget (atom_log.txt L390-392): a 22-word weather reply
+        # at rate 172 takes ~16s — the static 15s budget killed it 1s before
+        # the last sentence rendered. Effective budget per utterance is now:
+        #   max(watchdog_tts_timeout_s, words * watchdog_tts_per_word_s)
+        # capped at watchdog_tts_max_dynamic_s so a runaway 1000-word stream
+        # still gets cut off.
+        self._tts_per_word_s = float(perf.get("watchdog_tts_per_word_s", 0.5))
+        self._tts_max_dynamic_s = float(perf.get("watchdog_tts_max_dynamic_s", 45.0))
+        self._tts_active_word_count: int = 0
         self._tool_s = float(perf.get("watchdog_tool_timeout_s", 10))
         self._cooldown_s = float(perf.get("supervisor_restart_cooldown_s", 8))
         self._poll_interval = float(perf.get("watchdog_poll_interval_s", 2.0))
@@ -236,6 +247,7 @@ class RuntimeWatchdog:
         self._state_entered = time.monotonic()
         if getattr(new, "value", "") != "speaking":
             self._tts_started_at = 0.0
+            self._tts_active_word_count = 0
 
     async def _on_tts_started(
         self,
@@ -248,9 +260,36 @@ class RuntimeWatchdog:
         if self._tts_started_at > 0 and not is_first:
             return
         self._tts_started_at = time.monotonic()
+        self._tts_active_word_count = self._count_tts_words(text)
 
     async def _on_tts_complete(self, **_kw: Any) -> None:
         self._tts_started_at = 0.0
+        self._tts_active_word_count = 0
+
+    @staticmethod
+    def _count_tts_words(text: str) -> int:
+        """Cheap whitespace-split word count.  Empty / whitespace-only
+        text returns 0 so the caller can fall back to the static floor.
+        """
+        if not text:
+            return 0
+        return sum(1 for tok in text.split() if tok.strip())
+
+    def effective_tts_budget_s(self, word_count: int | None = None) -> float:
+        """Per-utterance TTS timeout: max(static_floor, words*per_word),
+        capped at ``watchdog_tts_max_dynamic_s``.
+
+        Used by the active speaking-stage watchdog loop so a long, valid
+        reply isn't murdered mid-sentence; short replies still benefit
+        from the tight static floor for fast bug-recovery.
+        """
+        if word_count is None:
+            word_count = self._tts_active_word_count
+        floor = self._tts_s
+        if word_count <= 0 or self._tts_per_word_s <= 0:
+            return floor
+        scaled = word_count * self._tts_per_word_s
+        return min(self._tts_max_dynamic_s, max(floor, scaled))
 
     async def _on_successful_turn(self, **_kw: Any) -> None:
         """Clear consecutive-timeout counters when a turn actually lands."""
@@ -359,6 +398,7 @@ class RuntimeWatchdog:
         if stage == "tts_synthesis":
             self._consecutive_tts_timeouts += 1
             self._tts_started_at = 0.0
+            self._tts_active_word_count = 0
             try:
                 self._bus.emit("text_display", text="[Watchdog] TTS timed out; audio skipped.")
             except Exception:
@@ -423,11 +463,16 @@ class RuntimeWatchdog:
             elapsed = time.monotonic() - self._state_entered
             if self._tts_started_at > 0:
                 tts_elapsed = time.monotonic() - self._tts_started_at
-                if tts_elapsed > self._tts_s:
+                effective_budget = self.effective_tts_budget_s()
+                if tts_elapsed > effective_budget:
                     self._handle_budget_timeout(
                         "tts_synthesis",
-                        self._tts_s,
-                        metadata={"elapsed_s": round(tts_elapsed, 2)},
+                        effective_budget,
+                        metadata={
+                            "elapsed_s": round(tts_elapsed, 2),
+                            "words": self._tts_active_word_count,
+                            "floor_s": self._tts_s,
+                        },
                     )
             if st is AtomState.THINKING and elapsed > self._think_s:
                 self._maybe_recover(f"THINKING stuck {elapsed:.0f}s")
