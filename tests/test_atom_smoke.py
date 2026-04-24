@@ -20,7 +20,7 @@ def test_settings_json_validates() -> None:
 
 
 def test_mlx_model_directory_exists() -> None:
-    """ATOM v3.2 runs a single MLX model declared at brain.mlx_model."""
+    """ATOM v3.3 runs a single MLX model declared at brain.mlx_model."""
     raw = (_ATOM_ROOT / "config" / "settings.json").read_text(encoding="utf-8")
     cfg = json.loads(raw)
     brain = cfg.get("brain", {})
@@ -31,7 +31,7 @@ def test_mlx_model_directory_exists() -> None:
 
 
 def test_mlx_brain_has_single_model_path() -> None:
-    """ATOM v3.2 runs ONE local MLX model (Qwen2.5-7B-Instruct-4bit by
+    """ATOM v3.3 runs ONE local MLX model (Qwen3-4B-Instruct-2507-4bit by
     default). MLXBrain still tags each request with a role label
     (``primary`` | ``fast``) for telemetry, but both resolve to the
     same on-disk path and the same in-memory tensors. Heavy reasoning

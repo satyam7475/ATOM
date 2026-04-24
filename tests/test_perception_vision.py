@@ -116,6 +116,72 @@ def test_choose_preferred_no_cameras_returns_none():
     assert camera_capture.choose_preferred([], preferred="auto") is None
 
 
+# ── CGColorSpaceCreateDeviceRGB resolution (live-fix Apr 2026) ───────
+
+
+def test_cg_color_space_resolver_finds_symbol_in_quartz_umbrella():
+    """Regression for the live boot crash on 2026-04-24 where
+    ``_Quartz.CGColorSpaceCreateDeviceRGB()`` raised AttributeError and
+    the JPEG video delegate logged
+    ``video delegate exception: 'CGColorSpaceCreateDeviceRGB'``,
+    breaking the boot face check.
+
+    The resolver must accept any of three PyObjC layouts:
+      1. symbol re-exported by the ``Quartz`` umbrella
+      2. symbol on ``Quartz.CoreGraphics``
+      3. symbol on the standalone ``CoreGraphics`` module
+    """
+    import sys as _sys
+    import types as _types
+
+    real_quartz = _sys.modules.get("Quartz")
+    real_quartz_cg = _sys.modules.get("Quartz.CoreGraphics")
+    real_cg = _sys.modules.get("CoreGraphics")
+    real_cap_quartz = camera_capture._Quartz
+    try:
+        # Layout A: only Quartz umbrella has it.
+        sentinel_a = lambda: "umbrella"
+        umbrella = _types.SimpleNamespace(CGColorSpaceCreateDeviceRGB=sentinel_a)
+        camera_capture._Quartz = umbrella  # type: ignore[attr-defined]
+        _sys.modules.pop("CoreGraphics", None)
+        _sys.modules.pop("Quartz.CoreGraphics", None)
+        fn = camera_capture._resolve_cg_color_space_create_device_rgb()
+        assert fn is sentinel_a
+
+        # Layout B: only Quartz.CoreGraphics has it.
+        sentinel_b = lambda: "qcg"
+        qcg = _types.SimpleNamespace(CGColorSpaceCreateDeviceRGB=sentinel_b)
+        umbrella_no_attr = _types.SimpleNamespace(CoreGraphics=qcg)
+        camera_capture._Quartz = umbrella_no_attr  # type: ignore[attr-defined]
+        fn = camera_capture._resolve_cg_color_space_create_device_rgb()
+        assert fn is sentinel_b
+
+        # Layout C: only the standalone CoreGraphics module has it.
+        sentinel_c = lambda: "standalone"
+        cg_mod = _types.ModuleType("CoreGraphics")
+        cg_mod.CGColorSpaceCreateDeviceRGB = sentinel_c  # type: ignore[attr-defined]
+        _sys.modules["CoreGraphics"] = cg_mod
+        camera_capture._Quartz = _types.SimpleNamespace()  # no attr, no submodule
+        fn = camera_capture._resolve_cg_color_space_create_device_rgb()
+        assert fn is sentinel_c
+
+        # Layout D: nobody has it (degraded PyObjC) → graceful None.
+        _sys.modules.pop("CoreGraphics", None)
+        camera_capture._Quartz = _types.SimpleNamespace()
+        fn = camera_capture._resolve_cg_color_space_create_device_rgb()
+        assert fn is None
+    finally:
+        camera_capture._Quartz = real_cap_quartz  # type: ignore[attr-defined]
+        if real_quartz is not None:
+            _sys.modules["Quartz"] = real_quartz
+        if real_quartz_cg is not None:
+            _sys.modules["Quartz.CoreGraphics"] = real_quartz_cg
+        if real_cg is not None:
+            _sys.modules["CoreGraphics"] = real_cg
+        else:
+            _sys.modules.pop("CoreGraphics", None)
+
+
 # ── VisionAuditLog ────────────────────────────────────────────────────
 
 

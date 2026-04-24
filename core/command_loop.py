@@ -51,7 +51,7 @@ class CommandLoop:
         "_total_commands", "_total_errors",
         "_system_state_engine", "_session_memory",
         "_ack_engine", "_pipeline_metrics",
-        "_intent_continuity", "_parallel_pipeline",
+        "_parallel_pipeline",
         "_suggestion_engine",
     )
 
@@ -78,7 +78,6 @@ class CommandLoop:
         self._session_memory = session_memory
         self._ack_engine: Any = None
         self._pipeline_metrics: Any = None
-        self._intent_continuity: Any = None
         self._parallel_pipeline: Any = None
         self._suggestion_engine: Any = None
 
@@ -93,9 +92,6 @@ class CommandLoop:
 
     def attach_pipeline_metrics(self, metrics: Any) -> None:
         self._pipeline_metrics = metrics
-
-    def attach_intent_continuity(self, continuity: Any) -> None:
-        self._intent_continuity = continuity
 
     def attach_parallel_pipeline(self, pipeline: Any) -> None:
         self._parallel_pipeline = pipeline
@@ -229,13 +225,6 @@ class CommandLoop:
                     )
                 except Exception:
                     logger.debug("Session memory record failed", exc_info=True)
-
-            # ── Update intent continuity ──────────────────────────────
-            if self._intent_continuity is not None:
-                try:
-                    self._intent_continuity.on_command_complete(text)
-                except Exception:
-                    logger.debug("Intent continuity update failed", exc_info=True)
 
             # ── Inline suggestion (only after action commands, not quick/conversational) ──
             if self._suggestion_engine is not None and response_ms > 100:

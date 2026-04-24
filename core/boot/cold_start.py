@@ -90,32 +90,74 @@ class ColdStartOptimizer:
         persistence_manager.register(_SNAPSHOT_KEY, self._snapshot_path)
 
     async def warm_up(self) -> ColdStartReport:
-        """Preload the hot path pieces needed for the first real query."""
+        """Preload the hot path pieces needed for the first real query.
+
+        Concurrency model
+        -----------------
+        Boot has three Metal/GPU consumers that all attach
+        ``addCompletedHandler:`` callbacks to the same Metal device queue:
+          1. ``_preload_fast_model`` -- MLX (Qwen3-4B-Instruct-2507-4bit)
+          2. ``_preload_embeddings`` -- torch.mps (SentenceTransformer)
+          3. ``_preload_vlm``        -- mlx-vlm   (SmolVLM-Instruct-4bit)
+
+        Running them concurrently triggers the Apple-internal assertion
+        ``-[_MTLCommandBuffer addCompletedHandler:]:1011: failed
+        assertion 'Completed handler provided after commit call'`` which
+        aborts the process with SIGABRT (exit 134). The first user-driven
+        inference after the race is the typical crash site, even when the
+        boot greeting itself appears to succeed.
+
+        We therefore split the warmup into two phases:
+          * **Phase A (Metal-serial):** fast model -> embeddings -> VLM,
+            awaited one at a time so each subsystem owns the Metal queue
+            exclusively while it builds its first command buffer.
+          * **Phase B (CPU-parallel):** session restore, command cache,
+            and intent regex priming are all CPU-bound and gather safely.
+
+        Phase B runs concurrently *with* Phase A so we don't pay for the
+        serialization on the wall clock; we only delay the Metal stages
+        relative to one another. The total cold-start budget is unchanged
+        in the typical case (CPU work finishes during the LLM warmup).
+        """
         self._boot_time = time.monotonic()
         self._restored_snapshot = self._load_snapshot()
 
-        results = await asyncio.gather(
-            self._preload_fast_model(),
-            self._preload_embeddings(),
+        async def _metal_serial_warmup() -> tuple[bool, bool, tuple[bool, float]]:
+            fast_ok = False
+            try:
+                fast_ok = bool(await self._preload_fast_model())
+            except Exception as exc:
+                logger.debug("Cold start fast-model warmup raised: %s", exc)
+            emb_ok = False
+            try:
+                emb_ok = bool(await self._preload_embeddings())
+            except Exception as exc:
+                logger.debug("Cold start embeddings warmup raised: %s", exc)
+            vlm_payload: tuple[bool, float] = (False, 0.0)
+            try:
+                vlm_payload = await self._preload_vlm()
+            except Exception as exc:
+                logger.debug("Cold start vlm warmup raised: %s", exc)
+            return fast_ok, emb_ok, vlm_payload
+
+        metal_task = asyncio.create_task(_metal_serial_warmup())
+        cpu_results = await asyncio.gather(
             self._restore_session(),
             self._cache_top_commands(),
             self._prime_intent_engine(),
-            self._preload_vlm(),
             return_exceptions=True,
         )
+        try:
+            fast_model_ready, embeddings_ready, vlm_payload = await metal_task
+        except Exception as exc:
+            logger.debug("Cold start metal warmup chain raised: %s", exc)
+            fast_model_ready, embeddings_ready, vlm_payload = False, False, (False, 0.0)
 
-        fast_model_ready = self._coerce_bool(results[0], "fast_model")
-        embeddings_ready = self._coerce_bool(results[1], "embeddings")
-        restored_turns = self._coerce_int(results[2], "session_restore")
-        cached_commands = self._coerce_int(results[3], "command_cache")
-        primed_intents = self._coerce_int(results[4], "intent_warmup")
-        vlm_payload = results[5] if len(results) > 5 else (False, 0.0)
-        if isinstance(vlm_payload, Exception):
-            logger.debug("Cold start vlm warmup failed: %s", vlm_payload)
-            vlm_ready, vlm_ms = False, 0.0
-        else:
-            vlm_ready = bool(vlm_payload[0])
-            vlm_ms = float(vlm_payload[1])
+        restored_turns = self._coerce_int(cpu_results[0], "session_restore")
+        cached_commands = self._coerce_int(cpu_results[1], "command_cache")
+        primed_intents = self._coerce_int(cpu_results[2], "intent_warmup")
+        vlm_ready = bool(vlm_payload[0])
+        vlm_ms = float(vlm_payload[1])
         if primed_intents:
             logger.info(
                 "Cold start: primed %d intent-engine regex paths", primed_intents,
@@ -261,9 +303,31 @@ class ColdStartOptimizer:
         Runs ``captioner._load`` in the default executor because mlx-vlm
         does heavy CPU/GPU work synchronously and we don't want to block
         the asyncio loop for ~2s during the ``asyncio.gather`` above.
+
+        When ``vision.vlm.warm_at_boot`` is ``false`` (the default after
+        the JARVIS-grade rewrite), we deliberately skip the boot warmup
+        and let the captioner's own lazy ``_load()`` fire on the first
+        ``describe()`` call. This frees ~1.6 GB of RAM at idle on
+        machines that go a whole session without needing vision —
+        exactly the common case for a desktop assistant. The first
+        actual vision call pays an extra ~1.5 s, which the user will
+        notice once and then never again (subsequent describes hit the
+        hot path).
         """
         captioner = self._vlm_captioner
         if captioner is None:
+            return False, 0.0
+        vlm_cfg = (
+            (self._config.get("vision") or {}).get("vlm") or {}
+            if isinstance(self._config, dict) else {}
+        )
+        warm_at_boot = bool(vlm_cfg.get("warm_at_boot", True))
+        if not warm_at_boot:
+            logger.info(
+                "Cold start: VLM warm-at-boot disabled by config "
+                "(vision.vlm.warm_at_boot=false); will load lazily on "
+                "first describe() call",
+            )
             return False, 0.0
         loader = getattr(captioner, "_load", None)
         if not callable(loader):

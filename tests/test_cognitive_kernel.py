@@ -112,8 +112,8 @@ class FakeBrainModeManager:
 def _config() -> dict:
     return {
         "cognitive_kernel": {
-            "quick_model": "qwen2.5-7b-instruct",
-            "full_model": "qwen2.5-7b-instruct",
+            "quick_model": "qwen3-4b-instruct",
+            "full_model": "qwen3-4b-instruct",
             "simple_query_max_chars": 48,
             "deep_query_min_chars": 120,
             "battery_degrade": True,
@@ -315,14 +315,14 @@ def test_optimal_profile_keeps_complex_queries_on_fast_model() -> None:
 
     complex_plan = kernel.route("explain properly how the scheduler and router work together")
     assert complex_plan.path is ExecPath.FULL
-    assert complex_plan.model == "qwen2.5-7b-instruct"
+    assert complex_plan.model == "qwen3-4b-instruct"
     assert complex_plan.model_role == "fast"
 
     report_plan = kernel.route(
         "research the best local-first architecture choices for ATOM and give me a rollout plan",
     )
     assert report_plan.path is ExecPath.DEEP
-    assert report_plan.model == "qwen2.5-7b-instruct"
+    assert report_plan.model == "qwen3-4b-instruct"
     assert report_plan.model_role == "primary"
     print("  PASS: optimal profile keeps normal complex work on the fast role")
 
@@ -342,7 +342,7 @@ def test_optimal_profile_downgrades_deep_queries_when_headroom_is_tight() -> Non
         "research the best local-first architecture choices for ATOM and give me a rollout plan",
     )
     assert plan.path is ExecPath.DEEP
-    assert plan.model == "qwen2.5-7b-instruct"
+    assert plan.model == "qwen3-4b-instruct"
     assert plan.model_role == "fast"
     print("  PASS: optimal profile protects memory by downgrading deep work when headroom is tight")
 
@@ -360,9 +360,76 @@ def test_full_performance_profile_allows_primary_model_for_complex_queries() -> 
 
     plan = kernel.route("explain properly how the scheduler and router work together")
     assert plan.path is ExecPath.FULL
-    assert plan.model == "qwen2.5-7b-instruct"
+    assert plan.model == "qwen3-4b-instruct"
     assert plan.model_role == "primary"
     print("  PASS: full performance mode still unlocks the primary model")
+
+
+def test_degraded_reason_uses_configured_threshold_not_hardcoded_85() -> None:
+    """Regression: ``_degradation_reason`` MUST mirror the threshold
+    used by ``_should_degrade``.
+
+    Live boot 2026-04-24 logged ``reason=degraded:unknown`` because:
+      - settings.json ships ``memory_pressure_threshold = 78``
+      - ``_should_degrade`` returned True for ``memory_pct=82``
+      - ``_degradation_reason`` hard-coded ``> 85`` → no leg matched →
+        returned the literal string ``"unknown"``
+
+    The fix moves the reason check onto the same configurable
+    threshold so the boot log is actionable.
+    """
+    cfg = _config()
+    cfg["cognitive_kernel"]["memory_pressure_threshold"] = 78
+    kernel = CognitiveKernel(
+        config=cfg,
+        bus=FakeBus(),
+        intent_engine=FakeIntentEngine(),
+        cache_engine=FakeCache(),
+        metrics=FakeMetrics(),
+        silicon_governor=FakeSiliconGovernor(memory_pct=82.0),
+    )
+
+    plan = kernel.route("what is ai")
+    assert plan.path is ExecPath.QUICK
+    # The exact label format is part of the contract — boot operators
+    # grep for ``degraded:memory_`` in the CK route line to find
+    # pressure incidents. The routing reason lives on ``plan.reason``;
+    # ``plan.latency_reason`` belongs to the latency controller.
+    assert plan.reason.startswith("degraded:memory_"), (
+        f"expected memory-pressure reason, got {plan.reason!r}"
+    )
+    assert "unknown" not in plan.reason, (
+        f"reason still leaks 'unknown' for in-band memory pressure: "
+        f"{plan.reason!r}"
+    )
+    print("  PASS: degraded reason honours the configured memory threshold")
+
+
+def test_degraded_reason_thermal_and_battery_remain_attributable() -> None:
+    """Sanity: thermal and battery legs of ``_degradation_reason`` must
+    not regress when we changed the memory leg."""
+    kernel = CognitiveKernel(
+        config=_config(),
+        bus=FakeBus(),
+        intent_engine=FakeIntentEngine(),
+        cache_engine=FakeCache(),
+        metrics=FakeMetrics(),
+        silicon_governor=FakeSiliconGovernor(
+            battery_pct=12,
+            on_battery=True,
+            is_throttled=True,
+            thermal_pressure="serious",
+        ),
+    )
+
+    plan = kernel.route("what is ai")
+    assert plan.path is ExecPath.QUICK
+    assert plan.reason.startswith("degraded:")
+    # Both legs should fire — joined by ``+`` per the reasoner contract.
+    assert "battery_12pct" in plan.reason
+    assert "thermal_serious" in plan.reason
+    assert "unknown" not in plan.reason
+    print("  PASS: thermal+battery degrade reasons still attribute correctly")
 
 
 if __name__ == "__main__":
@@ -373,4 +440,6 @@ if __name__ == "__main__":
     test_optimal_profile_keeps_complex_queries_on_fast_model()
     test_optimal_profile_downgrades_deep_queries_when_headroom_is_tight()
     test_full_performance_profile_allows_primary_model_for_complex_queries()
+    test_degraded_reason_uses_configured_threshold_not_hardcoded_85()
+    test_degraded_reason_thermal_and_battery_remain_attributable()
     print("\ntest_cognitive_kernel: ALL PASSED")

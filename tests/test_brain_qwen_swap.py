@@ -1,9 +1,24 @@
-"""v3.2 regression tests -- single-model brain (Qwen2.5-7B-Instruct-MLX-4bit).
+"""v3.3 regression tests -- single-model brain (Qwen3-4B-Instruct-2507-4bit).
+
+ATOM was on Qwen2.5-7B-Instruct-MLX-4bit until 2026-04-24; the v3.3
+JARVIS-grade rewrite swapped to Qwen3-4B-Instruct-2507-4bit because the
+7B was the dominant cause of:
+  - 6.3 GB warm RAM on a 16 GB Apple Silicon machine
+  - 14 tok/s steady-state (3-4 s first-token latency)
+  - frequent ``memory_pressure`` degrade trips when Cursor + Chrome ran
+    alongside ATOM
+
+Qwen3-4B-Instruct-2507-4bit lands at:
+  - 2.1 GB on disk (was 4.0 GB)
+  - ~2.4 GB warm RAM (was ~4.5 GB)
+  - higher steady-state tok/s with first-token < 1.5 s on the smoke run
+  - same single-model alias model: every role still resolves to one set
+    of weights, no extra memory for the 'fast' alias
 
 Pins:
-  1. Brain config points at the Qwen2.5-7B-Instruct-MLX-4bit directory
+  1. Brain config points at the Qwen3-4B-Instruct-2507-4bit directory
      via the single ``brain.mlx_model`` key.
-  2. ATOM v3.2 is single-model: legacy ``mlx_primary_model`` /
+  2. ATOM is single-model: legacy ``mlx_primary_model`` /
      ``mlx_fast_model`` / ``mlx_deep_model`` / ``mlx_default_role`` /
      ``model_path`` keys are gone from the default settings.json but the
      loader still accepts them for backwards compatibility.
@@ -12,8 +27,8 @@ Pins:
      and the same in-memory tensors via the alias-on-first-use path.
   4. The Qwen model directory exists on disk.
 
-Live generation is exercised in ``tests/test_brain_qwen_smoke.py``
-(marked slow, skipped in headless CI) so this file stays fast and
+Live generation is exercised in ``scripts/smoke_metal_warmup.py`` (real
+MLX + real torch.mps + real cold-start) so this file stays fast and
 import-safe.
 """
 from __future__ import annotations
@@ -25,7 +40,11 @@ import pytest
 
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-_QWEN_DIRNAME = "qwen2.5-7b-instruct-4bit"
+# Updated 2026-04-24 (v3.3): swapped 7B -> 4B for JARVIS-grade
+# responsiveness. Both names are kept here as constants because the
+# back-compat tests below have to reference the *current* on-disk model
+# directory (the legacy 7B dir is removed after the swap is verified).
+_QWEN_DIRNAME = "qwen3-4b-instruct-4bit"
 
 
 def _settings() -> dict:
@@ -38,12 +57,12 @@ def _settings() -> dict:
 # ─────────────────────────────────────────────────────────────────────
 
 
-def test_brain_mlx_model_is_qwen2_5_7b():
+def test_brain_mlx_model_is_qwen3_4b():
     cfg = _settings()
     model = cfg["brain"]["mlx_model"]
     assert _QWEN_DIRNAME in model.lower(), (
-        f"Brain must load Qwen2.5-7B-Instruct via brain.mlx_model after v3.2 "
-        f"single-model cleanup. Got {model!r}"
+        f"Brain must load Qwen3-4B-Instruct-2507 via brain.mlx_model after "
+        f"the v3.3 lightweight rewrite. Got {model!r}"
     )
 
 
@@ -69,11 +88,36 @@ def test_brain_legacy_keys_removed():
 def test_qwen_model_directory_exists():
     cfg = _settings()
     p = REPO_ROOT / cfg["brain"]["mlx_model"]
-    assert p.is_dir(), f"Qwen2.5-7B-Instruct model directory not found at {p}"
+    assert p.is_dir(), f"Qwen3-4B-Instruct model directory not found at {p}"
     safetensors = list(p.glob("*.safetensors"))
     assert safetensors, f"No .safetensors weights found in {p}"
     assert (p / "tokenizer.json").exists(), f"Missing tokenizer.json in {p}"
     assert (p / "config.json").exists(), f"Missing config.json in {p}"
+
+
+def test_brain_watchdog_budgets_match_4b_class():
+    """v3.3: tighter watchdog/latency budgets for the 4B brain.
+
+    The 7B's worst-case first-token was ~3-4 s, which forced a 28 s
+    LLM watchdog. The 4B replies in <1.5 s on the smoke and gets a
+    20 s brain timeout + 14 s LLM watchdog, which is what makes ATOM
+    feel snappier without false-positive recovery trips.
+    """
+    cfg = _settings()
+    assert cfg["brain"]["timeout_seconds"] <= 22, (
+        f"4B should not need the 7B's 28 s timeout; got "
+        f"{cfg['brain']['timeout_seconds']}"
+    )
+    perf = cfg["performance"]
+    assert perf["watchdog_llm_timeout_s"] <= 16, (
+        f"watchdog_llm_timeout_s should tighten with the smaller brain; "
+        f"got {perf['watchdog_llm_timeout_s']}"
+    )
+    lc = cfg["latency_controller"]
+    assert lc["quick_budget_ms"] <= 1100, (
+        f"quick_budget_ms should drop with the faster brain; got "
+        f"{lc['quick_budget_ms']}"
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -111,15 +155,16 @@ def test_mlx_brain_single_model_path_attribute():
     assert hasattr(brain, "_model_path")
     assert _QWEN_DIRNAME in brain._model_path.lower()
     assert not hasattr(brain, "_fast_path"), (
-        "v3.2 single-model cleanup should have removed _fast_path"
+        "single-model cleanup should have removed _fast_path"
     )
     assert not hasattr(brain, "_deep_path"), (
-        "v3.2 single-model cleanup should have removed _deep_path"
+        "single-model cleanup should have removed _deep_path"
     )
 
 
 def test_mlx_brain_dicts_only_have_two_role_slots():
-    """Per-role state dicts drop the 'deep' slot after v3.2 cleanup."""
+    """Per-role state dicts drop the 'deep' slot after the single-model
+    cleanup."""
     from brain.mlx_llm import MLXBrain
 
     cfg = _settings()
@@ -133,7 +178,7 @@ def test_mlx_brain_dicts_only_have_two_role_slots():
         brain._role_last_used,
     ):
         assert set(d.keys()) == {"primary", "fast"}, (
-            f"Per-role dict keys drifted after v3.2 cleanup: {set(d.keys())}"
+            f"Per-role dict keys drifted: {set(d.keys())}"
         )
 
 

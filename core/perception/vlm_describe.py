@@ -22,8 +22,10 @@ from a see-speak-and-hear one. Deliberately tiny surface area:
 Why SmolVLM-Instruct-4bit
 -------------------------
 * ~1.2 GB on disk, ~1.4 GB resident after load — comfortably fits
-  alongside Qwen2.5-7B-Instruct-4bit (~4.3 GB) on a 16 GB Apple
-  Silicon machine with room for the KV cache.
+  alongside Qwen3-4B-Instruct-2507-4bit (~2.4 GB) on a 16 GB Apple
+  Silicon machine with multiple GB of slack for the KV cache,
+  Cursor, and Chrome (the post-v3.3 brain swap freed ~1.9 GB of
+  unified memory at idle).
 * Idefics3 architecture, officially supported by mlx-vlm. First-token
   latency ~150-400 ms on M-series for a 512x512 input — short enough
   to fire on wake-word without the user noticing a stall.

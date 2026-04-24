@@ -77,6 +77,15 @@ _NF: Any = None
 _objc: Any = None
 _CoreMedia: Any = None
 _Quartz: Any = None
+# ``CGColorSpaceCreateDeviceRGB`` lives in CoreGraphics. PyObjC's
+# ``Quartz`` umbrella *usually* re-exports it, but on some installs (and
+# on the embedded Python interpreter inside ATOM.app) the symbol is
+# missing on the Quartz module and only resolvable via
+# ``Quartz.CoreGraphics`` or the dedicated ``CoreGraphics`` package. We
+# resolve it once at import time and fail-soft to ``None`` so the video
+# delegate can pick a sensible default colour space (or skip JPEG
+# encoding entirely) instead of crashing the boot face check.
+_CGColorSpaceCreateDeviceRGB: Any = None
 try:
     import AVFoundation as _AVF  # type: ignore[import-untyped]
     import CoreMedia as _CoreMedia  # type: ignore[import-untyped]
@@ -86,6 +95,43 @@ try:
     HAS_AVFOUNDATION = True
 except ImportError:
     pass
+
+
+def _resolve_cg_color_space_create_device_rgb() -> Any:
+    """Find ``CGColorSpaceCreateDeviceRGB`` across PyObjC layouts.
+
+    Returns the callable or ``None`` if no source resolves it. Tries (in
+    order): the Quartz umbrella, ``Quartz.CoreGraphics``, and the
+    standalone ``CoreGraphics`` module. Each step is wrapped in a
+    try/except so a partial PyObjC install (e.g. CoreGraphics shipped
+    without the Quartz umbrella, or vice versa) still produces a
+    working symbol when at least one source has it.
+    """
+    candidates: list[Any] = []
+    if _Quartz is not None:
+        candidates.append(_Quartz)
+        sub = getattr(_Quartz, "CoreGraphics", None)
+        if sub is not None:
+            candidates.append(sub)
+    try:
+        import CoreGraphics as _CG  # type: ignore[import-untyped]
+        candidates.append(_CG)
+    except ImportError:
+        pass
+    for src in candidates:
+        fn = getattr(src, "CGColorSpaceCreateDeviceRGB", None)
+        if callable(fn):
+            return fn
+    return None
+
+
+if HAS_AVFOUNDATION:
+    _CGColorSpaceCreateDeviceRGB = _resolve_cg_color_space_create_device_rgb()
+    if _CGColorSpaceCreateDeviceRGB is None:
+        logger.debug(
+            "camera_capture: CGColorSpaceCreateDeviceRGB unresolved; "
+            "JPEG encoding will request the CIContext-default colour space"
+        )
 
 
 # ── libdispatch via ctypes ────────────────────────────────────────────
@@ -371,16 +417,42 @@ def _build_video_delegate_class() -> Any:
                     self._error = "CIImage.imageWithCVPixelBuffer_ returned nil"
                     self._event.set()
                     return
-                # Use a no-GPU CIContext so we don't compete with MLX
-                # for Metal command buffers under memory pressure.
-                ctx = _Quartz.CIContext.contextWithOptions_(None)
-                color_space = _Quartz.CGColorSpaceCreateDeviceRGB()
+                # Force a software-backed CIContext: passing
+                # ``contextWithOptions_(None)`` defaults to a GPU-backed
+                # context that issues its own Metal command buffers,
+                # which races MLX/mlx-vlm for the same device queue and
+                # has been observed to trigger
+                # ``-[_MTLCommandBuffer addCompletedHandler:]:1011``
+                # SIGABRTs on cold start. Software encoding adds <30ms
+                # for one 1080p JPEG -- inconsequential vs. a process
+                # crash, and matches the comment that already lived on
+                # this site.
+                opts: dict[Any, Any] = {}
+                use_sw_key = getattr(_Quartz, "kCIContextUseSoftwareRenderer", None)
+                if use_sw_key is not None:
+                    opts[use_sw_key] = True
+                ctx = _Quartz.CIContext.contextWithOptions_(opts or None)
+                # Resolved at import time across (Quartz |
+                # Quartz.CoreGraphics | CoreGraphics) so we don't
+                # crash on the partial PyObjC layouts shipped inside
+                # ATOM.app.
+                color_space = (
+                    _CGColorSpaceCreateDeviceRGB()
+                    if _CGColorSpaceCreateDeviceRGB is not None
+                    else None
+                )
                 jpeg_options = _NF.NSDictionary.dictionary()
                 jpeg_data = ctx.JPEGRepresentationOfImage_colorSpace_options_(
                     ci_image, color_space, jpeg_options,
                 )
                 if jpeg_data is None:
-                    self._error = "JPEGRepresentationOfImage_ returned nil"
+                    self._error = (
+                        "JPEGRepresentationOfImage_ returned nil"
+                        if color_space is not None
+                        else "JPEGRepresentationOfImage_ returned nil "
+                             "(no colour space — CGColorSpaceCreateDeviceRGB "
+                             "missing in PyObjC)"
+                    )
                     self._event.set()
                     return
                 self._jpeg_bytes = bytes(jpeg_data)

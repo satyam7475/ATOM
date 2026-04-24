@@ -279,7 +279,7 @@ def _looks_like_wrapper_preface(text: str) -> bool:
 class MLXBrain:
     """Single-model MLX wrapper with MiniLLM-compatible behavior.
 
-    ATOM runs ONE local MLX model (Qwen2.5-7B-Instruct-4bit by default).
+    ATOM runs ONE local MLX model (Qwen3-4B-Instruct-2507-4bit by default).
     The cognitive kernel still tags each ``QueryPlan`` with a role label
     (``primary`` | ``fast``) for logs + telemetry so we can see which
     routing path picked the brain; both labels resolve to the same
@@ -291,7 +291,7 @@ class MLXBrain:
     # to make the enumeration order explicit for the per-role state dicts.
     _ROLES: tuple[str, ...] = ("primary", "fast")
 
-    _DEFAULT_MODEL_PATH = "models/qwen2.5-7b-instruct-4bit"
+    _DEFAULT_MODEL_PATH = "models/qwen3-4b-instruct-4bit"
 
     @classmethod
     def _resolve_model_path(cls, brain_cfg: dict) -> str:

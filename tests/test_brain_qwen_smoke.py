@@ -1,9 +1,14 @@
-"""Qwen2.5-7B-Instruct-MLX-4bit live generation smoke test.
+"""Qwen3-4B-Instruct-2507-4bit live generation smoke test.
 
 Loads the actual model on Metal and runs ONE short prompt to verify
 that mlx-lm can read the weights and produce a sensible answer. Slow
-(~5-8s on M5 first call, ~1-2s warm), so it's marked ``@pytest.mark.slow``
-and skipped if the model directory isn't present.
+(~3-5 s on M5 first call, ~1 s warm thanks to the 4B size — half the
+7B's wall clock), so it's marked ``@pytest.mark.slow`` and skipped if
+the model directory isn't present.
+
+ATOM was on Qwen2.5-7B-Instruct-MLX-4bit through 2026-04-24; the v3.3
+JARVIS-grade rewrite swapped to Qwen3-4B-Instruct-2507-4bit. The test
+now exercises the actual brain ATOM ships with.
 
 Run only this test:
     PYTHONPATH=. pytest tests/test_brain_qwen_smoke.py -v -m slow
@@ -19,14 +24,14 @@ import pytest
 
 
 QWEN_DIR = (
-    Path(__file__).resolve().parent.parent / "models" / "qwen2.5-7b-instruct-4bit"
+    Path(__file__).resolve().parent.parent / "models" / "qwen3-4b-instruct-4bit"
 )
 
 
 @pytest.mark.slow
 @pytest.mark.skipif(
     not QWEN_DIR.is_dir(),
-    reason=f"Qwen2.5-7B-Instruct model directory not present at {QWEN_DIR}",
+    reason=f"Qwen3-4B-Instruct model directory not present at {QWEN_DIR}",
 )
 def test_qwen_generates_basic_arithmetic():
     """Loads Qwen via mlx-lm and asks 'what is 2+2'. Must reply with '4'
@@ -35,8 +40,9 @@ def test_qwen_generates_basic_arithmetic():
     from mlx_lm import generate, load
 
     model, tokenizer = load(str(QWEN_DIR))
-    # Qwen2.5 uses the ChatML template. Let the tokenizer apply it so
-    # we inherit the exact formatting the training data expects.
+    # Qwen3 uses ChatML, same template family as Qwen2.5. Let the
+    # tokenizer apply it so we inherit the exact formatting the
+    # training data expects.
     messages = [
         {"role": "user", "content": "What is 2+2? Answer in one short sentence."}
     ]
@@ -56,7 +62,7 @@ def test_qwen_generates_basic_arithmetic():
 @pytest.mark.slow
 @pytest.mark.skipif(
     not QWEN_DIR.is_dir(),
-    reason=f"Qwen2.5-7B-Instruct model directory not present at {QWEN_DIR}",
+    reason=f"Qwen3-4B-Instruct model directory not present at {QWEN_DIR}",
 )
 def test_qwen_does_not_parrot_system_rules():
     """Regression for the v3 prompt-leak issue: when asked a simple

@@ -48,7 +48,8 @@
             "model_repo": "mlx-community/SmolVLM-Instruct-4bit",
             "prompt": "Describe this image in one short sentence.",
             "max_tokens": 48,
-            "temperature": 0.0
+            "temperature": 0.0,
+            "warm_at_boot": false
         }
     },
     "mic": {
@@ -169,7 +170,7 @@
     },
     "brain": {
         "enabled": true,
-        "mlx_model": "models/qwen2.5-7b-instruct-4bit",
+        "mlx_model": "models/qwen3-4b-instruct-4bit",
         "n_ctx": 4096,
         "n_threads": 4,
         "n_gpu_layers": -1,
@@ -178,10 +179,10 @@
         "temperature": 0.6,
         "top_p": 0.85,
         "repeat_penalty": 1.1,
-        "timeout_seconds": 28,
+        "timeout_seconds": 20,
         "prompt_cache_enabled": true,
-        "prompt_cache_max_size": 4,
-        "prompt_cache_max_mb": 512
+        "prompt_cache_max_size": 6,
+        "prompt_cache_max_mb": 320
     },
     "assistant_brain": {
         "active_profile": "optimal",
@@ -213,7 +214,7 @@
                 "n_threads": 4,
                 "n_gpu_layers": -1,
                 "n_batch": 256,
-                "timeout_seconds": 24,
+                "timeout_seconds": 18,
                 "temperature": 0.6,
                 "extra_stop_sequences": ["\n\nUser:", "\nUser:", "\n\nBoss:"]
             },
@@ -223,7 +224,7 @@
                 "n_threads": 4,
                 "n_gpu_layers": -1,
                 "n_batch": 512,
-                "timeout_seconds": 29,
+                "timeout_seconds": 22,
                 "temperature": 0.62
             }
         }
@@ -274,7 +275,7 @@
     },
     "performance": {
         "mode": "auto",
-        "auto_threshold_high": 78,
+        "auto_threshold_high": 82,
         "auto_threshold_mid": 45,
         "health_check_interval_s": 120,
         "stuck_state_threshold_s": 75,
@@ -284,13 +285,13 @@
         "idle_reminder": false,
         "cpu_governor": true,
         "cpu_governor_threshold": 75,
-        "watchdog_thinking_timeout_s": 120,
+        "watchdog_thinking_timeout_s": 90,
         "watchdog_speaking_timeout_s": 300,
         "watchdog_intent_timeout_ms": 150,
         "watchdog_intent_boot_grace_s": 20.0,
         "watchdog_cache_timeout_ms": 200,
         "watchdog_rag_timeout_ms": 750,
-        "watchdog_llm_timeout_s": 20,
+        "watchdog_llm_timeout_s": 14,
         "watchdog_tts_timeout_s": 15,
         "watchdog_tool_timeout_s": 10,
         "supervisor_restart_cooldown_s": 8,
@@ -438,20 +439,20 @@
         "poll_interval_s": 30
     },
     "cognitive_kernel": {
-        "quick_model": "qwen2.5-7b-instruct",
-        "full_model": "qwen2.5-7b-instruct",
+        "quick_model": "qwen3-4b-instruct",
+        "full_model": "qwen3-4b-instruct",
         "simple_query_max_chars": 48,
         "deep_query_min_chars": 140,
         "battery_degrade": true,
         "thermal_degrade": true,
-        "memory_pressure_threshold": 78
+        "memory_pressure_threshold": 82
     },
     "latency_controller": {
         "direct_budget_ms": 50,
         "cache_budget_ms": 100,
-        "quick_budget_ms": 1500,
-        "full_budget_ms": 5000,
-        "deep_budget_ms": 15000,
+        "quick_budget_ms": 900,
+        "full_budget_ms": 3200,
+        "deep_budget_ms": 9000,
         "simple_query_max_chars": 48,
         "memory_pressure_pct": 82,
         "low_battery_pct": 20,

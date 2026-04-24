@@ -317,8 +317,8 @@ class CognitiveKernel:
         self._latency = LatencyController(self._config)
 
         ck = self._config.get("cognitive_kernel", {})
-        self._quick_model = ck.get("quick_model", "qwen2.5-7b-instruct")
-        self._full_model = ck.get("full_model", "qwen2.5-7b-instruct")
+        self._quick_model = ck.get("quick_model", "qwen3-4b-instruct")
+        self._full_model = ck.get("full_model", "qwen3-4b-instruct")
         self._deep_query_min_chars = int(ck.get("deep_query_min_chars", 120))
         self._simple_query_max_chars = int(ck.get("simple_query_max_chars", 50))
         self._battery_degrade = bool(ck.get("battery_degrade", True))
@@ -937,6 +937,17 @@ class CognitiveKernel:
         reason = "simple_query"
         if degraded:
             reason = f"degraded:{self._degradation_reason(ctx)}"
+            # When the configured threshold trips degrade but the
+            # reasoner has nothing concrete to attribute it to (e.g.
+            # the user lowered ``memory_pressure_threshold`` below the
+            # historical 85% floor), fall back to the actual numeric
+            # state so the boot log never carries a useless
+            # ``degraded:unknown`` line.
+            if reason.endswith(":unknown"):
+                reason = (
+                    f"degraded:memory_{ctx.memory_pct:.0f}pct"
+                    f"_thr{self._memory_pressure_threshold:.0f}"
+                )
         elif full_broken:
             reason = "full_circuit_open_fallback"
 
@@ -1099,14 +1110,19 @@ class CognitiveKernel:
             return True
         return False
 
-    @staticmethod
-    def _degradation_reason(ctx: _SystemContext) -> str:
+    def _degradation_reason(self, ctx: _SystemContext) -> str:
+        # Mirror the *exact* trigger conditions in ``_should_degrade`` so
+        # a degrade decision can always be explained. The previous static
+        # method hard-coded ``> 85`` for the memory leg, which silently
+        # produced ``degraded:unknown`` whenever the user lowered
+        # ``memory_pressure_threshold`` (default 85, our config ships 78)
+        # and the actual pressure landed in the 78-85 band.
         reasons = []
-        if ctx.on_battery and ctx.battery_pct < 20:
+        if self._battery_degrade and ctx.on_battery and ctx.battery_pct < 20:
             reasons.append(f"battery_{ctx.battery_pct}pct")
-        if ctx.is_throttled:
+        if self._thermal_degrade and ctx.is_throttled:
             reasons.append(f"thermal_{ctx.thermal_pressure}")
-        if ctx.memory_pct > 85:
+        if ctx.memory_pct > self._memory_pressure_threshold:
             reasons.append(f"memory_{ctx.memory_pct:.0f}pct")
         return "+".join(reasons) or "unknown"
 

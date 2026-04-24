@@ -49,6 +49,17 @@ import psutil
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+# Hugging Face tokenizers fork a worker pool the first time they're
+# imported. Combined with our asyncio event loop + multiprocessing
+# semaphores in mlx-vlm, the default behaviour leaks one unnamed
+# semaphore at process exit and prints
+# ``resource_tracker: There appear to be 1 leaked semaphore objects``
+# on every shutdown. Setting this env var BEFORE any tokenizer import
+# (sentence-transformers, mlx-vlm, transformers) tells the tokenizer
+# library to do its work in-process, which both fixes the leak and
+# avoids a class of fork-after-exec deadlocks on macOS.
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+
 from core.boot.config_loader import load_config, set_config_overrides
 
 
@@ -2578,9 +2589,11 @@ async def main() -> None:
             or "mlx"
         )
         # Use ``Path.name`` (last path segment) instead of ``Path.stem`` —
-        # the model directory ``qwen2.5-7b-instruct-4bit`` would otherwise
-        # be truncated to "qwen2" because ``stem`` treats every dot after
-        # the first as an extension boundary.
+        # the legacy model directory ``qwen2.5-7b-instruct-4bit`` would
+        # otherwise be truncated to "qwen2" because ``stem`` treats every
+        # dot after the first as an extension boundary. The current
+        # ``qwen3-4b-instruct-4bit`` directory has no dots so it's safe
+        # either way, but keeping ``.name`` future-proofs the path.
         model_name = Path(model_raw).name.replace("-mlx", "")
         brain_label = f"Intent Engine + Agentic MLX LLM ({model_name})"
     elif brain_enabled:

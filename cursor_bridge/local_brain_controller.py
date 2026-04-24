@@ -860,7 +860,7 @@ class LocalBrainController:
     ) -> int | None:
         budget = str(budget_tier or "").strip().lower()
         requested = str(requested_tier or "").strip().lower()
-        # v3.1 brain: caps calibrated for Qwen2.5-7B-Instruct-MLX-4bit.
+        # v3.3 brain: caps calibrated for Qwen3-4B-Instruct-2507-4bit.
         # Empirically Qwen needs room comparable to Phi-3.5-mini for the
         # same answer quality (live smoke: 60-word reply at max_tokens=64
         # still coherent), so we keep the Phi-era ceilings. Above SHORT

@@ -208,7 +208,6 @@ class StructuredPromptBuilder:
         self._context_fusion = None
         self._real_world_intel = None
         self._preference_store = None
-        self._intent_continuity = None
         self._system_profile_provider = None
 
     @property
@@ -229,10 +228,6 @@ class StructuredPromptBuilder:
     def set_preference_store(self, preference_store) -> None:
         """v22: Wire PreferenceStore for owner preference injection into prompts."""
         self._preference_store = preference_store
-
-    def set_intent_continuity(self, intent_continuity) -> None:
-        """Wire IntentContinuity for goal/thread-aware prompt injection."""
-        self._intent_continuity = intent_continuity
 
     def set_system_profile_provider(self, provider) -> None:
         """Wire a callable that returns a compact ``[MACHINE] …`` line.
@@ -470,14 +465,6 @@ class StructuredPromptBuilder:
                     parts.append(f"OWNER PREFERENCES:\n{pref_block}")
             except Exception:
                 logger.debug("Owner preferences block inject failed", exc_info=True)
-
-        if self._intent_continuity is not None:
-            try:
-                intent_block = self._intent_continuity.context_for_prompt()
-                if intent_block:
-                    parts.append(intent_block)
-            except Exception:
-                logger.debug("Intent continuity block inject failed", exc_info=True)
 
         # Real-world block only when query needs weather/place/news/world awareness (prevents parroting Delhi/season)
         needs_real_world = any(
