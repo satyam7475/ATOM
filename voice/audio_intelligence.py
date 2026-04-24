@@ -1130,13 +1130,81 @@ class AudioIntelligenceEngine:
                 if bt_stem in out.name.lower() and out.is_output:
                     self._selected_output = out
                     logger.info("Matched BT output: '%s'", out.name)
+                    self._notify_output_change()
                     return out
 
         default_out = next((d for d in self._output_devices if d.is_default_output), None)
         self._selected_output = default_out
         if default_out:
             logger.info("Using default output: '%s'", default_out.name)
+        self._notify_output_change()
         return default_out
+
+    def _notify_output_change(self) -> None:
+        """Phase E5: push current output state to STT (VPIO restore) + TTS (BT tail).
+
+        Called after every assignment of ``self._selected_output`` so
+        downstream voice components stay in lockstep with the active
+        device topology. Both notification arms are best-effort and
+        wrapped in try/except so an audio-routing change can never
+        crash the recognition pipeline.
+        """
+        so = self._selected_output
+        if so is None:
+            return
+        si = self._selected_input
+        output_type = so.device_type
+        hw_match = bool(si is not None and si.device_type == output_type)
+        is_bluetooth = (output_type == "bluetooth")
+
+        stt = self._stt
+        if stt is not None and hasattr(stt, "notify_audio_output_change"):
+            try:
+                stt.notify_audio_output_change(
+                    output_type=output_type, hw_match=hw_match,
+                )
+            except Exception:
+                logger.debug(
+                    "audio_intelligence: stt.notify_audio_output_change failed",
+                    exc_info=True,
+                )
+
+        # The TTS wrapper exposes set_output_is_bluetooth at either the
+        # async wrapper level or on its underlying _NativeSynth; check
+        # both so we work whether the wrapper was rebuilt (Edge fallback
+        # has no native synth) or not.
+        tts = self._tts
+        bt_target: Any = None
+        if tts is not None:
+            if hasattr(tts, "set_output_is_bluetooth"):
+                bt_target = tts
+            else:
+                ns = getattr(tts, "_native_synth", None)
+                if ns is not None and hasattr(ns, "set_output_is_bluetooth"):
+                    bt_target = ns
+        if bt_target is not None:
+            try:
+                bt_target.set_output_is_bluetooth(is_bluetooth)
+            except Exception:
+                logger.debug(
+                    "audio_intelligence: tts.set_output_is_bluetooth failed",
+                    exc_info=True,
+                )
+
+        try:
+            self._bus.emit(
+                "audio_output_changed",
+                output_name=so.name,
+                output_type=output_type,
+                input_type=si.device_type if si else None,
+                hw_match=hw_match,
+                is_bluetooth=is_bluetooth,
+            )
+        except Exception:
+            logger.debug(
+                "audio_intelligence: audio_output_changed emit failed",
+                exc_info=True,
+            )
 
     def apply_system_default(self, device: AudioDeviceProfile) -> bool:
         """Set macOS system default input to the selected device via CoreAudio."""

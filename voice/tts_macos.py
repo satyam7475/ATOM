@@ -487,6 +487,64 @@ class _NativeSynth:
         # never went True). Surfaced so the higher-level TTS can decide
         # to fall back to the ``say`` subprocess on a flapping synth.
         self._stuck_starts: int = 0
+        # ── First-word warmup / tail drain ────────────────────────────
+        # Bluetooth + USB-C dongle outputs latch the audio device on the
+        # first sample after a silent gap. Without a pre-roll silence
+        # NSSpeechSynthesizer ships the first ~80ms of audio while the
+        # device is still ramping up, which truncates the first word
+        # ("Boss" -> "oss"). The tail drain mirrors this on shutdown so
+        # the last sample isn't cut by the buffer flush. Both can be
+        # tuned via _set_warmup_drain or disabled by setting them to 0.
+        self._first_word_warmup_s: float = 0.140
+        self._tail_drain_s: float = 0.120
+        self._tail_drain_bluetooth_s: float = 0.200
+        # Anchor so consecutive sentences in the same speech stream
+        # don't pay the warmup tax. monotonic timestamp of the last
+        # observed speak completion (0.0 means never spoken).
+        self._last_speak_finished_at: float = 0.0
+        self._warmup_skip_window_s: float = 0.800
+        # Set by audio_intelligence when output device is bluetooth
+        # (longer post-buffer flush). Defaults to False -> 120ms.
+        self._output_is_bluetooth: bool = False
+
+    def set_warmup_drain(
+        self,
+        *,
+        first_word_warmup_s: float | None = None,
+        tail_drain_s: float | None = None,
+        tail_drain_bluetooth_s: float | None = None,
+        warmup_skip_window_s: float | None = None,
+    ) -> None:
+        """Tune pre-roll and tail-drain durations from config."""
+        if first_word_warmup_s is not None:
+            self._first_word_warmup_s = max(0.0, float(first_word_warmup_s))
+        if tail_drain_s is not None:
+            self._tail_drain_s = max(0.0, float(tail_drain_s))
+        if tail_drain_bluetooth_s is not None:
+            self._tail_drain_bluetooth_s = max(0.0, float(tail_drain_bluetooth_s))
+        if warmup_skip_window_s is not None:
+            self._warmup_skip_window_s = max(0.0, float(warmup_skip_window_s))
+
+    def set_output_is_bluetooth(self, is_bt: bool) -> None:
+        """Update tail drain length for Bluetooth outputs.
+
+        Called by ``voice.audio_intelligence`` whenever the active output
+        device changes so the longer Bluetooth flush is applied
+        automatically without restarting TTS.
+        """
+        self._output_is_bluetooth = bool(is_bt)
+
+    def _effective_tail_drain_s(self) -> float:
+        return self._tail_drain_bluetooth_s if self._output_is_bluetooth \
+            else self._tail_drain_s
+
+    def _needs_warmup(self) -> bool:
+        if self._first_word_warmup_s <= 0:
+            return False
+        last = self._last_speak_finished_at
+        if last <= 0:
+            return True
+        return (time.monotonic() - last) >= self._warmup_skip_window_s
 
     def _ensure_synth(self) -> Any:
         """Allocate and configure the persistent NSSpeechSynthesizer.
@@ -551,10 +609,22 @@ class _NativeSynth:
         except Exception:
             logger.debug("setRate_ failed in speak_blocking", exc_info=True)
 
+        # First-word warmup: hold the audio device active for ~140ms
+        # before the first sample so Bluetooth / USB-C dongles don't
+        # latch onto the first phoneme. Skipped when the previous
+        # utterance ended within _warmup_skip_window_s -- continuous
+        # speech keeps the device hot already.
+        if self._needs_warmup():
+            try:
+                time.sleep(self._first_word_warmup_s)
+            except Exception:
+                logger.debug("first-word warmup sleep raised", exc_info=True)
+
         try:
             synth.startSpeakingString_(text)
         except Exception:
             logger.warning("startSpeakingString_ raised; aborting speak", exc_info=True)
+            self._last_speak_finished_at = time.monotonic()
             return
 
         rl = _Foundation.NSRunLoop.currentRunLoop()
@@ -607,8 +677,21 @@ class _NativeSynth:
                         logger.debug(
                             "stopSpeaking on wedged synth failed", exc_info=True,
                         )
+                    self._last_speak_finished_at = time.monotonic()
                     return
             elif ever_speaking:
+                # Tail drain: hold the audio device open after
+                # isSpeaking() flips to False so the last sample fully
+                # flushes through CoreAudio's render buffer. Without
+                # this the final word/syllable gets clipped on
+                # Bluetooth headsets (extra ~80ms hardware latency).
+                tail = self._effective_tail_drain_s()
+                if tail > 0:
+                    try:
+                        time.sleep(tail)
+                    except Exception:
+                        logger.debug("tail drain sleep raised", exc_info=True)
+                self._last_speak_finished_at = time.monotonic()
                 return
             elif now >= startup_deadline:
                 self._stuck_starts += 1
@@ -621,6 +704,7 @@ class _NativeSynth:
                     synth.stopSpeaking()
                 except Exception:
                     logger.debug("stopSpeaking on stuck synth failed", exc_info=True)
+                self._last_speak_finished_at = time.monotonic()
                 return
             try:
                 rl.runMode_beforeDate_(
@@ -668,6 +752,11 @@ class MacOSTTSAsync:
         max_lines: int = 4,
         voice: str = "system",
         rate: int = 165,
+        *,
+        first_word_warmup_ms: int = 140,
+        tail_drain_ms: int = 120,
+        tail_drain_bluetooth_ms: int = 200,
+        warmup_skip_window_ms: int = 800,
     ) -> None:
         self._bus = bus
         self._state = state
@@ -676,6 +765,10 @@ class MacOSTTSAsync:
         self._rate = rate
         self._voice_id: str = ""
         self._backend: str = "none"
+        self._first_word_warmup_s = max(0.0, first_word_warmup_ms / 1000.0)
+        self._tail_drain_s = max(0.0, tail_drain_ms / 1000.0)
+        self._tail_drain_bluetooth_s = max(0.0, tail_drain_bluetooth_ms / 1000.0)
+        self._warmup_skip_window_s = max(0.0, warmup_skip_window_ms / 1000.0)
 
         self._native_synth: _NativeSynth | None = None
         self._say_proc: asyncio.subprocess.Process | None = None
@@ -746,6 +839,12 @@ class MacOSTTSAsync:
             is_eloquence = "eloquence" in self._voice_id
             pitch_shift = _preferred_pitch_shift(self._voice_id)
             self._native_synth = _NativeSynth(self._voice_id, float(self._rate), pitch_shift)
+            self._native_synth.set_warmup_drain(
+                first_word_warmup_s=self._first_word_warmup_s,
+                tail_drain_s=self._tail_drain_s,
+                tail_drain_bluetooth_s=self._tail_drain_bluetooth_s,
+                warmup_skip_window_s=self._warmup_skip_window_s,
+            )
             self._backend = "NSSpeechSynthesizer"
 
             # Prewarm: load the voice file NOW (during boot, on the

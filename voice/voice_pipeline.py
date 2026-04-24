@@ -549,6 +549,10 @@ class VoicePipeline:
                 max_lines=tts_cfg.get("max_lines", 4),
                 voice=tts_cfg.get("macos_voice", "system"),
                 rate=tts_cfg.get("macos_rate", 165),
+                first_word_warmup_ms=int(tts_cfg.get("macos_first_word_warmup_ms", 140)),
+                tail_drain_ms=int(tts_cfg.get("macos_tail_drain_ms", 120)),
+                tail_drain_bluetooth_ms=int(tts_cfg.get("macos_tail_drain_bluetooth_ms", 200)),
+                warmup_skip_window_ms=int(tts_cfg.get("macos_warmup_skip_window_ms", 800)),
             )
             logger.info("TTS: macOS Native (voice=%s)", tts_cfg.get("macos_voice", "system"))
             self.tts_runtime_label = f"macOS Native ({tts_cfg.get('macos_voice', 'system')})"

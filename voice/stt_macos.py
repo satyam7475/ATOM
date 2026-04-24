@@ -342,14 +342,37 @@ class NativeSTT:
         )
         self._native_requires_on_device: bool = self._native_requires_on_device_cfg
         # Voice Processing I/O can break or silence some Bluetooth headsets — disable to test.
-        self._native_voice_processing: bool = bool(
+        self._native_voice_processing_cfg: bool = bool(
             self._config.get("native_voice_processing", True),
         )
+        # Runtime mirror of the cfg. ``_restart_audio_engine`` lowers it to
+        # False on attempt >=2 when input/output land on different hardware
+        # (BT mic + built-in speaker eats VPIO into silence). Phase E5
+        # restores it via :meth:`notify_audio_output_change` once the two
+        # ends are back on matching hardware.
+        self._native_voice_processing: bool = self._native_voice_processing_cfg
         self._tap_buffer_count: int = 0
         self._recognizer_supports_on_device: bool = False
         self._consecutive_silent_buffers: int = 0
         self._engine_restart_count: int = 0
         self._max_engine_restarts: int = 3
+        # ── Noise gate (Phase E3) ──────────────────────────────────────
+        # Drop ambient-room frames before they reach the SFSpeechRecognizer
+        # request. Without this, low-energy hum (HVAC, keyboard tap, distant
+        # voices) accumulates inside the recognizer's internal VAD and is
+        # eventually promoted to a near-empty hypothesis ("you", "uh huh",
+        # "okay"). The gate closes after _noise_gate_consecutive frames in
+        # a row sit below _noise_floor_dbfs (default -55 dBFS, ~12 dB below
+        # normal close-mic speech). It re-opens the moment a single frame
+        # crosses back above the floor so true speech onset is never lost.
+        self._noise_floor_dbfs: float = float(
+            self._config.get("noise_floor_dbfs", -55.0),
+        )
+        self._noise_gate_consecutive: int = max(
+            1, int(self._config.get("noise_gate_consecutive", 5)),
+        )
+        self._noise_gate_below_count: int = 0
+        self._noise_gate_dropped_total: int = 0
         self._rebind_audio_device: Callable[[], bool] | None = None
         self._preferred_device_name: str = ""
         self._signal_verified: bool = False
@@ -445,6 +468,22 @@ class NativeSTT:
             self._config.get("promotion_wake_grace_s", 3.0) or 3.0,
         )
         self._last_wake_seen_t: float = 0.0
+        # Phase E4: confidence floor for promoting hypotheses to a final.
+        # SFSpeechRecognizer assigns a confidence in [0.0, 1.0] per
+        # segment; we average them in ``_speech_pyobjc_block``. Bursts of
+        # low-confidence noise text ("you", "uh", random homophones) get
+        # promoted otherwise -- one of the most common sources of "ATOM
+        # talking to itself" turns. The wake-context grace lets a clear
+        # follow-up after "atom" land even at moderate confidence
+        # (intent is unambiguous), but cold conversational openers must
+        # clear the higher bar.
+        self._promotion_min_confidence: float = float(
+            self._config.get("promotion_min_confidence", 0.50) or 0.0,
+        )
+        self._promotion_min_confidence_no_wake: float = float(
+            self._config.get("promotion_min_confidence_no_wake", 0.65) or 0.0,
+        )
+        self._low_confidence_dropped_count: int = 0
 
     @property
     def is_available(self) -> bool:
@@ -995,6 +1034,43 @@ class NativeSTT:
         except Exception:
             return False
 
+    def notify_audio_output_change(
+        self,
+        *,
+        output_type: str | None,
+        hw_match: bool,
+    ) -> None:
+        """React to an output-device change pushed by ``AudioIntelligenceEngine``.
+
+        Phase E5: when the runtime engine-restart fallback disabled
+        Voice Processing I/O because input + output lived on different
+        hardware (BT mic + built-in speaker silences VPIO), and the
+        user has since reunified the two ends (e.g. unplugged the BT
+        headset), restore VPIO so its hardware echo cancellation kicks
+        back in. We only restore if the user originally asked for VPIO
+        in config -- no surprise re-enables.
+
+        ``hw_match`` is the engine's verdict that the selected input
+        and output share the same device type. ``output_type`` is the
+        new output device type (``"bluetooth"`` / ``"builtin"`` / ...);
+        used only for log context.
+        """
+        if not hw_match:
+            return
+        if not self._native_voice_processing_cfg:
+            return
+        if self._native_voice_processing:
+            return
+        logger.info(
+            "VOICE_INPUT: output now %s and matches input hardware -- "
+            "restoring Voice Processing I/O (was disabled by engine-restart fallback)",
+            output_type or "?",
+        )
+        self._native_voice_processing = True
+        self._engine_restart_count = 0
+        self._consecutive_silent_buffers = 0
+        self._schedule_engine_restart()
+
     def _is_recent_wake_context(self, now: float | None = None) -> bool:
         """True when a wake phrase was matched in the last
         ``_promotion_wake_grace_s`` seconds.
@@ -1007,6 +1083,38 @@ class NativeSTT:
             return False
         t = now if now is not None else time.monotonic()
         return (t - self._last_wake_seen_t) <= self._promotion_wake_grace_s
+
+    def _should_block_low_confidence_promotion(self, text: str) -> bool:
+        """Reject finals whose recognizer confidence is too low to trust.
+
+        Two thresholds, both configurable:
+
+          * ``_promotion_min_confidence`` -- absolute floor. Anything
+            below this is junk (sub-syllabic noise spikes) regardless of
+            whether the user just said the wake word.
+          * ``_promotion_min_confidence_no_wake`` -- the bar a cold
+            conversational opener has to clear when there is no recent
+            wake context. Lets a high-confidence sentence land but
+            blocks medium-confidence misheard noise during silence.
+
+        Returning ``True`` means the caller should drop the promotion.
+        """
+        text = (text or "").strip()
+        if not text:
+            return False
+        confidence = float(self._last_confidence or 0.0)
+        if confidence <= 0.0:
+            return False
+        if self._promotion_min_confidence > 0.0 \
+                and confidence < self._promotion_min_confidence:
+            self._low_confidence_dropped_count += 1
+            return True
+        if self._promotion_min_confidence_no_wake > 0.0 \
+                and confidence < self._promotion_min_confidence_no_wake \
+                and not self._is_recent_wake_context():
+            self._low_confidence_dropped_count += 1
+            return True
+        return False
 
     def _should_block_short_promotion(self, text: str) -> bool:
         """Reject finals that are too short to be a real command unless we
@@ -1142,23 +1250,23 @@ class NativeSTT:
         """
         self._tap_buffer_count += 1
 
-        check_rms = self._tap_buffer_count <= 60 or (
-            self._voice_debug and self._tap_buffer_count % 200 == 0
-        )
-        rms_db = self._estimate_rms_db(buffer) if check_rms else None
+        # Phase E3: noise gate needs RMS on every frame. The previous
+        # behaviour only sampled RMS on the first 60 buffers; the gate
+        # decision must run continuously to keep ambient hum out of the
+        # recognizer for the whole session.
+        rms_db = self._estimate_rms_db(buffer)
         self._note_audio_activity(rms_db)
 
-        if rms_db is not None:
-            if rms_db <= -95.0:
-                self._consecutive_silent_buffers += 1
-            else:
-                self._consecutive_silent_buffers = 0
-                if not self._signal_verified:
-                    self._signal_verified = True
-                    logger.info(
-                        "VOICE_INPUT: mic signal verified (rms=%.1f dB at buffer %d) — audio path healthy",
-                        rms_db, self._tap_buffer_count,
-                    )
+        if rms_db <= -95.0:
+            self._consecutive_silent_buffers += 1
+        else:
+            self._consecutive_silent_buffers = 0
+            if not self._signal_verified:
+                self._signal_verified = True
+                logger.info(
+                    "VOICE_INPUT: mic signal verified (rms=%.1f dB at buffer %d) — audio path healthy",
+                    rms_db, self._tap_buffer_count,
+                )
 
         if (self._consecutive_silent_buffers >= 15
                 and self._engine_restart_count < self._max_engine_restarts):
@@ -1174,7 +1282,7 @@ class NativeSTT:
             self._schedule_engine_restart()
             return
 
-        if self._voice_debug and rms_db is not None and (
+        if self._voice_debug and (
             self._tap_buffer_count == 1 or self._tap_buffer_count % 200 == 0
         ):
             logger.info(
@@ -1193,6 +1301,13 @@ class NativeSTT:
         # buffer so a second-pass re-decode is one method call away.
         # No-op when no confirmer is wired or it is disabled.
         self._feed_whisper_confirmer_from_avbuffer(buffer)
+
+        # Phase E3: drop sustained-silence frames before they reach
+        # SFSpeechRecognizer. The state gate above already blocks SPEAK/
+        # THINK; this gate keeps ambient room noise from being decoded
+        # into ghost partials during LISTENING.
+        if self._noise_gate_blocks(rms_db):
+            return
 
         with self._recognition_lock:
             req = self._recognition_request
@@ -1287,28 +1402,22 @@ class NativeSTT:
 
         self._tap_buffer_count += 1
 
-        check_rms = self._tap_buffer_count <= 60 or (
-            self._voice_debug and self._tap_buffer_count % 200 == 0
-        )
-        rms_db: float | None = None
-        if check_rms:
-            rms = float(np.sqrt(np.mean(indata ** 2)))
-            rms_db = 20.0 * float(np.log10(max(rms, 1e-10))) if rms > 1e-10 else -96.0
+        # Phase E3: noise gate runs every frame, so we always need RMS.
+        rms_db = self._rms_db_from_indata(indata)
         self._note_audio_activity(rms_db)
 
-        if rms_db is not None:
-            if rms_db <= -95.0:
-                self._consecutive_silent_buffers += 1
-            else:
-                self._consecutive_silent_buffers = 0
-                if not self._signal_verified:
-                    self._signal_verified = True
-                    logger.info(
-                        "VOICE_INPUT: mic signal verified (rms=%.1f dB at buffer %d) — audio path healthy",
-                        rms_db, self._tap_buffer_count,
-                    )
+        if rms_db <= -95.0:
+            self._consecutive_silent_buffers += 1
+        else:
+            self._consecutive_silent_buffers = 0
+            if not self._signal_verified:
+                self._signal_verified = True
+                logger.info(
+                    "VOICE_INPUT: mic signal verified (rms=%.1f dB at buffer %d) — audio path healthy",
+                    rms_db, self._tap_buffer_count,
+                )
 
-        if rms_db is not None and (
+        if self._voice_debug and (
             self._tap_buffer_count == 1 or self._tap_buffer_count % 200 == 0
         ):
             logger.info(
@@ -1326,7 +1435,6 @@ class NativeSTT:
         if not self._should_feed_recognizer():
             return
 
-        import numpy as np
         self._audio_prebuffer.append(np.array(indata, copy=True))
 
         # v3 Phase 4: tee into the WhisperConfirmer ring buffer.
@@ -1341,6 +1449,14 @@ class NativeSTT:
                     logger.debug(
                         "WhisperConfirmer feed (sd path) failed", exc_info=True,
                     )
+
+        # Phase E3: noise gate -- skip pushing low-energy frames into the
+        # SFSpeechRecognizer. The prebuffer above is still populated so a
+        # mid-utterance chain restart can replay context, but we refuse
+        # to drip silent CoreAudio frames into the live recognizer where
+        # they accumulate into ghost "you" / "uh huh" hypotheses.
+        if self._noise_gate_blocks(rms_db):
+            return
 
         with self._recognition_lock:
             req = self._recognition_request
@@ -1395,6 +1511,19 @@ class NativeSTT:
             self._last_partial = ""
             self._partial_stable_since = 0.0
             return
+        if self._should_block_low_confidence_promotion(text):
+            logger.info(
+                "STT: dropping low-confidence stable partial "
+                "(conf=%.2f, min=%.2f / no-wake=%.2f, wake=%s): '%s'",
+                float(self._last_confidence or 0.0),
+                self._promotion_min_confidence,
+                self._promotion_min_confidence_no_wake,
+                self._is_recent_wake_context(),
+                text,
+            )
+            self._last_partial = ""
+            self._partial_stable_since = 0.0
+            return
         logger.info(
             "STT: partial stable for %.1fs — promoting to final: '%s'",
             elapsed, text,
@@ -1441,6 +1570,41 @@ class NativeSTT:
                 self._logged_buf_fail = True
                 logger.warning("VOICE_INPUT: AVAudioPCMBuffer creation failed", exc_info=True)
             return None
+
+    def _noise_gate_blocks(self, rms_db: float | None) -> bool:
+        """Return True if this frame should be withheld from the recognizer.
+
+        Implements a hysteresis-free RMS gate: ``_noise_gate_consecutive``
+        consecutive frames below ``_noise_floor_dbfs`` close the gate; the
+        first frame at or above the floor reopens it immediately so we do
+        not clip the start of a real utterance.
+
+        ``rms_db`` of ``None`` means "RMS unknown for this frame" -- we
+        let those through (treat as supra-floor) so the gate can never
+        wedge on missing measurements.
+        """
+        if self._noise_floor_dbfs <= -96.0:
+            return False
+        if rms_db is None or rms_db >= self._noise_floor_dbfs:
+            self._noise_gate_below_count = 0
+            return False
+        self._noise_gate_below_count += 1
+        if self._noise_gate_below_count >= self._noise_gate_consecutive:
+            self._noise_gate_dropped_total += 1
+            return True
+        return False
+
+    def _rms_db_from_indata(self, indata: Any) -> float:
+        """RMS dBFS for a sounddevice float32 buffer (mono or interleaved)."""
+        try:
+            import numpy as np
+            arr = indata[:, 0] if getattr(indata, "ndim", 1) > 1 else indata
+            rms = float(np.sqrt(np.mean(arr ** 2)))
+            if rms < 1e-10:
+                return -96.0
+            return 20.0 * float(np.log10(rms))
+        except Exception:
+            return -96.0
 
     @staticmethod
     def _estimate_rms_db(buffer: Any) -> float:
@@ -1752,6 +1916,17 @@ class NativeSTT:
                         cleaned_final,
                     )
                     has_text = False
+                elif self._should_block_low_confidence_promotion(transcript):
+                    logger.info(
+                        "STT: dropping low-confidence final "
+                        "(conf=%.2f, min=%.2f / no-wake=%.2f, wake=%s): %r",
+                        float(self._last_confidence or 0.0),
+                        self._promotion_min_confidence,
+                        self._promotion_min_confidence_no_wake,
+                        self._is_recent_wake_context(),
+                        cleaned_final,
+                    )
+                    has_text = False
             if has_text:
                 # Also gate by state — never emit a final while ATOM is
                 # SPEAKING/THINKING. Those can only be echo / pre-buffer
@@ -1873,6 +2048,18 @@ class NativeSTT:
                         "STT: dropping short stable partial without wake context "
                         "(min=%d): '%s'",
                         self._promotion_min_alpha_chars,
+                        transcript,
+                    )
+                    self._last_partial = ""
+                    self._partial_stable_since = 0.0
+                elif self._should_block_low_confidence_promotion(transcript):
+                    logger.info(
+                        "STT: dropping low-confidence stable partial "
+                        "(conf=%.2f, min=%.2f / no-wake=%.2f, wake=%s): '%s'",
+                        float(self._last_confidence or 0.0),
+                        self._promotion_min_confidence,
+                        self._promotion_min_confidence_no_wake,
+                        self._is_recent_wake_context(),
                         transcript,
                     )
                     self._last_partial = ""
