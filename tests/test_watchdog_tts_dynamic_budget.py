@@ -196,3 +196,78 @@ def test_schema_accepts_dynamic_budget_keys() -> None:
         },
     }
     validate_config(base)  # must not raise
+
+
+# ---------------------------------------------------------------------------
+# D6: word count must ACCUMULATE across all partials in the active stream
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_partial_response_accumulates_word_count() -> None:
+    """atom_log.txt L470-L475 regression. A stream that begins with a
+    short ack ("Right away.") and then expands into a 22-word body must
+    have its TTS budget scale to the FULL utterance length, not just the
+    first slice. Before the D6 fix, ``_on_tts_started`` short-circuited
+    on subsequent partials and the watchdog killed the stream at the
+    static 15s floor."""
+    wd = _make_watchdog(
+        {"watchdog_tts_timeout_s": 15, "watchdog_tts_per_word_s": 0.5},
+    )
+
+    await wd._on_tts_started(text="Right away.", is_first=True)
+    assert wd._tts_active_word_count == 2
+    initial_clock = wd._tts_started_at
+    assert initial_clock > 0
+
+    body = " ".join(["word"] * 50)  # 50 words → scaled 25s clears 15s floor
+    await wd._on_tts_started(text=body, is_first=False)
+
+    expected = 2 + RuntimeWatchdog._count_tts_words(body)
+    assert wd._tts_active_word_count == expected, (
+        f"word count must accumulate across partials: got "
+        f"{wd._tts_active_word_count}, expected {expected}"
+    )
+    assert wd._tts_started_at == initial_clock, (
+        "subsequent partials must NOT reset the TTS clock; only the "
+        "first partial / response_ready event anchors wall-time"
+    )
+
+    # 52 words * 0.5s = 26s budget, comfortably above the 15s static floor
+    # and the 45s cap, so the dynamic scaler must win.
+    assert wd.effective_tts_budget_s() == pytest.approx(expected * 0.5)
+
+
+@pytest.mark.asyncio
+async def test_partial_response_accumulation_caps_at_max_dynamic() -> None:
+    """Even runaway accumulation must respect the hard cap."""
+    wd = _make_watchdog(
+        {
+            "watchdog_tts_timeout_s": 15,
+            "watchdog_tts_per_word_s": 0.5,
+            "watchdog_tts_max_dynamic_s": 45,
+        },
+    )
+    await wd._on_tts_started(text="one two three", is_first=True)
+    big = " ".join(["word"] * 200)
+    await wd._on_tts_started(text=big, is_first=False)
+    assert wd.effective_tts_budget_s() == 45.0
+
+
+@pytest.mark.asyncio
+async def test_first_partial_after_complete_resets_state() -> None:
+    """A new turn (is_first=True) after tts_complete must restart the
+    word count from zero, not accumulate forever across turns."""
+    wd = _make_watchdog(
+        {"watchdog_tts_timeout_s": 15, "watchdog_tts_per_word_s": 0.5},
+    )
+    await wd._on_tts_started(text="first turn", is_first=True)
+    await wd._on_tts_started(text="more text in same turn", is_first=False)
+    assert wd._tts_active_word_count == 7
+
+    await wd._on_tts_complete()
+    assert wd._tts_active_word_count == 0
+    assert wd._tts_started_at == 0.0
+
+    await wd._on_tts_started(text="brand new turn here", is_first=True)
+    assert wd._tts_active_word_count == 4

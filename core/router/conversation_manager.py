@@ -10,9 +10,12 @@ from __future__ import annotations
 
 from __future__ import annotations
 
+import logging
 import re
 import time
 from typing import Any
+
+logger = logging.getLogger("atom.conversation")
 
 # ── Regex patterns for conversational continuity ──────────────────────────────
 _FILLER = re.compile(
@@ -121,6 +124,13 @@ class ConversationManager:
             return ""
         return " ".join(significant[-3:])
 
+    # Hard cap on tokens that pronoun resolution may add. Without this
+    # guard, a multi-word _last_entity carried over from an earlier turn
+    # gets spliced into a fresh query and produces sentences the user
+    # never said (atom_log.txt L488: "how do that" was resolved to
+    # "how do you chicken wings", which then went to the LLM verbatim).
+    _MAX_RESOLVED_NEW_TOKENS = 2
+
     def resolve_pronouns(self, query: str) -> str:
         """Replace dangling pronouns with the last known entity."""
         if not self._last_entity:
@@ -140,6 +150,24 @@ class ConversationManager:
         if has_noun:
             return query
         resolved = _DANGLING_PRONOUN.sub(self._last_entity, query, count=1)
+
+        # Net-token-count guard: every word in the resolved query must
+        # already appear in the original query OR in the recorded
+        # _last_entity itself. We additionally require that the resolved
+        # query introduces at most _MAX_RESOLVED_NEW_TOKENS *content*
+        # tokens that the original query does not have. This blocks
+        # multi-word entity dumps from polluting short queries.
+        original_tokens = {w.lower().strip(".,!?;:") for w in query.split()}
+        resolved_tokens = {w.lower().strip(".,!?;:") for w in resolved.split()}
+        new_tokens = resolved_tokens - original_tokens
+        if len(new_tokens) > self._MAX_RESOLVED_NEW_TOKENS:
+            logger.info(
+                "Pronoun resolution rejected: '%s' -> '%s' would inject %d "
+                "new tokens (cap=%d, entity=%r)",
+                query, resolved, len(new_tokens),
+                self._MAX_RESOLVED_NEW_TOKENS, self._last_entity,
+            )
+            return query
         return resolved
 
     def track_entity(self, clean_text: str) -> None:

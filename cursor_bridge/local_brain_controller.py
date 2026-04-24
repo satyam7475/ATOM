@@ -269,16 +269,26 @@ _COT_PREFACE_STRIP_PARTIAL_RE = re.compile(
 
 # Bare stage-direction parentheticals leaked by smaller instruction-tuned
 # models (Qwen3-4B in particular) when the system prompt mentions tone/
-# manner adjectives. Length-capped + mood-keyword-anchored so that
-# legitimate parentheticals like "(see line 12)" or "(2 of 3)" survive.
+# manner adjectives. Length-capped + vocabulary-anchored so that legitimate
+# parentheticals like "(see line 12)" or "(2 of 3)" survive.
+_STAGE_LEAK_VOCAB = (
+    r"\b(?:tone|voice|manner|composed|composedly|calm(?:ly)?|softly|"
+    r"warmly|gently|firmly|politely|brief(?:ly)?|professional(?:ly)?|"
+    r"quietly|quickly|slowly|immediately|confidently|cheerful(?:ly)?|"
+    r"cheery|crisp(?:ly)?|relaxed|respectful(?:ly)?|measured|steady|"
+    r"steadily|chief\s+of\s+staff|friday[-\s]?style|jarvis[-\s]?style|"
+    r"respond(?:s|ed|ing)?|reply(?:ies|ied|ying)?|answer(?:s|ed|ing)?|"
+    r"pause(?:s|d|ing)?|nod(?:s|ded|ding)?|smile(?:s|d|ing)?|"
+    r"chuckle(?:s|d|ing)?|sigh(?:s|ed|ing)?|breathe(?:s|d|ing)?|"
+    r"speaks?|speaking|in\s+a\s+(?:tone|voice|manner))\b"
+)
+
 _STAGE_DIRECTION_LEAK_RE = re.compile(
     r"""
     ^\s*
     \(\s*
     [^()\n]{0,80}?
-    \b(?:tone|voice|manner|composed|composedly|calm(?:ly)?|softly|
-        warmly|gently|firmly|politely|brief(?:ly)?|professional(?:ly)?|
-        chief\s+of\s+staff|friday[-\s]?style|jarvis[-\s]?style)\b
+    """ + _STAGE_LEAK_VOCAB + r"""
     [^()\n]{0,80}?
     \)
     \s*[\.,;:\-\u2013\u2014]?\s*
@@ -286,21 +296,41 @@ _STAGE_DIRECTION_LEAK_RE = re.compile(
     re.IGNORECASE | re.VERBOSE,
 )
 
+# Open-paren stage-direction leak (no closing paren). The model truncated
+# the direction mid-clause, e.g. "(in a calm, composed tone" or
+# "(calm, composed tone." with the dot inside an unclosed paren.
+# Terminates at end-of-string or newline.
+_STAGE_DIRECTION_OPEN_LEAK_RE = re.compile(
+    r"""
+    ^\s*
+    \(\s*
+    [^()\n]{0,160}?
+    """ + _STAGE_LEAK_VOCAB + r"""
+    [^()\n]*?
+    (?:$|\n)
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
+
 
 def _strip_stage_direction_leak(text: str) -> str:
-    """Peel a leading bare parenthetical describing voice/tone/manner.
+    """Peel a leading bare parenthetical describing voice/tone/manner/action.
 
-    Defense-in-depth against models that parrot persona-adjective phrases
-    back as a stage direction (e.g. "(in a calm, composed tone). Boss…").
-    Anchored at the very head of the string and only fires when the
-    parenthetical contains a tone/manner keyword, so factual asides
-    like "(see line 12)" pass through untouched.
+    Handles four shapes seen in atom_log:
+      - "(in a calm, composed tone). Boss…"   (closed, original Sprint A)
+      - "(in a calm, composed tone"            (open, L357)
+      - "(calm, composed tone."                 (open with inner dot, L554)
+      - "(responds immediately) Sure, Boss"    (closed, narration verb, L409)
+    Anchored at head + vocabulary-gated so factual asides like "(see line 12)"
+    pass through untouched.
     """
-    if not text or "(" not in text[:120]:
+    if not text or "(" not in text[:160]:
         return text
     out = text
     for _ in range(2):
         new = _STAGE_DIRECTION_LEAK_RE.sub("", out, count=1).lstrip()
+        if new == out:
+            new = _STAGE_DIRECTION_OPEN_LEAK_RE.sub("", out, count=1).lstrip()
         if new == out:
             break
         out = new

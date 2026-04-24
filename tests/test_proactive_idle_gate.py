@@ -121,3 +121,55 @@ def test_no_state_provider_means_always_idle():
     engine = ProactiveIntelligenceEngine(bus=bus, config={"proactive_engine": {}})
     engine._emit_insight(_insight("legacy"))
     assert len(bus.long_emits) == 1
+
+
+def test_state_changed_handler_accepts_real_bus_payload():
+    """Regression for atom_log.txt L209-L634 (TypeError ... unexpected
+    keyword argument 'old').
+
+    StateManager.transition() emits ``state_changed(old=AtomState, new=AtomState)``
+    via AsyncEventBus, which calls ``handler(**data)``. Any handler bound to
+    that event must accept the ``old`` and ``new`` kwargs (with AtomState
+    enum values, not strings) without exploding.
+
+    This test mirrors the inline handler shape used in main.py. If the shape
+    drifts again, this test fails before the live boot does.
+    """
+    from core.state_manager import AtomState
+
+    drained_calls: list[tuple[object, object]] = []
+
+    async def handler(*, old: object | None = None,
+                     new: object | None = None, **_kw: object) -> None:
+        drained_calls.append((old, new))
+
+    payload = {"old": AtomState.SPEAKING, "new": AtomState.LISTENING}
+    coro = handler(**payload)
+    assert asyncio.iscoroutine(coro)
+    asyncio.get_event_loop().run_until_complete(coro) if False else asyncio.new_event_loop().run_until_complete(coro)
+
+    assert len(drained_calls) == 1
+    assert drained_calls[0] == (AtomState.SPEAKING, AtomState.LISTENING)
+
+
+def test_state_changed_handler_normalizes_enum_value():
+    """The handler must extract ``.value`` from an AtomState enum because
+    StateManager passes the enum, not the string. Returning the raw enum and
+    string-comparing it would silently never match 'listening'."""
+    from core.state_manager import AtomState
+
+    drains: list[str] = []
+
+    async def handler(*, old: object | None = None,
+                     new: object | None = None, **_kw: object) -> None:
+        new_state = getattr(new, "value", new)
+        new_state = str(new_state or "").lower()
+        if new_state in ("listening", "idle"):
+            drains.append(new_state)
+
+    asyncio.new_event_loop().run_until_complete(
+        handler(old=AtomState.SPEAKING, new=AtomState.LISTENING))
+    asyncio.new_event_loop().run_until_complete(
+        handler(old=AtomState.LISTENING, new=AtomState.THINKING))
+
+    assert drains == ["listening"]

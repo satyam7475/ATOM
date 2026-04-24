@@ -1014,6 +1014,16 @@ _STAGE_DIRECTION_LEAKS = [
     "(in a composed, friendly tone). On it, Boss.",
     "(softly) Right away, Boss.",
     "(warmly, but professionally) Understood.",
+    # New shapes proved to leak in atom_log.txt 2026-04-25 boot:
+    # L357 — TTS spoke "(in a calm, composed tone" (open paren, no ')')
+    "(in a calm, composed tone",
+    # L554 — TTS spoke "(calm, composed tone." (open paren with inner dot)
+    "(calm, composed tone.",
+    # L409 — TTS spoke "(responds immediately) Sure, Boss." (narration verb)
+    "(responds immediately) Sure, Boss.",
+    "(responds immediately)",
+    "(answers quickly) On it, Boss.",
+    "(pauses briefly). Got it.",
 ]
 
 

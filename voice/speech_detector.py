@@ -66,12 +66,14 @@ _TEXT_CORRECTIONS: list[tuple[str, str]] = [
     ("close know pad", "close notepad"),
     ("close no pad", "close notepad"),
 
-    ("at one", "atom"),
-    ("a tom", "atom"),
-    ("at um", "atom"),
-    ("at on", "atom"),
     ("atome", "atom"),
-    ("item", "atom"),
+    # NOTE: ("item", "atom") used to live here. Removed 2026-04 because
+    # it rewrote legitimate trailing wake-echoes in commands like
+    # "play some music for me item" -> "play some music for me atom",
+    # which broke music-intent matching (atom_log.txt L320-L325). The
+    # wake-only confusable substitution now happens in
+    # ``_correct_leading_wake_token`` and only fires when the suspect
+    # token is at the head of the utterance.
     ("no pad", "notepad"),
     ("know pad", "notepad"),
     ("note pad", "notepad"),
@@ -124,9 +126,39 @@ _HINDI_CORRECTIONS: list[tuple[str, str]] = [
 ]
 
 
+# Tokens we believe are STT misrecognitions of the wake word "atom" when
+# they appear in the wake position (head of utterance). Body-position
+# matches are NOT corrected because they are far more likely to be the
+# user's actual word (e.g. "add this item to the list", "play music for
+# me item" where the trailing token is a wake echo we tolerate).
+_WAKE_CONFUSABLES: frozenset[str] = frozenset({
+    "item",
+    "atum",
+})
+
+_LEADING_WAKE_RE = re.compile(
+    r"^\s*(?P<wake>" + "|".join(re.escape(w) for w in sorted(_WAKE_CONFUSABLES)) + r")\b",
+    re.IGNORECASE,
+)
+
+
+def _correct_leading_wake_token(text: str) -> str:
+    """Promote a confusable first token to the canonical wake word "atom".
+
+    Only the FIRST token is rewritten — body-position occurrences belong
+    to the user (e.g. "play music for me item"). Single-token utterances
+    ("item") still get rewritten because they're almost certainly a bare
+    wake call.
+    """
+    if not text:
+        return text
+    return _LEADING_WAKE_RE.sub("atom", text, count=1)
+
+
 def correct_text(text: str) -> str:
     """Fix common misrecognitions and strip filler words (English + Hindi)."""
     t = text.lower().strip()
+    t = _correct_leading_wake_token(t)
     for wrong, right in _TEXT_CORRECTIONS:
         pattern = r'\b' + re.escape(wrong) + r'\b'
         t = re.sub(pattern, right, t)

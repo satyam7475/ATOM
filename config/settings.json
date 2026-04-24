@@ -644,6 +644,7 @@
         "max_size": 256,
         "ttl_seconds": 600,
         "threshold": 0.92,
+        "min_jaccard_overlap": 0.4,
         "persistent": true,
         "persistent_max": 10000,
         "persistent_ttl_seconds": 604800,

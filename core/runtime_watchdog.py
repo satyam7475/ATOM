@@ -255,12 +255,31 @@ class RuntimeWatchdog:
         is_first: bool = False,
         **_kw: Any,
     ) -> None:
+        """Track TTS clock + word budget for the active stream.
+
+        Streaming TTS emits one ``partial_response`` per sentence (or
+        per ack + sentence). Before this fix the watchdog set the word
+        count from the FIRST partial only, which meant a 6-word ack
+        followed by a 22-word body got budgeted as if the full reply
+        was 6 words -- so the dynamic budget collapsed to the static
+        floor (15s) and the longer reply was murdered mid-sentence
+        (atom_log.txt L470-L475).
+
+        We now accumulate the word count across every partial in the
+        active stream, while still anchoring ``_tts_started_at`` to the
+        first event so the elapsed clock measures wall-time-to-audio.
+        ``effective_tts_budget_s`` reads ``_tts_active_word_count`` on
+        every poll, so the budget grows automatically as more text
+        arrives -- bounded by ``watchdog_tts_max_dynamic_s``.
+        """
         if not text.strip():
             return
-        if self._tts_started_at > 0 and not is_first:
-            return
-        self._tts_started_at = time.monotonic()
-        self._tts_active_word_count = self._count_tts_words(text)
+        word_count = self._count_tts_words(text)
+        if self._tts_started_at <= 0 or is_first:
+            self._tts_started_at = time.monotonic()
+            self._tts_active_word_count = word_count
+        else:
+            self._tts_active_word_count += word_count
 
     async def _on_tts_complete(self, **_kw: Any) -> None:
         self._tts_started_at = 0.0

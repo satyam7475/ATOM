@@ -2094,8 +2094,11 @@ async def main() -> None:
     try:
         proactive_intel.attach_idle_gate(state, command_loop)
 
-        async def _drain_proactive_on_listening(event_data: dict) -> None:
-            new_state = str(event_data.get("new", "") or "").lower()
+        async def _drain_proactive_on_listening(
+            *, old: object | None = None, new: object | None = None, **_kw: object
+        ) -> None:
+            new_state = getattr(new, "value", new)
+            new_state = str(new_state or "").lower()
             if new_state in ("listening", "idle"):
                 drained = proactive_intel.drain_pending()
                 if drained:

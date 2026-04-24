@@ -75,6 +75,50 @@ def _is_volatile(query: str) -> bool:
     return False
 
 
+# Stop tokens stripped from the Jaccard relevance check. Embedding similarity
+# happily clusters two semantically distant queries that share only function
+# words ("the", "is", "a"), which is exactly how "what's slbc shoes in the
+# terminal" hit "chicken wing nutrition" in atom_log.txt L605→L632. Removing
+# stop tokens forces the overlap check to fail when the *content* words don't
+# match.
+_JACCARD_STOPWORDS: frozenset[str] = frozenset({
+    "a", "an", "the", "is", "are", "am", "was", "were", "be", "been",
+    "of", "in", "on", "at", "to", "for", "with", "by", "from", "as",
+    "and", "or", "but", "so", "if", "than", "then", "that", "this",
+    "these", "those", "it", "its", "do", "does", "did", "doing",
+    "what", "whats", "whatis", "tell", "me", "you", "your", "i",
+    "my", "mine", "we", "our", "us", "they", "them", "he", "she",
+    "his", "her", "have", "has", "had", "can", "could", "would",
+    "should", "will", "shall", "may", "might", "must",
+    "boss", "atom",
+})
+
+_TOKEN_SPLIT_RE = re.compile(r"[^\w]+", re.UNICODE)
+
+
+def _content_tokens(text: str) -> set[str]:
+    """Tokenize for Jaccard relevance. Lowercases, strips punctuation,
+    drops stopwords, drops 1-char tokens. Returns a set."""
+    if not text:
+        return set()
+    parts = _TOKEN_SPLIT_RE.split(text.lower())
+    return {p for p in parts if p and len(p) > 1 and p not in _JACCARD_STOPWORDS}
+
+
+def _jaccard_overlap(a: str, b: str) -> float:
+    """Jaccard similarity over content tokens. Returns 0.0 when either
+    side has no content tokens (forces the cache to miss rather than
+    accidentally serve a cached answer for a single-word query that
+    happens to embed near anything)."""
+    sa = _content_tokens(a)
+    sb = _content_tokens(b)
+    if not sa or not sb:
+        return 0.0
+    inter = len(sa & sb)
+    union = len(sa | sb)
+    return inter / union if union else 0.0
+
+
 def _pack_embedding(vec: list[float]) -> bytes:
     """Pack a float32 vector into compact bytes for SQLite BLOB storage."""
     if not vec:
@@ -136,6 +180,12 @@ class SemanticCache:
         # answer paraphrased but distinct questions with a cached reply
         # for an unrelated query (e.g. "play the song" for "what is newton").
         self._similarity_threshold = float(cfg.get("threshold", 0.92))
+        # Even at 0.92 cosine similarity, two queries with no shared
+        # content words can still be hit-adjacent in the embedding space
+        # (atom_log.txt L605→L632: "slbc shoes terminal" returned a chicken-
+        # wing reply). The Jaccard guard requires both vectors to ALSO
+        # share enough literal vocabulary before we'll serve a cached hit.
+        self._min_jaccard_overlap = float(cfg.get("min_jaccard_overlap", 0.4))
         self._enabled = bool(cfg.get("enabled", True))
 
         # Persistence controls. Off by default for tests; production
@@ -469,13 +519,24 @@ class SemanticCache:
                         best_key = candidates[i][0]
 
                 if best_score >= self._similarity_threshold and best_key:
+                    overlap = _jaccard_overlap(query, best_key)
+                    if overlap < self._min_jaccard_overlap:
+                        logger.info(
+                            "SemanticCache: rejected near-hit (sim=%.3f, "
+                            "jaccard=%.2f<%.2f) '%s' → '%s' [topic mismatch]",
+                            best_score, overlap, self._min_jaccard_overlap,
+                            query[:40], best_key[:40],
+                        )
+                        self._total_misses += 1
+                        return None
                     entry = self._cache[best_key]
                     entry.hit_count += 1
                     self._cache.move_to_end(best_key)
                     self._total_hits += 1
                     logger.info(
-                        "SemanticCache: semantic hit (%.3f) '%s' → '%s'",
-                        best_score, query[:40], best_key[:40],
+                        "SemanticCache: semantic hit (sim=%.3f, jaccard=%.2f) "
+                        "'%s' → '%s'",
+                        best_score, overlap, query[:40], best_key[:40],
                     )
                     self._persist_touch(best_key)
                     return entry.response
@@ -639,6 +700,7 @@ class SemanticCache:
             "total_puts": self._total_puts,
             "hit_rate_pct": round(self.hit_rate * 100, 1),
             "similarity_threshold": self._similarity_threshold,
+            "min_jaccard_overlap": self._min_jaccard_overlap,
         }
 
     def close(self) -> None:
