@@ -679,6 +679,20 @@ CONFIG_SCHEMA: dict[str, Any] = {
                     "maximum": 8192,
                     "description": "Upper bound on memory used by the prompt-prefix KV cache (per MLX role).",
                 },
+                "prompt_cache_persist": {
+                    "type": "boolean",
+                    "description": "Persist the warm system-prompt KV state to disk on first turn and restore on next boot to skip the ~7s cold prefill.",
+                },
+                "prompt_cache_persist_path": {
+                    "type": "string",
+                    "description": "Filesystem path for the persisted prompt cache (per-role suffixes are appended automatically).",
+                },
+                "prompt_cache_persist_min_tokens": {
+                    "type": "integer",
+                    "minimum": 32,
+                    "maximum": 8192,
+                    "description": "Don't persist cache snapshots smaller than this — saves disk on degenerate first turns.",
+                },
             },
             "additionalProperties": False,
         },

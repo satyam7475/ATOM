@@ -51,6 +51,8 @@ _LRUPromptCache: Any = None
 _make_prompt_cache: Any = None
 _trim_prompt_cache: Any = None
 _can_trim_prompt_cache: Any = None
+_save_prompt_cache: Any = None
+_load_prompt_cache: Any = None
 if _HAS_MLX:
     try:
         from mlx_lm.models.cache import (  # type: ignore[import-not-found]
@@ -62,6 +64,16 @@ if _HAS_MLX:
         _HAS_PROMPT_CACHE = True
     except Exception:  # pragma: no cover -- optional feature
         _HAS_PROMPT_CACHE = False
+    # Disk persistence: best-effort -- works on mlx_lm versions that
+    # ship save/load_prompt_cache. If absent, persistence stays off.
+    try:
+        from mlx_lm.models.cache import (  # type: ignore[import-not-found]
+            save_prompt_cache as _save_prompt_cache,
+            load_prompt_cache as _load_prompt_cache,
+        )
+    except Exception:  # pragma: no cover -- optional feature
+        _save_prompt_cache = None
+        _load_prompt_cache = None
 
 
 _DEFAULT_STOP_SEQUENCES: tuple[str, ...] = (
@@ -383,6 +395,29 @@ class MLXBrain:
         self._prompt_cache_hits: int = 0
         self._prompt_cache_misses: int = 0
 
+        # Cross-boot prompt-cache persistence (B7). On first turn we
+        # snapshot the (system_prompt + first_response) KV state to disk;
+        # next boot we mmap-load it back into the LRU so the second-boot
+        # first-token latency drops from ~7s (cold prefill) to <1s
+        # (warm cache reuse). Keyed by role + model_path md5 so a model
+        # swap or prompt rewrite invalidates safely.
+        self._prompt_cache_persist_enabled: bool = bool(
+            brain_cfg.get("prompt_cache_persist", True)
+        ) and _save_prompt_cache is not None and _load_prompt_cache is not None
+        persist_path = brain_cfg.get(
+            "prompt_cache_persist_path", "data/prompt_cache_v33.safetensors",
+        )
+        self._prompt_cache_persist_path = Path(str(persist_path)).expanduser()
+        self._prompt_cache_persist_min_tokens: int = int(
+            brain_cfg.get("prompt_cache_persist_min_tokens", 256),
+        )
+        self._prompt_cache_persisted_role: dict[str, bool] = {
+            role: False for role in self._ROLES
+        }
+        self._prompt_cache_restore_attempted: dict[str, bool] = {
+            role: False for role in self._ROLES
+        }
+
         # Lifetime perf counters used by the periodic perf snapshot (logged
         # every ~60s by the main loop). We track totals rather than a
         # rolling window because the boot-time interest is "is the cache
@@ -569,6 +604,7 @@ class MLXBrain:
                 self._role_last_used[role] = time.monotonic()
                 elapsed = (time.monotonic() - t0) * 1000
                 logger.info("MLX model role=%s loaded in %.0fms", role, elapsed)
+                self._restore_persisted_prompt_cache(role)
                 return True
             except Exception:
                 logger.exception("Failed to load MLX model role=%s", role)
@@ -828,6 +864,100 @@ class MLXBrain:
             lru.insert_cache(model_key, tokens_for_trie, cache)
         except Exception:
             logger.debug("prompt_cache insert failed", exc_info=True)
+            return
+        if (
+            self._prompt_cache_persist_enabled
+            and not self._prompt_cache_persisted_role.get(role)
+            and len(full_prompt_tokens) >= self._prompt_cache_persist_min_tokens
+        ):
+            try:
+                self._persist_prompt_cache(role, cache, tokens_for_trie)
+                self._prompt_cache_persisted_role[role] = True
+            except Exception:
+                logger.debug("prompt_cache persist failed", exc_info=True)
+
+    # ── Cross-boot prompt-cache persistence (B7) ─────────────────────
+
+    def _persist_path_for_role(self, role: str) -> Path:
+        """Per-role snapshot path. Each role gets its own .safetensors so
+        a primary/fast cache mismatch can never cross-pollute."""
+        base = self._prompt_cache_persist_path
+        suffix = base.suffix or ".safetensors"
+        return base.with_name(f"{base.stem}-{role}{suffix}")
+
+    def _persist_prompt_cache(
+        self,
+        role: str,
+        cache: Any,
+        tokens_for_trie: list[int],
+    ) -> None:
+        """Write the current cache to disk + a sidecar JSON of metadata
+        (tokens, model_path, prompt_md5, version) so we can re-insert it
+        into the LRU on the next boot under the same trie key."""
+        if _save_prompt_cache is None:
+            return
+        path = self._persist_path_for_role(role)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        meta = {
+            "model_path": str(self._model_path),
+            "tokens": ",".join(str(t) for t in tokens_for_trie),
+            "n_tokens": str(len(tokens_for_trie)),
+            "version": "v33",
+        }
+        try:
+            _save_prompt_cache(str(path), cache, meta)
+            logger.info(
+                "MLX prompt-cache persisted: role=%s tokens=%d -> %s",
+                role, len(tokens_for_trie), path.name,
+            )
+        except Exception as exc:
+            logger.debug("save_prompt_cache failed: %s", exc)
+
+    def _restore_persisted_prompt_cache(self, role: str) -> None:
+        """On model load, try to load the persisted cache from disk and
+        inject it into the LRU. Skips silently if the file is missing,
+        the model_path doesn't match, or anything goes wrong — never
+        raises (failure just means cold prefill on first turn)."""
+        if (
+            not self._prompt_cache_persist_enabled
+            or _load_prompt_cache is None
+            or self._prompt_cache_restore_attempted.get(role)
+        ):
+            return
+        self._prompt_cache_restore_attempted[role] = True
+        path = self._persist_path_for_role(role)
+        if not path.is_file():
+            return
+        try:
+            cache, meta = _load_prompt_cache(str(path), return_metadata=True)
+        except Exception as exc:
+            logger.debug("load_prompt_cache failed: %s", exc)
+            return
+        if not meta or meta.get("model_path") != str(self._model_path):
+            logger.debug(
+                "MLX prompt-cache: model_path mismatch (have=%s, persisted=%s); ignoring",
+                self._model_path, (meta or {}).get("model_path"),
+            )
+            return
+        try:
+            tokens = [int(t) for t in (meta.get("tokens") or "").split(",") if t]
+        except Exception:
+            tokens = []
+        if not tokens:
+            return
+        lru = self._get_prompt_lru(role)
+        if lru is None:
+            return
+        try:
+            model_key = self._prompt_cache_model_key(role)
+            lru.insert_cache(model_key, tokens, cache, cache_type="system")
+            self._prompt_cache_persisted_role[role] = True
+            logger.info(
+                "MLX prompt-cache restored: role=%s tokens=%d (warm prefill on next turn)",
+                role, len(tokens),
+            )
+        except Exception as exc:
+            logger.debug("prompt_cache restore insert failed: %s", exc)
 
     def _make_sampler(self, temperature: float, top_p: float):
         temp = max(0.0, float(temperature))

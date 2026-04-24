@@ -182,7 +182,10 @@
         "timeout_seconds": 20,
         "prompt_cache_enabled": true,
         "prompt_cache_max_size": 6,
-        "prompt_cache_max_mb": 320
+        "prompt_cache_max_mb": 320,
+        "prompt_cache_persist": true,
+        "prompt_cache_persist_path": "data/prompt_cache_v33.safetensors",
+        "prompt_cache_persist_min_tokens": 256
     },
     "assistant_brain": {
         "active_profile": "optimal",

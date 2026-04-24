@@ -18,9 +18,40 @@ _WEATHER_REPORT = re.compile(
     r"forecast|mausam|temperature\s+outside)\b", re.I)
 
 _NEWS = re.compile(
-    r"\b(news|headlines|what('?s|\s+is)\s+(happening|going\s+on)|"
-    r"top\s+(stories|headlines|news)|latest\s+news|"
-    r"world\s+news|news\s+update|kya\s+chal\s+raha)\b", re.I)
+    # Verb-anchored: require a verb / determiner directly preceding
+    # "news" / "headlines" so phrases like "good news new movies" or
+    # "news report style article" don't false-positive (atom_log
+    # L418-420). Each branch nails news/headlines as the OBJECT, not
+    # an adjective for another noun.
+    r"\b("
+    r"(?:read|show|tell|give|fetch|pull)\s+(?:me\s+)?(?:the\s+)?"
+        r"(?:latest\s+|today'?s?\s+|world\s+|breaking\s+|top\s+)?"
+        r"(?:headlines?|news)|"
+    r"what(?:'s|\s+is)\s+(?:the\s+)?(?:latest\s+|top\s+)?"
+        r"(?:headlines?|news)|"
+    r"any\s+(?:latest\s+|new\s+|breaking\s+)?"
+        r"(?:headlines?|news)\??|"
+    r"today'?s?\s+(?:headlines?|news)|"
+    r"latest\s+(?:headlines?|news)|"
+    r"world\s+news|"
+    r"top\s+(?:stories|headlines)|"
+    r"news\s+update|news\s+briefing|news\s+report|"
+    r"breaking\s+news|"
+    r"what(?:'s|\s+is)\s+(?:happening|going\s+on)\s+(?:in\s+the\s+world|today|"
+        r"around\s+the\s+world)|"
+    r"kya\s+chal\s+raha"
+    r")\b",
+    re.I,
+)
+
+# Adjectival "news" — e.g. "news new movies", "news report style" — must
+# NOT classify as news_headlines. Used to short-circuit the regex above
+# when "news" is immediately followed by another noun.
+_NEWS_AS_ADJECTIVE = re.compile(
+    r"\bnews\s+(?:new|movies?|songs?|article|piece|style|kind|type|"
+    r"of|about|on|story|stories|item|items|report\s+style)\b",
+    re.I,
+)
 
 _BRIEFING = re.compile(
     r"\b(brief(ing)?|morning\s+brief|daily\s+brief|"
@@ -55,7 +86,7 @@ def check(text: str) -> IntentResult | None:
         return IntentResult(
             "daily_briefing", action="daily_briefing", action_args={})
 
-    if _NEWS.search(text):
+    if _NEWS.search(text) and not _NEWS_AS_ADJECTIVE.search(text):
         return IntentResult(
             "news_headlines", action="news_headlines", action_args={})
 

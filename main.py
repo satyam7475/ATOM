@@ -2780,6 +2780,10 @@ async def main() -> None:
         bus=bus, real_world_intel=real_world_intel,
         context_fusion=context_fusion,
     )
+    try:
+        router.attach_real_world_intel(real_world_intel)
+    except Exception as exc:
+        logger.warning("Router real-world wiring failed: %s", exc)
     wire_autonomy_and_governor(
         bus=bus, router=router, indicator=indicator, memory=memory,
         autonomy=autonomy, state=state, tts=tts,

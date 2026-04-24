@@ -132,6 +132,7 @@ class Router:
         self._cognitive_kernel: CognitiveKernel | None = None
         self._runtime_watchdog: RuntimeWatchdog | None = None
         self._task_manager: Any = None
+        self._real_world: Any = None
 
         self._local_brain_controller: Any = None
 
@@ -222,6 +223,19 @@ class Router:
         """Wire the centralized background task manager."""
         self._task_manager = task_manager
         logger.info("TaskManager attached to Router")
+
+    def attach_real_world_intel(self, real_world: Any) -> None:
+        """Wire RealWorldIntelligence for direct (synchronous) tool
+        dispatch on weather_report / news_headlines / world_clock /
+        daily_briefing / temporal_info / world_status intents.
+
+        Without this, those intents fall through to the LLM fallback
+        because the dispatch table only knew about the legacy ``weather``
+        action — which lets the model hallucinate weather instead of
+        reading the wttr.in tool result (atom_log.txt L356-392 fix).
+        """
+        self._real_world = real_world
+        logger.info("RealWorldIntelligence attached to Router")
 
     def attach_adaptive_engine(self, adaptive: Any) -> None:
         """Wire the Phase 2 Adaptive Intelligence Engine."""
@@ -1490,6 +1504,69 @@ class Router:
         network_actions.open_weather_fallback()
         return "Opening weather info in browser, boss."
 
+    # ── RealWorldIntelligence-backed action handlers ─────────────────
+    # These short-circuit the LLM fallback for tool-backed intents so
+    # the model can't hallucinate weather/news/time on top of (or
+    # instead of) the actual data. Hooked up to weather_report,
+    # news_headlines, world_clock, daily_briefing, temporal_info, and
+    # world_status — every intent the bus-side handler in
+    # core/wiring/intelligence_handlers.py listens for.
+    def _do_weather_report(self, _action: str, _args: dict) -> str:
+        rw = self._real_world
+        if rw is None:
+            return self._do_weather(_action, _args)
+        try:
+            return rw.get_weather_summary()
+        except Exception as exc:
+            logger.warning("weather_report dispatch failed: %s", exc)
+            return self._do_weather(_action, _args)
+
+    def _do_news_headlines(self, _action: str, args: dict) -> str:
+        rw = self._real_world
+        if rw is None:
+            return "News briefing isn't wired right now, Boss."
+        try:
+            count = int(args.get("count", 5))
+        except (TypeError, ValueError):
+            count = 5
+        count = max(1, min(count, 10))
+        return rw.get_news_summary(count=count)
+
+    def _do_world_clock(self, _action: str, _args: dict) -> str:
+        rw = self._real_world
+        if rw is None:
+            return "World clock isn't wired right now, Boss."
+        return rw.get_world_clock_summary()
+
+    def _do_daily_briefing(self, _action: str, _args: dict) -> str:
+        rw = self._real_world
+        if rw is None:
+            return "Daily briefing isn't wired right now, Boss."
+        return rw.get_briefing()
+
+    def _do_temporal_info(self, _action: str, _args: dict) -> str:
+        rw = self._real_world
+        if rw is None:
+            from datetime import datetime
+            return datetime.now().strftime(
+                "It's %A, %B %d at %I:%M %p, Boss.",
+            )
+        return rw.get_temporal_summary()
+
+    def _do_world_status(self, _action: str, _args: dict) -> str:
+        rw = self._real_world
+        if rw is None:
+            return "World status isn't wired right now, Boss."
+        try:
+            ctx = rw.get_world_context()
+            parts = [rw.get_temporal_summary()]
+            if not getattr(ctx.weather, "is_stale", True):
+                parts.append(rw.get_weather_summary())
+            return " ".join(parts)
+        except Exception as exc:
+            logger.warning("world_status dispatch failed: %s", exc)
+            return rw.get_temporal_summary()
+
     def _do_wifi_status(self, _action: str, _args: dict) -> str:
         return network_actions.get_wifi_status()
 
@@ -1871,6 +1948,12 @@ class Router:
         "read_clipboard": _do_read_clipboard,
         "open_url": _do_open_url,
         "weather": _do_weather,
+        "weather_report": _do_weather_report,
+        "news_headlines": _do_news_headlines,
+        "world_clock": _do_world_clock,
+        "daily_briefing": _do_daily_briefing,
+        "temporal_info": _do_temporal_info,
+        "world_status": _do_world_status,
         "wifi_status": _do_wifi_status,
         "set_reminder": _do_set_reminder,
         "show_reminders": _do_show_reminders,

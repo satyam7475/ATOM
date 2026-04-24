@@ -274,55 +274,23 @@ def wire_real_world(
     real_world_intel: Any,
     context_fusion: Any,
 ) -> None:
-    """Wire real-world intelligence event handlers."""
+    """Wire real-world intelligence event handlers.
 
-    async def _on_weather_request(intent: str = "", **_kw) -> None:
-        if intent == "weather_report":
-            msg = real_world_intel.get_weather_summary()
-            bus.emit_long("response_ready", text=msg)
-
-    async def _on_news_request(intent: str = "", **_kw) -> None:
-        if intent == "news_headlines":
-            msg = real_world_intel.get_news_summary(count=5)
-            bus.emit_long("response_ready", text=msg)
-
-    async def _on_world_clock_request(intent: str = "", **_kw) -> None:
-        if intent == "world_clock":
-            msg = real_world_intel.get_world_clock_summary()
-            bus.emit_long("response_ready", text=msg)
-
-    async def _on_briefing_request(intent: str = "", **_kw) -> None:
-        if intent == "daily_briefing":
-            msg = real_world_intel.get_briefing()
-            bus.emit_long("response_ready", text=msg)
-
-    async def _on_temporal_request(intent: str = "", **_kw) -> None:
-        if intent == "temporal_info":
-            msg = real_world_intel.get_temporal_summary()
-            bus.emit_long("response_ready", text=msg)
-
-    async def _on_world_status_request(intent: str = "", **_kw) -> None:
-        if intent == "world_status":
-            ctx = real_world_intel.get_world_context()
-            parts = [real_world_intel.get_temporal_summary()]
-            if not ctx.weather.is_stale:
-                parts.append(real_world_intel.get_weather_summary())
-            if ctx.headlines:
-                parts.append(real_world_intel.get_news_summary(3))
-            parts.append(real_world_intel.get_world_clock_summary())
-            parts.append(f"World intelligence quality: {ctx.quality_score():.0%}")
-            bus.emit_long("response_ready", text=" ".join(parts))
+    Note: weather/news/world_clock/briefing/temporal/world_status are
+    now dispatched **synchronously** by Router via
+    ``router.attach_real_world_intel(...)``. Re-emitting them on
+    ``intent_classified`` would double-fire the response (once from
+    the dispatcher, once from this bus handler) — so we intentionally
+    only keep the context_fusion bookkeeping here.
+    """
 
     async def _on_intent_for_context_fusion(intent: str = "", **kw) -> None:
         if intent and intent not in ("confirm", "deny", "empty"):
             context_fusion.log_action(intent, kw.get("text", "")[:60])
 
-    bus.on("intent_classified", _on_weather_request)
-    bus.on("intent_classified", _on_news_request)
-    bus.on("intent_classified", _on_world_clock_request)
-    bus.on("intent_classified", _on_briefing_request)
-    bus.on("intent_classified", _on_temporal_request)
-    bus.on("intent_classified", _on_world_status_request)
     bus.on("intent_classified", _on_intent_for_context_fusion)
 
-    logger.info("Real-world intelligence handlers wired: weather, news, briefing, world clock")
+    logger.info(
+        "Real-world intelligence: context-fusion handler wired "
+        "(weather/news/clock served by Router._do_* dispatch)",
+    )
