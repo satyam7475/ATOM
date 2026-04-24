@@ -16,22 +16,22 @@ machine-readable scorecard on every run (`logs/JARVIS_EVAL_REPORT.md`).
 
 ## Headline rating
 
-| Dimension | Jarvis | ATOM v2 | ATOM v3 | Notes |
-|---|---:|---:|---:|---|
-| **Conversational quality** | 10 | 6.0 | **8.5** | Phi-3.5-mini + slim prompt removes parroting + CoT leaks |
-| **Voice in (ASR)** | 10 | 6.5 | **8.0** | macOS native streaming + opt-in WhisperConfirmer second pass |
-| **Voice out (TTS)** | 10 | 7.5 | **8.5** | macOS native + final prompt-leak guard at audio boundary |
-| **Tool / action use** | 10 | 6.0 | **8.5** | Constrained grammar prompt + post-decode validator |
-| **Reasoning depth** | 10 | 5.5 | **8.0** | Hybrid local Phi + lazy Qwen3 deep + Gemini cloud-route |
-| **Latency (turn p50)** | 10 | 6.5 | **8.0** | Boot-grace watchdog, Phi tighter `max_tokens`, batched streaming |
-| **Stability / robustness** | 10 | 6.0 | **8.5** | Defense-in-depth sanitisers, daily cloud budget guard |
-| **Privacy** | 10 | 7.0 | **9.0** | PII redaction on every cloud egress, env-secret scrub |
-| **Always-on listening** | 10 | 7.5 | **8.5** | Existing dual-mode + correction-phrase bypass |
-| **Personality / Boss-feel** | 10 | 6.5 | **8.0** | Tighter Jarvis style + non-quotable STYLE FINGERPRINT |
-| **Production observability** | 10 | 5.0 | **8.0** | Per-turn LatencyTimeline JSONL + nightly Jarvis Eval |
-| **Total / 110** | 110 | 70.0 | **91.5** | |
+| Dimension | Jarvis | ATOM v2 | ATOM v3 | ATOM v3.1 | Notes |
+|---|---:|---:|---:|---:|---|
+| **Conversational quality** | 10 | 6.0 | 8.5 | **9.0** | Qwen2.5-7B-Instruct (v3.1) is noticeably more buddy-like than Phi-3.5-mini was |
+| **Voice in (ASR)** | 10 | 6.5 | 8.0 | **8.0** | macOS native streaming + opt-in WhisperConfirmer second pass |
+| **Voice out (TTS)** | 10 | 7.5 | 8.5 | **8.5** | macOS native + final prompt-leak guard at audio boundary |
+| **Tool / action use** | 10 | 6.0 | 8.5 | **8.5** | Constrained grammar prompt + post-decode validator |
+| **Reasoning depth** | 10 | 5.5 | 8.0 | **8.5** | Qwen2.5-7B local think-then-answer + Gemini cloud-route |
+| **Latency (turn p50)** | 10 | 6.5 | 8.0 | **7.8** | 7B is slightly slower cold (~9s) but warm generation still in budget |
+| **Stability / robustness** | 10 | 6.0 | 8.5 | **9.0** | Extended preflight (crypto + MLX + model-dir) + crash_guard short-circuit |
+| **Privacy** | 10 | 7.0 | 9.0 | **9.0** | PII redaction on every cloud egress, env-secret scrub |
+| **Always-on listening** | 10 | 7.5 | 8.5 | **8.5** | Existing dual-mode + correction-phrase bypass |
+| **Personality / Boss-feel** | 10 | 6.5 | 8.0 | **8.5** | Qwen's instruction-following makes "Boss" voice more consistent |
+| **Production observability** | 10 | 5.0 | 8.0 | **8.0** | Per-turn LatencyTimeline JSONL + nightly Jarvis Eval |
+| **Total / 110** | 110 | 70.0 | 91.5 | **93.3** | |
 
-**ATOM v3 = ~83 % of the Jarvis north-star, +21 percentage points over v2.**
+**ATOM v3.1 = ~85 % of the Jarvis north-star, +23 points over v2, +1.8 over v3.**
 
 ---
 
@@ -48,16 +48,53 @@ machine-readable scorecard on every run (`logs/JARVIS_EVAL_REPORT.md`).
 * Added 8-second boot grace to `core/runtime_watchdog.py` so cold-start
   intent-engine JIT compilation doesn't trip a 50 ms budget.
 
-### Phase 2 — Brain swap to Phi-3.5-mini
+### Phase 2 — Brain swap to Phi-3.5-mini (v3)
 
-* `models/phi-3.5-mini-mlx-4bit` is now `mlx_primary_model` and
+* `models/phi-3.5-mini-mlx-4bit` was `mlx_primary_model` and
   `mlx_fast_model`. Phi-3.5 follows length instructions and refuses to
   parrot.
-* Added a `deep` role in `brain/mlx_llm.py` that lazy-loads
-  `models/qwen3-8b-mlx-4bit` only for explicit deep-reasoning queries,
-  with a 5-min idle GC so RAM is reclaimed.
-* Re-tuned `_max_tokens_override` for Phi's tighter token economy
-  (SHORT 96, SIMPLE 128, NORMAL 160, DETAIL 256).
+* Added a `deep` role in `brain/mlx_llm.py` that lazy-loads a heavy
+  reasoning model only for explicit deep-reasoning queries, with a
+  5-min idle GC so RAM is reclaimed.
+* Re-tuned `_max_tokens_override` (SHORT 96, SIMPLE 128, NORMAL 160,
+  DETAIL 256) — caps carried forward to v3.1 unchanged (empirically
+  Qwen2.5-7B stays within the same budget).
+
+### Phase 2.2 — Single-model brain cleanup (v3.2)
+
+* `config/settings.json`: `mlx_primary_model`, `mlx_fast_model`,
+  `mlx_deep_model`, `mlx_default_role`, and the legacy GGUF
+  `model_path` keys collapsed into one **`brain.mlx_model`** key.
+* `brain/mlx_llm.py`: `_primary_path`, `_fast_path`, `_deep_path`,
+  `_maybe_unload_idle_deep`, `_DEEP_IDLE_UNLOAD_S` removed. The
+  per-role state dicts shrink from three slots to two (`primary`,
+  `fast`) purely for telemetry — both alias the same tensors on
+  first use, one load.
+* Loader keeps back-compat: an older `settings.json` with only
+  `mlx_primary_model` / `mlx_fast_model` / `model_path` still boots
+  (tests: `test_mlx_brain_accepts_legacy_*`).
+* Boot preflight updated to probe `mlx_model` with the same legacy
+  fallback chain — a pre-upgrade config doesn't trigger a preflight
+  abort.
+
+### Phase 2.1 — Brain upgrade to Qwen2.5-7B-Instruct-MLX-4bit (v3.1)
+
+* `models/qwen2.5-7b-instruct-4bit` is now both `mlx_primary_model`
+  and `mlx_fast_model`. Qwen 7B has stronger instruction-following
+  and multi-step reasoning than Phi-3.5-mini while still fitting
+  the 16 GB budget (~4.5 GB resident, 4-bit quantised).
+* Memory thresholds tightened: `gpu.memory_threshold_pct` and
+  `cognitive_kernel.memory_pressure_threshold` dropped 82 → 78 to
+  account for the heavier resident footprint before swap kicks in.
+* Boot preflight expanded: beyond `cryptography`, we now require
+  `mlx_lm` importable, the primary-model directory present, and the
+  minimum set of MLX artefacts (`config.json`, `tokenizer.json`, at
+  least one `*.safetensors` weight file). Missing any of these
+  exits at preflight with a clean CRITICAL log instead of looping
+  crash_guard.
+* Phi model files and `phi_swap` tests removed; replaced by
+  `tests/test_brain_qwen_swap.py` + `tests/test_brain_qwen_smoke.py`
+  (live generation + chat-template correctness).
 
 ### Phase 3 — Hybrid local + cloud reasoning
 

@@ -317,8 +317,8 @@ class CognitiveKernel:
         self._latency = LatencyController(self._config)
 
         ck = self._config.get("cognitive_kernel", {})
-        self._quick_model = ck.get("quick_model", "phi-3.5-mini")
-        self._full_model = ck.get("full_model", "phi-3.5-mini")
+        self._quick_model = ck.get("quick_model", "qwen2.5-7b-instruct")
+        self._full_model = ck.get("full_model", "qwen2.5-7b-instruct")
         self._deep_query_min_chars = int(ck.get("deep_query_min_chars", 120))
         self._simple_query_max_chars = int(ck.get("simple_query_max_chars", 50))
         self._battery_degrade = bool(ck.get("battery_degrade", True))
@@ -651,10 +651,18 @@ class CognitiveKernel:
             # Dynamic routing to cloud based on "Buddy" vs "Reasoning" triggers
             is_buddy = _BUDDY_HINTS.search(query) is not None
             is_hard = _CREATIVE_HINTS.search(query) is not None
+            is_actionable = _ACTION_HINTS.search(query) is not None
             query_len = len(query)
 
-            # Cloud Buddy: Conversations & personality
-            if is_buddy and query_len < 100:
+            # Cloud Buddy: Conversations & personality — but NEVER for
+            # queries that look actionable (play/open/launch/send/…).
+            # The wake word "atom" is in the buddy regex, which was
+            # pulling actionable sentences like "where is the song item
+            # it is not working" and "atom are you working on my music"
+            # into cloud_reason despite the user clearly wanting ATOM
+            # to act locally. Let those drop to local brain routing
+            # where the action executor can run the right tool.
+            if is_buddy and not is_actionable and query_len < 100:
                 plan = QueryPlan(
                     path=ExecPath.CLOUD_REASON,
                     model="gemini",

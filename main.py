@@ -917,6 +917,104 @@ async def main() -> None:
             screen_reader.ocr_backend,
         )
 
+    # ── Vision engine (camera + Apple Vision NE) ───────────────────
+    # Built around AVFoundation single-frame capture + Apple Vision
+    # face/object detection on the Neural Engine. No LLM/VLM is loaded
+    # by this subsystem -- it stays inside the user's "one 7B model"
+    # constraint while still giving ATOM eyes (built-in webcam +
+    # Continuity Camera = iPhone-as-webcam).
+    vision_engine = None
+    # Hoisted so cold_start.warm_up can pick it up even when the vision
+    # block below short-circuits (vision.enabled=false). cold_start
+    # tolerates ``None`` and just skips the VLM warmup task.
+    _captioner = None
+    _vision_cfg = config.get("vision", {}) or {}
+    if _vision_cfg.get("enabled", False):
+        try:
+            from core.perception.vision_engine import VisionEngine
+
+            # Optional VLM captioner (SmolVLM-Instruct-4bit via mlx-vlm).
+            # Stays disabled by default so ATOM still boots cleanly
+            # when the user hasn't fetched the ~1.2 GB model yet.
+            _vlm_cfg = _vision_cfg.get("vlm", {}) or {}
+            if _vlm_cfg.get("enabled", False):
+                try:
+                    from core.perception.vlm_describe import VLMCaptioner
+                    _vlm_repo = str(_vlm_cfg.get("model_repo") or "").strip()
+                    _captioner = VLMCaptioner(
+                        model_path=str(
+                            _vlm_cfg.get("model_path")
+                            or "models/smolvlm-instruct-4bit"
+                        ),
+                        model_repo=(_vlm_repo or None),
+                        prompt=str(
+                            _vlm_cfg.get("prompt")
+                            or "Describe this image in one short sentence."
+                        ),
+                        max_tokens=int(_vlm_cfg.get("max_tokens", 48)),
+                        temperature=float(_vlm_cfg.get("temperature", 0.0)),
+                    )
+                    _cap_reason = _captioner.disabled_reason()
+                    if _cap_reason:
+                        logger.warning(
+                            "VLM captioner configured but offline: %s",
+                            _cap_reason,
+                        )
+                    else:
+                        logger.info(
+                            "VLM captioner ready (path=%s, repo=%s)",
+                            _captioner.model_path,
+                            _vlm_repo or "<none>",
+                        )
+                except Exception:
+                    logger.warning(
+                        "VLM captioner init failed; vision stays "
+                        "face-only", exc_info=True,
+                    )
+                    _captioner = None
+
+            vision_engine = VisionEngine(
+                enabled=True,
+                preferred_camera=str(_vision_cfg.get("preferred_camera") or "auto"),
+                explicit_uid=_vision_cfg.get("explicit_camera_uid"),
+                audit_log_path=_vision_cfg.get("audit_log_path"),
+                emit=getattr(bus, "emit_fast", None) or getattr(bus, "emit", None),
+                min_gap_s=float(_vision_cfg.get("min_gap_s", 1.0)),
+                capture_timeout_s=float(_vision_cfg.get("capture_timeout_s", 3.5)),
+                captioner=_captioner,
+                caption_max_age_s=float(
+                    _vision_cfg.get("caption_max_age_s", 60.0),
+                ),
+            )
+            router.attach_vision_engine(vision_engine)
+            # Give the VoicePipeline the same handle so its wake-word
+            # handler can fire ``look(describe=True)`` in the background
+            # whenever ``vision.describe_on_wake`` is enabled.
+            try:
+                voice_pipeline.attach_vision_engine(vision_engine)
+            except Exception:
+                logger.debug(
+                    "voice_pipeline.attach_vision_engine failed",
+                    exc_info=True,
+                )
+            _vision_block_reason = vision_engine.disabled_reason()
+            _vision_cams = vision_engine.list_cameras_human()
+            if _vision_block_reason:
+                logger.warning(
+                    "Vision engine attached but offline: %s", _vision_block_reason,
+                )
+            else:
+                logger.info(
+                    "Vision engine ready: cameras=%s, preferred=%s",
+                    _vision_cams or ["<none>"],
+                    _vision_cfg.get("preferred_camera", "auto"),
+                )
+        except Exception:
+            logger.warning("VisionEngine init failed; camera tools disabled", exc_info=True)
+            vision_engine = None
+    else:
+        logger.info("Vision engine disabled (vision.enabled=false)")
+
     # ── v22: Hybrid Intelligence Layer (Security Gateway + Cloud + Confidence) ──
     from core.security_gateway import SecurityGateway
     from core.cloud.gemini_client import GeminiClient
@@ -943,16 +1041,22 @@ async def main() -> None:
     gemini_client: GeminiClient | None = None
     if cloud_enabled_cfg:
         gemini_client = GeminiClient(config, security_gateway=security_gateway)
-        from core.secrets_manager import get_gemini_fast_key
+        # Only probe the encrypted vault when the client hasn't already
+        # resolved a key from settings.json. This avoids loading the crypto
+        # stack on every boot when cloud is enabled-but-unkeyed, and keeps
+        # a bad vault (missing deps, wrong master pw) off the boot path.
+        if not gemini_client.is_available:
+            from core.secrets_manager import get_gemini_fast_key
 
-        _gemini_key = get_gemini_fast_key()
-        if _gemini_key:
-            gemini_client.configure_api_key(_gemini_key)
-            logger.info("Gemini API key loaded from secure storage")
-        else:
-            logger.warning(
-                "Gemini API key not found. Run: python scripts/setup_api_keys.py"
-            )
+            _gemini_key = get_gemini_fast_key()
+            if _gemini_key:
+                gemini_client.configure_api_key(_gemini_key)
+                logger.info("Gemini API key loaded from secure storage")
+            else:
+                logger.warning(
+                    "Gemini API key not found in settings.json or vault. "
+                    "Run: python scripts/setup_api_keys.py  (or set cloud.enabled=false)"
+                )
     else:
         logger.info("Cloud/Gemini disabled in config (cloud.enabled=false) — local MLX only for LLM routing")
 
@@ -1018,12 +1122,26 @@ async def main() -> None:
     except Exception:
         logger.info("SecurityGateway audit trail wiring skipped", exc_info=True)
 
-    code_introspector.scan()
+    # CodeIntrospector ASTs every .py in the repo (~1.6s on M5 Air for ~360
+    # files). It's only consumed by SelfHealingEngine's failure
+    # root-cause analysis, which can't fire until at least the first
+    # post-boot exception — moving it off the boot path makes ATOM ready
+    # ~1.6s sooner without losing self-healing capability.
+    async def _bg_introspect_scan() -> None:
+        try:
+            loop = asyncio.get_running_loop()
+            count = await loop.run_in_executor(None, code_introspector.scan)
+            logger.info(
+                "CodeIntrospector ready: %d modules indexed (background scan)",
+                count,
+            )
+        except Exception:
+            logger.warning("CodeIntrospector background scan failed", exc_info=True)
+    asyncio.create_task(_bg_introspect_scan())
     logger.info(
         "Production systems initialized: SecurityFortress(%s) + "
-        "CodeIntrospector(%d files) + SelfHealingEngine",
+        "CodeIntrospector(scanning in background) + SelfHealingEngine",
         security_fortress.vault_backend_label,
-        code_introspector.module_count,
     )
 
     # ── JARVIS-Level Intelligence ───────────────────────────────────
@@ -1599,6 +1717,11 @@ async def main() -> None:
         conversation_memory=conv_memory,
         intent_engine=intent_engine,
         system_monitor=system_monitor,
+        # Wired only when the user opted into the VLM (vision.vlm.enabled).
+        # Letting cold_start own the load means the first wake-word fire
+        # hits the hot path (~1.7s) instead of paying the ~2s cold-load
+        # latency on the wake-word executor thread.
+        vlm_captioner=_captioner,
     )
 
     await tts.init_voice()
@@ -1751,6 +1874,136 @@ async def main() -> None:
                     logger.debug("v7 periodic snapshot failed", exc_info=True)
 
         _bg_tasks.append(asyncio.create_task(_v7_periodic_snapshot()))
+
+    # Periodic LLM perf snapshot. The per-turn ``MLX [profile/role]: …``
+    # line is verbose; what's missing for diagnosing "is ATOM healthy?" is
+    # a single rolling summary line every minute showing the lifetime
+    # average decode rate, prompt-cache hit rate, and any active thermal
+    # clamp. Cheap (no extra model work, just reads counters), runs only
+    # when the local brain is enabled, and goes silent when no turns have
+    # happened yet so an idle ATOM doesn't spam the log.
+    if brain_enabled and local_brain is not None:
+        async def _llm_perf_snapshot() -> None:
+            await asyncio.sleep(60.0)  # first sample after warm-up
+            while True:
+                try:
+                    snap = local_brain.get_perf_snapshot()
+                    if snap and int(snap.get("turns", 0) or 0) > 0:
+                        cache = snap.get("cache", {}) or {}
+                        clamp = float(snap.get("thermal_clamp_ratio", 1.0) or 1.0)
+                        clamp_label = (
+                            f" thermal_clamp={clamp:.2f}x"
+                            if clamp < 0.999
+                            else ""
+                        )
+                        logger.info(
+                            "LLM perf: turns=%d tokens=%d avg=%.1f tok/s "
+                            "avg_ms=%.0f peak=%.2fGB cache=%d/%d (%.0f%%)%s",
+                            int(snap.get("turns", 0) or 0),
+                            int(snap.get("tokens", 0) or 0),
+                            float(snap.get("avg_tok_s", 0.0) or 0.0),
+                            float(snap.get("avg_ms", 0.0) or 0.0),
+                            float(snap.get("peak_memory_gb", 0.0) or 0.0),
+                            int(cache.get("hits", 0) or 0),
+                            int(cache.get("hits", 0) or 0) + int(cache.get("misses", 0) or 0),
+                            float(cache.get("hit_rate", 0.0) or 0.0) * 100.0,
+                            clamp_label,
+                        )
+                except Exception:
+                    logger.debug("LLM perf snapshot failed", exc_info=True)
+                await asyncio.sleep(60.0)
+        _bg_tasks.append(asyncio.create_task(_llm_perf_snapshot()))
+
+    # ── iPhone Shortcuts bridge (Phase 1 cross_device) ─────────────
+    # The bridge code (core/cross_device/iphone_bridge.py) shipped in
+    # an earlier sprint but was never plugged into the boot sequence.
+    # We wire it here, gated on ``cross_device.enabled`` so the
+    # default-off behaviour remains: no token, no listener, no event
+    # bus chatter unless the owner opts in via settings.json.
+    iphone_bridge = None
+    identity_engine = None
+    _cross_cfg = config.get("cross_device", {}) or {}
+    if _cross_cfg.get("enabled", False):
+        try:
+            from core.identity_engine import IdentityEngine
+            from core.cross_device.iphone_bridge import IPhoneBridge
+            from core.cross_device.bridge_event_wiring import wire_bridge_events
+
+            identity_engine = IdentityEngine(config=config)
+            router.attach_identity_engine(identity_engine)
+
+            # ``IPhoneBridge.__init__`` auto-generates a ~32-char hex
+            # token at ``config/bridge_token`` if one doesn't exist
+            # yet, so we never need a manual setup script.
+            iphone_bridge = IPhoneBridge(
+                config=config,
+                emit=getattr(bus, "emit_fast", None) or getattr(bus, "emit", None),
+                atom_root=Path(__file__).resolve().parent,
+            )
+
+            async def _speak_iphone_hint(hint: str) -> None:
+                # ProactiveAwareness hints land here; we echo them as a
+                # short partial_response so they surface through the
+                # same TTS path as everything else (and respect the
+                # state-machine SPEAKING transition).
+                try:
+                    bus.emit_long("partial_response", text=hint, is_first=True, is_last=True)
+                except Exception:
+                    logger.debug("iphone hint emit failed", exc_info=True)
+
+            wire_bridge_events(
+                bus=bus,
+                identity_engine=identity_engine,
+                proactive=proactive,
+                speak=_speak_iphone_hint,
+            )
+
+            async def _start_iphone_bridge() -> None:
+                ok = await iphone_bridge.start()
+                if not ok:
+                    logger.warning(
+                        "iPhone bridge failed to start; cross_device events disabled."
+                    )
+                    return
+                port = iphone_bridge.actual_port or _cross_cfg.get("bridge_port", 8787)
+                tok = iphone_bridge.token
+                # Loud, single-shot setup banner. The token must be
+                # entered into the iPhone Shortcuts (X-ATOM-Token
+                # header) on first run; we surface it here so the user
+                # never has to grep config/bridge_token by hand.
+                _here = Path(__file__).resolve().parent
+                logger.info("")
+                logger.info("┌──────────────────────────────────────────────────────────────────────")
+                logger.info("│  iPhone bridge ONLINE  ->  http://127.0.0.1:%d", port)
+                logger.info("│  Token: %s", tok)
+                logger.info("│  (also stored at %s/config/bridge_token)", _here)
+                logger.info("│")
+                logger.info("│  Next step on iPhone (one-time):")
+                logger.info("│   1. Open the Shortcuts app on your iPhone 15.")
+                logger.info("│   2. Create a Shortcut that does:")
+                logger.info("│        Get Contents of URL")
+                logger.info("│          URL:    http://<your-mac-ip>:%d/health", port)
+                logger.info("│          Method: GET")
+                logger.info("│          Headers: X-ATOM-Token = <paste token above>")
+                logger.info("│   3. Run it once -- success registers your iPhone as the")
+                logger.info("│      trusted device. Then add /faceid, /presence, /trigger.")
+                logger.info("│")
+                logger.info("│  See docs (or ask ATOM 'how do I connect my iPhone?')")
+                logger.info("└──────────────────────────────────────────────────────────────────────")
+                logger.info("")
+
+            _bg_tasks.append(asyncio.create_task(_start_iphone_bridge()))
+        except Exception:
+            logger.warning(
+                "iPhone bridge wiring failed; cross_device disabled this boot.",
+                exc_info=True,
+            )
+            iphone_bridge = None
+    else:
+        logger.info(
+            "iPhone bridge disabled (cross_device.enabled=false). "
+            "Flip it to true in config/settings.json and restart to enable."
+        )
 
     runtime_watchdog = RuntimeWatchdog(bus, state, config)
     runtime_watchdog.attach_local_brain(local_brain)
@@ -2312,9 +2565,23 @@ async def main() -> None:
 
     if local_brain and local_brain.available:
         brain_cfg = config.get("brain", {})
-        model_name = Path(
-            brain_cfg.get("mlx_primary_model") or brain_cfg.get("mlx_fast_model") or "mlx",
-        ).stem.replace("-mlx", "")
+        # Resolution order matches brain.mlx_llm._resolve_model_path so the
+        # boot banner reflects the model the runtime actually loaded. The
+        # ``mlx_model`` key is the post-consolidation canonical name; the
+        # legacy ``primary``/``fast``/``model_path`` keys remain for
+        # back-compat with older settings.json files.
+        model_raw = (
+            brain_cfg.get("mlx_model")
+            or brain_cfg.get("mlx_primary_model")
+            or brain_cfg.get("mlx_fast_model")
+            or brain_cfg.get("model_path")
+            or "mlx"
+        )
+        # Use ``Path.name`` (last path segment) instead of ``Path.stem`` —
+        # the model directory ``qwen2.5-7b-instruct-4bit`` would otherwise
+        # be truncated to "qwen2" because ``stem`` treats every dot after
+        # the first as an extension boundary.
+        model_name = Path(model_raw).name.replace("-mlx", "")
         brain_label = f"Intent Engine + Agentic MLX LLM ({model_name})"
     elif brain_enabled:
         brain_label = "Intent Engine + MLX LLM (model unavailable)"
@@ -2325,6 +2592,40 @@ async def main() -> None:
                 stt.mic_name, brain_label, cognitive_label)
     if not brain_enabled:
         logger.warning("brain.enabled is false — voice Q&A disabled; commands still work")
+
+    # Highly-visible remediation banner when STT could not initialise (most
+    # commonly because the user launched ``python main.py`` directly instead
+    # of the bundle wrapper, so SFSpeechRecognizer can't see the
+    # NSSpeechRecognitionUsageDescription in Info.plist). The earlier
+    # WARN/ERROR lines about "_DisabledSTT" scroll past in 200+ boot lines;
+    # this final block is the one log message that's almost impossible to
+    # miss when looking at a fresh boot.
+    _stt_label = getattr(stt, "mic_name", "")
+    _stt_disabled = (
+        not _stt_label
+        or _stt_label.lower() in {"disabled", "voice input unavailable"}
+        or "unavailable" in _stt_label.lower()
+    )
+    if _stt_disabled:
+        _here = Path(__file__).resolve().parent
+        _bundle_cmd = f'cd "{_here}" && ./Run\\ ATOM.command'
+        logger.warning("")
+        logger.warning("┌──────────────────────────────────────────────────────────────────────")
+        logger.warning("│  VOICE INPUT IS DISABLED — ATOM cannot hear you.")
+        logger.warning("│")
+        logger.warning("│  Cause: SFSpeechRecognizer needs to run inside ATOM.app so macOS")
+        logger.warning("│         can grant the bundle's NSSpeechRecognitionUsageDescription /")
+        logger.warning("│         Microphone TCC entitlements. Running 'python main.py' from")
+        logger.warning("│         a venv directly bypasses the bundle and the mic stays muted.")
+        logger.warning("│")
+        logger.warning("│  Fix:   Quit this process (Ctrl-C), then double-click")
+        logger.warning("│         '%s/Run ATOM.command' in Finder, or run:", _here)
+        logger.warning("│           %s", _bundle_cmd)
+        logger.warning("│")
+        logger.warning("│  TTS, dashboard chat (http://127.0.0.1:8765/), and tool execution")
+        logger.warning("│  still work in this mode — only the always-on voice loop is offline.")
+        logger.warning("└──────────────────────────────────────────────────────────────────────")
+        logger.warning("")
 
     # Hotkey support removed — requires root/sudo on macOS.
     # Use the UNSTICK button in the dashboard instead.
@@ -2495,6 +2796,64 @@ async def main() -> None:
                         logger.debug("Dashboard cognitive broadcast failed", exc_info=True)
         _bg_tasks.append(asyncio.create_task(_push_habits_periodically()))
 
+    # ── Boot-time corpus ingestion ───────────────────────────────────
+    # Walk owner-configured directories so personal knowledge (notes,
+    # repo READMEs, ~/Documents) is queryable on day one. Runs ONCE
+    # per boot, in the background, gated behind a 60s warmup so the
+    # embedding engine + vector store finish settling before we start
+    # batching. Already-ingested files are skipped via the persistent
+    # dedupe cache, so this is essentially a no-op on subsequent boots
+    # unless the owner edited a file or dropped a new one.
+    _doc_cfg = (config.get("documents") or {})
+    if _doc_cfg.get("auto_ingest_on_boot", False) and document_engine is not None:
+        _ingest_paths = list(_doc_cfg.get("auto_ingest_paths") or [])
+        if _ingest_paths:
+            async def _auto_ingest_corpus() -> None:
+                try:
+                    await asyncio.sleep(60.0)
+                    if not document_engine.is_ready:
+                        logger.info(
+                            "Auto-ingest skipped: document_engine not ready",
+                        )
+                        return
+                    for raw_path in _ingest_paths:
+                        try:
+                            target = str(raw_path).strip()
+                            if not target:
+                                continue
+                            result = await document_engine.ingest_directory(target)
+                            if "error" in result:
+                                logger.warning(
+                                    "Auto-ingest '%s' failed: %s",
+                                    target, result["error"],
+                                )
+                            else:
+                                logger.info(
+                                    "Auto-ingest '%s': %d new / %d already / "
+                                    "%d errors / %d chunks in %.1fs",
+                                    target,
+                                    result.get("ingested", 0),
+                                    result.get("skipped_already", 0),
+                                    result.get("errors", 0),
+                                    result.get("chunks", 0),
+                                    result.get("elapsed_s", 0.0),
+                                )
+                        except asyncio.CancelledError:
+                            raise
+                        except Exception:
+                            logger.exception(
+                                "Auto-ingest crashed on '%s'", raw_path,
+                            )
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    logger.exception("Auto-ingest supervisor crashed")
+            _bg_tasks.append(asyncio.create_task(_auto_ingest_corpus()))
+            logger.info(
+                "Auto-ingest queued for %d path(s); will start in 60s",
+                len(_ingest_paths),
+            )
+
     await cold_start.emit_restored_context()
     state.always_listen = True
     atom_runtime.patch_section(
@@ -2515,45 +2874,62 @@ async def main() -> None:
     # back down when _startup_greeting transitions to SPEAKING.
     await state.transition(AtomState.THINKING)
 
-    async def _startup_greeting() -> None:
-        """Speak a context-aware greeting with world intelligence."""
-        mode_label = _mode_label(perf_effective_mode)
+    # ── Boot face check (background; non-blocking) ──────────────────
+    # Snap one frame from the camera as soon as the runtime is up so
+    # the greeting can include "I see you, Boss." when the owner is
+    # actually in front of the lens. We deliberately schedule this in
+    # a thread executor (AVCaptureSession is synchronous + warms up
+    # for ~300-700ms on first call) and gate the result behind a 2.5s
+    # wait inside ``_startup_greeting`` so a slow camera never holds
+    # back the spoken greeting.
+    boot_face_future: asyncio.Future | None = None
+    if (
+        vision_engine is not None
+        and _vision_cfg.get("enabled", False)
+        and _vision_cfg.get("boot_face_check", True)
+    ):
+        loop = asyncio.get_running_loop()
+        def _do_boot_face_check() -> Any:
+            try:
+                return vision_engine.look(reason="boot_face_check")
+            except Exception:
+                logger.debug("boot face check raised", exc_info=True)
+                return None
+        boot_face_future = loop.run_in_executor(None, _do_boot_face_check)
 
+    async def _startup_greeting() -> None:
+        """Speak a context-aware greeting with world intelligence.
+
+        Kept deliberately short: a Jarvis-style boot greeting should land in
+        ~2s so the user can immediately speak.  The previous 16-word version
+        ("Here, Boss. Online and warmed up. Full Performance ready. N
+        active goals. What do you need?") spread over 5 TTS slices and took
+        7.6s end-to-end — long enough that the user assumed the system was
+        sluggish.  We now lead with the time-of-day greeting and only
+        appended high-signal extras (active goals, holiday, low battery).
+        Mode label and weather are dropped from the boot path because the
+        user can ask explicitly for those.
+        """
         world_ctx = real_world_intel.get_world_context()
         temporal = world_ctx.temporal
         time_g = _adaptive_personality.greeting_response()
 
-        greeting_bits = [f"{mode_label} ready."]
+        extras: list[str] = []
         if cognitive_enabled:
             active_goals = goal_engine.active_count
             if active_goals:
-                greeting_bits.append(
+                extras.append(
                     f"{active_goals} active goal{'s' if active_goals != 1 else ''}."
                 )
 
-        if not world_ctx.weather.is_stale:
-            greeting_bits.append(f"Weather: {world_ctx.weather.summary()}.")
-        elif world_ctx.weather.condition != "unknown":
-            greeting_bits.append(f"Last weather: {world_ctx.weather.summary()}.")
-
         if temporal.is_holiday:
-            greeting_bits.append(f"Today is {temporal.holiday_name}.")
+            extras.append(f"Today is {temporal.holiday_name}.")
 
-        # Varied boot-specific opener so every start sounds fresh. The
-        # adaptive greeting ends with its own "What do you need?" or
-        # similar, so we don't tack one on twice.
-        import random as _random
-        boot_opener_pool = [
-            "All systems online.",
-            "Online and warmed up.",
-            "Systems are up.",
-            "Everything's green.",
-            "I'm up and running.",
-            "Fully booted.",
-        ]
-        boot_opener = _random.choice(boot_opener_pool)
         tail = " What do you need?" if not time_g.rstrip().endswith("?") else ""
-        greeting = f"{time_g} {boot_opener} {' '.join(greeting_bits)}{tail}".strip()
+        if extras:
+            greeting = f"{time_g} {' '.join(extras)}{tail}".strip()
+        else:
+            greeting = f"{time_g}{tail}".strip()
         atom_runtime.patch_section(
             "reasoning",
             {
@@ -2569,6 +2945,45 @@ async def main() -> None:
                 greeting += f" Heads up, battery is at {bat.percent:.0f} percent."
         except Exception:
                     logger.info("Battery check failed", exc_info=True)
+
+        # Wait briefly for the boot face check (started in parallel
+        # before this coroutine ran). Hard 2.5s ceiling so a frozen
+        # AVCapture session can never delay the greeting more than
+        # the time it adds to ATOM feeling "snappy".
+        if boot_face_future is not None:
+            try:
+                face_result = await asyncio.wait_for(
+                    asyncio.shield(boot_face_future), timeout=2.5,
+                )
+            except (asyncio.TimeoutError, asyncio.CancelledError):
+                face_result = None
+            except Exception:
+                logger.debug("boot face check await failed", exc_info=True)
+                face_result = None
+            if face_result is not None:
+                if face_result.ok and face_result.faces > 0:
+                    cam_label = (
+                        face_result.camera.name if face_result.camera else "camera"
+                    )
+                    logger.info(
+                        "Boot face check: detected %d face(s) via %s in %.0fms",
+                        face_result.faces, cam_label, face_result.detection_ms,
+                    )
+                    if _vision_cfg.get("boot_face_check_announce", False):
+                        # Prepend, not append -- "I see you, Boss." should
+                        # be the first thing the user hears.
+                        greeting = f"I see you, Boss. {greeting}".strip()
+                elif face_result.ok:
+                    logger.info(
+                        "Boot face check: camera ready (%s) but no face yet",
+                        face_result.camera.name if face_result.camera else "?",
+                    )
+                else:
+                    logger.info(
+                        "Boot face check: %s",
+                        face_result.error or "no detail",
+                    )
+
         logger.info("Startup greeting: %s", greeting[:200])
 
         # Speak the boot greeting; partial_response handler will push state
@@ -2965,6 +3380,11 @@ async def main() -> None:
             await runtime_watchdog.shutdown()
         if priority_sched is not None:
             await priority_sched.shutdown()
+        if iphone_bridge is not None:
+            try:
+                await iphone_bridge.stop()
+            except Exception:
+                logger.debug("iPhone bridge stop failed", exc_info=True)
         bus.clear()
         stt.shutdown()
         await tts.shutdown()
@@ -2999,6 +3419,119 @@ async def main() -> None:
         logger.info("ATOM stopped.")
 
 
+# Boot-time permanent errors. Retrying these is pointless: an ImportError
+# at module load or a SyntaxError does not self-heal across a 2-second sleep.
+# Keep this tuple tight -- anything listed here will short-circuit crash_guard.
+_PERMANENT_BOOT_ERRORS: tuple[type[BaseException], ...] = (
+    ImportError,   # includes ModuleNotFoundError
+    SyntaxError,
+)
+
+
+# Dependencies that must import cleanly before main() runs. Each entry is
+# (module_name, install_hint). Kept minimal on purpose: only add deps that
+# are (a) always required for boot and (b) have caused a crash loop before.
+_HARD_DEPS: tuple[tuple[str, str], ...] = (
+    ("cryptography", "pip install cryptography"),
+    ("mlx_lm", "pip install mlx-lm  (Apple Silicon only)"),
+)
+
+
+# Files that must be present inside the primary MLX model directory for
+# mlx-lm to load weights + tokenizer cleanly. Missing any of these loops
+# the brain loader forever; fail fast at preflight instead.
+_MLX_MODEL_REQUIRED_FILES: tuple[str, ...] = (
+    "config.json",
+    "tokenizer.json",
+)
+
+
+def _preflight_hard_deps() -> list[str]:
+    """Return a list of install-hint strings for missing hard deps.
+
+    Idempotent and side-effect free. Called once before the crash_guard
+    retry loop so a missing dep produces a single diagnostic line instead
+    of N identical 3-page tracebacks.
+    """
+    preflight_log = logging.getLogger("atom.boot.preflight")
+    missing: list[str] = []
+    for module_name, hint in _HARD_DEPS:
+        try:
+            __import__(module_name)
+        except ImportError as exc:
+            missing.append(f"{module_name} ({exc}) -- {hint}")
+    if missing:
+        for line in missing:
+            preflight_log.critical("Missing hard dependency: %s", line)
+    return missing
+
+
+def _preflight_brain_model() -> list[str]:
+    """Verify the configured MLX primary model directory is loadable.
+
+    Returns a list of human-readable error strings; empty on success.
+    Checks, in order: (1) settings.json is readable, (2) the configured
+    primary-model path resolves to a directory, (3) required tokenizer
+    + config files exist, (4) at least one ``*.safetensors`` weight
+    file is present.
+
+    A missing model here would otherwise crash the brain controller on
+    first voice turn with a useless stacktrace and loop crash_guard.
+    """
+    preflight_log = logging.getLogger("atom.boot.preflight")
+    errors: list[str] = []
+    try:
+        import json as _json
+        from pathlib import Path as _Path
+        repo_root = _Path(__file__).resolve().parent
+        settings_path = repo_root / "config" / "settings.json"
+        if not settings_path.is_file():
+            errors.append(f"config/settings.json missing at {settings_path}")
+            return errors
+        cfg = _json.loads(settings_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        errors.append(f"settings.json unreadable: {exc}")
+        return errors
+
+    brain_cfg = cfg.get("brain") or {}
+    if not brain_cfg.get("enabled", True):
+        return []  # Brain disabled on purpose -- nothing to check.
+
+    # Preferred key: brain.mlx_model. Older profiles used separate
+    # primary/fast keys; accept them here for backwards compatibility
+    # so an out-of-date settings.json still boots.
+    rel = ""
+    for key in ("mlx_model", "mlx_primary_model", "mlx_fast_model", "model_path"):
+        val = str(brain_cfg.get(key) or "").strip()
+        if val:
+            rel = val
+            break
+    if not rel:
+        errors.append(
+            "brain.mlx_model missing from settings.json "
+            "(no legacy mlx_primary_model / mlx_fast_model / model_path either)"
+        )
+        return errors
+
+    from pathlib import Path as _Path
+    model_path = (_Path(__file__).resolve().parent / rel).resolve()
+    if not model_path.is_dir():
+        errors.append(f"MLX model directory missing: {model_path}")
+        return errors
+
+    for name in _MLX_MODEL_REQUIRED_FILES:
+        if not (model_path / name).is_file():
+            errors.append(f"{name} missing inside {model_path.name}/")
+
+    if not list(model_path.glob("*.safetensors")):
+        errors.append(f"no .safetensors weights found in {model_path.name}/")
+
+    if errors:
+        for line in errors:
+            preflight_log.critical("Brain model preflight: %s", line)
+    return errors
+
+
 def run_atom(config_overrides: dict | None = None) -> None:
     """Launch ATOM programmatically with optional config overrides.
 
@@ -3016,7 +3549,13 @@ def run_atom(config_overrides: dict | None = None) -> None:
     global _restart_requested
     set_config_overrides(config_overrides or {})
 
-
+    if _preflight_hard_deps() or _preflight_brain_model():
+        logging.getLogger("atom.crash_guard").critical(
+            "Preflight failed -- not starting main(). "
+            "Install missing deps / restore the MLX model directory and retry."
+        )
+        set_config_overrides({})
+        sys.exit(2)
 
     MAX_RETRIES = 5
     MAX_BACKOFF_S = 30.0
@@ -3038,6 +3577,15 @@ def run_atom(config_overrides: dict | None = None) -> None:
         except KeyboardInterrupt:
             break
         except SystemExit:
+            break
+        except _PERMANENT_BOOT_ERRORS as exc:
+            crash_logger = logging.getLogger("atom.crash_guard")
+            crash_logger.critical(
+                "Permanent boot failure (%s: %s) -- not retrying. "
+                "Fix the code/install the missing dep and relaunch.",
+                type(exc).__name__, exc,
+                exc_info=True,
+            )
             break
         except Exception:
             attempt += 1

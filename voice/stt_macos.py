@@ -936,6 +936,40 @@ class NativeSTT:
         """
         self._whisper_confirmer = confirmer
 
+    def on_media_started(self) -> None:
+        """Duck STT sensitivity while ATOM-originated media plays.
+
+        Called by the boot wiring when a ``media_started`` event fires
+        (e.g. YouTube playback begun). Under speaker bleed, SFSpeechRecognizer
+        can hallucinate short fragments from the music itself; we counter
+        that by demanding a longer stability window before promoting any
+        partial to a final. Idempotent.
+        """
+        elevated_stability_s = 3.0
+        if self._partial_finalize_s < elevated_stability_s:
+            old = self._partial_finalize_s
+            self._partial_finalize_s = elevated_stability_s
+            logger.info(
+                "STT: media started — partial-stability %.1fs -> %.1fs "
+                "to suppress speaker-bleed promotion",
+                old, elevated_stability_s,
+            )
+
+    def on_media_stopped(self) -> None:
+        """Restore normal STT sensitivity after media ends.
+
+        Pairs with :meth:`on_media_started`. Safe to call even if
+        media wasn't playing.
+        """
+        default_stability_s = 1.8
+        if abs(self._partial_finalize_s - default_stability_s) > 0.05:
+            old = self._partial_finalize_s
+            self._partial_finalize_s = default_stability_s
+            logger.info(
+                "STT: media stopped — partial-stability %.1fs -> %.1fs",
+                old, default_stability_s,
+            )
+
     def _is_self_echo(self, text: str) -> bool:
         """Ask the injected guard whether this text is ATOM's own TTS."""
         guard = self._echo_guard

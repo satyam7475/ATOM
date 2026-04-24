@@ -803,12 +803,42 @@ class AudioIntelligenceEngine:
             "chain_rotation",
             "idle_restart",
         }
-        if reason in _BENIGN_REASONS:
+        # The STT watchdog re-emits restart events with a ``soft:`` prefix
+        # when a chain rotation succeeded (see voice/stt_watchdog.py). The
+        # underlying cause is still benign, so strip the prefix before
+        # checking. Without this the original reason (e.g.
+        # ``soft:klsr_301_timeout``) slipped through the filter and a
+        # CoreAudio device rescan fired during TTS, wedging
+        # NSSpeechSynthesizer's output path for ~12s until the deadman
+        # force-stopped the utterance.
+        bare_reason = reason.split(":", 1)[-1] if reason else ""
+        if reason in _BENIGN_REASONS or bare_reason in _BENIGN_REASONS:
             logger.debug(
                 "STT watchdog restart reason=%s -- benign rotation, skipping device switch",
                 reason,
             )
             return
+
+        # Never switch audio devices while TTS is speaking or about to
+        # speak — re-enumerating CoreAudio hardware can wedge the output
+        # path on macOS 15+, and NSSpeechSynthesizer will report
+        # ``isSpeaking() == True`` with no audible output until the deadman
+        # fires. StateManager.current returns the AtomState enum.
+        try:
+            current = getattr(self._state, "current", None)
+            state_value = getattr(current, "value", "") or str(current)
+            if state_value.lower() == "speaking":
+                logger.debug(
+                    "STT stuck event (reason=%s) during SPEAKING — skipping "
+                    "device switch to avoid wedging TTS audio path",
+                    reason,
+                )
+                return
+        except Exception:
+            logger.debug(
+                "voice audio_intelligence: SPEAKING-state check failed",
+                exc_info=True,
+            )
 
         now = time.monotonic()
         self._stt_restart_times.append(now)

@@ -171,6 +171,19 @@ class Router:
         self._confirmation = ConfirmationManager(self._security)
         self._diagnostics = DiagnosticsHandler(self._config)
 
+        # Identity engine (Phase 1 cross_device): wired post-init via
+        # :py:meth:`attach_identity_engine`. When present AND
+        # ``cross_device.enabled`` is true AND an iPhone is registered,
+        # tier-3+ actions require a fresh Face ID from the Shortcuts
+        # bridge.
+        self._identity_engine: Any = None
+
+        # Vision engine (camera + Apple Vision NE): wired post-init by
+        # :py:meth:`attach_vision_engine`. ``vision_look`` returns a
+        # graceful "Camera is offline, Boss." string when not attached
+        # so the LLM never sees a Python traceback in its observation.
+        self._vision_engine: Any = None
+
         from core.reasoning.action_executor import ActionExecutor
         self._action_executor = ActionExecutor(
             dispatch_fn=self._dispatch_action,
@@ -222,6 +235,55 @@ class Router:
         """
         self._tts_echo_guard = echo_guard
         logger.info("Router: TTS echo guard wired")
+
+    def attach_identity_engine(self, identity_engine: Any) -> None:
+        """Wire the IdentityEngine for the Phase 1 tier-3+ freshness gate.
+
+        Safe to call before or after the bridge is running -- the gate
+        stays off until both ``cross_device.enabled=true`` and a
+        trusted iPhone has been registered.
+        """
+        self._identity_engine = identity_engine
+        logger.info("IdentityEngine attached to Router (Phase 1 tier-3 gate)")
+
+    def attach_vision_engine(self, vision_engine: Any) -> None:
+        """Wire the camera + Apple Vision engine.
+
+        ``vision_look`` is the user-facing tool that calls into this
+        engine.  When the engine is missing or disabled, the tool
+        returns a friendly "Camera is offline" sentence so the LLM
+        observation stays clean.
+        """
+        self._vision_engine = vision_engine
+        if vision_engine is None:
+            logger.info("VisionEngine detached from Router")
+            return
+        try:
+            reason = vision_engine.disabled_reason()
+        except Exception:
+            reason = ""
+        if reason:
+            logger.info("VisionEngine attached to Router (currently offline: %s)", reason)
+        else:
+            logger.info("VisionEngine attached to Router (camera ready)")
+
+    def _check_identity_gate(self, action: str) -> tuple[bool, str]:
+        """Return ``(allowed, reason)`` from the identity-freshness gate.
+
+        Always ``(True, "")`` when the gate does not apply (tier < 3,
+        cross_device disabled, no registered iPhone). Otherwise
+        defers to
+        :py:func:`core.router.identity_gate.check_identity_freshness`.
+        """
+        try:
+            from core.router.identity_gate import check_identity_freshness
+        except Exception:  # pragma: no cover -- identity_gate is stdlib-only
+            return True, ""
+        return check_identity_freshness(
+            config=self._config,
+            identity_engine=self._identity_engine,
+            action=action,
+        )
 
     def attach_routine_engine(self, routine_engine: Any) -> None:
         """Wire the user-defined routine engine (Sprint D4)."""
@@ -916,6 +978,15 @@ class Router:
             await self._execute_action(outcome.action_result)
         elif outcome.tool_call is not None:
             tool_call = outcome.tool_call
+            # Phase 1: identity-freshness gate for tier-3+ confirmed tools.
+            id_ok, id_reason = self._check_identity_gate(tool_call.name)
+            if not id_ok:
+                logger.info(
+                    "Identity gate BLOCKED confirmed tool '%s': %s",
+                    tool_call.name, id_reason,
+                )
+                self._bus.emit_long("response_ready", text=id_reason)
+                return
             allowed, reason = self._security.allow_action(
                 tool_call.name, dict(tool_call.arguments),
             )
@@ -956,6 +1027,18 @@ class Router:
 
         args = result.action_args or {}
         args = merge_signed_args(self._security, result.action, args)
+
+        # Phase 1 cross_device: identity-freshness gate for tier-3+
+        # actions. Runs before SecurityPolicy so a stale Face ID short-
+        # circuits everything else (rate limits, feature flags, etc).
+        id_ok, id_reason = self._check_identity_gate(result.action)
+        if not id_ok:
+            logger.info(
+                "Identity gate BLOCKED action '%s': %s",
+                result.action, id_reason,
+            )
+            self._emit_response(id_reason)
+            return
 
         allowed, reason = self._security.allow_action(result.action, args)
         if not allowed:
@@ -1047,6 +1130,13 @@ class Router:
         "self_diagnostic", "behavior_report",
         "spotlight_search", "smart_find_file",
         "whats_on_my_plate",
+        # AVCaptureSession + Vision typically takes 0.5-2.5s; running
+        # in the executor keeps the event loop responsive while the
+        # camera warms up (esp. Continuity Camera first call).
+        "vision_look",
+        # Adds VLM inference on top of vision_look — first call also
+        # pays ~150-400ms VLM first-token latency. Always async.
+        "vision_describe",
     })
 
     def _dispatch_action(self, action: str, args: dict) -> str | None:
@@ -1198,6 +1288,137 @@ class Router:
     def _do_screenshot(self, _action: str, _args: dict) -> str:
         system_actions.take_screenshot()
         return personality.action_done("screenshot")
+
+    def _do_vision_look(self, _action: str, args: dict) -> str:
+        """On-demand camera glance ("what do you see, ATOM?").
+
+        Captures one frame from the preferred camera (built-in webcam
+        or Continuity Camera = iPhone), runs Apple Vision face/object
+        detection on the Neural Engine, and returns a short, spoken-
+        friendly summary.  No LLM/VLM is loaded by this path.
+
+        Falls back to a friendly sentence whenever the engine is
+        unavailable so the LLM observation stays clean.
+        """
+        engine = self._vision_engine
+        if engine is None:
+            return "Camera is offline, Boss — vision engine isn't wired."
+        reason = ""
+        try:
+            reason = engine.disabled_reason() or ""
+        except Exception:
+            logger.debug("vision_look: disabled_reason() failed", exc_info=True)
+        if reason:
+            return f"Camera is offline, Boss — {reason}."
+
+        focus = str(args.get("focus") or "").strip().lower()
+        result = None
+        try:
+            # Fast common case: just give me a face count + camera name.
+            # We expose ``focus=barcodes`` for QR / barcode scans because
+            # Vision can do that on the same Neural Engine pass.
+            result = engine.look(
+                reason=f"vision_look:{focus or 'general'}",
+                detect_faces=True,
+                detect_barcodes=(focus == "barcodes"),
+            )
+        except Exception as exc:
+            logger.warning("vision_look failed: %s", exc, exc_info=True)
+            return "Camera glance failed, Boss — see logs for details."
+
+        if not result.ok:
+            return f"Camera glance came back empty, Boss: {result.error or 'no detail'}."
+
+        cam_name = result.camera.name if result.camera else "camera"
+        face_count = result.faces
+        # Hand-tuned spoken phrases so the LLM observation reads well
+        # when echoed straight to TTS without further rewriting.
+        if face_count == 0:
+            face_phrase = "no face yet"
+        elif face_count == 1:
+            face_phrase = "one face"
+        else:
+            face_phrase = f"{face_count} faces"
+        bits = [f"I'm seeing through {cam_name}", face_phrase]
+        if focus == "barcodes" and result.vision and result.vision.barcodes:
+            bits.append(f"barcodes: {', '.join(result.vision.barcodes[:3])}")
+        timing = (
+            f"({result.capture_ms:.0f}ms capture, {result.detection_ms:.0f}ms vision)"
+        )
+        return f"{', '.join(bits)} {timing}."
+
+    def _do_vision_describe(self, _action: str, args: dict) -> str:
+        """Rich scene caption via the configured on-device VLM.
+
+        Captures one frame, then runs the captioner for a single
+        natural-language sentence describing the scene. Falls back
+        cleanly to the ``vision_look`` response when the VLM is not
+        wired, so the LLM never sees a traceback as an observation.
+        """
+        engine = self._vision_engine
+        if engine is None:
+            return "Camera is offline, Boss — vision engine isn't wired."
+        engine_reason = ""
+        try:
+            engine_reason = engine.disabled_reason() or ""
+        except Exception:
+            logger.debug(
+                "vision_describe: disabled_reason() failed", exc_info=True,
+            )
+        if engine_reason:
+            return f"Camera is offline, Boss — {engine_reason}."
+
+        cap_available = bool(getattr(engine, "captioner_available", False))
+        if not cap_available:
+            cap_reason = ""
+            try:
+                cap_reason_fn = getattr(engine, "captioner_disabled_reason", None)
+                if callable(cap_reason_fn):
+                    cap_reason = cap_reason_fn() or ""
+            except Exception:
+                logger.debug(
+                    "vision_describe: captioner_disabled_reason failed",
+                    exc_info=True,
+                )
+            logger.info(
+                "vision_describe: captioner unavailable (%s); "
+                "falling back to vision_look",
+                cap_reason or "unknown",
+            )
+            return self._do_vision_look(_action, {})
+
+        prompt = str(args.get("prompt") or "").strip()
+        result = None
+        try:
+            result = engine.look(
+                reason=f"vision_describe:{prompt[:40] or 'general'}",
+                detect_faces=True,
+                detect_barcodes=False,
+                describe=True,
+            )
+        except Exception as exc:
+            logger.warning("vision_describe failed: %s", exc, exc_info=True)
+            return "Camera describe failed, Boss — see logs for details."
+
+        if not result.ok and not result.description:
+            return (
+                f"Camera describe came back empty, Boss: "
+                f"{result.error or 'no detail'}."
+            )
+
+        caption = (result.description or "").strip()
+        if not caption:
+            cam_name = result.camera.name if result.camera else "camera"
+            return (
+                f"I'm seeing through {cam_name} but the VLM returned no caption."
+            )
+
+        cam_name = result.camera.name if result.camera else "camera"
+        timing = (
+            f"({result.capture_ms:.0f}ms capture, "
+            f"{result.description_ms:.0f}ms caption)"
+        )
+        return f"Through {cam_name}: {caption} {timing}"
 
     def _do_set_brightness(self, _action: str, args: dict) -> str:
         actual = system_actions.set_brightness(args.get("percent"), args.get("delta"))
@@ -1634,6 +1855,8 @@ class Router:
         "copy_path": _do_copy_path,
         "lock_screen": _do_lock_screen,
         "screenshot": _do_screenshot,
+        "vision_look": _do_vision_look,
+        "vision_describe": _do_vision_describe,
         "set_brightness": _do_set_brightness,
         "shutdown_pc": _do_shutdown_pc,
         "restart_pc": _do_restart_pc,
@@ -2146,6 +2369,29 @@ class Router:
                 if topics:
                     context_bundle = dict(context_bundle or {})
                     context_bundle["active_topics"] = ", ".join(topics)
+
+        if self._vision_engine is not None:
+            # When the on-wake describe trigger (or any recent
+            # ``vision_describe`` tool call) produced a caption within
+            # the engine's staleness window, inject it as ambient
+            # visual context so the brain knows what the user is
+            # looking at without having to call ``vision_describe``
+            # explicitly. Keeps the "always-watching" feel while
+            # staying strictly opt-in via ``vision.describe_on_wake``.
+            try:
+                recent_caption_fn = getattr(
+                    self._vision_engine, "recent_caption", None,
+                )
+                caption = (
+                    recent_caption_fn() if callable(recent_caption_fn) else ""
+                )
+                if caption:
+                    context_bundle = dict(context_bundle or {})
+                    context_bundle["visual_context"] = caption
+            except Exception:
+                logger.debug(
+                    "visual_context injection failed", exc_info=True,
+                )
 
         if not self._security.is_feature_enabled("llm"):
             logger.info("LLM feature disabled by policy")

@@ -232,6 +232,66 @@ class ToolRegistry:
             Tool("capture_screen", "Take a screenshot to read the active screen", "perception", "safe"),
             Tool("analyze_screen", "Take a screenshot and deeply analyze visual UI elements", "perception", "moderate",
                  [ToolParameter("query", "string", "What to look for on screen", False, "Read the screen")]),
+            Tool(
+                "vision_look",
+                (
+                    "Open the camera (built-in webcam or iPhone Continuity "
+                    "Camera) and report what you see in front of the user. "
+                    "Detects faces and (optionally) barcodes via the Apple "
+                    "Neural Engine. Use when the user asks 'what do you see', "
+                    "'can you see me', 'who is in the room', or to scan a QR/"
+                    "barcode."
+                ),
+                "perception",
+                "moderate",
+                [
+                    ToolParameter(
+                        "focus", "string",
+                        "What to prioritise: 'general' (faces only), "
+                        "'barcodes' (also scan barcodes/QR codes).",
+                        False, "general",
+                        enum=["general", "barcodes"],
+                    ),
+                ],
+                examples=[
+                    "what do you see",
+                    "can you see me right now",
+                    "scan this QR code",
+                    "look at the camera",
+                ],
+            ),
+            Tool(
+                "vision_describe",
+                (
+                    "Open the camera (built-in webcam or iPhone Continuity "
+                    "Camera) and generate a rich one-sentence description "
+                    "of the scene using the on-device VLM (SmolVLM-Instruct-"
+                    "4bit, mlx-vlm). "
+                    "Use when the user wants actual understanding of what's "
+                    "in front of them, not just a face count: 'describe what "
+                    "you see', 'tell me about the room', 'what am I holding', "
+                    "'read this page to me'. Returns empty when the VLM is "
+                    "not installed — fall back to ``vision_look`` in that "
+                    "case."
+                ),
+                "perception",
+                "moderate",
+                [
+                    ToolParameter(
+                        "prompt", "string",
+                        "Optional custom prompt to steer the caption (e.g. "
+                        "'what text is on this page'). Defaults to a "
+                        "general short-caption prompt.",
+                        False, "",
+                    ),
+                ],
+                examples=[
+                    "describe what you see",
+                    "tell me about the scene",
+                    "what am I holding",
+                    "read the page in front of the camera",
+                ],
+            ),
             Tool("lock_screen", "Lock the workstation", "system", "moderate"),
             Tool("set_brightness", "Set screen brightness", "system", "safe",
                  [ToolParameter("percent", "integer", "Brightness 0-100", True)]),

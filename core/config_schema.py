@@ -577,26 +577,37 @@ CONFIG_SCHEMA: dict[str, Any] = {
                     "type": "string",
                     "description": "Legacy GGUF fallback model path (not used by the default MLX runtime).",
                 },
+                "mlx_model": {
+                    "type": "string",
+                    "description": (
+                        "Path to the single MLX model directory ATOM "
+                        "loads at boot. ATOM v3.2 runs one local model; "
+                        "legacy mlx_primary_model / mlx_fast_model / "
+                        "mlx_deep_model / mlx_default_role / model_path "
+                        "are still accepted by the brain loader for "
+                        "backwards compatibility but should be removed."
+                    ),
+                },
                 "mlx_primary_model": {
                     "type": "string",
-                    "description": "Path to the primary MLX model directory.",
+                    "description": "DEPRECATED: legacy alias for mlx_model.",
                 },
                 "mlx_fast_model": {
                     "type": "string",
-                    "description": "Path to the fast MLX model directory.",
+                    "description": "DEPRECATED: legacy alias for mlx_model.",
                 },
                 "mlx_deep_model": {
                     "type": "string",
                     "description": (
-                        "Path to the heavyweight on-device deep-reasoning "
-                        "MLX model directory (lazy-loaded fallback used when "
-                        "cloud is unreachable)."
+                        "DEPRECATED: the v3.2 brain is single-model; "
+                        "deep reasoning routes to cloud (Gemini) via the "
+                        "cognitive kernel. Ignored at load time."
                     ),
                 },
                 "mlx_default_role": {
                     "type": "string",
                     "enum": ["primary", "fast", "deep"],
-                    "description": "Default MLX role to load first.",
+                    "description": "DEPRECATED: the brain has a single role slot.",
                 },
                 "n_ctx": {
                     "type": "integer",
@@ -748,14 +759,245 @@ CONFIG_SCHEMA: dict[str, Any] = {
             },
             "additionalProperties": True,
         },
+        "cross_device": {
+            "type": "object",
+            "description": (
+                "Phase 1 iPhone Shortcuts bridge. When enabled, a local HTTP "
+                "listener accepts POST /faceid, /presence, /trigger from an "
+                "iPhone's Shortcuts app. No Xcode, no Apple developer account."
+            ),
+            "properties": {
+                "enabled": {
+                    "type": "boolean",
+                    "description": "Master switch. Off by default so a fresh install does not open a port.",
+                },
+                "bridge_port": {
+                    "type": "integer",
+                    "minimum": 1024,
+                    "maximum": 65535,
+                    "description": "Preferred listener port. On bind failure the bridge tries port+1 and port+2.",
+                },
+                "bind_host": {
+                    "type": "string",
+                    "description": "Bind address. 127.0.0.1 for localhost-only (recommended); LAN IP to accept Wi-Fi POSTs from iPhone.",
+                },
+                "faceid_freshness_s": {
+                    "type": "number",
+                    "minimum": 30,
+                    "maximum": 3600,
+                    "description": "Seconds a Face ID verification stays 'fresh' for tier-3 gate. 300 (5 min) is the default.",
+                },
+                "allow_origins": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Allow-listed source IPs (reserved for Phase 1.5; enforcement lives in bridge_auth).",
+                },
+                "token_path": {
+                    "type": "string",
+                    "description": "Path to the pre-shared bridge token file. Auto-minted at first boot.",
+                },
+                "audit_log_path": {
+                    "type": "string",
+                    "description": "Append-only JSONL log of auth failures + 409 rejections.",
+                },
+                "trusted_device_path": {
+                    "type": "string",
+                    "description": "Single-iPhone UDID-hash state file. Reset by deleting or via `python -m core.cross_device.trusted_device reset`.",
+                },
+                "port_file_path": {
+                    "type": "string",
+                    "description": "Path written with the actual bound port so Shortcuts can pick it up after fallback.",
+                },
+            },
+            "additionalProperties": True,
+        },
         "vision": {
             "type": "object",
+            "description": (
+                "Camera + Apple Vision (Neural Engine) settings. Covers both "
+                "the built-in MacBook webcam and Continuity Camera (iPhone-as-"
+                "webcam). Detection runs on-device via VNDetectFaceRectangles "
+                "— no LLM/VLM is loaded by this subsystem."
+            ),
             "properties": {
-                "enabled": {"type": "boolean"},
-                "camera_index": {"type": "integer", "minimum": 0},
-                "check_interval_seconds": {"type": "number", "minimum": 1, "maximum": 60},
+                "enabled": {
+                    "type": "boolean",
+                    "description": (
+                        "Master switch. False keeps AVFoundation untouched and "
+                        "the camera lights stay off."
+                    ),
+                },
+                "preferred_camera": {
+                    "type": "string",
+                    "enum": ["auto", "continuity", "builtin"],
+                    "description": (
+                        "auto = prefer iPhone (Continuity) when present, else "
+                        "built-in. continuity = require iPhone. builtin = "
+                        "ignore iPhone even if available."
+                    ),
+                },
+                "explicit_camera_uid": {
+                    "type": ["string", "null"],
+                    "description": (
+                        "AVCaptureDevice uniqueID; if set, wins over "
+                        "preferred_camera. Use to pin a specific external rig."
+                    ),
+                },
+                "boot_face_check": {
+                    "type": "boolean",
+                    "description": (
+                        "If true, ATOM captures one frame at end of boot to "
+                        "detect a face and log 'I see you' / 'no face yet'. "
+                        "Off by default — opt in once you trust the camera."
+                    ),
+                },
+                "boot_face_check_announce": {
+                    "type": "boolean",
+                    "description": (
+                        "If true *and* boot_face_check is true *and* a face is "
+                        "detected, ATOM speaks one short greeting confirming "
+                        "it can see the user. False = log only."
+                    ),
+                },
+                "capture_timeout_s": {
+                    "type": "number",
+                    "minimum": 0.5,
+                    "maximum": 10.0,
+                    "description": (
+                        "Max wall time to wait for a single frame from the "
+                        "AVCaptureSession. Continuity Camera needs the higher "
+                        "end of this range on first warm-up."
+                    ),
+                },
+                "min_gap_s": {
+                    "type": "number",
+                    "minimum": 0.0,
+                    "maximum": 60.0,
+                    "description": (
+                        "Minimum spacing between consecutive captures from the "
+                        "engine. Throttle for tool-call retry loops."
+                    ),
+                },
+                "audit_log_path": {
+                    "type": "string",
+                    "description": (
+                        "JSONL audit log path (one line per capture). 0o600 on "
+                        "first write."
+                    ),
+                },
+                "camera_index": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": (
+                        "Legacy opencv index (used only by "
+                        "scripts/enroll_owner_face.py)."
+                    ),
+                },
+                "check_interval_seconds": {
+                    "type": "number",
+                    "minimum": 1,
+                    "maximum": 60,
+                    "description": "Legacy poll cadence (unused by VisionEngine).",
+                },
                 "require_owner_for_sensitive": {"type": "boolean"},
-                "owner_encoding_path": {"type": "string"},
+                "owner_encoding_path": {
+                    "type": "string",
+                    "description": (
+                        "Legacy face_recognition encoding (only "
+                        "scripts/enroll_owner_face.py writes this)."
+                    ),
+                },
+                "describe_on_wake": {
+                    "type": "boolean",
+                    "description": (
+                        "When true AND vision.vlm.enabled is true, ATOM "
+                        "captures one frame each time the wake phrase "
+                        "fires and runs the VLM captioner. The caption "
+                        "is stashed on the vision engine so the next "
+                        "LLM turn gets a ``visual_context`` entry in "
+                        "its context_bundle. This is the single flag "
+                        "that makes ATOM feel always-watching — off by "
+                        "default to respect privacy + keep boot clean."
+                    ),
+                },
+                "caption_max_age_s": {
+                    "type": "number",
+                    "minimum": 1.0,
+                    "maximum": 600.0,
+                    "description": (
+                        "How long a VLM caption stays 'fresh' for "
+                        "visual_context injection. After this many "
+                        "seconds the caption is treated as stale and "
+                        "not attached to new LLM turns."
+                    ),
+                },
+                "vlm": {
+                    "type": "object",
+                    "description": (
+                        "Visual Language Model settings (SmolVLM-Instruct-"
+                        "4bit via mlx-vlm; ~1.2 GB on disk). Opt-in via "
+                        "the ``enabled`` flag because the weights are a "
+                        "separate download."
+                    ),
+                    "properties": {
+                        "enabled": {
+                            "type": "boolean",
+                            "description": (
+                                "Master switch for the VLM captioner. "
+                                "When false, ``vision_describe`` falls "
+                                "back to ``vision_look`` and "
+                                "``describe_on_wake`` is a no-op."
+                            ),
+                        },
+                        "model_path": {
+                            "type": "string",
+                            "description": (
+                                "Local directory containing the mlx-vlm "
+                                "weights. Default: "
+                                "models/smolvlm-instruct-4bit. Fetch "
+                                "with: hf download "
+                                "mlx-community/SmolVLM-Instruct-4bit "
+                                "--local-dir models/smolvlm-instruct-4bit"
+                            ),
+                        },
+                        "model_repo": {
+                            "type": "string",
+                            "description": (
+                                "Optional Hugging Face repo id used as "
+                                "fallback when ``model_path`` is missing "
+                                "on disk. mlx-vlm + huggingface_hub will "
+                                "fetch on first use. Leave empty for "
+                                "strict offline operation."
+                            ),
+                        },
+                        "prompt": {
+                            "type": "string",
+                            "description": (
+                                "Default prompt for short scene captions. "
+                                "Tool calls may override with their own."
+                            ),
+                        },
+                        "max_tokens": {
+                            "type": "integer",
+                            "minimum": 4,
+                            "maximum": 256,
+                            "description": (
+                                "Hard cap on caption length. 48 keeps "
+                                "output at one natural sentence."
+                            ),
+                        },
+                        "temperature": {
+                            "type": "number",
+                            "minimum": 0.0,
+                            "maximum": 2.0,
+                            "description": (
+                                "Sampling temperature. 0.0 = greedy, "
+                                "deterministic, best for consistency."
+                            ),
+                        },
+                    },
+                    "additionalProperties": True,
+                },
             },
             "additionalProperties": True,
         },
@@ -931,6 +1173,17 @@ CONFIG_SCHEMA: dict[str, Any] = {
                     "minimum": 10,
                     "maximum": 500,
                     "description": "RuntimeWatchdog: Intent engine budget before forced fallback.",
+                },
+                "watchdog_intent_boot_grace_s": {
+                    "type": "number",
+                    "minimum": 0,
+                    "maximum": 120,
+                    "description": (
+                        "Disables the intent_engine budget for the first N "
+                        "seconds after RuntimeWatchdog construction so the "
+                        "first turn after a cold boot isn't killed while "
+                        "JIT-compiling regex paths and warming caches."
+                    ),
                 },
                 "watchdog_cache_timeout_ms": {
                     "type": "number",

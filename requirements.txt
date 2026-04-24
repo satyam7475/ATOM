@@ -43,9 +43,23 @@ sounddevice==0.5.1
 # Voice Activity Detection for audio intelligence (lightweight C extension, ~50KB)
 webrtcvad>=2.0.10
 
+# Fernet-encrypted API-key vault (core/secure_credentials.py); without this the
+# secrets_manager degrades to "no cloud keys" instead of crashing the boot.
+cryptography>=42.0
+
 # ─── Apple Silicon Local Brain (primary path on M-series Macs) ───────────
 mlx>=0.30.4
 mlx-lm==0.31.2
+
+# ─── Apple Silicon Vision Language Model (optional) ─────────────────────
+# SmolVLM-Instruct-4bit captioner (~1.4 GB) powering the vision_describe
+# tool + on-wake "always-watching" context. Flip vision.vlm.enabled=true
+# in config/settings.json to activate. Weights are fetched separately:
+#   hf download mlx-community/SmolVLM-Instruct-4bit \
+#     --local-dir models/smolvlm-instruct-4bit
+# (moondream2 has no first-class mlx-vlm port today; the captioner is
+# model-agnostic and will pick it up the moment one ships.)
+mlx-vlm>=0.1.20
 
 # ─── Semantic Memory (embedding + vector store) ──────────────────────────
 # Embedding engine for semantic search (~260MB model)

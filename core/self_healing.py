@@ -592,7 +592,7 @@ class FixEngine:
                 fix_type="manual",
                 auto_fixable=False,
                 fix_commands=[
-                    "Verify brain.mlx_primary_model and brain.mlx_fast_model point to valid MLX model directories",
+                    "Verify brain.mlx_model points to a valid MLX model directory",
                     "Re-download the MLX model directory if corrupted",
                 ],
                 confidence=0.5,

@@ -105,7 +105,7 @@ def test_parser_extracts_simple_tool() -> None:
 
 def test_parser_recovers_naked_json_tool_call() -> None:
     """A naked tool-call-shaped JSON object is recovered. This is the
-    common Phi-3.5 mistake -- forgetting the <tool_call> wrap."""
+    common small-model mistake -- forgetting the <tool_call> wrap."""
     raw = (
         'Opening Chrome.\n'
         '{"name": "open_app", "arguments": {"app_name": "Chrome"}}'

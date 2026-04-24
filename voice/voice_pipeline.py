@@ -106,6 +106,12 @@ class VoicePipeline:
         self._loop_task: asyncio.Task | None = None
         self._audio_intel: Any = None
         self._earcons: Any = None
+        # Optional reference to the VisionEngine so the wake-word
+        # handler can fire a VLM describe pass in the background.
+        # Attached post-init via :py:meth:`attach_vision_engine` (see
+        # main.py), mirroring how the router receives the same engine.
+        self._vision_engine: Any = None
+        self._on_wake_describe_in_flight: bool = False
 
     def build(self) -> None:
         """Construct STT and TTS engines based on config + platform."""
@@ -117,6 +123,153 @@ class VoicePipeline:
             self.stt_runtime_label,
             self.tts_runtime_label,
         )
+
+    def attach_vision_engine(self, vision_engine: Any) -> None:
+        """Wire the VisionEngine so ``describe_on_wake`` can fire.
+
+        Safe to call multiple times or with ``None``. Must be called
+        AFTER :py:meth:`build_listening_mode_controller` has registered
+        its handlers; the wake handler dereferences ``self._vision_engine``
+        lazily at call time, so the order actually doesn't matter.
+        """
+        self._vision_engine = vision_engine
+
+    def _describe_on_wake_enabled(self) -> bool:
+        """Cheap check: is every prerequisite in place to fire the
+        describe-on-wake path right now?"""
+        vision_cfg = (self._config.get("vision") or {})
+        if not vision_cfg.get("enabled", False):
+            return False
+        if not vision_cfg.get("describe_on_wake", False):
+            return False
+        engine = self._vision_engine
+        if engine is None:
+            return False
+        if not getattr(engine, "captioner_available", False):
+            return False
+        return True
+
+    # How long a freshly captured caption is considered "still good
+    # enough" to skip the on-wake describe entirely. Shorter than
+    # ``vision.caption_max_age_s`` (used by the router for context
+    # injection) on purpose -- we want fast back-and-forth wakes to
+    # reuse a recent caption (saves CPU + 1.5s latency), but a 15s
+    # window also lets the scene update if the user has moved away
+    # from the desk between turns.
+    _ON_WAKE_DEDUPE_MAX_AGE_S: float = 15.0
+
+    def _schedule_describe_on_wake(self, *, trigger: str) -> None:
+        """Fire ``engine.look(describe=True)`` in the default executor.
+
+        Safeguards (in order of evaluation):
+
+        * **Single-flight per pipeline instance.** If a previous
+          describe pass is still running we skip -- AVCapture only
+          cooperates with one session at a time, and the camera lock
+          inside the engine would just block us anyway.
+        * **Speaking-state guard.** If TTS is currently playing we
+          skip; the VLM eats GIL + neural-engine cycles and would
+          stretch perceived TTS latency. The next user turn will get a
+          fresh describe via the router-side caption injection.
+        * **Recent-caption dedupe.** If the engine has a caption
+          younger than ``_ON_WAKE_DEDUPE_MAX_AGE_S`` we skip -- a 5-15s
+          old caption is still good enough for the next LLM turn and
+          firing a fresh describe just heats the M5 Air for nothing.
+        * **Engine disabled-check** is re-run inside the executor so a
+          late config flip doesn't race the coroutine.
+        * **Exceptions are swallowed**; the camera path already
+          audit-logs failures internally.
+        """
+        if self._on_wake_describe_in_flight:
+            logger.debug(
+                "describe_on_wake skipped; prior pass still in flight",
+            )
+            return
+        engine = self._vision_engine
+        if engine is None:
+            return
+
+        # Don't compete with TTS for CPU/Neural-Engine. SPEAKING is the
+        # only state where the M5 Air feels the VLM as a TTS hiccup --
+        # IDLE / LISTENING / THINKING are all fine because the user
+        # already accepts a 100-300ms gap before ATOM responds.
+        if self._is_speaking_now():
+            logger.debug(
+                "describe_on_wake skipped; ATOM is currently speaking",
+            )
+            return
+
+        # Re-use a fresh caption rather than burning another inference.
+        # Most rapid wakes (user calls ATOM twice in a row) hit this.
+        try:
+            recent_caption_fn = getattr(engine, "recent_caption", None)
+            if callable(recent_caption_fn):
+                fresh = recent_caption_fn(
+                    max_age_s=self._ON_WAKE_DEDUPE_MAX_AGE_S,
+                )
+                if fresh:
+                    logger.debug(
+                        "describe_on_wake skipped; reusing fresh "
+                        "caption (%d chars, age <= %.0fs)",
+                        len(fresh),
+                        self._ON_WAKE_DEDUPE_MAX_AGE_S,
+                    )
+                    return
+        except Exception:
+            logger.debug(
+                "describe_on_wake dedupe-check raised", exc_info=True,
+            )
+
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            logger.debug(
+                "describe_on_wake: no running loop; skipping",
+            )
+            return
+
+        self._on_wake_describe_in_flight = True
+
+        def _blocking_describe() -> None:
+            try:
+                engine.look(
+                    reason=f"on_wake:{trigger[:40]}",
+                    detect_faces=True,
+                    detect_barcodes=False,
+                    describe=True,
+                )
+            except Exception:
+                logger.debug(
+                    "describe_on_wake worker raised", exc_info=True,
+                )
+
+        future = loop.run_in_executor(None, _blocking_describe)
+
+        def _clear(_fut: asyncio.Future) -> None:
+            self._on_wake_describe_in_flight = False
+
+        future.add_done_callback(_clear)
+
+    def _is_speaking_now(self) -> bool:
+        """Return True if StateManager reports ATOM is currently
+        speaking (TTS in flight). Defensive against any unexpected
+        StateManager API shape -- returns False on any error so the
+        VLM can still fire if we can't read the state.
+        """
+        state = self._state
+        if state is None:
+            return False
+        try:
+            from core.state_manager import AtomState  # local import: avoid cycles
+        except Exception:
+            return False
+        try:
+            current = getattr(state, "current_state", None) or getattr(state, "current", None)
+            if current is None:
+                return False
+            return bool(current == AtomState.SPEAKING)
+        except Exception:
+            return False
 
     def _wire_echo_guard(self) -> None:
         """Connect TTS.is_echo() to STT so stable partials that match
@@ -662,6 +815,26 @@ class VoicePipeline:
                 _cancel_revert_task()
             except Exception:
                 logger.debug("wake_word_detected handler failed", exc_info=True)
+            # Fire-and-forget a VLM describe pass so the NEXT cognitive
+            # turn inherits a ``visual_context`` entry. The camera
+            # warm-up + VLM inference can take 1-3s on first call; we
+            # run it in the default executor so wake-word handling
+            # itself stays instantaneous.
+            if self._describe_on_wake_enabled():
+                self._schedule_describe_on_wake(trigger=f"wake:{word}")
+
+        async def _on_describe_request(**kw: Any) -> None:
+            # Same path as wake-on-describe but driven by an explicit
+            # request (e.g. a button press, a shortcut, or an STT
+            # keyphrase bypass). Kept separate so the wake handler
+            # doesn't have to guard both sources.
+            reason = str(kw.get("reason") or "manual")
+            if not self._describe_on_wake_enabled():
+                logger.debug(
+                    "describe request ignored; prerequisites not met",
+                )
+                return
+            self._schedule_describe_on_wake(trigger=f"manual:{reason}")
 
         async def _on_tts_complete(**_kw: Any) -> None:
             # Whenever we finish speaking, the user is still in an active
@@ -721,6 +894,7 @@ class VoicePipeline:
                 logger.debug("wake_hint TTS emit failed", exc_info=True)
 
         self._bus.on("wake_word_detected", _on_wake_word)
+        self._bus.on("vision.describe.request", _on_describe_request)
         self._bus.on("tts_complete", _on_tts_complete)
         self._bus.on("speech_partial", _on_partial_or_final)
         self._bus.on("speech_final", _on_partial_or_final)

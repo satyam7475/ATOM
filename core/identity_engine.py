@@ -3,16 +3,29 @@ Identity engine for ATOM's self-model and owner relationship.
 
 This sits between raw owner state and response generation so multiple
 subsystems can adapt tone and proactivity in a consistent way.
+
+Since Phase 1 it also tracks **Face ID freshness** -- verifications
+arriving from the iPhone bridge (:py:class:`core.cross_device.iphone_bridge.IPhoneBridge`)
+are recorded here so the router's tier-3 gate and the proactive
+engine can ask a single question: *is Boss verified right now?*
 """
 
 from __future__ import annotations
 
+import logging
+import time
 from datetime import datetime
+from threading import Lock
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from core.owner_understanding import OwnerUnderstanding
     from core.personality_modes import PersonalityModes
+
+
+_DEFAULT_FACEID_FRESHNESS_S = 300.0  # 5 minutes -- matches settings default
+
+logger = logging.getLogger("atom.identity")
 
 
 class IdentityEngine:
@@ -26,6 +39,12 @@ class IdentityEngine:
         "_system_role",
         "_owner_name",
         "_owner_title",
+        "_faceid_freshness_s",
+        "_last_faceid_ts",
+        "_last_faceid_device_id",
+        "_last_faceid_label",
+        "_last_faceid_verified",
+        "_faceid_lock",
     )
 
     def __init__(
@@ -43,6 +62,22 @@ class IdentityEngine:
         self._owner_name = str(owner_cfg.get("name", "Satyam") or "Satyam")
         self._owner_title = str(owner_cfg.get("title", "Boss") or "Boss")
 
+        cross = self._config.get("cross_device") or {}
+        try:
+            self._faceid_freshness_s = float(
+                cross.get("faceid_freshness_s", _DEFAULT_FACEID_FRESHNESS_S),
+            )
+        except (TypeError, ValueError):
+            self._faceid_freshness_s = _DEFAULT_FACEID_FRESHNESS_S
+        if self._faceid_freshness_s <= 0:
+            self._faceid_freshness_s = _DEFAULT_FACEID_FRESHNESS_S
+
+        self._last_faceid_ts: float = 0.0
+        self._last_faceid_device_id: str = ""
+        self._last_faceid_label: str = ""
+        self._last_faceid_verified: bool = False
+        self._faceid_lock = Lock()
+
     def configure_owner(self, name: str = "Satyam", title: str = "Boss") -> None:
         self._owner_name = str(name or "Satyam")
         self._owner_title = str(title or "Boss")
@@ -52,6 +87,84 @@ class IdentityEngine:
 
     def attach_modes(self, modes: PersonalityModes | None) -> None:
         self._modes = modes
+
+    # ── Face ID freshness (iPhone bridge) ─────────────────────────────
+
+    def record_faceid_verification(
+        self,
+        verified: bool,
+        *,
+        timestamp: float | None = None,
+        device_id: str = "",
+        label: str = "",
+    ) -> None:
+        """Record a Face ID verification from the iPhone bridge.
+
+        A ``verified=False`` event is kept too (so diagnostics can show
+        "phone reported failure"), but :py:meth:`is_owner_verified`
+        only accepts a *successful* Face ID inside the freshness
+        window.
+        """
+        ts = float(timestamp) if timestamp else time.time()
+        if ts <= 0:
+            ts = time.time()
+        with self._faceid_lock:
+            self._last_faceid_ts = ts
+            self._last_faceid_verified = bool(verified)
+            self._last_faceid_device_id = str(device_id or "")[:96]
+            self._last_faceid_label = str(label or "")[:64]
+        logger.info(
+            "faceid recorded verified=%s device=%s… ts=%.1f",
+            verified, (device_id or "")[:12], ts,
+        )
+
+    def is_owner_verified(self, window_s: float | None = None) -> bool:
+        """Did Boss verify via Face ID within *window_s* seconds?
+
+        ``window_s=None`` uses the configured
+        ``cross_device.faceid_freshness_s`` (default 300 s).
+
+        Returns False if no Face ID has ever arrived, if the last one
+        reported failure, or if the freshness window has elapsed.
+        """
+        window = float(window_s) if window_s is not None else self._faceid_freshness_s
+        if window <= 0:
+            return False
+        with self._faceid_lock:
+            ts = self._last_faceid_ts
+            verified = self._last_faceid_verified
+        if not verified or ts <= 0:
+            return False
+        return (time.time() - ts) <= window
+
+    def faceid_freshness_info(self) -> dict[str, Any]:
+        """Introspection: age, freshness window, last device. Safe to
+        surface in diagnostics / logs. Never returns the raw device id,
+        only a short prefix so the log is not doxxy if copy-pasted."""
+        with self._faceid_lock:
+            ts = self._last_faceid_ts
+            verified = self._last_faceid_verified
+            device_id = self._last_faceid_device_id
+            label = self._last_faceid_label
+        now = time.time()
+        return {
+            "last_verified": bool(verified),
+            "last_timestamp": ts,
+            "age_s": (now - ts) if ts > 0 else None,
+            "freshness_window_s": self._faceid_freshness_s,
+            "fresh": bool(verified and ts > 0 and (now - ts) <= self._faceid_freshness_s),
+            "device_prefix": device_id[:12] + ("…" if len(device_id) > 12 else ""),
+            "label": label,
+        }
+
+    def clear_faceid(self) -> None:
+        """Explicit invalidation (logout, session lock, manual CLI reset)."""
+        with self._faceid_lock:
+            self._last_faceid_ts = 0.0
+            self._last_faceid_verified = False
+            self._last_faceid_device_id = ""
+            self._last_faceid_label = ""
+        logger.info("faceid cleared")
 
     @staticmethod
     def _time_of_day(hour: int) -> str:

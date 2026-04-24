@@ -42,10 +42,13 @@ def test_config_settings_required_keys() -> None:
     for key in required_keys:
         assert key in settings, f"Missing required config key: {key}"
     
-    # Brain config must have model settings
+    # Brain config must have model settings.
+    # v3.2 single-model brain uses ``mlx_model``; legacy keys are still
+    # accepted by the loader so we treat any of them as valid here.
     brain = settings.get("brain", {})
-    assert "model_path" in brain or "mlx_primary_model" in brain, \
-        "Brain config missing model_path or mlx_primary_model"
+    assert any(
+        k in brain for k in ("mlx_model", "mlx_primary_model", "mlx_fast_model", "model_path")
+    ), "Brain config missing mlx_model (or any legacy alias)"
     
     # STT config
     stt = settings.get("stt", {})

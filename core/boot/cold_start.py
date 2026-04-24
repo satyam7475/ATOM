@@ -48,6 +48,8 @@ class ColdStartReport:
     restored_turns: int
     cached_commands: int
     restored_context_available: bool
+    vlm_ready: bool = False
+    vlm_warmup_ms: float = 0.0
 
 
 class ColdStartOptimizer:
@@ -64,6 +66,7 @@ class ColdStartOptimizer:
         local_brain: Any = None,
         conversation_memory: Any = None,
         system_monitor: Any = None,
+        vlm_captioner: Any = None,
         snapshot_path: str | Path | None = None,
     ) -> None:
         self._config = config or {}
@@ -74,6 +77,11 @@ class ColdStartOptimizer:
         self._local_brain = local_brain
         self._conversation_memory = conversation_memory
         self._system_monitor = system_monitor
+        # Optional VLM captioner. When wired, ``warm_up`` triggers
+        # ``captioner._load()`` in the executor in parallel with the
+        # other warmup tasks so the first wake-word fire doesn't pay
+        # the ~2s mlx-vlm cold-load latency on its critical path.
+        self._vlm_captioner = vlm_captioner
         self._snapshot_path = Path(snapshot_path or _SNAPSHOT_PATH)
         self._boot_time = 0.0
         self._restored_snapshot: dict[str, Any] = {}
@@ -92,6 +100,7 @@ class ColdStartOptimizer:
             self._restore_session(),
             self._cache_top_commands(),
             self._prime_intent_engine(),
+            self._preload_vlm(),
             return_exceptions=True,
         )
 
@@ -100,6 +109,13 @@ class ColdStartOptimizer:
         restored_turns = self._coerce_int(results[2], "session_restore")
         cached_commands = self._coerce_int(results[3], "command_cache")
         primed_intents = self._coerce_int(results[4], "intent_warmup")
+        vlm_payload = results[5] if len(results) > 5 else (False, 0.0)
+        if isinstance(vlm_payload, Exception):
+            logger.debug("Cold start vlm warmup failed: %s", vlm_payload)
+            vlm_ready, vlm_ms = False, 0.0
+        else:
+            vlm_ready = bool(vlm_payload[0])
+            vlm_ms = float(vlm_payload[1])
         if primed_intents:
             logger.info(
                 "Cold start: primed %d intent-engine regex paths", primed_intents,
@@ -110,13 +126,16 @@ class ColdStartOptimizer:
         )
 
         logger.info(
-            "Cold start ready in %.0fms (fast=%s embeddings=%s session=%d cache=%d context=%s)",
+            "Cold start ready in %.0fms (fast=%s embeddings=%s session=%d "
+            "cache=%d context=%s vlm=%s vlm_ms=%.0f)",
             elapsed_ms,
             fast_model_ready,
             embeddings_ready,
             restored_turns,
             cached_commands,
             restored_context_available,
+            vlm_ready,
+            vlm_ms,
         )
 
         return ColdStartReport(
@@ -126,6 +145,8 @@ class ColdStartOptimizer:
             restored_turns=restored_turns,
             cached_commands=cached_commands,
             restored_context_available=restored_context_available,
+            vlm_ready=vlm_ready,
+            vlm_warmup_ms=vlm_ms,
         )
 
     async def emit_restored_context(self) -> bool:
@@ -200,10 +221,18 @@ class ColdStartOptimizer:
             return False
 
         try:
+            # ``load_all=True`` aliases the ``primary`` role off the
+            # same loaded weights after ``fast`` is materialised (zero
+            # extra memory, ~0 ms). Previously ``primary`` was loaded
+            # lazily on the first non-fast request, adding ~2 s to the
+            # first streaming turn's first-token latency.
             try:
-                result = await warm_up(model_role="fast")
+                result = await warm_up(load_all=True)
             except TypeError:
-                result = await warm_up()
+                try:
+                    result = await warm_up(model_role="fast")
+                except TypeError:
+                    result = await warm_up()
             return bool(result)
         except Exception:
             logger.debug("Cold start fast-model preload failed", exc_info=True)
@@ -218,6 +247,65 @@ class ColdStartOptimizer:
         except Exception:
             logger.debug("Cold start embedding preload failed", exc_info=True)
             return False
+
+    async def _preload_vlm(self) -> tuple[bool, float]:
+        """Load the VLM weights into memory in parallel with the other
+        warmup tasks.
+
+        Returning ``(True, ms)`` means ``mlx_vlm.load`` succeeded and the
+        captioner is ready to caption. Returning ``(False, ms)`` is the
+        fail-open path — captioner stays in its disabled state, and the
+        on-wake describe handler will quietly skip until the user fixes
+        the underlying issue (missing weights, wrong path, etc.).
+
+        Runs ``captioner._load`` in the default executor because mlx-vlm
+        does heavy CPU/GPU work synchronously and we don't want to block
+        the asyncio loop for ~2s during the ``asyncio.gather`` above.
+        """
+        captioner = self._vlm_captioner
+        if captioner is None:
+            return False, 0.0
+        loader = getattr(captioner, "_load", None)
+        if not callable(loader):
+            return False, 0.0
+        is_loaded = getattr(captioner, "is_loaded", False)
+        if is_loaded:
+            return True, 0.0
+
+        loop = asyncio.get_running_loop()
+        t0 = time.monotonic()
+
+        def _do_load() -> bool:
+            try:
+                return bool(loader())
+            except Exception:
+                logger.debug("VLM cold-load raised", exc_info=True)
+                return False
+
+        try:
+            ok = await loop.run_in_executor(None, _do_load)
+        except Exception:
+            logger.debug("VLM cold-load dispatch failed", exc_info=True)
+            ok = False
+        dt_ms = (time.monotonic() - t0) * 1000.0
+        if ok:
+            logger.info(
+                "Cold start: VLM warmed in %.0fms (next wake-word "
+                "describe will hit the hot path)", dt_ms,
+            )
+        else:
+            reason_fn = getattr(captioner, "disabled_reason", None)
+            reason = ""
+            if callable(reason_fn):
+                try:
+                    reason = str(reason_fn() or "")
+                except Exception:
+                    reason = ""
+            logger.info(
+                "Cold start: VLM warmup skipped (%s)",
+                reason or "captioner unavailable",
+            )
+        return ok, dt_ms
 
     async def _restore_session(self) -> int:
         if self._conversation_memory is None:

@@ -1,0 +1,69 @@
+{
+  "name": "Verify with ATOM",
+  "purpose": "Face-ID verify, then POST /faceid so ATOM unlocks tier-3 tools for faceid_freshness_s seconds (default 300).",
+  "icon": "faceid",
+  "recommended_surfaces": ["Home Screen", "Lock Screen Widget", "Control Center"],
+  "actions": [
+    {
+      "step": 1,
+      "action": "Get Device Details",
+      "param": "Name",
+      "store_as": "device_id",
+      "notes": "Stable human-readable device name; the bridge hashes it before storing."
+    },
+    {
+      "step": 2,
+      "action": "Get Current Date",
+      "store_as": "now",
+      "notes": "Sent as ISO-8601; bridge parses with datetime.fromisoformat()."
+    },
+    {
+      "step": 3,
+      "action": "Authenticate (Face ID / Touch ID)",
+      "param": "Prompt: 'Verify with ATOM'",
+      "on_cancel": "stop_and_notify",
+      "on_fail": "stop_and_notify"
+    },
+    {
+      "step": 4,
+      "action": "Get Details of Saved Passwords",
+      "param": "Service: atom-bridge / User: atom",
+      "store_as": "token",
+      "notes": "Pulls the bridge token you pasted into iCloud Keychain. Never hard-code the token here."
+    },
+    {
+      "step": 5,
+      "action": "Get Contents of URL",
+      "method": "POST",
+      "url": "http://<MAC_LAN_IP>:<PORT>/faceid",
+      "headers": {
+        "X-ATOM-Token": "[token]",
+        "Content-Type": "application/json"
+      },
+      "body": {
+        "type": "JSON",
+        "value": {
+          "device_id": "[device_id]",
+          "verified": true,
+          "label": "[device_id]",
+          "timestamp": "[now]"
+        }
+      }
+    },
+    {
+      "step": 6,
+      "action": "Show Result",
+      "param": "Contents of URL",
+      "notes": "Optional -- sanity check {\"ok\": true, \"accepted_at\": ...}. Remove after first successful run."
+    }
+  ],
+  "expected_response_200": {
+    "ok": true,
+    "accepted_at": "<float epoch>"
+  },
+  "troubleshooting": {
+    "401 unauthorized": "Re-paste config/bridge_token into the atom-bridge Keychain entry.",
+    "409 device_conflict": "Another iPhone claimed the slot. Run `rm data/trusted_iphone.json` on the Mac.",
+    "Could not connect": "Mac asleep, wrong IP/port, or bind_host is 127.0.0.1 instead of the LAN IP."
+  }
+}

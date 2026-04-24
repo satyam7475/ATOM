@@ -86,6 +86,12 @@ class GeminiClient:
         # Circuit breaker settings
         self._circuit_threshold = 3
         self._circuit_cooldown_s = 60.0
+        # When Gemini replies with 429 RESOURCE_EXHAUSTED (daily free-tier
+        # quota hit), there is no point retrying for 60s — the quota
+        # typically only resets on a rolling window of minutes-to-hours.
+        # Open the circuit immediately with a longer cooldown so every
+        # buddy turn stops paying the 500-800ms 429-round-trip tax.
+        self._quota_cooldown_s = 900.0  # 15 minutes
 
         # Thread-safe cancellation flag for streaming requests.
         # Set by cancel_streaming(); checked by _call_streaming_sync().
@@ -233,7 +239,11 @@ class GeminiClient:
                 error_body = e.read().decode("utf-8", errors="ignore")[:200]
             except Exception:
                 logger.debug('core cloud gemini client optional step failed', exc_info=True)
-            self._record_failure(f"HTTP {e.code}: {error_body}")
+            self._record_failure(
+                f"HTTP {e.code}: {error_body}",
+                http_status=int(e.code),
+                error_body=error_body,
+            )
             logger.warning(
                 "Gemini HTTP error %d (%.0fms): %s",
                 e.code, latency_ms, error_body[:100],
@@ -497,7 +507,11 @@ class GeminiClient:
                 error_body = e.read().decode("utf-8", errors="ignore")[:200]
             except Exception:
                 logger.debug('Stream end callback failed', exc_info=True)
-            self._record_failure(f"HTTP {e.code}: {error_body}")
+            self._record_failure(
+                f"HTTP {e.code}: {error_body}",
+                http_status=int(e.code),
+                error_body=error_body,
+            )
             logger.warning(
                 "Gemini streaming HTTP error %d (%.0fms): %s",
                 e.code, latency_ms, error_body[:100],
@@ -605,11 +619,44 @@ class GeminiClient:
         self._consecutive_failures = 0
         self._last_error = ""
 
-    def _record_failure(self, error: str) -> None:
+    def _record_failure(
+        self,
+        error: str,
+        *,
+        http_status: int | None = None,
+        error_body: str = "",
+    ) -> None:
         self._total_requests += 1
         self._total_failures += 1
         self._consecutive_failures += 1
         self._last_error = error
+
+        # Fast-fail on 429 RESOURCE_EXHAUSTED: daily/project quota is
+        # exhausted and will not recover within the normal 60s
+        # cooldown. Open the circuit right away with an extended
+        # cooldown so routing stops wasting every buddy turn on a
+        # round-trip that's guaranteed to fail.
+        quota_signal = False
+        if http_status == 429:
+            quota_signal = True
+        elif error_body and (
+            "RESOURCE_EXHAUSTED" in error_body
+            or "exceeded your current quota" in error_body.lower()
+            or "quota" in error_body.lower() and "exceed" in error_body.lower()
+        ):
+            quota_signal = True
+
+        if quota_signal:
+            now = time.monotonic()
+            new_until = now + self._quota_cooldown_s
+            if new_until > self._circuit_open_until:
+                self._circuit_open_until = new_until
+                logger.warning(
+                    "GeminiClient circuit OPEN on quota exhaustion "
+                    "(HTTP %s, cooldown=%.0fs) — falling back to local brain",
+                    http_status or "?", self._quota_cooldown_s,
+                )
+            return
 
         if self._consecutive_failures >= self._circuit_threshold:
             self._circuit_open_until = (

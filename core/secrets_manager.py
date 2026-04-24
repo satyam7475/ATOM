@@ -33,19 +33,34 @@ AVAILABLE_CREDENTIALS = {
     # "OPENAI_GPT": "openai_gpt",
 }
 
-# Global credential manager instance
+# Global credential manager instance. `_init_failed` short-circuits subsequent
+# calls so a missing vault logs once per process, not once per credential lookup.
 _manager: Optional[CredentialManager] = None
+_init_failed: bool = False
 
 
 def _get_manager() -> Optional[CredentialManager]:
-    """Get or initialize credential manager."""
-    global _manager
-    if _manager is None:
-        try:
-            _manager = CredentialManager()
-        except ValueError as e:
-            logger.warning(f"Credential manager not available: {e}")
-            return None
+    """Get or initialize credential manager.
+
+    Returns None (never raises) when the vault cannot be opened. The boot
+    path treats a missing vault as "no cloud keys available" and continues
+    on local MLX only; a raised exception here would loop crash_guard.
+    """
+    global _manager, _init_failed
+    if _manager is not None:
+        return _manager
+    if _init_failed:
+        return None
+    try:
+        _manager = CredentialManager()
+    except (ValueError, ImportError) as e:
+        _init_failed = True
+        logger.warning("Credential manager disabled: %s", e)
+        return None
+    except Exception as e:  # corrupt vault, permission denied, etc.
+        _init_failed = True
+        logger.error("Credential manager failed to initialise: %s", e)
+        return None
     return _manager
 
 

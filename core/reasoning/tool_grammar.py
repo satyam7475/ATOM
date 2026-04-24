@@ -2,8 +2,9 @@
 
 Why this exists
 ---------------
-Small models (Phi-3.5-mini, Qwen3-8B) can be coaxed into emitting a JSON
-tool-call when prompted with the format, but they regularly invent
+Small instruct models (Qwen2.5-7B-Instruct being the current v3.1 default,
+Phi-3.5-mini and Qwen3-8B in prior profiles) can be coaxed into emitting a
+JSON tool-call when prompted with the format, but they regularly invent
 fields ("type": "open_app"), drop the wrapping element, or pour prose
 in front of the JSON. The pure-regex `tool_parser` then has to guess
 which broken JSON-ish blob was meant to be a tool call. That guess is
@@ -169,10 +170,11 @@ def build_tool_call_prompt_grammar(registry: "ToolRegistry") -> str:
     """Build a compact, non-quotable grammar fragment for the system prompt.
 
     The output is intentionally NOT formatted like Markdown rules (no
-    "RULE 1:" preambles, no numbered lists), so Phi-3.5-mini does not
-    parrot it. The prompt-leak detector also explicitly suppresses
-    fragments that match the rule headers used in older prompts -- this
-    block is designed to fly under that guard.
+    "RULE 1:" preambles, no numbered lists), so small instruct models
+    (Qwen2.5-7B, Phi-3.5-mini, etc.) do not parrot it verbatim. The
+    prompt-leak detector also explicitly suppresses fragments that match
+    the rule headers used in older prompts -- this block is designed to
+    fly under that guard.
     """
     if registry is None:
         return ""

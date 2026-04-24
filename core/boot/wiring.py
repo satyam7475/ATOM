@@ -607,13 +607,29 @@ def wire_events(
 
     # ── Media / error recovery ────────────────────────────────────
     async def _on_media_started(**_kw) -> None:
-        stt.on_media_started()
+        fn = getattr(stt, "on_media_started", None)
+        if callable(fn):
+            fn()
+
+    async def _on_media_stopped(**_kw) -> None:
+        fn = getattr(stt, "on_media_stopped", None)
+        if callable(fn):
+            fn()
+
     bus.on(
         "media_started",
         _guard_handler(
             "media_started",
             _on_media_started,
             source="stt.on_media_started",
+        ),
+    )
+    bus.on(
+        "media_stopped",
+        _guard_handler(
+            "media_stopped",
+            _on_media_stopped,
+            source="stt.on_media_stopped",
         ),
     )
 

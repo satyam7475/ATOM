@@ -88,6 +88,24 @@ class STTWatchdog:
         self._last_final_time = now
         self._last_tap_count = 0
 
+    async def on_external_chain_restart(self, reason: str = "", **_kw: Any) -> None:
+        """Called when the STT engine self-heals (e.g. reactive
+        kLSRErrorDomain 301 chain restart in stt_macos.py).
+
+        Without this, the watchdog's ``_last_final_time`` keeps
+        growing during long silences and we falsely log
+        ``STT Watchdog: stuck for 28.8s`` even though the engine
+        already recovered. Resetting both timers tells the watchdog
+        "we're listening fresh, stop counting from the previous
+        final".
+        """
+        if not reason or "reactive_klsr" not in str(reason):
+            return
+        now = time.monotonic()
+        self._last_partial_time = now
+        self._last_final_time = now
+        self._consecutive_chain_restarts = 0
+
     async def on_speech_partial(self, text: str = "", **_kw: Any) -> None:
         """Called from bus on every STT partial -- updates liveness."""
         now = time.monotonic()
@@ -140,6 +158,18 @@ class STTWatchdog:
         if self._task is not None and not self._task.done():
             return
         self._shutdown.clear()
+        # Subscribe to the bus event the STT engine emits when it
+        # self-heals from a benign 301 idle timeout. Done here rather
+        # than __init__ so we still construct cleanly in unit tests
+        # that pass a mock bus without ``on``.
+        try:
+            self._bus.on("stt_watchdog_restart", self.on_external_chain_restart)
+        except Exception:
+            logger.debug(
+                "STT Watchdog: bus.on(stt_watchdog_restart) not available "
+                "(test mock?); external 301 resets will not propagate.",
+                exc_info=True,
+            )
         self._task = asyncio.create_task(self._monitor_loop())
         logger.info("STT Watchdog started (silent=%.0fs stuck=%.0fs)",
                      self._silent_timeout, self._stuck_timeout)
@@ -268,8 +298,13 @@ class STTWatchdog:
                 # lightweight chain-restart here.
                 is_soft_timeout = "kLSRErrorDomain" in err_str and "code=301" in err_str
 
-                logger.warning(
-                    "STT Watchdog: stuck for %.1fs with error '%s' -- %s",
+                # 301 is benign idle expiry — log at INFO so the user-
+                # visible boot log doesn't shout "stuck for 28s" every
+                # time they pause for half a minute.
+                log = logger.info if is_soft_timeout else logger.warning
+                log(
+                    "STT Watchdog: %s for %.1fs with error '%s' -- %s",
+                    "idle" if is_soft_timeout else "stuck",
                     since_final,
                     err_str[:80],
                     "soft chain-restart (kLSRErrorDomain 301)" if is_soft_timeout else "restarting",
@@ -362,7 +397,13 @@ class STTWatchdog:
             try:
                 loop = asyncio.get_running_loop()
                 await loop.run_in_executor(None, restart_fn)
-                self._last_partial_time = time.monotonic()
+                # Reset BOTH liveness timers — without resetting
+                # ``_last_final_time`` the watchdog's next health
+                # check will still see the previous (now-irrelevant)
+                # silence as "stuck" and re-trigger.
+                now_t = time.monotonic()
+                self._last_partial_time = now_t
+                self._last_final_time = now_t
                 logger.info(
                     "STT Watchdog: soft chain-restart completed (%s, #%d)",
                     reason, self._total_restarts,

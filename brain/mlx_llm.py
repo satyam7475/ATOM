@@ -277,48 +277,55 @@ def _looks_like_wrapper_preface(text: str) -> bool:
 
 
 class MLXBrain:
-    """Lazy-loading MLX wrapper with MiniLLM-compatible behavior."""
+    """Single-model MLX wrapper with MiniLLM-compatible behavior.
 
-    # v3 brain: "primary" + "fast" are the hot, always-warm light-weight
-    # local models (Phi-3.5-mini); "deep" is the heavyweight on-device
-    # fallback for offline deep-reasoning when cloud is down. Loaded
-    # lazily on first use, unloaded after _DEEP_IDLE_UNLOAD_S idle.
-    _VALID_ROLES = frozenset({"primary", "fast", "deep"})
-    _DEEP_IDLE_UNLOAD_S = 300.0  # 5 min
+    ATOM runs ONE local MLX model (Qwen2.5-7B-Instruct-4bit by default).
+    The cognitive kernel still tags each ``QueryPlan`` with a role label
+    (``primary`` | ``fast``) for logs + telemetry so we can see which
+    routing path picked the brain; both labels resolve to the same
+    weights here, so the state dicts are keyed by role purely for
+    observability -- not for separate loads.
+    """
+
+    # Role labels emitted by the kernel. Kept as a tuple (not frozenset)
+    # to make the enumeration order explicit for the per-role state dicts.
+    _ROLES: tuple[str, ...] = ("primary", "fast")
+
+    _DEFAULT_MODEL_PATH = "models/qwen2.5-7b-instruct-4bit"
+
+    @classmethod
+    def _resolve_model_path(cls, brain_cfg: dict) -> str:
+        """Resolve the MLX model path with back-compat for pre-v3.2 keys.
+
+        Preferred key: ``brain.mlx_model``. For older settings.json
+        files we also accept ``mlx_primary_model`` / ``mlx_fast_model`` /
+        ``model_path`` (in that order) so an upgrade doesn't crash on a
+        stale config.
+        """
+        for key in ("mlx_model", "mlx_primary_model", "mlx_fast_model", "model_path"):
+            val = brain_cfg.get(key)
+            if val:
+                return str(Path(str(val)).expanduser())
+        return cls._DEFAULT_MODEL_PATH
 
     def __init__(self, config: dict) -> None:
         self._config = config
         brain_cfg = config.get("brain", {})
 
-        self._primary_path = str(
-            Path(brain_cfg.get("mlx_primary_model", "models/phi-3.5-mini-mlx-4bit")).expanduser(),
-        )
-        self._fast_path = str(
-            Path(brain_cfg.get("mlx_fast_model", "models/phi-3.5-mini-mlx-4bit")).expanduser(),
-        )
-        # Heavy on-device deep-reasoning fallback (used when cloud is
-        # unreachable and the user explicitly asked for analysis). May
-        # be empty -- if so, "deep" requests fall back to "primary".
-        self._deep_path = str(
-            Path(brain_cfg.get("mlx_deep_model", "")).expanduser(),
-        ) if brain_cfg.get("mlx_deep_model") else ""
-        default_role = str(brain_cfg.get("mlx_default_role", "primary")).strip().lower()
-        self._active_role = default_role if default_role in self._VALID_ROLES else "primary"
+        self._model_path = self._resolve_model_path(brain_cfg)
+        self._active_role = "primary"
 
         self._max_tokens = int(brain_cfg.get("max_tokens", 512))
         self._temperature = float(brain_cfg.get("temperature", 0.7))
         self._top_p = float(brain_cfg.get("top_p", 0.9))
         self._timeout = float(brain_cfg.get("timeout_seconds", 30))
 
-        self._models: dict[str, Any | None] = {"primary": None, "fast": None, "deep": None}
-        self._tokenizers: dict[str, Any | None] = {"primary": None, "fast": None, "deep": None}
-        self._fingerprints: dict[str, str | None] = {"primary": None, "fast": None, "deep": None}
-        self._loaded_roles: dict[str, bool] = {"primary": False, "fast": False, "deep": False}
-        self._load_failed: dict[str, bool] = {"primary": False, "fast": False, "deep": False}
-        # Track last-used timestamp so deep model can be unloaded when idle.
-        self._role_last_used: dict[str, float] = {
-            "primary": 0.0, "fast": 0.0, "deep": 0.0,
-        }
+        self._models: dict[str, Any | None] = {role: None for role in self._ROLES}
+        self._tokenizers: dict[str, Any | None] = {role: None for role in self._ROLES}
+        self._fingerprints: dict[str, str | None] = {role: None for role in self._ROLES}
+        self._loaded_roles: dict[str, bool] = {role: False for role in self._ROLES}
+        self._load_failed: dict[str, bool] = {role: False for role in self._ROLES}
+        self._role_last_used: dict[str, float] = {role: 0.0 for role in self._ROLES}
 
         self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="mlx")
         self._load_lock = threading.RLock()
@@ -341,6 +348,17 @@ class MLXBrain:
         self._prompt_cache_lock = threading.Lock()
         self._prompt_cache_hits: int = 0
         self._prompt_cache_misses: int = 0
+
+        # Lifetime perf counters used by the periodic perf snapshot (logged
+        # every ~60s by the main loop). We track totals rather than a
+        # rolling window because the boot-time interest is "is the cache
+        # paying off so far?" not "what's my last 30s look like?". A
+        # second pass can add a windowed view if needed.
+        self._perf_total_turns: int = 0
+        self._perf_total_tokens: int = 0
+        self._perf_total_ms: float = 0.0
+        self._perf_peak_memory_gb: float = 0.0
+        self._perf_lock = threading.Lock()
 
         # Thermal derate (Sprint C4): an external thermal-aware orchestrator
         # (Silicon Governor) can ask us to cap ``max_tokens`` so the laptop
@@ -370,51 +388,23 @@ class MLXBrain:
     def is_available(self) -> bool:
         if not _HAS_MLX:
             return False
-        return (
-            Path(self._primary_path).is_dir()
-            or Path(self._fast_path).is_dir()
-            or (bool(self._deep_path) and Path(self._deep_path).is_dir())
-        )
+        return Path(self._model_path).is_dir()
 
     def _normalize_role(self, role: str | None) -> str:
+        """Coerce any role label to one of the two tracked tags.
+
+        Historical values like "deep" now collapse to "primary" so old
+        callers keep working without a KeyError on the state dicts.
+        """
         key = (role or self._active_role or "primary").strip().lower()
-        if key in self._VALID_ROLES:
+        if key in self._ROLES:
             return key
         return "primary"
 
     def _path_for_role(self, role: str) -> str:
-        key = self._normalize_role(role)
-        if key == "fast":
-            return self._fast_path
-        if key == "deep":
-            # Deep falls back to primary when no dedicated heavy model
-            # is configured -- caller still gets a sensible answer.
-            return self._deep_path or self._primary_path
-        return self._primary_path
-
-    def _maybe_unload_idle_deep(self) -> None:
-        """Unload the heavy deep model after _DEEP_IDLE_UNLOAD_S of inactivity.
-
-        Called opportunistically from _ensure_loaded; cheap (just a clock
-        check) and avoids a second timer thread.
-        """
-        if not self._loaded_roles.get("deep"):
-            return
-        last = self._role_last_used.get("deep", 0.0)
-        if last <= 0:
-            return
-        idle = time.monotonic() - last
-        if idle < self._DEEP_IDLE_UNLOAD_S:
-            return
-        with self._load_lock:
-            if not self._loaded_roles.get("deep"):
-                return
-            logger.info(
-                "MLX: unloading deep model after %.0fs idle (frees ~5GB)",
-                idle,
-            )
-            self._unload_role_unlocked("deep")
-            self._clear_mlx_cache()
+        # Single model: every role resolves to the same weights.
+        self._normalize_role(role)
+        return self._model_path
 
     def _effective_inference(self, model_role: str | None = None) -> dict[str, Any]:
         role = self._normalize_role(model_role)
@@ -490,11 +480,6 @@ class MLXBrain:
         if not _HAS_MLX or load is None:
             return False
 
-        # Cheap opportunistic GC: if the heavyweight deep model has been
-        # idle for a while, drop it before doing anything else so we
-        # don't hold ~5GB resident for a query that doesn't need it.
-        self._maybe_unload_idle_deep()
-
         eff = self._effective_inference(model_role)
         role = eff["model_role"]
         model_path = Path(eff["model_path"])
@@ -508,17 +493,15 @@ class MLXBrain:
                 self._role_last_used[role] = time.monotonic()
                 return True
 
-            # When two roles point to the same directory, reuse one load
-            # (RAM + stability). For primary/fast this is the common case
-            # (both -> Phi). For deep this almost never matches because
-            # it points at qwen3-8b, but we still check.
-            other_candidates = [r for r in self._VALID_ROLES if r != role]
-            shared = False
-            for other in other_candidates:
-                other_path = Path(self._path_for_role(other))
+            # Single-model profile: if any role already holds this weight
+            # file, alias the tensors into the requested role instead of
+            # loading twice. Saves ~4.5 GB RAM + ~6 s of reload latency
+            # when the kernel toggles between primary/fast labels.
+            for other in self._ROLES:
+                if other == role:
+                    continue
                 if (
-                    other_path.resolve() == model_path.resolve()
-                    and self._loaded_roles[other]
+                    self._loaded_roles[other]
                     and self._fingerprints[other] == str(model_path)
                     and self._models[other] is not None
                 ):
@@ -529,13 +512,10 @@ class MLXBrain:
                     self._load_failed[role] = False
                     self._role_last_used[role] = time.monotonic()
                     logger.info(
-                        "MLX: sharing loaded weights for role=%s with %s (%s)",
-                        role, other, model_path.name,
+                        "MLX: aliasing loaded weights for role=%s from %s",
+                        role, other,
                     )
-                    shared = True
-                    break
-            if shared:
-                return True
+                    return True
 
             self._load_failed[role] = False
             self._unload_role_unlocked(role)
@@ -565,11 +545,11 @@ class MLXBrain:
 
     def preload(self, *, model_role: str | None = None, load_all: bool = False) -> bool:
         if load_all:
+            # Single model: loading primary is sufficient, fast aliases
+            # the same tensors on first request. Kept as a loop so a
+            # future multi-model profile only needs _ROLES expanded.
             ok = True
-            # Deep is intentionally NOT preloaded -- it's heavyweight and
-            # only needed for offline deep-reasoning. Lazy-loaded on
-            # first use, idle-unloaded after _DEEP_IDLE_UNLOAD_S.
-            for role in ("primary", "fast"):
+            for role in self._ROLES:
                 ok = self._ensure_loaded(role) and ok
             return ok
         return self._ensure_loaded(model_role)
@@ -646,6 +626,35 @@ class MLXBrain:
             "roles_cached": sorted(self._prompt_caches.keys()),
         }
 
+    def get_perf_snapshot(self) -> dict[str, Any]:
+        """Return a lifetime performance summary suitable for periodic INFO logs.
+
+        Returned fields:
+            - ``turns``: number of completed generations since boot
+            - ``tokens``: total decoded tokens
+            - ``avg_tok_s``: lifetime average decode rate (tokens / total ms)
+            - ``avg_ms``: lifetime average per-turn wall time
+            - ``peak_memory_gb``: largest peak GPU memory observed
+            - ``cache``: ``prompt_cache_stats`` dict
+            - ``thermal_clamp_ratio``: current Silicon Governor clamp
+        """
+        with self._perf_lock:
+            turns = self._perf_total_turns
+            tokens = self._perf_total_tokens
+            total_ms = self._perf_total_ms
+            peak_gb = self._perf_peak_memory_gb
+        avg_tok_s = (tokens / (total_ms / 1000.0)) if total_ms > 0 else 0.0
+        avg_ms = (total_ms / turns) if turns > 0 else 0.0
+        return {
+            "turns": turns,
+            "tokens": tokens,
+            "avg_tok_s": round(avg_tok_s, 1),
+            "avg_ms": round(avg_ms, 0),
+            "peak_memory_gb": round(peak_gb, 2),
+            "cache": self.prompt_cache_stats,
+            "thermal_clamp_ratio": round(self._thermal_clamp_ratio, 2),
+        }
+
     @staticmethod
     def _encode_prompt_tokens(tokenizer: Any, prompt: str) -> list[int] | None:
         """Tokenise ``prompt`` the SAME way ``stream_generate`` does.
@@ -683,11 +692,7 @@ class MLXBrain:
         same trie slot.
         """
         normalized = self._normalize_role(role)
-        if normalized == "fast":
-            path = self._fast_path
-        else:
-            path = self._primary_path
-        return (normalized, str(path or normalized))
+        return (normalized, str(self._model_path or normalized))
 
     def _prepare_prompt_cache(
         self,
@@ -1071,6 +1076,12 @@ class MLXBrain:
             )
             generation_tps = float(getattr(last_resp, "generation_tps", 0.0))
             peak_memory = float(getattr(last_resp, "peak_memory", 0.0))
+            with self._perf_lock:
+                self._perf_total_turns += 1
+                self._perf_total_tokens += generation_tokens
+                self._perf_total_ms += elapsed_ms
+                if peak_memory > self._perf_peak_memory_gb:
+                    self._perf_peak_memory_gb = peak_memory
             logger.info(
                 "MLX [%s/%s]: %.0fms, %d tokens, ~%d words, %.1f tok/s, peak %.2fGB",
                 eff["profile"],

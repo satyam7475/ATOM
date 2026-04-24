@@ -455,43 +455,186 @@ class _NativeSynth:
 
     Speech runs in a dedicated thread with its own NSRunLoop so we
     don't block asyncio. The asyncio layer awaits via run_in_executor.
+
+    Performance note (Sprint live-fix Apr 2026)
+    -------------------------------------------
+    Earlier revisions allocated a fresh ``NSSpeechSynthesizer`` and
+    re-ran ``setVoice_`` on every utterance. Under sustained memory
+    pressure (>80 % on 16 GB M5 Air with the 7B MLX model loaded),
+    re-loading the voice file from disk could block ``startSpeakingString_``
+    long enough for the 6 s TTS deadman watchdog to fire mid-phrase
+    ("I'm listening, Boss." force-stopped after 6 s in production logs).
+
+    The synth is now created **once** and reused across utterances.
+    The voice is loaded eagerly in :meth:`prewarm` so the first call
+    after boot doesn't pay the cold-load tax. We also detect and report
+    a stuck startup (``isSpeaking() == False`` for >1.5 s after
+    ``startSpeakingString_``) so the caller can fall back to ``say``.
     """
 
     def __init__(self, voice_id: str, rate: float, pitch_shift: float = 0.0) -> None:
         self._voice_id = voice_id
         self._rate = rate
         self._pitch_shift = pitch_shift
+        # Single reused synthesizer instance. Lazily created on first
+        # use (or eagerly via :meth:`prewarm`) so we don't pay the
+        # voice-load cost in the executor thread of the first speak
+        # call, which is what was blowing the 6 s deadman.
         self._synth: Any = None
         self._stop_flag = threading.Event()
+        self._synth_lock = threading.Lock()
+        # Counts how often the synth refused to start (``isSpeaking()``
+        # never went True). Surfaced so the higher-level TTS can decide
+        # to fall back to the ``say`` subprocess on a flapping synth.
+        self._stuck_starts: int = 0
+
+    def _ensure_synth(self) -> Any:
+        """Allocate and configure the persistent NSSpeechSynthesizer.
+
+        Idempotent. Holds ``_synth_lock`` so concurrent prewarm + first
+        speak don't race on initialization.
+        """
+        with self._synth_lock:
+            if self._synth is not None:
+                return self._synth
+            synth = _AppKit.NSSpeechSynthesizer.alloc().init()
+            if self._voice_id:
+                try:
+                    synth.setVoice_(self._voice_id)
+                except Exception:
+                    logger.debug("setVoice_ failed; continuing with default", exc_info=True)
+            try:
+                synth.setRate_(self._rate)
+            except Exception:
+                logger.debug("setRate_ failed", exc_info=True)
+            if self._pitch_shift != 0.0:
+                try:
+                    pitch_prop = getattr(_AppKit, "NSSpeechPitchBaseProperty", "pbas")
+                    result = synth.objectForProperty_error_(pitch_prop, None)
+                    base_pitch = result[0] if isinstance(result, tuple) else result
+                    if base_pitch is not None:
+                        new_pitch = float(base_pitch) + self._pitch_shift
+                        synth.setObject_forProperty_error_(new_pitch, pitch_prop, None)
+                except Exception:
+                    logger.debug('macOS speech synth pitch step failed', exc_info=True)
+            self._synth = synth
+            return synth
+
+    def prewarm(self) -> None:
+        """Eagerly load the voice so the first speak call is fast.
+
+        Safe to call from any thread (e.g. main thread during TTS init).
+        Silently swallows any AVFoundation/AppKit hiccups — the synth
+        will be lazily allocated on first speak if prewarm fails.
+        """
+        try:
+            self._ensure_synth()
+            logger.debug("NSSpeechSynthesizer prewarmed (voice=%s)", self._voice_id)
+        except Exception:
+            logger.debug("NSSpeechSynthesizer prewarm failed", exc_info=True)
 
     def speak_blocking(self, text: str) -> None:
-        """Speak text synchronously (called from executor thread)."""
-        self._stop_flag.clear()
-        synth = _AppKit.NSSpeechSynthesizer.alloc().init()
-        if self._voice_id:
-            synth.setVoice_(self._voice_id)
-        synth.setRate_(self._rate)
-        if self._pitch_shift != 0.0:
-            try:
-                pitch_prop = getattr(_AppKit, "NSSpeechPitchBaseProperty", "pbas")
-                result = synth.objectForProperty_error_(pitch_prop, None)
-                base_pitch = result[0] if isinstance(result, tuple) else result
-                if base_pitch is not None:
-                    new_pitch = float(base_pitch) + self._pitch_shift
-                    synth.setObject_forProperty_error_(new_pitch, pitch_prop, None)
-            except Exception:
-                logger.debug('macOS speech synth step failed', exc_info=True)
-        self._synth = synth
+        """Speak text synchronously (called from executor thread).
 
-        synth.startSpeakingString_(text)
+        Blocks the calling thread until the utterance ends or
+        :meth:`stop` is invoked. Pumps an NSRunLoop on this thread so
+        ``NSSpeechSynthesizer`` callbacks are processed.
+        """
+        self._stop_flag.clear()
+        synth = self._ensure_synth()
+
+        # Update the rate live each call. Cheap (no I/O) and lets the
+        # adaptive layer change pacing without needing to recreate the
+        # synth.
+        try:
+            synth.setRate_(self._rate)
+        except Exception:
+            logger.debug("setRate_ failed in speak_blocking", exc_info=True)
+
+        try:
+            synth.startSpeakingString_(text)
+        except Exception:
+            logger.warning("startSpeakingString_ raised; aborting speak", exc_info=True)
+            return
 
         rl = _Foundation.NSRunLoop.currentRunLoop()
-        while synth.isSpeaking() and not self._stop_flag.is_set():
-            rl.runMode_beforeDate_(
-                _Foundation.NSDefaultRunLoopMode,
-                _Foundation.NSDate.dateWithTimeIntervalSinceNow_(0.03),
-            )
-        self._synth = None
+        # Detect a stuck synth: if isSpeaking() doesn't flip to True
+        # within ~1.5 s of startSpeakingString_, the voice file failed
+        # to load (most often under memory pressure) or the audio
+        # session is wedged. Bail so the caller can fall back to `say`.
+        startup_grace_s = 1.5
+        startup_deadline = time.monotonic() + startup_grace_s
+
+        # Progress watchdog for the *already-speaking* case. If
+        # ``isSpeaking()`` stays True much longer than the text could
+        # realistically need, the audio output path is wedged (seen when
+        # CoreAudio rescan fires during TTS on macOS 15+). We bail
+        # around 3× the estimated finish time so the outer deadman
+        # doesn't need the full 12s floor to unblock the caller. The
+        # rate is in words/minute per NSSpeechSynthesizer convention
+        # (~180 wpm default), so words/(rate/60) seconds per word.
+        word_count = max(1, len(text.split()))
+        effective_rate = max(60.0, float(self._rate or 180.0))
+        est_finish_s = word_count / (effective_rate / 60.0)
+        progress_deadline_slack_s = 3.0
+        progress_budget_s = max(4.0, est_finish_s * 3.0 + progress_deadline_slack_s)
+        speaking_since: float = 0.0
+
+        ever_speaking = False
+        while not self._stop_flag.is_set():
+            try:
+                speaking = bool(synth.isSpeaking())
+            except Exception:
+                logger.debug("isSpeaking() raised", exc_info=True)
+                speaking = False
+            now = time.monotonic()
+            if speaking:
+                if not ever_speaking:
+                    speaking_since = now
+                ever_speaking = True
+                if (now - speaking_since) > progress_budget_s:
+                    self._stuck_starts += 1
+                    logger.warning(
+                        "NSSpeechSynthesizer wedged mid-utterance "
+                        "(isSpeaking=True for %.1fs, expected <%.1fs, %d words, rate=%.0f);"
+                        " aborting. stuck_starts=%d",
+                        now - speaking_since, progress_budget_s,
+                        word_count, effective_rate, self._stuck_starts,
+                    )
+                    try:
+                        synth.stopSpeaking()
+                    except Exception:
+                        logger.debug(
+                            "stopSpeaking on wedged synth failed", exc_info=True,
+                        )
+                    return
+            elif ever_speaking:
+                return
+            elif now >= startup_deadline:
+                self._stuck_starts += 1
+                logger.warning(
+                    "NSSpeechSynthesizer never started (isSpeaking=False after %.1fs);"
+                    " aborting blocking wait. stuck_starts=%d",
+                    startup_grace_s, self._stuck_starts,
+                )
+                try:
+                    synth.stopSpeaking()
+                except Exception:
+                    logger.debug("stopSpeaking on stuck synth failed", exc_info=True)
+                return
+            try:
+                rl.runMode_beforeDate_(
+                    _Foundation.NSDefaultRunLoopMode,
+                    _Foundation.NSDate.dateWithTimeIntervalSinceNow_(0.03),
+                )
+            except Exception:
+                logger.debug("NSRunLoop runMode_ raised", exc_info=True)
+                return
+
+    @property
+    def stuck_starts(self) -> int:
+        """How often :meth:`speak_blocking` saw the synth refuse to start."""
+        return self._stuck_starts
 
     def stop(self) -> None:
         """Immediately stop speech from any thread."""
@@ -605,6 +748,17 @@ class MacOSTTSAsync:
             self._native_synth = _NativeSynth(self._voice_id, float(self._rate), pitch_shift)
             self._backend = "NSSpeechSynthesizer"
 
+            # Prewarm: load the voice file NOW (during boot, on the
+            # main thread, before audio is even needed) so the first
+            # speak call doesn't pay the cold-load cost in its
+            # executor thread — the source of the 6 s deadman fires
+            # observed in the live boot logs.
+            try:
+                loop = asyncio.get_running_loop()
+                await loop.run_in_executor(None, self._native_synth.prewarm)
+            except RuntimeError:
+                self._native_synth.prewarm()
+
             voice_name = self._voice_id.rsplit(".", 1)[-1] if self._voice_id else "default"
             if is_premium:
                 quality = "premium neural"
@@ -627,7 +781,13 @@ class MacOSTTSAsync:
     # ── Core speech dispatch ───────────────────────────────────────
 
     async def _speak_one(self, text: str) -> None:
-        """Speak a single utterance via the active backend."""
+        """Speak a single utterance via the active backend.
+
+        If the persistent ``NSSpeechSynthesizer`` reports a stuck start
+        (voice file failed to load / audio session wedged), we fall
+        back to the ``say`` subprocess on the very next utterance so
+        the user keeps hearing ATOM even if the in-process synth dies.
+        """
         if self._cancel_requested or not text:
             return
 
@@ -637,10 +797,24 @@ class MacOSTTSAsync:
         self._record_spoken(text)
 
         if self._backend == "NSSpeechSynthesizer" and self._native_synth:
+            stuck_before = self._native_synth.stuck_starts
             loop = asyncio.get_running_loop()
             await loop.run_in_executor(
                 None, self._native_synth.speak_blocking, text,
             )
+            stuck_after = self._native_synth.stuck_starts
+            if stuck_after > stuck_before:
+                # The native synth refused to start — most likely the
+                # audio session is held by another process or memory
+                # pressure paged out the voice. Re-speak via ``say`` so
+                # the user actually hears this utterance instead of
+                # silently losing it. Logged at WARNING so the live
+                # boot logs make it obvious when this fallback fires.
+                logger.warning(
+                    "TTS: native synth stuck (#%d) — falling back to `say` for: '%s'",
+                    stuck_after, text[:60],
+                )
+                await self._say_subprocess(text)
         else:
             await self._say_subprocess(text)
 
@@ -1180,16 +1354,29 @@ class MacOSTTSAsync:
     def _estimate_speak_budget_s(text: str) -> float:
         """Estimate a safe time budget for speaking ``text``.
 
-        Rough model: ~3 words/s at the slowest sane rate, with a 3s
-        setup grace for NSSpeechSynthesizer. Also honors a floor for
-        short utterances so an ack like "yes, boss" still gets ~6s.
+        Conservative model so the deadman is a *true* safety net, not
+        a UX bottleneck. Live-fix Apr 2026: short streaming slices
+        like "I'm listening, Boss." were force-stopped at exactly 6 s
+        because the per-slice budget plus first-call NSSpeechSynthesizer
+        warmup blew through the prior 6 s floor. We scale at ~2.5 wps
+        with a 5 s setup grace to absorb the worst-case voice paging
+        seen on memory-pressured M5 Air (>80 % unified memory
+        utilization with the 7B MLX model loaded).
+
+        Apr 22 2026 — the 12 s floor is fine for streamed phrases
+        (word limit per slice is large), but it made the deadman wait
+        a full 12 s on two-word acks like ``"I'm here."`` when the
+        audio output path was wedged by a CoreAudio rescan. Short
+        utterances now get a tighter 6 s floor; phrases of ~10+ words
+        still scale up to the original budget.
         """
         if not text:
             return 6.0
         words = max(1, len(text.split()))
-        # 3 wps at slow-end; give 2× that as a comfortable cap.
-        base = words / 3.0
-        return max(6.0, base * 2.5 + 3.0)
+        base = words / 2.5
+        computed = base * 2.5 + 5.0
+        floor = 6.0 if words <= 5 else 12.0
+        return max(floor, computed)
 
     def _start_deadman(self, text: str) -> None:
         """Record the expected finish time and spawn the watchdog task."""

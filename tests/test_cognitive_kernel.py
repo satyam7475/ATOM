@@ -112,8 +112,8 @@ class FakeBrainModeManager:
 def _config() -> dict:
     return {
         "cognitive_kernel": {
-            "quick_model": "qwen3-8b",
-            "full_model": "qwen3-8b",
+            "quick_model": "qwen2.5-7b-instruct",
+            "full_model": "qwen2.5-7b-instruct",
             "simple_query_max_chars": 48,
             "deep_query_min_chars": 120,
             "battery_degrade": True,
@@ -315,14 +315,14 @@ def test_optimal_profile_keeps_complex_queries_on_fast_model() -> None:
 
     complex_plan = kernel.route("explain properly how the scheduler and router work together")
     assert complex_plan.path is ExecPath.FULL
-    assert complex_plan.model == "qwen3-8b"
+    assert complex_plan.model == "qwen2.5-7b-instruct"
     assert complex_plan.model_role == "fast"
 
     report_plan = kernel.route(
         "research the best local-first architecture choices for ATOM and give me a rollout plan",
     )
     assert report_plan.path is ExecPath.DEEP
-    assert report_plan.model == "qwen3-8b"
+    assert report_plan.model == "qwen2.5-7b-instruct"
     assert report_plan.model_role == "primary"
     print("  PASS: optimal profile keeps normal complex work on the fast role")
 
@@ -342,7 +342,7 @@ def test_optimal_profile_downgrades_deep_queries_when_headroom_is_tight() -> Non
         "research the best local-first architecture choices for ATOM and give me a rollout plan",
     )
     assert plan.path is ExecPath.DEEP
-    assert plan.model == "qwen3-8b"
+    assert plan.model == "qwen2.5-7b-instruct"
     assert plan.model_role == "fast"
     print("  PASS: optimal profile protects memory by downgrading deep work when headroom is tight")
 
@@ -360,7 +360,7 @@ def test_full_performance_profile_allows_primary_model_for_complex_queries() -> 
 
     plan = kernel.route("explain properly how the scheduler and router work together")
     assert plan.path is ExecPath.FULL
-    assert plan.model == "qwen3-8b"
+    assert plan.model == "qwen2.5-7b-instruct"
     assert plan.model_role == "primary"
     print("  PASS: full performance mode still unlocks the primary model")
 

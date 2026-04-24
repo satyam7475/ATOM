@@ -16,6 +16,7 @@ import asyncio
 import json
 import logging
 import re
+import time
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -174,6 +175,17 @@ class GoalEngine:
         "_goals", "_task", "_shutdown",
         "_eval_interval", "_last_briefing_date",
         "_dirty",
+        # Bus-driven re-evaluation: instead of waiting the full
+        # _eval_interval (default 1h) for the timer to fire, we hook
+        # context_snapshot (emitted ~every 60-120s by HealthMonitor)
+        # and re-evaluate when meaningful state has changed. The
+        # snapshot interval (default 5min) is the floor on how often
+        # snapshots can drive a re-eval -- without it, every snapshot
+        # would force an eval and goal_briefing() would spam. The
+        # original 1h timer stays as a deadline-style safety net for
+        # the case where snapshots stop flowing.
+        "_snapshot_eval_interval",
+        "_last_snapshot_eval",
     )
 
     def __init__(
@@ -187,12 +199,16 @@ class GoalEngine:
         cfg = (config or {}).get("cognitive", {})
         self._config = cfg
         self._eval_interval: float = cfg.get("goal_evaluation_interval_s", 3600.0)
+        self._snapshot_eval_interval: float = float(
+            cfg.get("goal_snapshot_eval_interval_s", 300.0),
+        )
 
         self._goals: list[dict] = []
         self._task: asyncio.Task | None = None
         self._shutdown = asyncio.Event()
         self._last_briefing_date: str = ""
         self._dirty = False
+        self._last_snapshot_eval: float = 0.0
         self._load()
 
     # ── Persistence ────────────────────────────────────────────────────
@@ -256,10 +272,12 @@ class GoalEngine:
             logger.info("Goal engine disabled via config")
             return
         self._bus.on("tool_executed", self._on_tool_executed)
+        self._bus.on("context_snapshot", self._on_context_snapshot)
         self._task = asyncio.create_task(self._run())
         logger.info(
-            "Goal engine started (eval_interval=%.0fs, %d goals loaded)",
-            self._eval_interval, len(self._goals),
+            "Goal engine started (snapshot_interval=%.0fs, "
+            "timer_safety_net=%.0fs, %d goals loaded)",
+            self._snapshot_eval_interval, self._eval_interval, len(self._goals),
         )
 
     def stop(self) -> None:
@@ -268,12 +286,43 @@ class GoalEngine:
             self._bus.off("tool_executed", self._on_tool_executed)
         except Exception:
             logger.debug("goal_engine tool_executed off failed", exc_info=True)
+        try:
+            self._bus.off("context_snapshot", self._on_context_snapshot)
+        except Exception:
+            logger.debug("goal_engine context_snapshot off failed", exc_info=True)
         if self._task and not self._task.done():
             self._task.cancel()
             self._task = None
         self.persist()
 
+    async def _on_context_snapshot(self, **_kw: Any) -> None:
+        """Re-evaluate goals when fresh system context arrives.
+
+        HealthMonitor emits ``context_snapshot`` every 60-120s with
+        active_app, idle_minutes, time_of_day, etc. That's a much
+        tighter signal than the 1h ``_eval_interval`` timer, so we
+        ride it -- but rate-limit at ``_snapshot_eval_interval`` so a
+        burst of snapshots can't trigger a flood of evaluations or
+        repeated morning briefings.
+        """
+        now = time.monotonic()
+        if now - self._last_snapshot_eval < self._snapshot_eval_interval:
+            return
+        self._last_snapshot_eval = now
+        try:
+            self._evaluate_goals()
+            self._maybe_briefing()
+            if self._dirty:
+                self.persist()
+        except Exception:
+            logger.exception("Goal engine snapshot eval error")
+
     async def _run(self) -> None:
+        # Safety-net timer. With the bus subscription above this is
+        # almost always a no-op (the snapshot handler beat us to it),
+        # but it's the deadline guarantee for the case where snapshots
+        # stop flowing -- e.g. HealthMonitor wedged, fleet offline,
+        # or owner runs ATOM headless without context.
         await asyncio.sleep(30.0)
         while not self._shutdown.is_set():
             try:

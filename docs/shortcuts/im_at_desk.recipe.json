@@ -1,0 +1,39 @@
+{
+  "name": "I'm at desk",
+  "purpose": "POST /presence state=at_desk so ATOM greets Boss and fires morning briefing.",
+  "icon": "desk",
+  "recommended_surfaces": ["Home Screen", "Automation: Arrive at location=Home + Wi-Fi=home_ssid"],
+  "actions": [
+    {
+      "step": 1,
+      "action": "Get Device Details",
+      "param": "Name",
+      "store_as": "device_id"
+    },
+    {
+      "step": 2,
+      "action": "Get Details of Saved Passwords",
+      "param": "Service: atom-bridge / User: atom",
+      "store_as": "token"
+    },
+    {
+      "step": 3,
+      "action": "Get Contents of URL",
+      "method": "POST",
+      "url": "http://<MAC_LAN_IP>:<PORT>/presence",
+      "headers": {
+        "X-ATOM-Token": "[token]",
+        "Content-Type": "application/json"
+      },
+      "body": {
+        "type": "JSON",
+        "value": {
+          "device_id": "[device_id]",
+          "state": "at_desk"
+        }
+      }
+    }
+  ],
+  "allowed_states": ["at_desk", "leaving", "home", "away", "busy"],
+  "expected_response_200": {"ok": true, "state": "at_desk"}
+}

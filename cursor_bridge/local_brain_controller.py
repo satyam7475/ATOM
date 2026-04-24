@@ -860,12 +860,14 @@ class LocalBrainController:
     ) -> int | None:
         budget = str(budget_tier or "").strip().lower()
         requested = str(requested_tier or "").strip().lower()
-        # v3 brain: Phi-3.5-mini-instruct generates ~30% fewer wasted
-        # tokens per answer than Qwen3-8B (less CoT preamble, less role
-        # narration). The previous Qwen-tuned 72/96/128 caps cut Phi off
-        # mid-sentence on legitimately short answers, so we lift them
-        # ~30% to match. Anything over ~110 SHORT tokens is still the
-        # model starting to narrate -- cap remains tight.
+        # v3.1 brain: caps calibrated for Qwen2.5-7B-Instruct-MLX-4bit.
+        # Empirically Qwen needs room comparable to Phi-3.5-mini for the
+        # same answer quality (live smoke: 60-word reply at max_tokens=64
+        # still coherent), so we keep the Phi-era ceilings. Above SHORT
+        # ~110 tokens the model starts to narrate instead of answer --
+        # caps remain tight on purpose. The SKILL.md invariant
+        # "max_tokens <= 320 for voice turns" is enforced transitively
+        # here: DETAIL=256, REPORT=unbounded (non-voice only).
         if response_mode is ResponseMode.SHORT or budget in {"command", "info"}:
             return 96
         if budget == "simple":
@@ -1135,6 +1137,24 @@ class LocalBrainController:
                 fn(reason=reason)
             except Exception:
                 logger.info("Local brain prompt-cache drop failed", exc_info=True)
+
+    def get_perf_snapshot(self) -> dict[str, Any]:
+        """Forward the brain's lifetime perf snapshot for periodic logging.
+
+        Returns ``{}`` for backends without ``get_perf_snapshot`` (e.g. the
+        legacy GGUF path) so callers can use ``snap or None`` and skip the
+        log line cleanly.
+        """
+        llm = self._llm
+        fn = getattr(llm, "get_perf_snapshot", None)
+        if callable(fn):
+            try:
+                snap = fn()
+                if isinstance(snap, dict):
+                    return snap
+            except Exception:
+                logger.debug("Perf snapshot fetch failed", exc_info=True)
+        return {}
 
     def set_thermal_clamp(self, ratio: float, *, reason: str = "") -> None:
         """Forward a thermal ``max_tokens`` multiplier to the backend.

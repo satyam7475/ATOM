@@ -19,35 +19,32 @@ def test_settings_json_validates() -> None:
     assert not errors, "settings.json schema errors:\n" + "\n".join(errors)
 
 
-def test_mlx_model_directories_exist() -> None:
-    """Single-model MLX profile uses phi-3.5-mini-mlx-4bit for both roles."""
+def test_mlx_model_directory_exists() -> None:
+    """ATOM v3.2 runs a single MLX model declared at brain.mlx_model."""
     raw = (_ATOM_ROOT / "config" / "settings.json").read_text(encoding="utf-8")
     cfg = json.loads(raw)
     brain = cfg.get("brain", {})
-    for key in ("mlx_primary_model", "mlx_fast_model"):
-        rel = str(brain.get(key) or "").strip()
-        assert rel, f"brain.{key} missing"
-        p = (_ATOM_ROOT / rel).resolve()
-        assert p.is_dir(), f"MLX model directory missing: {p}"
+    rel = str(brain.get("mlx_model") or "").strip()
+    assert rel, "brain.mlx_model missing from settings.json"
+    p = (_ATOM_ROOT / rel).resolve()
+    assert p.is_dir(), f"MLX model directory missing: {p}"
 
 
-def test_mlx_brain_shares_single_model_path() -> None:
-    """Fast and primary roles reuse the same Phi-3.5-mini directory.
-
-    ATOM v3 runs ONE local model (Phi-3.5-mini-MLX-4bit) for both
-    latency tiers. MLXBrain still exposes ``fast`` and ``primary``
-    roles for routing, but both resolve to the same on-disk model path
-    and share one in-memory load. Heavy reasoning is delegated to
-    Gemini cloud via cognitive_kernel Path 2.65.
+def test_mlx_brain_has_single_model_path() -> None:
+    """ATOM v3.2 runs ONE local MLX model (Qwen2.5-7B-Instruct-4bit by
+    default). MLXBrain still tags each request with a role label
+    (``primary`` | ``fast``) for telemetry, but both resolve to the
+    same on-disk path and the same in-memory tensors. Heavy reasoning
+    is delegated to Gemini cloud via cognitive_kernel Path 2.65.
     """
     from brain.mlx_llm import MLXBrain
 
     raw = (_ATOM_ROOT / "config" / "settings.json").read_text(encoding="utf-8")
     cfg = json.loads(raw)
     b = MLXBrain(cfg)
-    assert Path(b._primary_path).resolve() == Path(b._fast_path).resolve()
-    assert Path(b._primary_path).is_dir()
-    assert Path(b._fast_path).is_dir()
+    assert Path(b._model_path).is_dir()
+    assert b._path_for_role("primary") == b._path_for_role("fast")
+    assert b._path_for_role("primary") == b._model_path
 
 
 def test_voice_defaults_pin_reliable_stt_and_jarvis_preset() -> None:

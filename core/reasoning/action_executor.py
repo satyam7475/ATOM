@@ -28,6 +28,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Optional
 
+from core.reasoning.tool_grammar import validate_tool_call
 from core.reasoning.tool_parser import ToolCall
 from core.reasoning.tool_registry import ToolRegistry, get_tool_registry
 from core.security_policy import SecurityPolicy
@@ -50,6 +51,12 @@ class ActionResult:
     confirmation_prompt: str = ""
     blocked: bool = False
     block_reason: str = ""
+    # When True, the tool call was rejected by the schema validator BEFORE
+    # any side-effect ran. This is distinct from a plain ``error`` because
+    # the LLM can almost always recover by re-emitting a corrected call --
+    # the ReAct loop sees the [INVALID TOOL CALL] prefix and re-prompts.
+    invalid: bool = False
+    validation_error: str = ""
 
     @property
     def observation(self) -> str:
@@ -58,6 +65,8 @@ class ActionResult:
             return f"[BLOCKED] {self.tool_name}: {self.block_reason}"
         if self.needs_confirmation:
             return f"[AWAITING CONFIRMATION] {self.tool_name}: {self.confirmation_prompt}"
+        if self.invalid:
+            return f"[INVALID TOOL CALL] {self.tool_name}: {self.validation_error or self.error}"
         if not self.success:
             return f"[ERROR] {self.tool_name}: {self.error}"
         return f"[OK] {self.tool_name}: {self.output or 'Done.'}"
@@ -90,10 +99,61 @@ class ActionExecutor:
         self._max_per_turn = max_actions_per_turn
         self._total_executions = 0
         self._total_blocked = 0
+        self._total_invalid = 0
 
     def set_registry(self, registry: ToolRegistry) -> None:
         """Update the tool registry (e.g., after full initialization)."""
         self._registry = registry
+
+    def _schema_reject(
+        self,
+        name: str,
+        normalized_args: dict,
+        original_call: ToolCall,
+        t0: float,
+    ) -> ActionResult | None:
+        """Run the rich schema validator over an alias-normalized call.
+
+        Returns ``None`` when the call is well-formed (continue dispatch),
+        or an ``ActionResult`` with ``invalid=True`` when the validator
+        rejects it. The error message is the structured, multi-dimensional
+        explanation from ``ToolValidationResult.as_user_facing_error()``
+        (e.g. ``unknown args: foo; wrong types: level (expected integer)``)
+        which the ReAct loop feeds straight back to the LLM as the next
+        observation. This is what gives ATOM a tight self-correction loop
+        instead of a generic "execution failed".
+
+        ``_validate_params`` runs first so alias-only mismatches like
+        ``{"exe": "Chrome"}`` are normalized to ``{"name": "Chrome"}``
+        before the validator sees them -- otherwise the validator would
+        flag ``exe`` as unknown and reject perfectly recoverable calls.
+        """
+        norm_call = ToolCall(
+            name=name,
+            arguments=normalized_args,
+            raw=getattr(original_call, "raw", "") or "",
+        )
+        try:
+            result = validate_tool_call(norm_call, self._registry)
+        except Exception:
+            logger.debug("validate_tool_call raised; skipping", exc_info=True)
+            return None
+        if result.ok:
+            return None
+        self._total_invalid += 1
+        message = result.as_user_facing_error()
+        logger.info(
+            "ActionExecutor rejected '%s' (reason=%s): %s",
+            name, result.reason, message,
+        )
+        return ActionResult(
+            tool_name=name,
+            success=False,
+            invalid=True,
+            validation_error=message,
+            error=message,
+            elapsed_ms=(time.perf_counter() - t0) * 1000,
+        )
 
     def _record_error_timeline(self, tool_name: str, message: str) -> None:
         if self._timeline is None:
@@ -133,6 +193,10 @@ class ActionExecutor:
                     error=f"Missing required parameters: {', '.join(missing)}",
                     elapsed_ms=(time.perf_counter() - t0) * 1000,
                 )
+
+            schema_reject = self._schema_reject(name, args, tool_call, t0)
+            if schema_reject is not None:
+                return schema_reject
 
             if tool_def.safety_level == "blocked":
                 self._total_blocked += 1
@@ -239,6 +303,10 @@ class ActionExecutor:
                     error=f"Missing required parameters: {', '.join(missing)}",
                     elapsed_ms=(time.perf_counter() - t0) * 1000,
                 )
+
+            schema_reject = self._schema_reject(name, args, tool_call, t0)
+            if schema_reject is not None:
+                return schema_reject
 
             if tool_def.safety_level == "blocked":
                 self._total_blocked += 1

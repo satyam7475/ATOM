@@ -5,10 +5,25 @@ Combines the learned user profile (preferred rate/pause) with the
 current perception state (emotion, urgency) to produce final TTS
 parameters.  All values are clamped to safe ranges.
 
+Floor was raised from 0.85 → 0.95 because a stuck 0.85x rate combined
+with multi-second TTS chunks made ATOM sound sluggish — even neutral
+greetings took 7+ seconds to read out.  Anything below 0.95x feels
+"drugged" for a Jarvis-style assistant; we keep ≤1.0 reachable so the
+calm/low-urgency softening is still audible, just less extreme.
+
 Owner: Satyam
 """
 
 from __future__ import annotations
+
+
+# Anything below 0.95 makes ATOM sound drugged. Keep the floor here in sync
+# with ``BehaviorMemory._MIN_RATE`` so restored / learned profiles cannot
+# push the live optimizer below the perceived-snappiness threshold either.
+_MIN_RATE = 0.95
+_MAX_RATE = 1.35
+_MIN_PAUSE = 0.5
+_MAX_PAUSE = 1.5
 
 
 class SpeechOptimizer:
@@ -42,6 +57,6 @@ class SpeechOptimizer:
             pause *= 1.1
 
         return {
-            "rate_multiplier": round(max(0.85, min(rate, 1.35)), 3),
-            "pause_multiplier": round(max(0.5, min(pause, 1.5)), 3),
+            "rate_multiplier": round(max(_MIN_RATE, min(rate, _MAX_RATE)), 3),
+            "pause_multiplier": round(max(_MIN_PAUSE, min(pause, _MAX_PAUSE)), 3),
         }

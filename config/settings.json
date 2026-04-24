@@ -16,12 +16,40 @@
         "name": "Satyam",
         "title": "Boss"
     },
+    "cross_device": {
+        "enabled": true,
+        "bridge_port": 8787,
+        "bind_host": "127.0.0.1",
+        "faceid_freshness_s": 300,
+        "allow_origins": ["127.0.0.1"],
+        "token_path": "config/bridge_token",
+        "audit_log_path": "logs/atom_bridge_audit.jsonl",
+        "trusted_device_path": "data/trusted_iphone.json",
+        "port_file_path": "logs/atom_bridge.port"
+    },
     "vision": {
-        "enabled": false,
+        "enabled": true,
+        "preferred_camera": "auto",
+        "explicit_camera_uid": null,
+        "boot_face_check": true,
+        "boot_face_check_announce": true,
+        "capture_timeout_s": 5.0,
+        "min_gap_s": 1.0,
+        "audit_log_path": "logs/atom_vision_audit.jsonl",
         "camera_index": 0,
         "check_interval_seconds": 5,
         "require_owner_for_sensitive": false,
-        "owner_encoding_path": "config/owner_face.npy"
+        "owner_encoding_path": "config/owner_face.npy",
+        "describe_on_wake": true,
+        "caption_max_age_s": 60.0,
+        "vlm": {
+            "enabled": true,
+            "model_path": "models/smolvlm-instruct-4bit",
+            "model_repo": "mlx-community/SmolVLM-Instruct-4bit",
+            "prompt": "Describe this image in one short sentence.",
+            "max_tokens": 48,
+            "temperature": 0.0
+        }
     },
     "mic": {
         "device_name": null,
@@ -141,10 +169,7 @@
     },
     "brain": {
         "enabled": true,
-        "model_path": "models/qwen3-8b-q4_k_m.gguf",
-        "mlx_primary_model": "models/phi-3.5-mini-mlx-4bit",
-        "mlx_fast_model": "models/phi-3.5-mini-mlx-4bit",
-        "mlx_default_role": "primary",
+        "mlx_model": "models/qwen2.5-7b-instruct-4bit",
         "n_ctx": 4096,
         "n_threads": 4,
         "n_gpu_layers": -1,
@@ -261,9 +286,10 @@
         "cpu_governor_threshold": 75,
         "watchdog_thinking_timeout_s": 120,
         "watchdog_speaking_timeout_s": 300,
-        "watchdog_intent_timeout_ms": 50,
-        "watchdog_cache_timeout_ms": 100,
-        "watchdog_rag_timeout_ms": 500,
+        "watchdog_intent_timeout_ms": 150,
+        "watchdog_intent_boot_grace_s": 20.0,
+        "watchdog_cache_timeout_ms": 200,
+        "watchdog_rag_timeout_ms": 750,
         "watchdog_llm_timeout_s": 20,
         "watchdog_tts_timeout_s": 15,
         "watchdog_tool_timeout_s": 10,
@@ -354,7 +380,7 @@
     "embedding": {
         "model": "all-MiniLM-L6-v2",
         "dimension": 384,
-        "device": "auto",
+        "device": "cpu",
         "warm_file": {
             "enabled": true,
             "path": "data/embeddings_warm.npz",
@@ -367,7 +393,19 @@
     },
     "documents": {
         "chunk_size": 500,
-        "chunk_overlap": 50
+        "chunk_overlap": 50,
+        "auto_ingest_on_boot": false,
+        "auto_ingest_paths": [],
+        "max_files_per_directory": 200,
+        "max_file_bytes": 2097152,
+        "excluded_dirs": [
+            ".git", ".hg", ".svn",
+            "node_modules", "bower_components",
+            ".venv", "venv", "env", ".env", "__pycache__",
+            ".tox", ".mypy_cache", ".pytest_cache", ".ruff_cache",
+            "dist", "build", ".next", ".nuxt", "target", "out",
+            ".idea", ".vscode", ".cursor"
+        ]
     },
     "reasoning": {
         "max_plan_steps": 10,
@@ -385,7 +423,7 @@
     "wake_word": {
         "enabled": true,
         "sensitivity": 0.5,
-        "model": "hey_jarvis"
+        "model": "ATOM/Buddy/hey_atom/atom"
     },
     "emotion": {
         "enabled": true
@@ -396,17 +434,17 @@
     "gpu": {
         "enabled": true,
         "thermal_threshold": 85,
-        "memory_threshold_pct": 82,
+        "memory_threshold_pct": 78,
         "poll_interval_s": 30
     },
     "cognitive_kernel": {
-        "quick_model": "qwen3-8b",
-        "full_model": "qwen3-8b",
+        "quick_model": "qwen2.5-7b-instruct",
+        "full_model": "qwen2.5-7b-instruct",
         "simple_query_max_chars": 48,
         "deep_query_min_chars": 140,
         "battery_degrade": true,
         "thermal_degrade": true,
-        "memory_pressure_threshold": 82
+        "memory_pressure_threshold": 78
     },
     "latency_controller": {
         "direct_budget_ms": 50,
@@ -554,7 +592,7 @@
         "simulation_mode": "hybrid"
     },
     "cloud": {
-        "enabled": true,
+        "enabled": false,
         "provider": "gemini",
         "use_secure_credentials": true,
         "buddy_model": "gemini-2.0-flash",

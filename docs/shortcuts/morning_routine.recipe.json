@@ -1,0 +1,44 @@
+{
+  "name": "Run morning routine",
+  "purpose": "POST /trigger name=morning_routine. Fires MorningBriefing.run() over the event bus.",
+  "icon": "sunrise",
+  "recommended_surfaces": ["Home Screen", "Automation: 07:00 weekdays"],
+  "actions": [
+    {
+      "step": 1,
+      "action": "Get Device Details",
+      "param": "Name",
+      "store_as": "device_id"
+    },
+    {
+      "step": 2,
+      "action": "Get Details of Saved Passwords",
+      "param": "Service: atom-bridge / User: atom",
+      "store_as": "token"
+    },
+    {
+      "step": 3,
+      "action": "Get Contents of URL",
+      "method": "POST",
+      "url": "http://<MAC_LAN_IP>:<PORT>/trigger",
+      "headers": {
+        "X-ATOM-Token": "[token]",
+        "Content-Type": "application/json"
+      },
+      "body": {
+        "type": "JSON",
+        "value": {
+          "device_id": "[device_id]",
+          "name": "morning_routine"
+        }
+      }
+    }
+  ],
+  "supported_names_phase_1": [
+    "morning_routine",
+    "evening_wrap",
+    "focus_on",
+    "focus_off"
+  ],
+  "expected_response_200": {"ok": true, "name": "morning_routine"}
+}

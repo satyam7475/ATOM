@@ -905,7 +905,11 @@ class SystemScanner:
             models_dir = atom_root / "models"
             brain_cfg = self._config.get("brain", {})
             mlx_candidates = []
+            # v3.2 single-model brain: ``brain.mlx_model`` is the
+            # canonical key. Legacy keys are still accepted so a scan
+            # of an older deploy still surfaces sensible candidates.
             for raw in (
+                brain_cfg.get("mlx_model", ""),
                 brain_cfg.get("mlx_primary_model", ""),
                 brain_cfg.get("mlx_fast_model", ""),
             ):

@@ -37,7 +37,31 @@ def wire_documents_and_workflows(
     """Wire document ingestion, workflow, and screen reader handlers."""
 
     async def _on_document_ingest(path: str = "", **_kw) -> None:
-        if document_engine.is_ready:
+        if not document_engine.is_ready:
+            bus.emit_long(
+                "response_ready",
+                text="Document learning isn't available right now, Boss.",
+            )
+            return
+        # Route by what the user actually pointed at -- single file goes
+        # through the precise ``ingest`` path, a directory triggers the
+        # bulk walker. The brain just speaks `learn this`; we handle the
+        # type detection here.
+        from pathlib import Path as _Path
+        target = _Path(path).expanduser() if path else None
+        if target is not None and target.is_dir():
+            result = await document_engine.ingest_directory(str(target))
+            if "error" in result:
+                msg = f"Couldn't ingest folder: {result['error']}"
+            else:
+                msg = (
+                    f"Walked '{target.name}': "
+                    f"{result['ingested']} new docs, "
+                    f"{result['skipped_already']} already known, "
+                    f"{result['errors']} errors -- "
+                    f"{result['chunks']} chunks stored."
+                )
+        else:
             result = await document_engine.ingest(path)
             status = result.get("status", result.get("error", "unknown"))
             if result.get("status") == "success":
@@ -46,9 +70,7 @@ def wire_documents_and_workflows(
                 msg = f"I already know '{result['name']}', Boss."
             else:
                 msg = f"Document ingestion issue: {status}"
-            bus.emit_long("response_ready", text=msg)
-        else:
-            bus.emit_long("response_ready", text="Document learning isn't available right now, Boss.")
+        bus.emit_long("response_ready", text=msg)
     bus.on("document_ingest_request", _on_document_ingest)
 
     async def _on_workflow_start(name: str = "", **_kw) -> None:

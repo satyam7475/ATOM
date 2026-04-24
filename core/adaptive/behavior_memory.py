@@ -32,6 +32,14 @@ _DEFAULT_PROFILE: dict[str, float] = {
     "verbosity": 0.5,
 }
 
+# Floor for the learned ``preferred_rate``. Raised from 0.85 → 0.95 because
+# a long stretch of low-interrupt sessions could otherwise pin the rate at
+# 0.85, locking ATOM into a permanent slow-speech mode that sounded sluggish
+# even for neutral greetings (the 7.6s "Here, Boss…" greeting came from this).
+# Must stay in sync with ``speech_optimizer._MIN_RATE``.
+_MIN_RATE = 0.95
+_MAX_RATE = 1.30
+
 _PERSIST_INTERVAL_S = 30.0  # debounce disk writes
 
 
@@ -86,9 +94,9 @@ class BehaviorMemory:
             p["verbosity"] = min(0.8, p["verbosity"] + 0.05)
 
         if avg_interrupts > 1.0:
-            p["preferred_rate"] = min(1.3, p["preferred_rate"] + 0.08)
+            p["preferred_rate"] = min(_MAX_RATE, p["preferred_rate"] + 0.08)
         elif avg_interrupts < 0.3:
-            p["preferred_rate"] = max(0.85, p["preferred_rate"] - 0.02)
+            p["preferred_rate"] = max(_MIN_RATE, p["preferred_rate"] - 0.02)
 
         p["preferred_pause"] = round(2.0 - p["preferred_rate"], 3)
 
@@ -158,6 +166,21 @@ class BehaviorMemory:
                         self._user_profile[key] = float(prof[key])
                     except (TypeError, ValueError):
                         pass
+
+            # Migrate older profiles that were saved when the floor was
+            # 0.85: clamp ``preferred_rate`` (and recompute the inverse
+            # pause) so we never restore into a slow-speech state again.
+            old_rate = self._user_profile.get("preferred_rate", 1.0)
+            clamped = max(_MIN_RATE, min(_MAX_RATE, old_rate))
+            if abs(clamped - old_rate) > 1e-3:
+                self._user_profile["preferred_rate"] = clamped
+                self._user_profile["preferred_pause"] = round(2.0 - clamped, 3)
+                logger.info(
+                    "Behavior profile rate clamped to %.2f (was %.2f) — "
+                    "old floor of 0.85 retired in favor of 0.95.",
+                    clamped, old_rate,
+                )
+
             logger.info(
                 "Behavior profile restored from %s (verb=%.2f, rate=%.2f)",
                 self._persist_path,

@@ -82,6 +82,13 @@ class ProactiveIntelligenceEngine:
         "_last_scan",
         "_brain_mode_mgr",
         "_quota",
+        # Bus-driven scan path: react to context_snapshot (every
+        # 60-120s) and active-app changes instead of waiting the full
+        # check_interval (default 15min). scan() itself already
+        # debounces per-category at 600s, so calling it more often is
+        # safe -- cost is just iterating internal data structures.
+        "_snapshot_scan_interval",
+        "_last_snapshot_scan",
     )
 
     def __init__(
@@ -95,6 +102,10 @@ class ProactiveIntelligenceEngine:
         cfg = (config or {}).get("proactive_engine", {})
         self._config = cfg
         self._check_interval = cfg.get("check_interval_s", 300.0)
+        self._snapshot_scan_interval = float(
+            cfg.get("snapshot_scan_interval_s", 60.0),
+        )
+        self._last_snapshot_scan: float = 0.0
         self._m5 = cfg.get("m5_triggers") or {}
         self._brain_mode_mgr = brain_mode_manager
 
@@ -160,7 +171,11 @@ class ProactiveIntelligenceEngine:
         self._bus.on("idle_detected", self._on_idle_detected)
         self._bus.on("fs_event", self._on_fs_event)
         self._bus.on("system_state_update", self._on_system_state_update)
-        
+        # NEW: bus-driven scan trigger. Lets workflow / behavioral /
+        # temporal / conversation / m5_context triggers all react in
+        # ~1min cadence instead of every 15min.
+        self._bus.on("context_snapshot", self._on_context_snapshot)
+
         async def _supervisor() -> None:
             while not self._shutdown.is_set():
                 try:
@@ -170,15 +185,28 @@ class ProactiveIntelligenceEngine:
                 except Exception as e:
                     logger.error("SUPERVISOR: ProactiveEngine crashed! (%s). Restarting in 10s...", e)
                     await asyncio.sleep(10.0)
-                    
+
         self._task = asyncio.create_task(_supervisor())
         logger.info(
-            "Proactive Intelligence Engine started (interval=%.0fs)",
-            self._check_interval,
+            "Proactive Intelligence Engine started "
+            "(snapshot_interval=%.0fs, timer_safety_net=%.0fs)",
+            self._snapshot_scan_interval, self._check_interval,
         )
 
     def stop(self) -> None:
         self._shutdown.set()
+        for evt, fn in (
+            ("action_executed", self._on_action),
+            ("system_light_scan", self._on_system_light_scan),
+            ("idle_detected", self._on_idle_detected),
+            ("fs_event", self._on_fs_event),
+            ("system_state_update", self._on_system_state_update),
+            ("context_snapshot", self._on_context_snapshot),
+        ):
+            try:
+                self._bus.off(evt, fn)
+            except Exception:
+                logger.debug("proactive_engine off(%s) failed", evt, exc_info=True)
         if self._task and not self._task.done():
             self._task.cancel()
 
@@ -251,12 +279,50 @@ class ProactiveIntelligenceEngine:
                 "source": "proactive_scanner",
             })
 
+    async def _on_context_snapshot(self, **_kw: Any) -> None:
+        """Run lightweight scan when fresh context arrives on the bus.
+
+        HealthMonitor emits ``context_snapshot`` each cycle (default
+        60-120s) with the same shape (active_app, idle, cpu, ram,
+        time_of_day) we used to wait for the 15min ``_check_interval``
+        timer to consume. Riding the snapshot makes the engine feel
+        live: workflow patterns get suggested within a minute of the
+        third repetition, end-of-day prompts arrive at 5pm rather than
+        "5pm-plus-up-to-15min", and morning briefing fires within
+        ~1min of waking. Per-category 600s cooldown inside ``scan``
+        prevents any of this from spamming.
+        """
+        now = time.time()
+        if now - self._last_snapshot_scan < self._snapshot_scan_interval:
+            return
+        self._last_snapshot_scan = now
+        try:
+            if not self._background_enabled():
+                return
+            insights = self.scan()
+            for insight_data in insights:
+                self._emit_insight(insight_data)
+        except Exception:
+            logger.debug("Proactive snapshot-driven scan error", exc_info=True)
+
     async def _on_system_state_update(
         self, snapshot: dict | None = None, changed_app: bool = False, **_kw: Any,
     ) -> None:
-        """React to real-time system state changes from SystemStateEngine."""
+        """React to real-time system state changes from SystemStateEngine.
+
+        ``changed_app=True`` is ATOM's canonical "app focus changed"
+        signal -- we treat it like a snapshot for scan purposes so a
+        workflow trigger that just hit threshold fires the moment the
+        owner switches to a relevant app, not on the next timer tick.
+        """
         if not snapshot:
             return
+
+        if changed_app:
+            # Cheap way to bypass the snapshot debounce when focus
+            # actually moves; the per-category cooldown inside scan()
+            # still prevents spam.
+            self._last_snapshot_scan = 0.0
 
         battery_pct = int(snapshot.get("battery_pct", 100))
         battery_plugged = bool(snapshot.get("battery_plugged", True))

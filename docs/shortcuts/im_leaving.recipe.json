@@ -1,0 +1,38 @@
+{
+  "name": "I'm leaving",
+  "purpose": "POST /presence state=leaving so ATOM switches to away mode (quieter proactivity, tighter tier-3 gate).",
+  "icon": "walking",
+  "recommended_surfaces": ["Home Screen", "Automation: Leave location=Home"],
+  "actions": [
+    {
+      "step": 1,
+      "action": "Get Device Details",
+      "param": "Name",
+      "store_as": "device_id"
+    },
+    {
+      "step": 2,
+      "action": "Get Details of Saved Passwords",
+      "param": "Service: atom-bridge / User: atom",
+      "store_as": "token"
+    },
+    {
+      "step": 3,
+      "action": "Get Contents of URL",
+      "method": "POST",
+      "url": "http://<MAC_LAN_IP>:<PORT>/presence",
+      "headers": {
+        "X-ATOM-Token": "[token]",
+        "Content-Type": "application/json"
+      },
+      "body": {
+        "type": "JSON",
+        "value": {
+          "device_id": "[device_id]",
+          "state": "leaving"
+        }
+      }
+    }
+  ],
+  "expected_response_200": {"ok": true, "state": "leaving"}
+}

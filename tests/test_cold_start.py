@@ -135,7 +135,7 @@ def test_cold_start_warm_up_and_restore() -> None:
             assert report.restored_turns == 2
             assert report.cached_commands == 2
             assert conv.turn_count == 2
-            assert local_brain.calls == [("fast", False)]
+            assert local_brain.calls == [(None, True)]
             assert memory.embedding_warmed is True
             assert cmd_cache.get("open chrome") is not None
             assert cmd_cache.get("mute volume") is not None
@@ -155,6 +155,147 @@ def test_cold_start_warm_up_and_restore() -> None:
 
     asyncio.run(_run())
     print("  PASS: ColdStart warm-up restores session, cache, and context")
+
+
+def test_cold_start_warms_vlm_when_captioner_wired() -> None:
+    """ColdStartOptimizer must call ``captioner._load`` in the executor
+    so the first wake-word fire hits the VLM hot path."""
+    from core.boot.cold_start import ColdStartOptimizer
+    from core.conversation_memory import ConversationMemory
+
+    class FakeCaptioner:
+        def __init__(self) -> None:
+            self.load_calls = 0
+            self.is_loaded = False
+
+        def _load(self) -> bool:
+            self.load_calls += 1
+            self.is_loaded = True
+            return True
+
+        def disabled_reason(self) -> str:
+            return ""
+
+    async def _run() -> None:
+        cap = FakeCaptioner()
+        cold_start = ColdStartOptimizer(
+            config={},
+            bus=FakeBus(),
+            state_manager=FakeState(),
+            local_brain=FakeLocalBrain(),
+            memory_store=FakeMemory(),
+            conversation_memory=ConversationMemory(),
+            intent_engine=object(),
+            system_monitor=FakeSystemMonitor(),
+            vlm_captioner=cap,
+        )
+        report = await cold_start.warm_up()
+        assert cap.load_calls == 1, "captioner._load should be invoked once"
+        assert report.vlm_ready is True
+        assert report.vlm_warmup_ms >= 0.0
+
+    asyncio.run(_run())
+    print("  PASS: ColdStart warms VLM captioner at boot")
+
+
+def test_cold_start_skips_vlm_when_already_loaded() -> None:
+    """Pre-loaded captioners must short-circuit (no second _load)."""
+    from core.boot.cold_start import ColdStartOptimizer
+    from core.conversation_memory import ConversationMemory
+
+    class HotCaptioner:
+        def __init__(self) -> None:
+            self.load_calls = 0
+            self.is_loaded = True  # already warm
+
+        def _load(self) -> bool:
+            self.load_calls += 1
+            return True
+
+        def disabled_reason(self) -> str:
+            return ""
+
+    async def _run() -> None:
+        cap = HotCaptioner()
+        cold_start = ColdStartOptimizer(
+            config={},
+            bus=FakeBus(),
+            state_manager=FakeState(),
+            local_brain=FakeLocalBrain(),
+            memory_store=FakeMemory(),
+            conversation_memory=ConversationMemory(),
+            intent_engine=object(),
+            system_monitor=FakeSystemMonitor(),
+            vlm_captioner=cap,
+        )
+        report = await cold_start.warm_up()
+        assert cap.load_calls == 0
+        assert report.vlm_ready is True
+
+    asyncio.run(_run())
+    print("  PASS: ColdStart skips VLM warmup when already loaded")
+
+
+def test_cold_start_handles_vlm_load_failure_gracefully() -> None:
+    """A captioner that returns False from _load must not crash boot."""
+    from core.boot.cold_start import ColdStartOptimizer
+    from core.conversation_memory import ConversationMemory
+
+    class FailingCaptioner:
+        is_loaded = False
+
+        def _load(self) -> bool:
+            return False
+
+        def disabled_reason(self) -> str:
+            return "weights missing on disk"
+
+    async def _run() -> None:
+        cold_start = ColdStartOptimizer(
+            config={},
+            bus=FakeBus(),
+            state_manager=FakeState(),
+            local_brain=FakeLocalBrain(),
+            memory_store=FakeMemory(),
+            conversation_memory=ConversationMemory(),
+            intent_engine=object(),
+            system_monitor=FakeSystemMonitor(),
+            vlm_captioner=FailingCaptioner(),
+        )
+        report = await cold_start.warm_up()
+        # Failure is non-fatal; report just flags vlm_ready=False.
+        assert report.vlm_ready is False
+        # Other warmup tasks must still succeed.
+        assert report.fast_model_ready is True
+        assert report.embeddings_ready is True
+
+    asyncio.run(_run())
+    print("  PASS: ColdStart tolerates VLM load failure")
+
+
+def test_cold_start_no_vlm_captioner_is_a_no_op() -> None:
+    """When no captioner is wired, the warmup task must be a silent no-op."""
+    from core.boot.cold_start import ColdStartOptimizer
+    from core.conversation_memory import ConversationMemory
+
+    async def _run() -> None:
+        cold_start = ColdStartOptimizer(
+            config={},
+            bus=FakeBus(),
+            state_manager=FakeState(),
+            local_brain=FakeLocalBrain(),
+            memory_store=FakeMemory(),
+            conversation_memory=ConversationMemory(),
+            intent_engine=object(),
+            system_monitor=FakeSystemMonitor(),
+            # no vlm_captioner
+        )
+        report = await cold_start.warm_up()
+        assert report.vlm_ready is False
+        assert report.vlm_warmup_ms == 0.0
+
+    asyncio.run(_run())
+    print("  PASS: ColdStart skips VLM warmup when captioner not wired")
 
 
 def test_cold_start_persist_snapshot() -> None:
@@ -190,5 +331,9 @@ def test_cold_start_persist_snapshot() -> None:
 
 if __name__ == "__main__":
     test_cold_start_warm_up_and_restore()
+    test_cold_start_warms_vlm_when_captioner_wired()
+    test_cold_start_skips_vlm_when_already_loaded()
+    test_cold_start_handles_vlm_load_failure_gracefully()
+    test_cold_start_no_vlm_captioner_is_a_no_op()
     test_cold_start_persist_snapshot()
     print("\ntest_cold_start: ALL PASSED")
