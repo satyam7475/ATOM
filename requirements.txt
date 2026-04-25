@@ -34,6 +34,10 @@ jsonschema==4.26.0
 # Web dashboard
 aiohttp==3.13.3
 
+# Fast event loop + JSON for hot async/control-plane paths
+uvloop>=0.22.0; platform_system != "Windows"
+orjson>=3.11.0
+
 # Desktop capture (screenshot for Vision OCR)
 Pillow==12.1.1
 

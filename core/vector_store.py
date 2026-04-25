@@ -23,12 +23,13 @@ Contract: CognitiveModuleContract (start, stop, persist)
 
 from __future__ import annotations
 
-import json
 import logging
 import time
 import uuid
 from pathlib import Path
 from typing import Any
+
+from core import json_fast
 
 logger = logging.getLogger("atom.vector_store")
 
@@ -146,7 +147,7 @@ class VectorStore:
             self._fallback_data[name] = []
         if _FALLBACK_FILE.exists():
             try:
-                data = json.loads(_FALLBACK_FILE.read_text(encoding="utf-8"))
+                data = json_fast.loads(_FALLBACK_FILE.read_text(encoding="utf-8"))
                 for name in self._COLLECTIONS:
                     self._fallback_data[name] = data.get(name, [])
                 logger.info("Fallback vector store loaded from disk")
@@ -446,7 +447,7 @@ class VectorStore:
                 for name, entries in self._fallback_data.items():
                     serializable[name] = entries[-_FALLBACK_PERSIST_CAP:]
                 _FALLBACK_FILE.write_text(
-                    json.dumps(serializable, separators=(",", ":")),
+                    json_fast.dumps(serializable, separators=(",", ":")),
                     encoding="utf-8",
                 )
                 self._fallback_dirty = False

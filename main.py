@@ -67,6 +67,7 @@ from core.boot.boot_timeline import (
     mark as _bt_mark,
     log_summary as _bt_log_summary,
 )
+from core.boot.event_loop import install_fast_event_loop
 
 
 logger = logging.getLogger("atom.main")
@@ -4069,6 +4070,8 @@ def run_atom(config_overrides: dict | None = None) -> None:
         )
         set_config_overrides({})
         sys.exit(2)
+
+    install_fast_event_loop()
 
     MAX_RETRIES = 5
     MAX_BACKOFF_S = 30.0

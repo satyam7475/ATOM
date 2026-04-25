@@ -39,6 +39,8 @@ import time
 from pathlib import Path
 from typing import Any
 
+from core import json_fast
+
 logger = logging.getLogger("atom.persistence")
 
 
@@ -121,11 +123,11 @@ class PersistenceManager:
 
         try:
             text = path.read_text(encoding="utf-8")
-            data = json.loads(text)
+            data = json_fast.loads(text)
             with self._lock:
                 entry.data = data
             return data
-        except json.JSONDecodeError:
+        except json_fast.JSONDecodeError:
             logger.error("Corrupted JSON in %s, attempting backup recovery", path)
             return self._try_backup_recovery(key, path)
         except Exception:
@@ -225,7 +227,7 @@ class PersistenceManager:
         backup_path = path.with_suffix(".json.bak")
         if backup_path.exists():
             try:
-                data = json.loads(backup_path.read_text(encoding="utf-8"))
+                data = json_fast.loads(backup_path.read_text(encoding="utf-8"))
                 logger.warning("Recovered %s from backup", key)
                 # Restore the backup as the main file
                 self.save_now(key, data)

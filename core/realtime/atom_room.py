@@ -34,13 +34,14 @@ Design goals
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import secrets
 import time
 from dataclasses import dataclass, field
 from enum import IntEnum
 from typing import Any, Awaitable, Callable
+
+from core import json_fast
 
 logger = logging.getLogger("atom.realtime.room")
 
@@ -141,12 +142,12 @@ class RoomParticipant:
     async def send_data(self, event: str, **payload: Any) -> bool:
         """Queue a structured data message. Returns ``False`` if dropped."""
         msg = {"type": "data", "event": event, "data": payload, "ts": time.time()}
-        return await self._enqueue(json.dumps(msg, default=_json_safe))
+        return await self._enqueue(json_fast.dumps(msg, default=_json_safe))
 
     async def send_state(self, state: str, **payload: Any) -> bool:
         """Convenience wrapper for the most common event class."""
         msg = {"type": "state", "state": state, "data": payload, "ts": time.time()}
-        return await self._enqueue(json.dumps(msg, default=_json_safe))
+        return await self._enqueue(json_fast.dumps(msg, default=_json_safe))
 
     async def send_frame(self, frame: Frame) -> bool:
         return await self._enqueue(frame.encode())
@@ -529,8 +530,8 @@ class AtomRoomServer:
 
     async def _handle_text(self, participant: RoomParticipant, raw: str) -> None:
         try:
-            payload = json.loads(raw)
-        except json.JSONDecodeError:
+            payload = json_fast.loads(raw)
+        except json_fast.JSONDecodeError:
             logger.debug("room participant=%s sent invalid JSON: %r", participant.id, raw[:80])
             return
         if not isinstance(payload, dict):
