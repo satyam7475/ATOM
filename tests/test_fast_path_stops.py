@@ -1,15 +1,24 @@
-"""ATOM -- regression tests for FAST-path stop sequences (Sprint C4).
+"""ATOM -- regression tests for FAST-path stop sequences.
 
-Pins three behaviours so future edits can't accidentally reopen the
-"(in a." stage-direction leak path (atomLogs.txt L301) at the model
-layer:
+History:
 
-1. ``_FAST_PATH_STOP_SEQUENCES`` includes ``(`` and ``\\n\\n`` so the
-   FAST/QUICK voice path stops generation at the *token* layer
-   instead of relying on the streaming sanitiser to scrub leaks.
+* Sprint C4 hardened the FAST path with ``(`` and ``\\n\\n`` token
+  stops to kill the "(in a." stage-direction leak from
+  ``atomLogs.txt`` L301.
+* Sprint K2 removed ``(`` from the role-level FAST stops because it
+  was truncating real one-token replies (``"Sure (Boss…"`` →
+  empty), but kept ``\\n\\n`` and the streaming sanitiser as the
+  defence-in-depth layer.
+
+Pins three behaviours so future edits can't regress either fix:
+
+1. ``_FAST_PATH_STOP_SEQUENCES`` keeps ``\\n\\n`` and stays
+   ``(``-free so the FAST/QUICK voice path doesn't re-introduce the
+   token-layer truncation.
 2. ``MLXBrain._generate_sync_streaming_inner`` merges per-call
    ``extra_stop_sequences`` on top of the role-level defaults --
-   without mutating the cached role config.
+   without mutating the cached role config -- so callers can still
+   opt-in to ``(`` when they really want it.
 3. ``LocalBrainController._run_llm_streaming`` only adds the FAST
    stops when ``model_role == "fast"``; primary / deep paths stay
    unrestricted.
@@ -29,16 +38,18 @@ from cursor_bridge import local_brain_controller as lbc_mod
 # ── _FAST_PATH_STOP_SEQUENCES ────────────────────────────────────
 
 
-def test_fast_path_stops_include_open_paren_and_double_newline() -> None:
-    """The two characters that produced log line 301 must be hard
-    stops on the FAST path."""
+def test_fast_path_stops_keep_double_newline_and_drop_open_paren() -> None:
+    """``\\n\\n`` must remain so a FAST reply is one paragraph; ``(``
+    must NOT be present, otherwise the model truncates legitimate
+    parenthetical openings to zero tokens (Sprint K2 regression)."""
     stops = mlx_llm._FAST_PATH_STOP_SEQUENCES
-    assert "(" in stops, (
-        "Open-paren must be a FAST-path stop sequence to kill the "
-        "stage-direction leak at the token layer."
-    )
     assert "\n\n" in stops, (
         "Double-newline keeps FAST replies to a single paragraph."
+    )
+    assert "(" not in stops, (
+        "Open-paren must NOT be a FAST-path stop -- it was truncating "
+        "valid replies that started with a parenthetical and produced "
+        "the empty-response cascade in the 2026-04-25 demo log."
     )
 
 
@@ -231,7 +242,7 @@ def test_local_brain_controller_module_imports_fast_stops() -> None:
     constant. Future renames will fail loudly here."""
     from brain.mlx_llm import _FAST_PATH_STOP_SEQUENCES
     assert isinstance(_FAST_PATH_STOP_SEQUENCES, tuple)
-    assert len(_FAST_PATH_STOP_SEQUENCES) >= 2
+    assert len(_FAST_PATH_STOP_SEQUENCES) >= 1
 
 
 def test_local_brain_controller_fast_branch_imports_stops() -> None:

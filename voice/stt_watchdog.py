@@ -23,13 +23,13 @@ logger = logging.getLogger("atom.stt_watchdog")
 
 _SILENT_TIMEOUT_S = 8.0
 _STUCK_TIMEOUT_S = 15.0
-_MAX_RESTARTS_PER_WINDOW = 5
+_MAX_RESTARTS_PER_WINDOW = 3
 # Sprint A5: shrink the breaker cooldown from 300s -> 60s. Five minutes
 # of forced deafness in the middle of a session is unacceptable -- the
 # Apple framework typically clears whatever made it choke within the
 # first minute, and the new audible "STT recovering" announcement
 # (`_speak_breaker_open`) means the user is no longer surprised.
-_RESTART_WINDOW_S = 60.0
+_RESTART_WINDOW_S = 30.0
 _CHECK_INTERVAL_S = 2.0
 # After this many consecutive chain restarts (with SFSpeechRecognizer
 # recreate) that still produce zero partials, escalate to a full engine
@@ -79,6 +79,7 @@ class STTWatchdog:
         self._full_restart_failures: int = 0
         self._last_full_restart_time: float = 0.0
         self._failover_pending: bool = False
+        self._degraded_announced: bool = False
 
         self._task: asyncio.Task | None = None
         self._shutdown = asyncio.Event()
@@ -145,6 +146,14 @@ class STTWatchdog:
     async def on_needs_full_restart(self, reason: str = "", **_kw: Any) -> None:
         """Bus handler for hardened-STT escalation signals (empty-final
         cascade, recreate storm). Forces a full engine restart."""
+        if reason == "native_permanently_degraded":
+            self._failover_pending = True
+            self._emit_degraded_once(reason=reason)
+            logger.error(
+                "STT Watchdog: native STT permanently degraded; "
+                "suppressing further restart attempts",
+            )
+            return
         stt = self._stt_ref
         if stt is None:
             return
@@ -205,6 +214,8 @@ class STTWatchdog:
     async def _check_health(self) -> None:
         stt = self._stt_ref
         if stt is None:
+            return
+        if self._failover_pending:
             return
 
         now = time.monotonic()
@@ -346,6 +357,12 @@ class STTWatchdog:
                 )
                 self._circuit_open_logged = True
                 self._speak_breaker_open()
+                self._emit_degraded_once(
+                    reason=(
+                        f"{len(self._restart_times)} restarts in "
+                        f"{_RESTART_WINDOW_S:.0f}s"
+                    ),
+                )
             return False
         if breaker_was_open and len(self._restart_times) < _MAX_RESTARTS_PER_WINDOW:
             logger.info(
@@ -373,6 +390,23 @@ class STTWatchdog:
             )
         except Exception:
             logger.debug("breaker_open speak failed", exc_info=True)
+
+    def _emit_degraded_once(self, *, reason: str) -> None:
+        """One-shot hard degradation event for UI/voice-loop fallbacks."""
+        if self._degraded_announced:
+            return
+        self._degraded_announced = True
+        try:
+            self._bus.emit_fast(
+                "stt_degraded",
+                reason=reason,
+                text=(
+                    "Speech recognition is unstable, Boss. "
+                    "I'll stop restarting it for a moment."
+                ),
+            )
+        except Exception:
+            logger.debug("stt_degraded emit failed", exc_info=True)
 
     def _speak_breaker_recovered(self) -> None:
         try:

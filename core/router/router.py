@@ -1177,9 +1177,14 @@ class Router:
         if result.action in self._FIRE_AND_FORGET_ACTIONS:
             self._emit_response(response_text)
             try:
-                self._dispatch_action(result.action, dispatch_args)
+                dispatch_response = self._dispatch_action(result.action, dispatch_args)
+                if self._looks_like_action_failure(dispatch_response):
+                    self._emit_delayed_diagnostic(dispatch_response)
             except Exception as exc:
                 logger.error("Background action failed: %s", exc)
+                self._emit_delayed_diagnostic(
+                    f"That action failed, Boss. ({exc.__class__.__name__})",
+                )
             self._emit_chain_suggestion(result.action, dispatch_args)
             return
 
@@ -1199,6 +1204,34 @@ class Router:
 
         self._emit_response(response_text)
         self._emit_chain_suggestion(result.action, dispatch_args)
+
+    @staticmethod
+    def _looks_like_action_failure(text: str | None) -> bool:
+        if not text:
+            return False
+        lower = str(text).strip().lower()
+        return lower.startswith((
+            "sorry", "couldn't", "could not", "failed", "error",
+            "spotify isn't", "camera is offline",
+        ))
+
+    def _emit_delayed_diagnostic(self, text: str | None, delay_s: float = 1.5) -> None:
+        if not text:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            self._emit_response(str(text))
+            return
+
+        async def _later() -> None:
+            try:
+                await asyncio.sleep(max(0.0, float(delay_s)))
+                self._emit_response(str(text))
+            except Exception:
+                logger.debug("delayed action diagnostic failed", exc_info=True)
+
+        loop.create_task(_later())
 
     async def _run_skill_chain(self, chain: list[str]) -> None:
         """Execute remaining steps of a multi-step skill sequentially."""
@@ -1237,7 +1270,6 @@ class Router:
         "minimize_window", "maximize_window", "switch_window",
         "next_window_in_app", "switch_space",
         "flush_dns", "open_url",
-        "music_play", "music_pause", "music_next", "music_prev",
     })
 
     _SLOW_ACTIONS = frozenset({
@@ -1387,7 +1419,26 @@ class Router:
     def _do_music_play(self, _action: str, _args: dict) -> str:
         ok = spotify_actions.play()
         if not ok:
-            return personality.error_response("music_play")
+            try:
+                from core.intent_engine.app_intents import APP_MAP
+                from core.router.offer_registry import get_offer_registry
+
+                apple_music_args = dict(APP_MAP.get("music") or {})
+                apple_music_args["name"] = "music"
+                get_offer_registry().stash(
+                    action="open_app",
+                    args=apple_music_args,
+                    offer_text="Want me to open Apple Music instead, Boss?",
+                    source_query="music_play_failed",
+                    source_response="Spotify is unavailable",
+                    metadata={"category": "music_fallback", "source": "router"},
+                )
+            except Exception:
+                logger.debug("music fallback offer stash failed", exc_info=True)
+            return (
+                "Spotify isn't installed or available right now, Boss. "
+                "Want me to open Apple Music instead?"
+            )
         self._bus.emit_fast("media_started")
         return personality.action_done("music_play")
 
@@ -2816,8 +2867,10 @@ class Router:
         first_token = [True]
         batch: list[str] = []
         last_flush = [time.perf_counter()]
-        _BATCH_SIZE = 5
-        _BATCH_INTERVAL = 0.05
+        _FIRST_BATCH_SIZE = 3
+        _FIRST_BATCH_INTERVAL = 0.03
+        _BATCH_SIZE = 8
+        _BATCH_INTERVAL = 0.08
 
         def _flush_batch(is_last: bool) -> None:
             if my_generation != self._cloud_stream_generation:
@@ -2865,8 +2918,13 @@ class Router:
 
             if is_last:
                 _flush_batch(True)
-            elif len(batch) >= _BATCH_SIZE or elapsed >= _BATCH_INTERVAL:
-                _flush_batch(False)
+            else:
+                target_size = _FIRST_BATCH_SIZE if first_token[0] else _BATCH_SIZE
+                target_interval = (
+                    _FIRST_BATCH_INTERVAL if first_token[0] else _BATCH_INTERVAL
+                )
+                if len(batch) >= target_size or elapsed >= target_interval:
+                    _flush_batch(False)
 
         default_system = (
             "You are ATOM, a personal AI assistant (JARVIS-style) created by Satyam Yadav. "

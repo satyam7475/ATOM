@@ -1010,6 +1010,15 @@ async def main() -> None:
                     "voice_pipeline.attach_vision_engine failed",
                     exc_info=True,
                 )
+            try:
+                attach_vision = getattr(local_brain, "attach_vision_engine", None)
+                if callable(attach_vision):
+                    attach_vision(vision_engine)
+            except Exception:
+                logger.debug(
+                    "local_brain.attach_vision_engine failed",
+                    exc_info=True,
+                )
             _vision_block_reason = vision_engine.disabled_reason()
             _vision_cams = vision_engine.list_cameras_human()
             if _vision_block_reason:
@@ -3146,7 +3155,14 @@ async def main() -> None:
 
         # Speak the boot greeting; partial_response handler will push state
         # to SPEAKING while TTS plays, then back to LISTENING when done.
-        bus.emit_long("partial_response", text=greeting, is_first=True, is_last=True)
+        bus.emit_long(
+            "partial_response",
+            text=greeting,
+            is_first=True,
+            is_last=True,
+            bypass_chunking=True,
+            source="startup",
+        )
 
         await stt_preload_done.wait()
         logger.info("STT ready -- ATOM fully operational")

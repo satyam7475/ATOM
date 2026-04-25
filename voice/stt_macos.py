@@ -59,6 +59,10 @@ _SILENCE_TIMEOUT_S = 2.0
 _MAX_RECORD_S = 15.0
 
 
+class STTPermanentlyDegradedError(RuntimeError):
+    """Native SFSpeechRecognizer entered a non-recoverable starvation loop."""
+
+
 def _format_ns_error(error: Any) -> str:
     """Best-effort NSError / PyObjc exception string for STT diagnostics."""
     if error is None:
@@ -335,6 +339,8 @@ class NativeSTT:
         self._barge_in_during_speak: bool = bool(
             self._config.get("barge_in_during_speak", False),
         )
+        self._callback_muted_until: float = 0.0
+        self._callback_hard_muted: bool = False
         # On-device-only often yields zero partials on Bluetooth + some locales (e.g. en-IN).
         # When False, Apple may use server-assisted recognition (requires network; not fully private).
         self._native_requires_on_device_cfg: bool = bool(
@@ -387,6 +393,7 @@ class NativeSTT:
         self._last_speech_candidate_time: float = 0.0
         self._callback_starvation_count: int = 0
         self._on_device_proven_broken: bool = False
+        self._permanently_degraded: bool = False
         # Plain function passed to recognitionTaskWithRequest — bound methods can fail to bridge as ObjC blocks.
         self._speech_pyobjc_block: Callable[..., None] | None = None
         # Count of consecutive recognition-chain restarts that produced zero partials.
@@ -926,11 +933,39 @@ class NativeSTT:
         (subsequent attempts when on-device repeatedly silently starves).
         """
         self._callback_starvation_count += 1
+        if self._permanently_degraded:
+            logger.warning(
+                "VOICE_INPUT: starvation ignored; Native STT is permanently "
+                "degraded for this session",
+            )
+            return
         logger.warning(
             "VOICE_INPUT: recognizer callback starvation (locale=%s, starvation #%d) — "
             "forcing SFSpeechRecognizer recreate on next chain restart",
             self._locale, self._callback_starvation_count,
         )
+        if self._on_device_proven_broken and self._callback_starvation_count >= 3:
+            self._permanently_degraded = True
+            err = STTPermanentlyDegradedError(
+                "SFSpeechRecognizer starved after on-device was already "
+                "disabled; native STT is quarantined for this session",
+            )
+            logger.error("VOICE_INPUT: %s", err)
+            try:
+                self._bus.emit(
+                    "stt_permanently_degraded",
+                    reason=str(err),
+                )
+            except Exception:
+                logger.debug("emit stt_permanently_degraded failed", exc_info=True)
+            try:
+                self._bus.emit(
+                    "stt_needs_full_restart",
+                    reason="native_permanently_degraded",
+                )
+            except Exception:
+                logger.debug("emit stt_needs_full_restart failed", exc_info=True)
+            return
         # Explicitly invalidate the "current chain had partials" signal so the
         # chain-restart logic classifies this chain as zombie regardless of
         # any error callbacks it produced.
@@ -1230,11 +1265,19 @@ class NativeSTT:
             cur = self._state.current
         except Exception:
             return True
+        now = time.monotonic()
+        if self._callback_hard_muted or now < self._callback_muted_until:
+            return False
         if cur is AtomState.LISTENING:
             return True
         if cur is AtomState.SPEAKING and self._barge_in_during_speak:
             return True
         return False
+
+    async def on_tts_complete(self, **_kw) -> None:
+        """Keep the mic muted briefly after TTS to absorb speaker tail."""
+        self._callback_hard_muted = False
+        self._callback_muted_until = time.monotonic() + 0.25
 
     def _audio_buffer_callback(self, buffer: Any, when: Any) -> None:
         """Tap callback: forward audio buffers to the recognition request.
@@ -2760,6 +2803,10 @@ class NativeSTT:
             # from emitting empty isFinals on a dangling session and
             # releases the sounddevice stream so it cannot silently hold
             # the CoreAudio handle during TTS playback.
+            if new in (AtomState.SPEAKING, AtomState.ERROR_RECOVERY):
+                self._callback_hard_muted = True
+                self._callback_muted_until = float("inf")
+
             if (old is AtomState.LISTENING
                     and new in (AtomState.SPEAKING, AtomState.THINKING)
                     and self._listening
@@ -2777,6 +2824,8 @@ class NativeSTT:
                 self._consecutive_empty_finals = 0
 
             if old is AtomState.SPEAKING and new is AtomState.LISTENING:
+                self._callback_hard_muted = False
+                self._callback_muted_until = time.monotonic() + 0.25
                 self._need_post_tts_cooldown = True
                 self._last_partial = ""
                 self._partial_stable_since = 0.0

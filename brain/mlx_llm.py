@@ -82,7 +82,6 @@ if _HAS_MLX:
 # the token layer -- not after the speech sanitiser has tried to scrub
 # it. ``\n\n`` keeps a FAST reply to a single paragraph.
 _FAST_PATH_STOP_SEQUENCES: tuple[str, ...] = (
-    "(",
     "\n\n",
 )
 
@@ -1092,6 +1091,13 @@ class MLXBrain:
 
         trimmed = _TRAILING_ASSISTANT_LOOP_RE.sub("", guarded).rstrip()
         if trimmed != guarded:
+            if len(trimmed.split()) < 30:
+                # Sprint K: short FAST replies can end with a harmless
+                # duplicated speaker label after already producing usable
+                # content. Treating a 10-20 word answer as a hard
+                # speaker-label loop caused "empty response" recoveries in
+                # atomlogs.txt. Strip the label, keep the answer.
+                return trimmed, None, False
             # A speaker-label loop terminated generation early. If the pre-loop
             # buffer is only a wrapper preface like `The answer is "..."` with
             # almost no real content, treat it as unusable — small models

@@ -93,8 +93,21 @@ def infer_mood(signals: MoodSignals) -> MoodResult:
     rationale: list[str] = []
     scores: dict[str, float] = {m: 0.0 for m in VALID_MOODS if m != "unknown"}
 
-    # Presence drives the floor: no-face -> idle.
-    if signals.presence_present is False or signals.presence_face_count == 0:
+    audio_active = (
+        signals.voice_rms_db is not None
+        and signals.voice_rms_db > -25.0
+    )
+
+    # Presence drives the floor, but Sprint K prevents a camera miss from
+    # overriding obvious speech activity. In the bad log, the camera said
+    # "no face" while Boss was actively talking, so ATOM called him idle.
+    if (
+        signals.presence_present is False
+        or signals.presence_face_count == 0
+    ) and audio_active:
+        scores["engaged"] += 0.35
+        rationale.append("active voice despite no face")
+    elif signals.presence_present is False or signals.presence_face_count == 0:
         scores["idle"] += 0.6
         rationale.append("no face in front of camera")
     elif signals.presence_present is True:
@@ -182,6 +195,9 @@ class MoodInferenceEngine:
         "_min_consecutive", "_streak_mood", "_streak_count",
         "_last_emit_at", "_last_mood",
         "_total_emits", "_total_updates",
+        "_no_face_miss_count", "_last_no_face_miss_at",
+        "_no_face_required_misses", "_no_face_window_s",
+        "_voice_activity_times",
     )
 
     def __init__(
@@ -200,6 +216,11 @@ class MoodInferenceEngine:
         self._last_mood: str = "unknown"
         self._total_emits = 0
         self._total_updates = 0
+        self._no_face_miss_count = 0
+        self._last_no_face_miss_at = 0.0
+        self._no_face_required_misses = 3
+        self._no_face_window_s = 90.0
+        self._voice_activity_times: list[float] = []
 
     # ── public API ───────────────────────────────────────────────
 
@@ -258,9 +279,30 @@ class MoodInferenceEngine:
     # ── handlers ────────────────────────────────────────────────
 
     async def _on_presence(self, **payload: Any) -> None:
-        self._signals.presence_present = bool(payload.get("present", False))
-        self._signals.presence_face_count = int(payload.get("face_count", 0) or 0)
-        self._signals.presence_quality = str(payload.get("quality", "") or "")
+        present = bool(payload.get("present", False))
+        face_count = int(payload.get("face_count", 0) or 0)
+        quality = str(payload.get("quality", "") or "")
+        no_face = (not present) or face_count <= 0 or quality == "no_face"
+        now = time.monotonic()
+        if no_face:
+            if now - self._last_no_face_miss_at > self._no_face_window_s:
+                self._no_face_miss_count = 0
+            self._last_no_face_miss_at = now
+            self._no_face_miss_count += 1
+            if self._no_face_miss_count < self._no_face_required_misses:
+                logger.debug(
+                    "mood no-face sample %d/%d ignored (debounce)",
+                    self._no_face_miss_count,
+                    self._no_face_required_misses,
+                )
+                return
+        else:
+            self._no_face_miss_count = 0
+            self._last_no_face_miss_at = 0.0
+
+        self._signals.presence_present = present
+        self._signals.presence_face_count = face_count
+        self._signals.presence_quality = quality
         self._reinfer()
 
     async def _on_emotion(self, **payload: Any) -> None:
@@ -282,6 +324,13 @@ class MoodInferenceEngine:
     ) -> None:
         if rms_dbfs is not None:
             self._signals.voice_rms_db = float(rms_dbfs)
+            now = time.monotonic()
+            if float(rms_dbfs) > -25.0:
+                self._voice_activity_times.append(now)
+            cutoff = now - 30.0
+            self._voice_activity_times = [
+                t for t in self._voice_activity_times if t >= cutoff
+            ]
             self._reinfer()
 
     # ── inference + hysteresis ─────────────────────────────────

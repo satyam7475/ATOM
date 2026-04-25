@@ -47,7 +47,7 @@ _SEE_ME = re.compile(
     r"  am\s+i\s+(?:visible|in\s+(?:the\s+)?frame)|"
     r"  do\s+you\s+see\s+me"
     r")"
-    r"(?:\s+(?:right\s+now|now|atom|boss|please))*\s*[?.!]?\s*$",
+    r"(?:\s+(?:right\s+now|now|today|at|here|there|atom|boss|please))*\s*[?.!]?\s*$",
     re.X | re.I,
 )
 

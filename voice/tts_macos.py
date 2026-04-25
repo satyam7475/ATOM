@@ -747,6 +747,13 @@ class MacOSTTSAsync:
     _STREAM_UNPUNCT_MIN_WORDS: int = 5
     _STREAM_UNPUNCT_BATCH: int = 10
 
+    @staticmethod
+    def _should_skip_chunking(text: str) -> bool:
+        clean = re.sub(r"\s+", " ", (text or "").strip())
+        if not clean:
+            return False
+        return len(clean) < 60 or len(clean.split()) < 12
+
     def __init__(
         self,
         bus: AsyncEventBus,
@@ -1694,11 +1701,35 @@ class MacOSTTSAsync:
 
     async def on_partial_response(
         self, text: str, is_first: bool = False,
-        is_last: bool = False, source: str = "", stream_id: str = "", **_kw,
+        is_last: bool = False, source: str = "", stream_id: str = "",
+        bypass_chunking: bool = False, **_kw,
     ) -> None:
         from core.state_manager import AtomState
 
         normalized_text = self._normalize_stream_text(text) if text else ""
+
+        if (
+            is_first
+            and is_last
+            and normalized_text
+            and (bypass_chunking or self._should_skip_chunking(normalized_text))
+        ):
+            leak_guard = StreamingLeakBuffer()
+            cleaned_slices = leak_guard.feed(normalized_text) or leak_guard.flush()
+            direct_text = " ".join(s for s in cleaned_slices if s).strip()
+            if not direct_text:
+                direct_text = normalized_text
+            logger.info(
+                "TTS short reply bypassing stream chunker (%d words): '%s'",
+                len(direct_text.split()),
+                direct_text[:100],
+            )
+            if self._playing or self._stream_queue is not None or self._stream_task is not None:
+                await self.stop()
+                self._cancel_requested = False
+            await self._state.transition(AtomState.SPEAKING)
+            await self.speak(direct_text)
+            return
 
         if is_first:
             self._active_source = source or "unknown"

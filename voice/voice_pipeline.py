@@ -115,8 +115,8 @@ class VoicePipeline:
 
     def build(self) -> None:
         """Construct STT and TTS engines based on config + platform."""
-        self._build_stt()
         self._build_tts()
+        self._build_stt()
         self._wire_echo_guard()
         logger.info(
             "VoicePipeline built: stt=%s tts=%s",
@@ -402,9 +402,9 @@ class VoicePipeline:
         """Construct the whisper.cpp Metal backend (Sprint B3).
 
         Returns ``(stt, "")`` on success and ``(None, reason)`` if any
-        native dependency or the GGML model file is missing. The caller
-        is expected to fall back to ``_build_native_stt`` /
-        ``_build_disabled_stt`` on a non-empty reason.
+        dependency is missing. Sprint K blocks the first boot to install
+        the GGML model instead of silently falling back to Apple's
+        unstable SFSpeechRecognizer.
         """
         try:
             from voice.stt_whisper import WhisperSTT, is_whisper_available
@@ -419,14 +419,47 @@ class VoicePipeline:
                 (self._config.get("stt") or {}).get("whisper_model_path"),
             )
             if not model_path.exists():
+                try:
+                    from voice.whisper_install import ensure_model
+
+                    logger.warning(
+                        "whisper.cpp model missing at %s -- blocking boot "
+                        "to install it now",
+                        model_path,
+                    )
+                    try:
+                        self._bus.emit_fast(
+                            "tts_say",
+                            text=(
+                                "Setting up speech recognition, Boss. "
+                                "This is a one-time download."
+                            ),
+                            source="whisper_install",
+                        )
+                    except Exception:
+                        logger.debug("whisper install TTS cue failed", exc_info=True)
+
+                    ensure_model(
+                        model_path=model_path,
+                        progress_cb=lambda msg: logger.info(
+                            "Whisper install: %s", msg,
+                        ),
+                    )
+                except Exception as exc:
+                    return None, (
+                        f"Whisper model install failed for {model_path}: {exc}"
+                    )
+                if not is_whisper_available(self._config):
+                    return None, (
+                        f"Whisper model installed at {model_path}, but "
+                        "whisper.cpp is still unavailable; check pywhispercpp "
+                        "/ sounddevice / webrtcvad dependencies."
+                    )
+            if not is_whisper_available(self._config):
                 return None, (
-                    f"Whisper model not found at {model_path} -- run "
-                    "`python scripts/install_whisper_model.py`"
+                    "whisper.cpp deps missing -- "
+                    "`pip install pywhispercpp sounddevice webrtcvad`"
                 )
-            return None, (
-                "whisper.cpp deps missing -- "
-                "`pip install pywhispercpp sounddevice webrtcvad`"
-            )
         stt = WhisperSTT(
             self._bus,
             self._state,
@@ -504,25 +537,15 @@ class VoicePipeline:
                     self.stt_runtime_fallbacks.append(
                         f"whisper.cpp unavailable: {whisper_reason}",
                     )
-                    logger.warning(
-                        "whisper.cpp STT unavailable (%s) -- "
-                        "falling back to macOS Native", whisper_reason,
+                    logger.error(
+                        "whisper.cpp STT unavailable (%s) -- refusing "
+                        "SFSpeech fallback after Sprint K",
+                        whisper_reason,
                     )
-                    native_stt, native_reason = self._build_native_stt()
-                    if native_stt is not None:
-                        self.stt = native_stt
-                        self.stt_runtime_label = (
-                            "macOS Native (whisper.cpp fallback)"
-                        )
-                    else:
-                        self.stt_runtime_fallbacks.append(
-                            f"native unavailable: {native_reason}",
-                        )
-                        self.stt = self._build_disabled_stt(
-                            f"whisper.cpp unavailable ({whisper_reason}); "
-                            f"native unavailable ({native_reason})",
-                        )
-                        self.stt_runtime_label = "Disabled"
+                    self.stt = self._build_disabled_stt(
+                        f"whisper.cpp unavailable ({whisper_reason})",
+                    )
+                    self.stt_runtime_label = "Disabled (whisper.cpp required)"
             elif engine_pref == "auto":
                 # Sprint B3: prefer whisper.cpp when it's installed,
                 # because SFSpeechRecognizer suffers from the
@@ -540,32 +563,16 @@ class VoicePipeline:
                     self.stt_runtime_fallbacks.append(
                         f"whisper.cpp unavailable: {whisper_reason}",
                     )
-                    native_stt, native_reason = self._build_native_stt()
-                    if native_stt is not None:
-                        self.stt = native_stt
-                        self.stt_runtime_label = (
-                            "macOS Native (auto fallback)"
-                        )
-                        logger.info(
-                            "STT auto: SFSpeechRecognizer (whisper.cpp "
-                            "missing: %s)", whisper_reason,
-                        )
-                    else:
-                        self.stt_runtime_error = native_reason or ""
-                        self.stt_runtime_fallbacks.append(
-                            f"native unavailable: {native_reason}",
-                        )
-                        logger.warning(
-                            "Native STT unavailable (%s) -- trying "
-                            "Faster-Whisper", native_reason,
-                        )
-                        self.stt = self._build_faster_whisper_stt()
-                        if isinstance(self.stt, _DisabledSTT):
-                            self.stt_runtime_label = "Disabled"
-                        else:
-                            self.stt_runtime_label = (
-                                "Faster-Whisper (auto fallback)"
-                            )
+                    self.stt_runtime_error = whisper_reason or ""
+                    logger.error(
+                        "STT auto: whisper.cpp unavailable (%s) -- "
+                        "not falling back to SFSpeechRecognizer after Sprint K",
+                        whisper_reason,
+                    )
+                    self.stt = self._build_disabled_stt(
+                        f"whisper.cpp unavailable ({whisper_reason})",
+                    )
+                    self.stt_runtime_label = "Disabled (whisper.cpp required)"
             elif engine_pref == "macos_native":
                 native_stt, native_reason = self._build_native_stt()
                 if native_stt is not None:

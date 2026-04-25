@@ -621,6 +621,7 @@ class LocalBrainController:
         # branch falls through to this captioner instead of speaking
         # the legacy "Gemini Client offline" string.
         self._vlm_captioner: Any = None
+        self._vision_engine: Any = None
 
         # Optional vetter — invoked on the final LLM text before it leaves
         # the controller. Wired from the Router so it can apply verb-match
@@ -694,6 +695,17 @@ class LocalBrainController:
             logger.info(
                 "VLM captioner attached to local brain (vision fallback ready)",
             )
+
+    def attach_vision_engine(self, vision_engine: Any) -> None:
+        """Wire the camera VisionEngine for PERCEPTION disambiguation.
+
+        The local brain's broad PERCEPTION classifier previously sent all
+        such queries to ``ScreenReader.analyze_screen``. If router-level
+        intent matching misses a trailing-STT fragment ("can you see me at"),
+        this handle lets the brain still route camera-facing phrases to the
+        actual camera instead of describing the laptop screen.
+        """
+        self._vision_engine = vision_engine
 
     def attach_cloud_intelligence(
         self,
@@ -1427,6 +1439,58 @@ class LocalBrainController:
         logger.info("Cognitive Intent detected: %s (conf: %.2f)", intent.category.name, intent.confidence)
         
         if intent.category.name == "PERCEPTION":
+            try:
+                from core.intent_engine import vision_intents
+
+                native_vision = vision_intents.check(text)
+            except Exception:
+                native_vision = None
+            if (
+                native_vision is not None
+                and getattr(native_vision, "action", "") == "vision_describe"
+                and self._vision_engine is not None
+            ):
+                logger.info(
+                    "PERCEPTION routed to camera via vision_intents (%s)",
+                    getattr(native_vision, "intent", ""),
+                )
+                prompt = (
+                    (getattr(native_vision, "action_args", {}) or {}).get("prompt")
+                    or "user-facing self-check"
+                )
+                try:
+                    result = self._vision_engine.look(
+                        reason=f"local_brain_perception:{str(prompt)[:40]}",
+                        detect_faces=True,
+                        detect_barcodes=False,
+                        describe=True,
+                    )
+                    if getattr(result, "description", ""):
+                        self._bus.emit_long(
+                            "response_ready",
+                            text=str(result.description).strip(),
+                        )
+                    elif getattr(result, "ok", False):
+                        faces = int(getattr(result, "faces", 0) or 0)
+                        if faces > 0:
+                            text_out = f"I can see you, Boss. {faces} face detected."
+                        else:
+                            text_out = "Camera is on, Boss, but I don't see a face clearly."
+                        self._bus.emit_long("response_ready", text=text_out)
+                    else:
+                        self._bus.emit_long(
+                            "response_ready",
+                            text="Camera describe failed, Boss — see logs for details.",
+                        )
+                    return
+                except Exception:
+                    logger.warning("PERCEPTION camera route failed", exc_info=True)
+                    self._bus.emit_long(
+                        "response_ready",
+                        text="Camera describe failed, Boss — see logs for details.",
+                    )
+                    return
+
             logger.info("PERCEPTION isolated: Bypassing inference loop for Vision AI.")
             from core.perception.screen_reader import ScreenReader
             vision = ScreenReader(
@@ -1853,6 +1917,7 @@ class LocalBrainController:
                         model_role=plan_model_role,
                         max_tokens_override=repair_tokens_override,
                         policy_query=policy_query,
+                        extra_stop_sequences_override=(),
                     )
                     if retry_first_token_ms and not first_token_ms:
                         first_token_ms = retry_first_token_ms
@@ -1897,6 +1962,7 @@ class LocalBrainController:
                     model_role=plan_model_role,
                     max_tokens_override=repair_tokens_override,
                     policy_query=policy_query,
+                    extra_stop_sequences_override=(),
                 )
                 if retry_first_token_ms and not first_token_ms:
                     first_token_ms = retry_first_token_ms
@@ -2351,6 +2417,7 @@ class LocalBrainController:
         model_role: str | None = None,
         max_tokens_override: int | None = None,
         policy_query: str | None = None,
+        extra_stop_sequences_override: tuple[str, ...] | None = None,
         _watchdog_guard: bool = False,
     ) -> tuple[str, float, bool]:
         """Run LLM inference with optional streaming to TTS.
@@ -2369,6 +2436,7 @@ class LocalBrainController:
                     model_role=model_role,
                     max_tokens_override=max_tokens_override,
                     policy_query=policy_query,
+                    extra_stop_sequences_override=extra_stop_sequences_override,
                     _watchdog_guard=True,
                 ),
                 default=("", 0.0, True),
@@ -2391,13 +2459,12 @@ class LocalBrainController:
             generate_kwargs["model_role"] = model_role
         if max_tokens_override:
             generate_kwargs["max_tokens_override"] = int(max_tokens_override)
-        # Sprint C4: kill stage-direction leaks at the token layer for
-        # the FAST/QUICK path. ``_FAST_PATH_STOP_SEQUENCES`` adds "("
-        # and "\n\n" so any leading parenthetical aborts generation
-        # before reaching the streaming sanitiser. The DEEP/primary
-        # path stays unrestricted because long answers legitimately
-        # use parens for citations.
-        if str(model_role or "").lower() == "fast":
+        # Sprint C4/K: token-layer stop sequences for FAST. K removed
+        # "(" because it killed valid replies on token 1; the streaming
+        # sanitiser strips parentheticals safely after generation.
+        if extra_stop_sequences_override is not None:
+            generate_kwargs["extra_stop_sequences"] = extra_stop_sequences_override
+        elif str(model_role or "").lower() == "fast":
             try:
                 from brain.mlx_llm import _FAST_PATH_STOP_SEQUENCES
                 generate_kwargs["extra_stop_sequences"] = (

@@ -372,6 +372,16 @@ def wire_events(
             source="stt.on_state_changed",
         ),
     )
+    stt_on_tts_complete = getattr(stt, "on_tts_complete", None)
+    if callable(stt_on_tts_complete):
+        bus.on(
+            "tts_complete",
+            _guard_handler(
+                "tts_complete",
+                stt_on_tts_complete,
+                source="stt.on_tts_complete",
+            ),
+        )
     _speech_target = command_loop.submit if command_loop is not None else router.on_speech
 
     def _is_self_echo_final(text: str) -> bool:
