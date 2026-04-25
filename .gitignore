@@ -23,7 +23,13 @@ __pycache__/
 # IDE / workspace
 .vscode/
 .idea/
-.cursor/
+# Ignore Cursor runtime/cache (logs, indexes), but back up the
+# project-level engineering knowledge that lives next to the code:
+#   .cursor/rules/   -- agent behaviour contracts
+#   .cursor/skills/  -- reusable agent skills + scripts
+.cursor/*
+!.cursor/rules/
+!.cursor/skills/
 
 # Models (too large for GitHub -- re-downloadable)
 models/*.gguf

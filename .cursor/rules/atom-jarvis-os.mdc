@@ -1,0 +1,121 @@
+---
+description: ATOM Jarvis-OS operating manifesto -- behavior contract for core/voice/brain/cursor_bridge changes
+globs: ["core/**/*.py", "voice/**/*.py", "brain/**/*.py", "cursor_bridge/**/*.py"]
+alwaysApply: false
+---
+
+# ATOM Jarvis-OS Manifesto
+
+ATOM is **not a chatbox**. It is Satyam's local-first cognitive
+operating system. Every change in `core/`, `voice/`, `brain/`,
+`cursor_bridge/` must keep these laws true. If a patch makes one of
+them less true, it is the wrong patch.
+
+## I. The Five-Beat Cognitive Loop
+
+Every interaction follows: **think -> decide -> answer/speak -> reanalyze -> act/advise**.
+
+* `think` happens in `core/cognitive_kernel.py` (cache/quick/full/deep/RAG/cloud lanes).
+* `decide` happens in `core/router/router.py` (intent vs tool vs LLM).
+* `speak` happens via `core/speech_controller.py` -> `voice/tts_*.py`.
+* `reanalyze` is `core/cognitive/reflective_loop.py` (post-`tts_complete`, 60s cooldown, JSON-only LLM call).
+* `act/advise` either fires a tool through the Router or emits one
+  proactive `response_ready` with `source="reflective_loop"` /
+  `source="jarvis_suggester"`.
+
+**Never** add a code path that answers and then forgets the turn.
+Always emit `turn_complete` (see `core/command_loop.py::attach_turn_emitter`).
+
+## II. Frictionless Control, Strict Confirmation
+
+Music, focus/DND, lock screen, screenshot, brightness, volume,
+window/space switching, YouTube playback are **never confirmed**
+(`core/action_safety.py::default_risk_for_action`, `config/settings.json::security.require_confirmation_for`).
+
+Destructive verbs (shutdown, restart, file delete/move, close app)
+**always confirm**. If you add a new tool, place it in exactly one
+of these two buckets in `core/reasoning/tool_registry.py` and add
+the corresponding regression test in `tests/test_confirmation_policy.py`.
+
+## III. Voice Quality Is Sacred
+
+* TTS must never clip the first or last word. The 140 ms pre-roll
+  and 120/200 ms tail-drain in `voice/tts_macos.py` are load-bearing.
+* STT must never promote a low-confidence frame as user intent.
+  Floors live in `voice/stt_*.py` (`_promotion_min_confidence` = 0.50,
+  `_promotion_min_confidence_no_wake` = 0.65). Do not relax them
+  without an A/B test attached.
+* The 5-frame RMS noise gate at `noise_floor_dbfs = -55` stays.
+  Removing it brings back music-on-other-tab false interrupts.
+
+## IV. Vision Is Suggestive, Not Surveilling
+
+`core/perception/presence_sampler.py` and `core/perception/scene_context.py`:
+
+* Never sample while ATOM is `SPEAKING`, `LISTENING`, or `THINKING`.
+* VLM calls only on a meaningful presence change AND a >=5 min
+  hard rate-limit.
+* Never emit a raw caption to TTS. Captions feed mood inference
+  and the suggester only.
+
+## V. Suggester Cadence (Don't Be A Reminder Bot)
+
+`core/cognitive/jarvis_suggester.py`:
+
+* >=12 min between any two proactive nudges.
+* <=4 nudges per UTC day.
+* Never nudge while `mood in {frustrated, focused, idle}`.
+* Never nudge in the user's quiet hours (default 23:00 -> 06:00).
+* Per-category cooldown (default 45 min) -- no repeating the same
+  category back-to-back even if a different mood reopens the gate.
+* Score >= 0.7 or it stays silent.
+
+## VI. State Discipline
+
+The `StateManager` in `core/state_manager.py` is the only authority
+on `IDLE / LISTENING / THINKING / SPEAKING / SLEEP / ERROR`. Read
+state with `state.current`; mutate only via `state.transition()` /
+`state.on_*()` helpers. Subscribers to `state_changed` must accept
+both `old` and `new` kwargs (this was a real bug -- see
+`tests/test_proactive_idle_gate.py`).
+
+## VII. Event Bus Is The Contract
+
+If two modules need to talk, they go through `core/async_event_bus.py`.
+Direct references break the cognitive loop's pluggability. New
+events must:
+
+1. Be named `snake_case_noun` or `noun.subnoun`.
+2. Have one canonical emitter and >=1 subscribers.
+3. Be emitted via `emit_fast` (control-plane, sub-100 ms) or
+   `emit_long` (data-plane, may take seconds). Never await emit.
+
+## VIII. Persona Lives In Config, Not Code
+
+ATOM's tone is centralised in `config/atom_persona.md` and loaded
+into the system prompt via `brain/structured_prompt_builder.py`.
+**Do not** hard-code "Boss", quirky preambles, or response shapes
+in router/tool layers. Tone changes are config-only.
+
+## IX. Test Before You Ship
+
+* New cognitive/perception module: ship with a regression suite
+  (mock the bus, mock the LLM, mock the camera).
+* New voice path: extend `tests/test_voice_pipeline_critical.py`
+  or `tests/test_tts_macos_streaming.py`.
+* New tool: extend `tests/test_confirmation_policy.py` AND add a
+  router-dispatch regression.
+* Run `pytest -x -q` before commit. The full suite is the contract.
+
+## X. Owner Voice
+
+The user is **Satyam ("Boss")**. ATOM is not "your assistant" or
+"a helpful AI". It is **his** OS. Replies are short, Indian-English
+casual, never sycophantic. Never apologise unless something actually
+broke.
+
+---
+
+When in doubt, read `.cursor/skills/atom-systems-engineer/SKILL.md`
+and `.cursor/rules/ATOM_RULES.md` first. This file is the *behavior*
+contract; those are the *engineering* contract.
