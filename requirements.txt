@@ -83,6 +83,27 @@ openwakeword>=0.6.0
 # idle-timeout cliff (atomLogs.txt L310/L437/L553 starvation cascade).
 # Install the model with `python scripts/install_whisper_model.py`.
 pywhispercpp>=1.2.0
+
+# ─── Sprint Ω: smart turn-taker (Silero VAD v5) ──────────────────────────
+# Adaptive end-of-turn detector that drops trailing-silence wait from
+# 600 ms to ~180 ms when the speaker has clearly finished, while
+# extending the listen window during real mid-thought pauses.
+# Wired via voice/smart_turn_taker.py (opt-in via stt.smart_turn_taker).
+silero-vad>=5.1
+
+# ─── Sprint Ω7-8: Model Context Protocol (MCP) interop ──────────────────
+# Lets Claude Desktop / Cursor / Zed / any MCP-aware client call ATOM's
+# tools, AND lets ATOM consume tools from external MCP servers.
+# Server entry point: scripts/run_mcp_server.py
+# Client config:      config/mcp_servers.json
+mcp>=1.2.0
+
+# ─── Sprint Ω2: Kokoro neural TTS (optional, opt-in) ────────────────────
+# Ultra-fast offline neural TTS at ~24 kHz.
+# Requires the ONNX model + voices files (run scripts/install_kokoro.py)
+# AND `brew install espeak-ng` for the phonemizer. When unavailable
+# voice/voice_pipeline.py auto-falls back to macOS Native (Daniel).
+kokoro-onnx>=0.4.5
 #
 # ─── Optional: Legacy / cross-platform fallbacks ────────────────────────────
 # Primary macOS path uses SFSpeech + AVAudio/sounddevice; Whisper is fallback.

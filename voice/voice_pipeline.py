@@ -527,7 +527,7 @@ class VoicePipeline:
                 whisper_stt, whisper_reason = self._build_whisper_cpp_stt()
                 if whisper_stt is not None:
                     self.stt = whisper_stt
-                    self.stt_runtime_label = "whisper.cpp Metal (small.en-q5_0)"
+                    self.stt_runtime_label = "whisper.cpp Metal (small.en-q5_1)"
                     logger.info(
                         "STT: whisper.cpp Metal (long-session reliable, "
                         "no idle timeout)",
@@ -736,9 +736,42 @@ class VoicePipeline:
                 self._bus, self._state,
                 max_lines=tts_cfg.get("max_lines", 4),
                 voice=tts_cfg.get("kokoro_voice", "af_heart"),
+                model_path=tts_cfg.get("kokoro_model_path"),
+                voices_path=tts_cfg.get("kokoro_voices_path"),
+                speed=float(tts_cfg.get("kokoro_speed", 1.0)),
+                language=tts_cfg.get("kokoro_language", "en-us"),
             )
-            logger.info("TTS: Kokoro Neural fallback (offline)")
-            self.tts_runtime_label = f"Kokoro ({tts_cfg.get('kokoro_voice', 'af_heart')})"
+            # Sprint Ω2: graceful auto-fallback so a misconfigured
+            # Kokoro install (missing model files, missing espeak-ng)
+            # never silences ATOM at boot.
+            if not getattr(self.tts, "_available", False):
+                logger.warning(
+                    "TTS: Kokoro requested but unavailable -- "
+                    "falling back to macOS Native (Daniel)",
+                )
+                from voice.tts_macos import MacOSTTSAsync
+                self.tts = MacOSTTSAsync(
+                    self._bus, self._state,
+                    max_lines=tts_cfg.get("max_lines", 4),
+                    voice=tts_cfg.get("macos_voice", "system"),
+                    rate=tts_cfg.get("macos_rate", 165),
+                    first_word_warmup_ms=int(tts_cfg.get("macos_first_word_warmup_ms", 140)),
+                    tail_drain_ms=int(tts_cfg.get("macos_tail_drain_ms", 120)),
+                    tail_drain_bluetooth_ms=int(tts_cfg.get("macos_tail_drain_bluetooth_ms", 200)),
+                    warmup_skip_window_ms=int(tts_cfg.get("macos_warmup_skip_window_ms", 800)),
+                )
+                self.tts_runtime_label = (
+                    f"macOS Native ({tts_cfg.get('macos_voice', 'system')})"
+                    " [kokoro-unavailable-fallback]"
+                )
+            else:
+                logger.info(
+                    "TTS: Kokoro Neural offline (voice=%s)",
+                    tts_cfg.get("kokoro_voice", "af_heart"),
+                )
+                self.tts_runtime_label = (
+                    f"Kokoro ({tts_cfg.get('kokoro_voice', 'af_heart')})"
+                )
         else:
             from voice.tts_edge import EdgeTTSAsync
             self.tts = EdgeTTSAsync(

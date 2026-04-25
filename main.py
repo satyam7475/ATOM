@@ -394,6 +394,50 @@ async def main() -> None:
         except Exception as exc:
             logger.warning("V7 intelligence layer partial wiring: %s", exc)
         logger.info("Local brain ENABLED (agentic mode, tool-use, brain.enabled=true)")
+
+        # Sprint Ω6: meta-LLM supervisor + DAG planner. Bound to the
+        # local brain so plans run on-device by default; the executor
+        # still passes through the same ActionExecutor security gates
+        # used by Layer 3, so no policy can be bypassed.
+        try:
+            from core.reasoning.agent_supervisor import (
+                AgentSupervisor, SupervisorConfig,
+            )
+
+            _sup_cfg_dict = (config.get("agent_supervisor") or {}) if isinstance(config, dict) else {}
+
+            async def _supervisor_llm_call(prompt: str, system: str) -> str:
+                # AgentSupervisor passes (user_prompt, system_prompt).
+                # MLXBrain.generate consumes a flat prompt; we splice
+                # system + user with the same separator the rest of
+                # the brain uses so the model sees a familiar shape.
+                composed = f"{system}\n\nUser: {prompt}\n\nAssistant:" if system else prompt
+                text, _ok = await local_brain._llm.generate(
+                    composed,
+                    max_tokens_override=int(_sup_cfg_dict.get("plan_max_tokens", 768)),
+                )
+                return (text or "").strip()
+
+            agent_supervisor = AgentSupervisor(
+                tool_registry=router.action_executor.registry,
+                action_executor=router.action_executor,
+                config=SupervisorConfig(
+                    enabled=bool(_sup_cfg_dict.get("enabled", True)),
+                    max_plan_steps=int(_sup_cfg_dict.get("max_plan_steps", 5)),
+                    max_concurrency=int(_sup_cfg_dict.get("max_concurrency", 3)),
+                    per_step_timeout_s=float(_sup_cfg_dict.get("per_step_timeout_s", 12.0)),
+                    review_on_partial_failure=bool(
+                        _sup_cfg_dict.get("review_on_partial_failure", True),
+                    ),
+                ),
+                llm_call=_supervisor_llm_call,
+            )
+            router.attach_supervisor(agent_supervisor)
+        except Exception:
+            logger.exception(
+                "AgentSupervisor wiring failed -- router will keep running "
+                "without the meta-LLM planner",
+            )
     else:
         logger.info("Local brain DISABLED — enable brain.enabled for voice Q&A")
 

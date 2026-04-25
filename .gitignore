@@ -45,6 +45,13 @@ models/*-vlm-*/
 models/*-instruct-*/
 models/*.safetensors
 models/*.npz
+# Sprint Ω: whisper.cpp GGML weights (~190 MB) and Kokoro neural TTS
+# weights (~310 MB ONNX + 24 MB voices). Re-downloadable via the
+# install scripts (see scripts/install_whisper_model.py and
+# scripts/install_kokoro.py), so keep them out of git.
+models/ggml-*.bin
+models/ggml-*.bin.sha256
+models/kokoro/
 
 # macOS
 .DS_Store

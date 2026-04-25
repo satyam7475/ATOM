@@ -159,7 +159,7 @@ CONFIG_SCHEMA: dict[str, Any] = {
                 },
                 "whisper_model_path": {
                     "type": "string",
-                    "description": "Sprint B: ggml model path consumed by voice/stt_whisper.py. Relative names resolve under ./models/. Default: ggml-small.en-q5_0.bin.",
+                    "description": "Sprint B: ggml model path consumed by voice/stt_whisper.py. Relative names resolve under ./models/. Default: ggml-small.en-q5_1.bin (small.en-q5_0 was removed upstream Apr 2026 and is auto-redirected).",
                 },
                 "whisper_n_threads": {
                     "type": "integer",
@@ -361,6 +361,21 @@ CONFIG_SCHEMA: dict[str, Any] = {
                     },
                     "additionalProperties": False,
                 },
+                "smart_turn_taker": {
+                    "type": "object",
+                    "description": "Sprint Ω9 -- adaptive end-of-turn detector built on Silero VAD. When enabled the trailing-silence ceiling becomes a soft floor; final cuts can drop to ~min_silence_s and pauses extend up to max_silence_s when the model judges the speaker is mid-thought.",
+                    "properties": {
+                        "enabled": {"type": "boolean"},
+                        "sample_rate": {"type": "integer", "minimum": 8000, "maximum": 48000},
+                        "decision_window_s": {"type": "number", "minimum": 0.2, "maximum": 4.0},
+                        "min_silence_s": {"type": "number", "minimum": 0.05, "maximum": 1.0},
+                        "max_silence_s": {"type": "number", "minimum": 0.3, "maximum": 4.0},
+                        "eot_probability_threshold": {"type": "number", "minimum": 0.0, "maximum": 1.0},
+                        "midthought_lockout_threshold": {"type": "number", "minimum": 0.0, "maximum": 1.0},
+                        "min_eval_interval_ms": {"type": "number", "minimum": 10.0, "maximum": 500.0},
+                    },
+                    "additionalProperties": False,
+                },
             },
             "additionalProperties": False,
         },
@@ -430,6 +445,24 @@ CONFIG_SCHEMA: dict[str, Any] = {
                     "minimum": 0,
                     "maximum": 5000,
                     "description": "Phase E1: window (ms) within which a follow-up speak skips the warmup pre-roll because the audio device is still hot.",
+                },
+                "kokoro_speed": {
+                    "type": "number",
+                    "minimum": 0.5,
+                    "maximum": 2.0,
+                    "description": "Sprint Ω2 -- Kokoro neural TTS playback speed multiplier. 1.0 = native model rate.",
+                },
+                "kokoro_language": {
+                    "type": "string",
+                    "description": "Sprint Ω2 -- Kokoro language tag passed to the phonemizer (e.g. 'en-us', 'en-gb').",
+                },
+                "kokoro_model_path": {
+                    "type": "string",
+                    "description": "Sprint Ω2 -- path to the Kokoro ONNX model file (default models/kokoro/kokoro-v1.0.onnx).",
+                },
+                "kokoro_voices_path": {
+                    "type": "string",
+                    "description": "Sprint Ω2 -- path to the Kokoro voices.bin file (default models/kokoro/voices-v1.0.bin).",
                 },
             },
             "additionalProperties": False,
@@ -811,6 +844,10 @@ CONFIG_SCHEMA: dict[str, Any] = {
                     "minimum": 0,
                     "maximum": 8192,
                     "description": "Tokens to keep at full precision before switching to quantised KV cache. Higher = better quality on the first sentence; lower = bigger memory savings sooner.",
+                },
+                "mlx_model_fallback": {
+                    "type": "string",
+                    "description": "Sprint Ω1c -- secondary MLX model directory used when ``mlx_model`` cannot be loaded (e.g. half-downloaded weights, OOM under thermal pressure). Lets ATOM degrade from Qwen3-8B-4bit to Qwen3-4B-Instruct-4bit instead of going silent.",
                 },
             },
             "additionalProperties": False,

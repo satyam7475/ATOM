@@ -21,25 +21,63 @@ logger = logging.getLogger("atom.whisper_install")
 ROOT = Path(__file__).resolve().parent.parent
 MODELS_DIR = ROOT / "models"
 BASE_URL = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main"
-DEFAULT_MODEL = "small.en-q5_0"
+# Apr 25 2026 hot-fix: ggerganov/whisper.cpp dropped every q5_0 quant
+# of the *.en family from the HF repo (404), so the previous default
+# (small.en-q5_0) can no longer be downloaded. We're switching to the
+# q5_1 variant of the same model -- same architecture, same disk
+# footprint, identical pywhispercpp load path -- and aliasing the old
+# key so any pinned config keeps working.
+DEFAULT_MODEL = "small.en-q5_1"
 
 KNOWN_MODELS: dict[str, dict[str, object]] = {
-    "small.en-q5_0": {
-        "filename": "ggml-small.en-q5_0.bin",
-        "approx_mb": 152,
+    "small.en-q5_1": {
+        "filename": "ggml-small.en-q5_1.bin",
+        "approx_mb": 181,
     },
-    "base.en-q5_0": {
-        "filename": "ggml-base.en-q5_0.bin",
+    "small.en-q8_0": {
+        "filename": "ggml-small.en-q8_0.bin",
+        "approx_mb": 264,
+    },
+    "small.en": {
+        "filename": "ggml-small.en.bin",
+        "approx_mb": 466,
+    },
+    "base.en-q5_1": {
+        "filename": "ggml-base.en-q5_1.bin",
+        "approx_mb": 57,
+    },
+    "base.en-q8_0": {
+        "filename": "ggml-base.en-q8_0.bin",
         "approx_mb": 81,
+    },
+    "base.en": {
+        "filename": "ggml-base.en.bin",
+        "approx_mb": 142,
     },
     "medium.en-q5_0": {
         "filename": "ggml-medium.en-q5_0.bin",
-        "approx_mb": 469,
+        "approx_mb": 514,
     },
     "tiny.en-q5_1": {
         "filename": "ggml-tiny.en-q5_1.bin",
         "approx_mb": 32,
     },
+    "tiny.en": {
+        "filename": "ggml-tiny.en.bin",
+        "approx_mb": 75,
+    },
+}
+
+# Legacy → current redirects so callers / configs that still reference
+# the removed q5_0 file names automatically use the q5_1 replacement
+# without surprise.
+_DEPRECATED_KEY_REDIRECTS: dict[str, str] = {
+    "small.en-q5_0": "small.en-q5_1",
+    "base.en-q5_0": "base.en-q5_1",
+}
+_DEPRECATED_FILENAME_REDIRECTS: dict[str, str] = {
+    "ggml-small.en-q5_0.bin": "ggml-small.en-q5_1.bin",
+    "ggml-base.en-q5_0.bin": "ggml-base.en-q5_1.bin",
 }
 
 ProgressCallback = Callable[[str], None]
@@ -61,9 +99,22 @@ def model_key_for_path(path: Path) -> str:
     """Return the known model key that matches ``path.name``.
 
     Falls back to ``DEFAULT_MODEL`` when the path is custom/empty; callers
-    can still pass ``model_key`` explicitly to override this.
+    can still pass ``model_key`` explicitly to override this. Filenames
+    pointing at removed upstream quants are auto-redirected so old
+    config files keep booting.
     """
     filename = path.name
+    if filename in _DEPRECATED_FILENAME_REDIRECTS:
+        new_name = _DEPRECATED_FILENAME_REDIRECTS[filename]
+        for key, spec in KNOWN_MODELS.items():
+            if spec.get("filename") == new_name:
+                logger.warning(
+                    "whisper model %s no longer exists upstream; "
+                    "redirecting to %s",
+                    filename,
+                    new_name,
+                )
+                return key
     for key, spec in KNOWN_MODELS.items():
         if spec.get("filename") == filename:
             return key
@@ -132,6 +183,15 @@ def ensure_model(
         path = Path(model_path)
         if path.name:
             key = model_key or model_key_for_path(path)
+    if key in _DEPRECATED_KEY_REDIRECTS:
+        new_key = _DEPRECATED_KEY_REDIRECTS[key]
+        logger.warning(
+            "whisper model key %r is deprecated (removed upstream); "
+            "using %r instead",
+            key,
+            new_key,
+        )
+        key = new_key
     if key not in KNOWN_MODELS:
         raise ValueError(
             f"unknown whisper model {key!r}; choose one of: "
@@ -140,7 +200,16 @@ def ensure_model(
 
     spec = KNOWN_MODELS[key]
     filename = str(spec["filename"])
-    dest = Path(model_path).expanduser() if model_path is not None else MODELS_DIR / filename
+    if model_path is not None:
+        # Honour an explicit caller path, but if the basename points at a
+        # removed quant rewrite it to the live filename so we don't try
+        # to download a 404.
+        explicit_path = Path(model_path).expanduser()
+        if explicit_path.name in _DEPRECATED_FILENAME_REDIRECTS:
+            explicit_path = explicit_path.with_name(filename)
+        dest = explicit_path
+    else:
+        dest = MODELS_DIR / filename
     if not dest.is_absolute():
         dest = ROOT / "models" / dest.name
     dest = dest.resolve()
@@ -177,12 +246,28 @@ def ensure_model(
     return dest
 
 
-def verify_runtime_can_load(model_path: Path) -> None:
-    """Best-effort pywhispercpp load check."""
+def verify_runtime_can_load(model_path: Path, *, strict: bool = True) -> None:
+    """Verify ``pywhispercpp`` can actually load the model.
+
+    Apr 25 2026: this used to silently no-op when ``pywhispercpp`` was
+    missing, which masked an empty venv -- ATOM booted, claimed STT was
+    "verified", then crashed at runtime. ``strict=True`` (the default,
+    used by the CLI installer) now raises so we can never ship a model
+    file without the binding to load it. ``strict=False`` keeps the old
+    soft behaviour for callers that explicitly tolerate a missing
+    binding (e.g. dev tooling on non-mac platforms).
+    """
     try:
         import pywhispercpp.model as wmod  # type: ignore[import-untyped]
-    except ImportError:
-        logger.info("pywhispercpp not installed; skipping runtime load check")
+    except ImportError as exc:
+        msg = (
+            "pywhispercpp not installed -- run "
+            "`pip install pywhispercpp>=1.2.0` (Apple Silicon ships a "
+            "Metal-built wheel)."
+        )
+        if strict:
+            raise RuntimeError(msg) from exc
+        logger.warning("%s (continuing because strict=False)", msg)
         return
     try:
         wmod.Model(str(model_path), n_threads=2)  # noqa: F841

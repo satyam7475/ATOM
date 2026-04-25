@@ -1,8 +1,28 @@
 """
 ATOM -- Kokoro TTS Engine (JARVIS-Level Local Voice).
 
-Ultra-fast, fully offline, natural neural TTS.
-Requires: pip install kokoro-tts sounddevice
+Ultra-fast, fully offline neural TTS via the kokoro-onnx runtime
+(82M-param Kokoro model, ~24kHz output, real-time on Apple Silicon).
+
+Setup
+-----
+Three things need to be on disk before this engine becomes available:
+
+1. ``pip install kokoro-onnx sounddevice`` (handled by requirements.txt).
+2. ``brew install espeak-ng`` -- required for the phonemizer; without
+   it the ONNX runtime cannot synthesise speech.
+3. Model + voices files. Default path is ``models/kokoro/``::
+
+       kokoro-v1.0.onnx     (~310 MB)
+       voices-v1.0.bin      (~24 MB)
+
+   Run ``python scripts/install_kokoro.py`` to download both, or set
+   ``tts.kokoro_model_path`` / ``tts.kokoro_voices_path`` in
+   ``config/settings.json`` to point at custom locations.
+
+Until all three exist this engine reports ``available=False`` and
+voice_pipeline will fall back to the macOS Native voice (``Daniel``)
+without crashing the boot path.
 
 Implements the same public interface as MacOSTTSAsync / EdgeTTSAsync
 so it can be used as a drop-in replacement via config.
@@ -16,6 +36,7 @@ import asyncio
 import logging
 import time
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 logger = logging.getLogger("atom.tts.kokoro")
@@ -23,6 +44,14 @@ logger = logging.getLogger("atom.tts.kokoro")
 if TYPE_CHECKING:
     from core.async_event_bus import AsyncEventBus
     from core.state_manager import StateManager
+
+_DEFAULT_MODEL_REL = "models/kokoro/kokoro-v1.0.onnx"
+_DEFAULT_VOICES_REL = "models/kokoro/voices-v1.0.bin"
+_DEFAULT_LANG = "en-us"
+
+
+def _project_root() -> Path:
+    return Path(__file__).resolve().parent.parent
 
 
 class KokoroTTSAsync:
@@ -40,12 +69,21 @@ class KokoroTTSAsync:
         state: StateManager,
         max_lines: int = 4,
         voice: str = "af_heart",
+        *,
+        model_path: str | Path | None = None,
+        voices_path: str | Path | None = None,
+        speed: float = 1.0,
+        language: str = _DEFAULT_LANG,
     ) -> None:
         self._bus = bus
         self._state = state
         self._max_lines = max_lines
         self._voice = voice
-        self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="kokoro")
+        self._speed = float(speed)
+        self._language = language
+        self._executor = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="kokoro",
+        )
         self._running = False
         self._current_task: asyncio.Task | None = None
         self._model: Any = None
@@ -53,20 +91,55 @@ class KokoroTTSAsync:
         self._emotion: str = "neutral"
         self._stream_buffer: str = ""
 
+        root = _project_root()
+        self._model_path = Path(model_path) if model_path else root / _DEFAULT_MODEL_REL
+        self._voices_path = Path(voices_path) if voices_path else root / _DEFAULT_VOICES_REL
+
         self._init_model()
 
     def _init_model(self) -> None:
-        try:
-            from kokoro_tts import Kokoro
-            self._model = Kokoro(voice=self._voice)
-            self._available = True
-            logger.info("Kokoro TTS initialized with voice: %s", self._voice)
-        except ImportError:
-            logger.error(
-                "kokoro-tts not installed. Run: pip install kokoro-tts sounddevice"
+        if not self._model_path.exists():
+            logger.warning(
+                "Kokoro TTS unavailable -- model file missing at %s "
+                "(run `python scripts/install_kokoro.py`)",
+                self._model_path,
             )
-        except Exception as e:
-            logger.error("Failed to initialize Kokoro TTS: %s", e)
+            return
+        if not self._voices_path.exists():
+            logger.warning(
+                "Kokoro TTS unavailable -- voices file missing at %s "
+                "(run `python scripts/install_kokoro.py`)",
+                self._voices_path,
+            )
+            return
+        try:
+            from kokoro_onnx import Kokoro
+        except ImportError:
+            logger.warning(
+                "Kokoro TTS unavailable -- run `pip install kokoro-onnx sounddevice`",
+            )
+            return
+        try:
+            self._model = Kokoro(
+                str(self._model_path), str(self._voices_path),
+            )
+        except Exception as exc:
+            msg = str(exc).lower()
+            if "espeak" in msg or "phonemizer" in msg:
+                logger.warning(
+                    "Kokoro TTS unavailable -- espeak-ng not on PATH "
+                    "(install via `brew install espeak-ng`): %s", exc,
+                )
+            else:
+                logger.error(
+                    "Failed to initialize Kokoro TTS: %s", exc,
+                )
+            return
+        self._available = True
+        logger.info(
+            "Kokoro TTS initialized (voice=%s speed=%.2f lang=%s)",
+            self._voice, self._speed, self._language,
+        )
 
     # ── Public interface (matches MacOSTTSAsync) ─────────────────────
 
@@ -208,13 +281,8 @@ class KokoroTTSAsync:
 
             clean_text = text.replace("*", "").replace("_", "").replace("`", "")
 
-            loop = asyncio.get_running_loop()
             t0 = time.monotonic()
-
-            await loop.run_in_executor(
-                self._executor, self._generate_and_play, clean_text,
-            )
-
+            await self._stream_and_play(clean_text)
             elapsed = time.monotonic() - t0
             logger.info("Kokoro TTS completed in %.2fs", elapsed)
 
@@ -226,20 +294,53 @@ class KokoroTTSAsync:
             self._running = False
             self._bus.emit("tts_complete")
 
-    def _generate_and_play(self, text: str) -> None:
-        """Blocking: generate and play audio chunks via Kokoro."""
+    async def _stream_and_play(self, text: str) -> None:
+        """Stream Kokoro chunks straight into a single sounddevice
+        OutputStream so the user hears the first phoneme in <200 ms
+        instead of waiting for the whole sentence to synthesise.
+        """
         if not self._running or not self._model:
             return
         try:
             import sounddevice as sd
+        except ImportError:
+            logger.warning(
+                "sounddevice missing -- install with `pip install sounddevice`",
+            )
+            return
 
-            for audio, sr in self._model.create_stream(text):
+        loop = asyncio.get_running_loop()
+        stream = None
+        sample_rate = 0
+        try:
+            async for audio, sr in self._model.create_stream(
+                text,
+                voice=self._voice,
+                speed=self._speed,
+                lang=self._language,
+            ):
                 if not self._running:
                     break
-                sd.play(audio, sr)
-                sd.wait()
-        except Exception as e:
-            logger.error("Kokoro playback error: %s", e)
+                if stream is None:
+                    sample_rate = int(sr)
+                    stream = sd.OutputStream(
+                        samplerate=sample_rate,
+                        channels=1,
+                        dtype="float32",
+                    )
+                    await loop.run_in_executor(self._executor, stream.start)
+                await loop.run_in_executor(
+                    self._executor, stream.write, audio,
+                )
+        except Exception:
+            logger.exception("Kokoro playback error")
+        finally:
+            if stream is not None:
+                try:
+                    await loop.run_in_executor(self._executor, stream.stop)
+                    await loop.run_in_executor(self._executor, stream.close)
+                except Exception:
+                    pass
 
     # ── Lifecycle ────────────────────────────────────────────────────
 

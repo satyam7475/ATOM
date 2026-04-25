@@ -187,6 +187,16 @@ class Router:
         # so the LLM never sees a Python traceback in its observation.
         self._vision_engine: Any = None
 
+        # Sprint Ω5/6: parallel DAG executor and meta-LLM supervisor.
+        # Wired post-init by :py:meth:`attach_supervisor`. The router
+        # itself never owns the LLM -- the supervisor receives an
+        # ``llm_call`` callable that ultimately dispatches through
+        # ``LocalBrainController``. Until attached, ``execute_dag_plan``
+        # falls back to the sequential :class:`MultiStepPlanner`.
+        self._supervisor: Any = None
+        self._parallel_executor: Any = None
+        self._sequential_planner: Any = None
+
         from core.reasoning.action_executor import ActionExecutor
         self._action_executor = ActionExecutor(
             dispatch_fn=self._dispatch_action,
@@ -300,6 +310,73 @@ class Router:
             identity_engine=self._identity_engine,
             action=action,
         )
+
+    def attach_supervisor(self, supervisor: Any) -> None:
+        """Wire the Sprint Ω agent supervisor.
+
+        ``supervisor`` is an :class:`AgentSupervisor` instance whose
+        default ``llm_call`` is expected to be bound to the local
+        brain (see ``LocalBrainController``). Attaching also surfaces
+        the supervisor's parallel planner so :py:meth:`execute_dag_plan`
+        can dispatch without rebuilding the DAG graph for every call.
+        """
+        self._supervisor = supervisor
+        self._parallel_executor = getattr(supervisor, "planner", None)
+        # ``MultiStepPlanner`` is built lazily on first sequential use;
+        # we don't need it during attach_supervisor.
+        self._sequential_planner = None
+        logger.info(
+            "AgentSupervisor attached to Router (parallel=%s)",
+            self._parallel_executor is not None,
+        )
+
+    async def execute_dag_plan(self, plan_blob: Any) -> Any:
+        """Public entry point for running a structured plan.
+
+        Accepts either a flat list of steps (sequential) or a DAG
+        ``{"steps": [...]}`` with ``depends_on`` edges (parallel).
+        Routes to :class:`ParallelPlanExecutor` when available, falls
+        back to :class:`MultiStepPlanner` otherwise. Reuses
+        ``ActionExecutor`` for security and parameter validation, so
+        every step still passes through the same safety gates as a
+        normal LLM tool call.
+        """
+        if self._parallel_executor is not None:
+            try:
+                return await self._parallel_executor.execute(plan_blob)
+            except Exception:
+                logger.exception(
+                    "ParallelPlanExecutor.execute raised; "
+                    "falling back to sequential planner",
+                )
+        if self._sequential_planner is None:
+            from core.reasoning.multi_step_planner import MultiStepPlanner
+            self._sequential_planner = MultiStepPlanner(
+                tool_registry=getattr(self._action_executor, "registry", None),
+                action_executor=self._action_executor,
+            )
+        return await self._sequential_planner.execute(plan_blob)
+
+    async def run_supervised(
+        self,
+        query: str,
+        *,
+        context: dict[str, Any] | None = None,
+    ) -> Any:
+        """Run a query through the meta-LLM supervisor end-to-end.
+
+        Returns ``None`` when no supervisor is attached or when the
+        supervisor's triage decides the query does not warrant a
+        plan. Callers should treat ``None`` as "fall through to the
+        normal Layer 3 path".
+        """
+        if self._supervisor is None:
+            return None
+        try:
+            return await self._supervisor.run(query, context=context or {})
+        except Exception:
+            logger.exception("AgentSupervisor.run raised; falling through")
+            return None
 
     def attach_routine_engine(self, routine_engine: Any) -> None:
         """Wire the user-defined routine engine (Sprint D4)."""

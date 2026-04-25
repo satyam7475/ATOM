@@ -106,7 +106,7 @@
         "engine": "whisper_cpp",
         "locale": "en-US",
         "whisper_model_size": "base",
-        "whisper_model_path": "models/ggml-small.en-q5_0.bin",
+        "whisper_model_path": "models/ggml-small.en-q5_1.bin",
         "whisper_n_threads": 4,
         "whisper_language": "en",
         "whisper_partial_interval_s": 1.0,
@@ -116,6 +116,15 @@
         "bilingual": true,
         "sample_rate": 16000,
         "chunk_size": 2048,
+        "smart_turn_taker": {
+            "enabled": true,
+            "decision_window_s": 1.0,
+            "min_silence_s": 0.18,
+            "max_silence_s": 1.2,
+            "eot_probability_threshold": 0.78,
+            "midthought_lockout_threshold": 0.92,
+            "min_eval_interval_ms": 60.0
+        },
         "post_tts_cooldown_ms": 600,
         "preload": true,
         "calibration_delay_s": 2.0,
@@ -162,7 +171,12 @@
         "edge_voice": "en-GB-SoniaNeural",
         "edge_rate": "+0%",
         "edge_postprocess": true,
-        "edge_ack_cache": true
+        "edge_ack_cache": true,
+        "kokoro_voice": "af_heart",
+        "kokoro_speed": 1.0,
+        "kokoro_language": "en-us",
+        "kokoro_model_path": "models/kokoro/kokoro-v1.0.onnx",
+        "kokoro_voices_path": "models/kokoro/voices-v1.0.bin"
     },
     "voice": {
         "activation_mode": "always_on",
@@ -209,7 +223,8 @@
     },
     "brain": {
         "enabled": true,
-        "mlx_model": "models/qwen3-4b-instruct-4bit",
+        "mlx_model": "models/qwen3-8b-4bit",
+        "mlx_model_fallback": "models/qwen3-4b-instruct-4bit",
         "n_ctx": 4096,
         "n_threads": 4,
         "n_gpu_layers": -1,
@@ -218,7 +233,7 @@
         "temperature": 0.6,
         "top_p": 0.85,
         "repeat_penalty": 1.1,
-        "timeout_seconds": 20,
+        "timeout_seconds": 28,
         "prompt_cache_enabled": true,
         "prompt_cache_max_size": 6,
         "prompt_cache_max_mb": 320,
@@ -517,8 +532,8 @@
         "poll_interval_s": 30
     },
     "cognitive_kernel": {
-        "quick_model": "qwen3-4b-instruct",
-        "full_model": "qwen3-4b-instruct",
+        "quick_model": "qwen3-8b",
+        "full_model": "qwen3-8b",
         "simple_query_max_chars": 48,
         "deep_query_min_chars": 140,
         "battery_degrade": true,
@@ -671,10 +686,10 @@
         "simulation_mode": "hybrid"
     },
     "cloud": {
-        "enabled": false,
+        "enabled": true,
         "provider": "gemini",
         "use_secure_credentials": true,
-        "buddy_model": "gemini-2.0-flash",
+        "buddy_model": "gemini-2.5-flash",
         "reasoning_model": "gemini-2.5-flash",
         "deep_model": "gemini-2.5-pro",
         "timeout_seconds": 8,
@@ -691,6 +706,22 @@
         ],
         "smart_route_min_query_words": 25,
         "smart_route_local_confidence_floor": 0.5
+    },
+    "cloud_brain_router": {
+        "enabled": true,
+        "daily_quota": 60,
+        "min_query_chars_for_auto_escalate": 80,
+        "cooldown_after_failure_s": 30.0,
+        "fallback_only": false,
+        "log_decisions": false
+    },
+    "agent_supervisor": {
+        "enabled": true,
+        "max_plan_steps": 5,
+        "max_concurrency": 3,
+        "per_step_timeout_s": 12.0,
+        "review_on_partial_failure": true,
+        "plan_max_tokens": 768
     },
     "security_gateway": {
         "block_system_paths": true,

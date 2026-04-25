@@ -1,0 +1,44 @@
+{
+  "_comment": "External MCP servers ATOM should mount as additional tool sources. Each server is spawned on demand via stdio. Set 'enabled' to true to activate. Tool names will be prefixed 'mcp_<server>__<tool>' and dispatched through the same SecurityPolicy as built-in actions. Add API keys / secrets to 'env'; they are passed only to the spawned subprocess.",
+  "servers": [
+    {
+      "name": "filesystem",
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "/Users/satyamyadav/Desktop"],
+      "enabled": false,
+      "description": "Read/write/list local files under a sandboxed root.",
+      "safety_level": "moderate",
+      "call_timeout_s": 8.0
+    },
+    {
+      "name": "git",
+      "command": "uvx",
+      "args": ["mcp-server-git", "--repository", "/Users/satyamyadav/Desktop/Personal/ATOM"],
+      "enabled": false,
+      "description": "Inspect and operate on a local git repository.",
+      "safety_level": "moderate",
+      "call_timeout_s": 10.0
+    },
+    {
+      "name": "fetch",
+      "command": "uvx",
+      "args": ["mcp-server-fetch"],
+      "enabled": false,
+      "description": "Fetch arbitrary HTTP(S) URLs with HTML->markdown conversion.",
+      "safety_level": "moderate",
+      "call_timeout_s": 12.0
+    },
+    {
+      "name": "github",
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-github"],
+      "env": {
+        "GITHUB_PERSONAL_ACCESS_TOKEN": ""
+      },
+      "enabled": false,
+      "description": "Read/write GitHub issues, PRs, repos. Requires a PAT in env.",
+      "safety_level": "moderate",
+      "call_timeout_s": 12.0
+    }
+  ]
+}

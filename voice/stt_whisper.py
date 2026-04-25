@@ -14,7 +14,7 @@ Architecture::
         v
     Rolling 30 s ring buffer
         v
-    whisper.cpp (Metal, small.en-q5_0)
+    whisper.cpp (Metal, small.en-q5_1)
         +-> partial transcript every 1.0 s of speech
         +-> final transcript after 600 ms of trailing silence
         v
@@ -39,7 +39,7 @@ Event-bus events emitted (identical shape to NativeSTT)::
     voice.partial(text, confidence, engine, mic)
     voice.final(text, language, confidence, engine, mic)
 
-Latency budget: ~30 ms VAD + ~200-300 ms whisper-small.en-q5_0 transcribe
+Latency budget: ~30 ms VAD + ~200-300 ms whisper-small.en-q5_1 transcribe
 = sub-500 ms end-of-speech to final on M-series.
 """
 
@@ -96,8 +96,16 @@ _TRAILING_SILENCE_S = 0.6
 _MAX_UTTERANCE_S = 20.0
 _MIN_UTTERANCE_MS = 250
 
-# Where install_whisper_model.py writes the GGML weights.
-_DEFAULT_MODEL_FILENAME = "ggml-small.en-q5_0.bin"
+# Where install_whisper_model.py writes the GGML weights. As of
+# Apr 25 2026 ggerganov/whisper.cpp removed the q5_0 small.en quant
+# from HF (404), so we now default to the q5_1 variant of the same
+# model. Old configs pointing at the q5_0 filename are auto-redirected
+# in voice/whisper_install.py.
+_DEFAULT_MODEL_FILENAME = "ggml-small.en-q5_1.bin"
+_LEGACY_FILENAME_REDIRECTS = {
+    "ggml-small.en-q5_0.bin": "ggml-small.en-q5_1.bin",
+    "ggml-base.en-q5_0.bin": "ggml-base.en-q5_1.bin",
+}
 
 
 def _resolve_model_path(config_path: str | None) -> Path:
@@ -106,11 +114,17 @@ def _resolve_model_path(config_path: str | None) -> Path:
     Resolution order:
       1. explicit ``stt.whisper_model_path`` (if absolute).
       2. ``./models/<filename>`` if the explicit path is just a name.
-      3. ``./models/ggml-small.en-q5_0.bin`` (default).
+      3. ``./models/ggml-small.en-q5_1.bin`` (default).
     """
     root = Path(__file__).resolve().parent.parent
+
+    def _maybe_redirect(p: Path) -> Path:
+        if p.name in _LEGACY_FILENAME_REDIRECTS:
+            return p.with_name(_LEGACY_FILENAME_REDIRECTS[p.name])
+        return p
+
     if config_path:
-        p = Path(config_path)
+        p = _maybe_redirect(Path(config_path))
         if p.is_absolute():
             return p
         return (root / "models" / p.name).resolve()
@@ -152,6 +166,37 @@ class WhisperSTT:
         self._max_utterance_s: float = float(
             self._config.get("whisper_max_utterance_s", _MAX_UTTERANCE_S),
         )
+        # Sprint Ω9: adaptive end-of-turn detector. Built lazily in
+        # ``preload`` only when stt.smart_turn_taker.enabled = true.
+        # When unavailable, all decisions route to the legacy
+        # ``trailing_silence_s`` ceiling so behaviour is unchanged.
+        from voice.smart_turn_taker import (  # local import keeps boot cheap
+            SmartTurnTaker,
+            SmartTurnTakerConfig,
+        )
+        _stt_cfg = self._config.get("smart_turn_taker") or {}
+        self._turn_taker: SmartTurnTaker | None = None
+        if isinstance(_stt_cfg, dict) and _stt_cfg.get("enabled"):
+            self._turn_taker = SmartTurnTaker(SmartTurnTakerConfig(
+                enabled=True,
+                sample_rate=int(_stt_cfg.get("sample_rate", _SAMPLE_RATE)),
+                decision_window_s=float(_stt_cfg.get("decision_window_s", 1.0)),
+                min_silence_s=float(_stt_cfg.get(
+                    "min_silence_s", 0.18,
+                )),
+                max_silence_s=float(_stt_cfg.get(
+                    "max_silence_s", max(self._trailing_silence_s, 1.20),
+                )),
+                eot_probability_threshold=float(_stt_cfg.get(
+                    "eot_probability_threshold", 0.78,
+                )),
+                midthought_lockout_threshold=float(_stt_cfg.get(
+                    "midthought_lockout_threshold", 0.92,
+                )),
+                min_eval_interval_ms=float(_stt_cfg.get(
+                    "min_eval_interval_ms", 60.0,
+                )),
+            ))
         self._vad_aggressiveness: int = max(
             0, min(3, int(self._config.get("whisper_vad_aggressiveness", 2))),
         )
@@ -264,6 +309,31 @@ class WhisperSTT:
                 self._vad_aggressiveness,
                 elapsed_ms,
             )
+            # Sprint Ω9: best-effort load of the adaptive turn-taker.
+            # Failure is non-fatal -- the legacy trailing-silence wait
+            # remains the default decision.
+            if self._turn_taker is not None:
+                try:
+                    if self._turn_taker.preload():
+                        logger.info(
+                            "WhisperSTT smart turn-taker active "
+                            "(min=%.2fs max=%.2fs eot_thr=%.2f)",
+                            self._turn_taker.config.min_silence_s,
+                            self._turn_taker.config.max_silence_s,
+                            self._turn_taker.config.eot_probability_threshold,
+                        )
+                    else:
+                        logger.info(
+                            "WhisperSTT smart turn-taker requested but "
+                            "unavailable -- falling back to fixed "
+                            "trailing-silence (%.2fs)",
+                            self._trailing_silence_s,
+                        )
+                except Exception:
+                    logger.debug(
+                        "Smart turn-taker preload raised; falling back",
+                        exc_info=True,
+                    )
             return True
         except Exception as exc:
             self._available = False
@@ -492,10 +562,55 @@ class WhisperSTT:
         )
         silence_duration_s = self._silence_frames * _FRAME_MS / 1000.0
 
-        # Final: trailing silence exceeded OR max-utterance length hit.
-        if (
+        # Sprint Ω9: consult the smart turn-taker first. It either
+        # produces an explicit finalize/no-finalize decision (with a
+        # cooldown so we never burn CPU per frame) or returns
+        # ``eval_skipped=True`` and the loop continues with the legacy
+        # trailing-silence rule. Mid-thought lockout actively delays
+        # the legacy 600 ms trigger when Silero is highly confident
+        # the speaker hasn't finished.
+        legacy_trailing_finalize = (
             silence_duration_s >= self._trailing_silence_s
-            or utterance_duration_s >= self._max_utterance_s
+        )
+        max_utterance_finalize = (
+            utterance_duration_s >= self._max_utterance_s
+        )
+        early_final = False
+        midthought_lock = False
+        if (
+            self._turn_taker is not None
+            and self._turn_taker.is_available
+            and self._utterance_frames
+        ):
+            try:
+                decision = self._turn_taker.should_finalize(
+                    b"".join(self._utterance_frames),
+                    silence_s=silence_duration_s,
+                    utterance_s=utterance_duration_s,
+                )
+                early_final = bool(decision.finalize)
+                midthought_lock = (
+                    decision.reason == "midthought_lockout"
+                )
+                if decision.finalize:
+                    logger.debug(
+                        "WhisperSTT smart-final: reason=%s "
+                        "silence=%.2fs prob=%.2f eot=%.2f",
+                        decision.reason,
+                        silence_duration_s,
+                        decision.probability,
+                        decision.eot_score,
+                    )
+            except Exception:
+                logger.debug(
+                    "Smart turn-taker raised; using legacy fallback",
+                    exc_info=True,
+                )
+
+        if (
+            early_final
+            or max_utterance_finalize
+            or (legacy_trailing_finalize and not midthought_lock)
         ):
             text = self._flush_utterance(force=True)
             if text:
@@ -564,6 +679,8 @@ class WhisperSTT:
         self._utterance_started_at = 0.0
         self._last_partial_emit_at = 0.0
         self._last_partial = ""
+        if self._turn_taker is not None:
+            self._turn_taker.reset()
 
     # ── emit helpers (duck-compatible with NativeSTT) ───────────
 

@@ -105,6 +105,17 @@ class ActionExecutor:
         """Update the tool registry (e.g., after full initialization)."""
         self._registry = registry
 
+    @property
+    def registry(self) -> ToolRegistry:
+        """Public read-only handle to the active tool registry.
+
+        Used by Sprint Ω components (``ParallelPlanExecutor``,
+        ``AgentSupervisor``, ``AtomMCPServer``) so they can build
+        plan/tool prompts from the same source of truth without
+        reaching into ``_registry`` directly.
+        """
+        return self._registry
+
     def _schema_reject(
         self,
         name: str,
