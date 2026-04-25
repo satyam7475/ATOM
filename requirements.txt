@@ -69,6 +69,7 @@ mlx-vlm>=0.1.20
 # Embedding engine for semantic search (~260MB model)
 # Note: embedding_engine.py now detects MPS (Apple Silicon GPU) automatically
 sentence-transformers>=3.0.0
+fastembed>=0.7.0
 
 # Persistent vector database (falls back to in-memory JSON if not installed)
 chromadb>=0.5.0

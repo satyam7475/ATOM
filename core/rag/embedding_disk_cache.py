@@ -30,8 +30,14 @@ def similar_bucket_key(q: str) -> str:
 class PersistentEmbeddingCache:
     """SQLite-backed embedding vectors; thread-safe."""
 
-    def __init__(self, path: str = "data/rag_embedding_cache.sqlite") -> None:
+    def __init__(
+        self,
+        path: str = "data/rag_embedding_cache.sqlite",
+        *,
+        namespace: str = "default",
+    ) -> None:
         self._path = Path(path)
+        self._namespace = namespace or "default"
         self._path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.Lock()
         self._conn: sqlite3.Connection | None = None
@@ -51,17 +57,29 @@ class PersistentEmbeddingCache:
                 CREATE TABLE IF NOT EXISTS embeddings (
                     qkey TEXT PRIMARY KEY,
                     bucket TEXT,
+                    namespace TEXT DEFAULT 'default',
                     dim INTEGER,
                     vec TEXT,
                     updated REAL
                 )
                 """
             )
+            cols = {
+                str(row[1])
+                for row in c.execute("PRAGMA table_info(embeddings)").fetchall()
+            }
+            if "namespace" not in cols:
+                c.execute(
+                    "ALTER TABLE embeddings "
+                    "ADD COLUMN namespace TEXT DEFAULT 'default'",
+                )
             c.execute("CREATE INDEX IF NOT EXISTS idx_bucket ON embeddings(bucket)")
+            c.execute("CREATE INDEX IF NOT EXISTS idx_namespace ON embeddings(namespace)")
             c.commit()
 
     def _qkey(self, normalized: str) -> str:
-        return hashlib.sha256(normalized.encode("utf-8", errors="replace")).hexdigest()
+        payload = f"{self._namespace}:{normalized}"
+        return hashlib.sha256(payload.encode("utf-8", errors="replace")).hexdigest()
 
     def get(self, query: str) -> list[float] | None:
         n = normalize_query_for_cache(query)
@@ -71,7 +89,8 @@ class PersistentEmbeddingCache:
         with self._lock:
             try:
                 cur = self._get_conn().execute(
-                    "SELECT vec FROM embeddings WHERE qkey = ?", (k,)
+                    "SELECT vec FROM embeddings WHERE qkey = ? AND namespace = ?",
+                    (k, self._namespace),
                 )
                 row = cur.fetchone()
                 if row:
@@ -83,8 +102,12 @@ class PersistentEmbeddingCache:
         with self._lock:
             try:
                 cur = self._get_conn().execute(
-                    "SELECT vec FROM embeddings WHERE bucket = ? ORDER BY updated DESC LIMIT 1",
-                    (b,),
+                    """
+                    SELECT vec FROM embeddings
+                    WHERE bucket = ? AND namespace = ?
+                    ORDER BY updated DESC LIMIT 1
+                    """,
+                    (b, self._namespace),
                 )
                 row = cur.fetchone()
                 if row:
@@ -103,10 +126,11 @@ class PersistentEmbeddingCache:
             try:
                 self._get_conn().execute(
                     """
-                    INSERT OR REPLACE INTO embeddings (qkey, bucket, dim, vec, updated)
-                    VALUES (?, ?, ?, ?, ?)
+                    INSERT OR REPLACE INTO embeddings
+                        (qkey, bucket, namespace, dim, vec, updated)
+                    VALUES (?, ?, ?, ?, ?, ?)
                     """,
-                    (k, b, len(vec), json.dumps(vec), time.time()),
+                    (k, b, self._namespace, len(vec), json.dumps(vec), time.time()),
                 )
                 self._get_conn().commit()
             except Exception:

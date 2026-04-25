@@ -598,6 +598,39 @@ CONFIG_SCHEMA: dict[str, Any] = {
             },
             "additionalProperties": False,
         },
+        "embedding": {
+            "type": "object",
+            "properties": {
+                "backend": {
+                    "type": "string",
+                    "enum": ["sentence_transformers", "legacy", "fastembed", "onnx"],
+                },
+                "provider_version": {"type": "string"},
+                "shadow_compare": {"type": "boolean"},
+                "shadow_phrases": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                },
+                "model": {"type": "string"},
+                "dimension": {"type": "integer", "minimum": 1, "maximum": 4096},
+                "device": {"type": "string"},
+                "warm_file": {
+                    "oneOf": [
+                        {"type": "string"},
+                        {
+                            "type": "object",
+                            "properties": {
+                                "enabled": {"type": "boolean"},
+                                "path": {"type": "string"},
+                                "max_entries": {"type": "integer", "minimum": 1},
+                            },
+                            "additionalProperties": False,
+                        },
+                    ],
+                },
+            },
+            "additionalProperties": False,
+        },
         "memory": {
             "type": "object",
             "properties": {

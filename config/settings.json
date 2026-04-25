@@ -472,6 +472,15 @@
         "state_path": "data/morning_briefing.json"
     },
     "embedding": {
+        "backend": "sentence_transformers",
+        "provider_version": "1",
+        "shadow_compare": false,
+        "shadow_phrases": [
+            "what time is it",
+            "open spotify",
+            "what did we talk about earlier",
+            "describe what's on screen"
+        ],
         "model": "all-MiniLM-L6-v2",
         "dimension": 384,
         "device": "cpu",

@@ -170,7 +170,7 @@ class SemanticCache:
     # Schema version. Bump this if we change the table layout so stale
     # DBs get rebuilt automatically on next boot instead of crashing at
     # read time.
-    _SCHEMA_VERSION = 1
+    _SCHEMA_VERSION = 2
 
     def __init__(self, config: dict | None = None) -> None:
         cfg = (config or {}).get("semantic_cache", {})
@@ -205,6 +205,8 @@ class SemanticCache:
 
         self._embedding_engine: Any = None
         self._has_embeddings = False
+        self._embedding_meta: dict[str, Any] = {}
+        self._embedding_signature = "exact-match"
 
         self._total_hits = 0
         self._total_misses = 0
@@ -240,6 +242,12 @@ class SemanticCache:
         try:
             from core.embedding_engine import get_embedding_engine
             self._embedding_engine = get_embedding_engine()
+            meta_fn = getattr(self._embedding_engine, "provider_metadata", None)
+            if callable(meta_fn):
+                self._embedding_meta = dict(meta_fn())
+                self._embedding_signature = str(
+                    self._embedding_meta.get("signature") or self._embedding_signature,
+                )
             self._has_embeddings = True
         except ImportError:
             logger.info("SemanticCache: embeddings unavailable, using exact match only")
@@ -291,7 +299,11 @@ class SemanticCache:
                         created_at REAL NOT NULL,
                         last_access REAL NOT NULL,
                         hit_count INTEGER DEFAULT 0,
-                        source TEXT DEFAULT 'local'
+                        source TEXT DEFAULT 'local',
+                        embedding_provider TEXT DEFAULT '',
+                        embedding_model TEXT DEFAULT '',
+                        embedding_provider_version TEXT DEFAULT '',
+                        embedding_signature TEXT DEFAULT ''
                     )
                     """,
                 )
@@ -303,6 +315,10 @@ class SemanticCache:
                     "INSERT OR REPLACE INTO meta(key, value) VALUES(?, ?)",
                     ("schema_version", str(self._SCHEMA_VERSION)),
                 )
+            conn.execute(
+                "INSERT OR REPLACE INTO meta(key, value) VALUES(?, ?)",
+                ("embedding_signature", self._embedding_signature),
+            )
             conn.commit()
             self._conn = conn
             self._db_path = db_path
@@ -328,13 +344,15 @@ class SemanticCache:
                 rows = self._conn.execute(
                     """
                     SELECT query, response, embedding, dim,
-                           created_at, last_access, hit_count, source
+                           created_at, last_access, hit_count, source,
+                           embedding_signature
                     FROM cache
                     WHERE last_access >= ?
+                      AND (embedding_signature = ? OR embedding_signature = '')
                     ORDER BY last_access DESC
                     LIMIT ?
                     """,
-                    (cutoff, self._max_size),
+                    (cutoff, self._embedding_signature, self._max_size),
                 ).fetchall()
         except sqlite3.Error:
             logger.debug("SemanticCache: restore failed", exc_info=True)
@@ -342,8 +360,10 @@ class SemanticCache:
 
         restored = 0
         with self._lock:
-            for q, resp, emb_blob, dim, created, last_access, hit, src in rows:
+            for q, resp, emb_blob, dim, created, last_access, hit, src, sig in rows:
                 if not isinstance(q, str) or not isinstance(resp, str):
+                    continue
+                if sig and sig != self._embedding_signature:
                     continue
                 if now - created > self._persistent_ttl:
                     continue
@@ -376,16 +396,24 @@ class SemanticCache:
             with self._db_lock:
                 self._conn.execute(
                     """
-                    INSERT INTO cache(query, response, embedding, dim,
-                                      created_at, last_access, hit_count, source)
-                    VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+                    INSERT INTO cache(
+                        query, response, embedding, dim,
+                        created_at, last_access, hit_count, source,
+                        embedding_provider, embedding_model,
+                        embedding_provider_version, embedding_signature
+                    )
+                    VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(query) DO UPDATE SET
                         response = excluded.response,
                         embedding = excluded.embedding,
                         dim = excluded.dim,
                         last_access = excluded.last_access,
                         hit_count = cache.hit_count + 1,
-                        source = excluded.source
+                        source = excluded.source,
+                        embedding_provider = excluded.embedding_provider,
+                        embedding_model = excluded.embedding_model,
+                        embedding_provider_version = excluded.embedding_provider_version,
+                        embedding_signature = excluded.embedding_signature
                     """,
                     (
                         entry.query,
@@ -396,6 +424,10 @@ class SemanticCache:
                         entry.timestamp,
                         entry.hit_count,
                         entry.source,
+                        str(self._embedding_meta.get("provider", "")),
+                        str(self._embedding_meta.get("model_name", "")),
+                        str(self._embedding_meta.get("provider_version", "")),
+                        self._embedding_signature,
                     ),
                 )
                 self._conn.commit()

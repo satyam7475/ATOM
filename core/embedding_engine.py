@@ -102,6 +102,8 @@ class EmbeddingEngine:
 
     __slots__ = (
         "_model_name", "_dimension", "_device", "_model",
+        "_backend", "_provider", "_provider_version", "_shadow_compare",
+        "_shadow_phrases", "_shadow_reported",
         "_load_lock", "_loaded", "_load_failed",
         "_cache", "_zero_vec",
         "_warm_path", "_warm_enabled", "_warm_max",
@@ -114,6 +116,16 @@ class EmbeddingEngine:
         self._dimension: int = cfg.get("dimension", self._DIMENSION)
         self._device: str = _resolve_embedding_device(cfg.get("device", "cpu"))
         self._model: Any = None
+        self._backend: str = str(
+            cfg.get("backend") or cfg.get("runtime") or "sentence_transformers",
+        ).strip().lower()
+        self._provider: Any = None
+        self._provider_version: str = str(cfg.get("provider_version") or "1")
+        self._shadow_compare: bool = bool(cfg.get("shadow_compare", False))
+        self._shadow_phrases: list[str] = [
+            str(x) for x in (cfg.get("shadow_phrases") or []) if str(x).strip()
+        ][:16]
+        self._shadow_reported: bool = False
         self._load_lock = threading.Lock()
         self._loaded: bool = False
         self._load_failed: bool = False
@@ -143,6 +155,29 @@ class EmbeddingEngine:
     def is_loaded(self) -> bool:
         return self._loaded
 
+    @property
+    def backend(self) -> str:
+        return self._backend
+
+    @property
+    def provider_signature(self) -> str:
+        return self._embedding_signature()
+
+    def provider_metadata(self) -> dict[str, Any]:
+        return {
+            "provider": self._backend,
+            "provider_version": self._provider_version,
+            "model_name": self._model_name,
+            "dimension": self._dimension,
+            "signature": self._embedding_signature(),
+        }
+
+    def _embedding_signature(self) -> str:
+        return (
+            f"{self._backend}:{self._model_name}:"
+            f"{self._dimension}:{self._provider_version}"
+        )
+
     def _get_zero_vec(self) -> list[float]:
         if self._zero_vec is None or len(self._zero_vec) != self._dimension:
             self._zero_vec = [0.0] * self._dimension
@@ -157,6 +192,9 @@ class EmbeddingEngine:
             if self._loaded:
                 return True
             try:
+                if self._backend in {"fastembed", "onnx"}:
+                    return self._ensure_provider_loaded()
+
                 # Sprint Ω.1: silence the two cosmetic boot-log
                 # leaks that come out of the HF / sentence-transformers
                 # stack the first time we touch them:
@@ -231,6 +269,48 @@ class EmbeddingEngine:
                 logger.exception("Failed to load embedding model")
                 self._load_failed = True
                 return False
+
+    def _ensure_provider_loaded(self) -> bool:
+        try:
+            provider_cfg = {
+                "model_name": self._model_name,
+                "dimension": self._dimension,
+            }
+            if self._backend in {"fastembed", "onnx"}:
+                from core.embeddings import FastEmbedProvider
+
+                self._provider = FastEmbedProvider(**provider_cfg)
+            else:
+                logger.warning(
+                    "Unknown embedding backend %r; falling back to hash embeddings",
+                    self._backend,
+                )
+                self._load_failed = True
+                return False
+
+            t0 = time.monotonic()
+            self._provider.load()
+            self._dimension = int(getattr(self._provider, "dimension", self._dimension))
+            self._provider_version = str(
+                getattr(self._provider, "version", self._provider_version),
+            )
+            self._zero_vec = None
+            self._loaded = True
+            elapsed = (time.monotonic() - t0) * 1000
+            logger.info(
+                "Embedding provider loaded: %s model=%s (%d-dim, numpy=%s) in %.0fms",
+                self._backend,
+                self._model_name,
+                self._dimension,
+                "yes" if _np is not None else "no",
+                elapsed,
+            )
+            self._run_shadow_compare_once()
+            return True
+        except Exception:
+            logger.exception("Failed to load embedding provider %s", self._backend)
+            self._load_failed = True
+            return False
 
     @staticmethod
     def _capture_fd_load(fn: Any) -> dict:
@@ -397,6 +477,30 @@ class EmbeddingEngine:
 
             saved_model = meta.get("model_name")
             saved_dim = int(meta.get("dimension", 0) or 0)
+            saved_provider = str(meta.get("provider") or "").strip().lower()
+            saved_version = str(meta.get("provider_version") or "").strip()
+            if saved_provider and saved_provider != self._backend:
+                logger.info(
+                    "Warm-file provider mismatch (have=%s want=%s); ignoring",
+                    saved_provider, self._backend,
+                )
+                return
+            if (
+                saved_version
+                and saved_version != self._provider_version
+                and saved_provider
+            ):
+                logger.info(
+                    "Warm-file provider version mismatch (have=%s want=%s); ignoring",
+                    saved_version, self._provider_version,
+                )
+                return
+            if not saved_provider and self._backend not in {"sentence_transformers", "legacy"}:
+                logger.info(
+                    "Warm-file missing provider marker for backend=%s; ignoring",
+                    self._backend,
+                )
+                return
             if saved_model and saved_model != self._model_name:
                 logger.info(
                     "Warm-file model mismatch (have=%s want=%s); ignoring",
@@ -474,6 +578,9 @@ class EmbeddingEngine:
                     json.dumps(
                         {
                             "version": self._WARM_FILE_VERSION,
+                            "provider": self._backend,
+                            "provider_version": self._provider_version,
+                            "signature": self._embedding_signature(),
                             "model_name": self._model_name,
                             "dimension": self._dimension,
                             "saved_at": time.time(),
@@ -529,6 +636,10 @@ class EmbeddingEngine:
             "restored_on_boot": self._warm_restored,
             "in_memory_entries": len(self._cache),
             "dirty_count": self._warm_dirty_count,
+            "provider": self._backend,
+            "model_name": self._model_name,
+            "dimension": self._dimension,
+            "signature": self._embedding_signature(),
         }
 
     def embed_sync(self, text: str) -> list[float]:
@@ -541,14 +652,22 @@ class EmbeddingEngine:
             self._cache.move_to_end(text)
             return cached
 
-        if not self._ensure_loaded() or self._model is None:
+        if not self._ensure_loaded():
             return self._fallback_embed(text)
 
         try:
-            raw = self._model.encode(
-                text, normalize_embeddings=True, show_progress_bar=False,
-            )
-            vec = raw.tolist() if hasattr(raw, "tolist") else list(raw)
+            if self._provider is not None:
+                vec = self._provider.encode(text)
+            else:
+                if self._model is None:
+                    return self._fallback_embed(text)
+                raw = self._model.encode(
+                    text, normalize_embeddings=True, show_progress_bar=False,
+                )
+                vec = raw.tolist() if hasattr(raw, "tolist") else list(raw)
+            if len(vec) != self._dimension:
+                self._dimension = len(vec)
+                self._zero_vec = None
             self._cache_put(text, vec)
             return vec
         except Exception:
@@ -566,18 +685,26 @@ class EmbeddingEngine:
         if not texts:
             return []
 
-        if not self._ensure_loaded() or self._model is None:
+        if not self._ensure_loaded():
             return [self._fallback_embed(t) for t in texts]
 
         import asyncio
 
         def _batch_sync() -> list[list[float]]:
             try:
-                raw = self._model.encode(
-                    texts, normalize_embeddings=True,
-                    show_progress_bar=False, batch_size=64,
-                )
-                vecs = raw.tolist() if hasattr(raw, "tolist") else [list(r) for r in raw]
+                if self._provider is not None:
+                    vecs = self._provider.encode_batch(texts)
+                else:
+                    if self._model is None:
+                        return [self._fallback_embed(t) for t in texts]
+                    raw = self._model.encode(
+                        texts, normalize_embeddings=True,
+                        show_progress_bar=False, batch_size=64,
+                    )
+                    vecs = raw.tolist() if hasattr(raw, "tolist") else [list(r) for r in raw]
+                if vecs and len(vecs[0]) != self._dimension:
+                    self._dimension = len(vecs[0])
+                    self._zero_vec = None
                 for t, v in zip(texts, vecs):
                     self._cache_put(t, v)
                 return vecs
@@ -635,6 +762,76 @@ class EmbeddingEngine:
             scores = mat @ q / (mat_norms * q_norm)
             return scores.tolist()
         return [EmbeddingEngine.similarity(query, c) for c in candidates]
+
+    def shadow_compare_phrases(self, phrases: list[str]) -> dict[str, Any]:
+        """Compare the active provider against legacy SentenceTransformer.
+
+        This is an explicit validation tool, not a boot-time path. It lets
+        us measure whether a new provider is close enough before switching
+        production defaults or reusing existing vector stores.
+        """
+        clean = [p.strip() for p in phrases if p and p.strip()]
+        if not clean:
+            return {"enabled": False, "count": 0, "avg_similarity": 0.0}
+        if self._backend in {"sentence_transformers", "legacy"}:
+            return {
+                "enabled": False,
+                "reason": "active provider is already legacy",
+                "count": len(clean),
+                "avg_similarity": 1.0,
+            }
+        active = [self.embed_sync(p) for p in clean]
+        try:
+            self._silence_hf_boot_noise()
+            from sentence_transformers import SentenceTransformer
+
+            captured = self._capture_fd_load(
+                lambda: SentenceTransformer(self._model_name, device=self._device),
+            )
+            legacy_model = captured["result"]
+            raw = legacy_model.encode(
+                clean, normalize_embeddings=True, show_progress_bar=False,
+            )
+            legacy = raw.tolist() if hasattr(raw, "tolist") else [list(r) for r in raw]
+        except Exception as exc:
+            return {
+                "enabled": True,
+                "count": len(clean),
+                "error": f"{type(exc).__name__}: {exc}",
+                "avg_similarity": 0.0,
+            }
+        scores = [
+            self.similarity(a, b)
+            for a, b in zip(active, legacy)
+            if a and b and len(a) == len(b)
+        ]
+        return {
+            "enabled": True,
+            "count": len(clean),
+            "compared": len(scores),
+            "avg_similarity": (sum(scores) / len(scores)) if scores else 0.0,
+            "min_similarity": min(scores) if scores else 0.0,
+            "max_similarity": max(scores) if scores else 0.0,
+            "provider": self._backend,
+            "model_name": self._model_name,
+            "dimension": self._dimension,
+        }
+
+    def _run_shadow_compare_once(self) -> None:
+        if self._shadow_reported or not self._shadow_compare or not self._shadow_phrases:
+            return
+        self._shadow_reported = True
+        report = self.shadow_compare_phrases(self._shadow_phrases)
+        if report.get("error"):
+            logger.warning("Embedding shadow compare failed: %s", report["error"])
+            return
+        logger.info(
+            "Embedding shadow compare: provider=%s compared=%s avg=%.3f min=%.3f",
+            report.get("provider", self._backend),
+            report.get("compared", 0),
+            float(report.get("avg_similarity", 0.0)),
+            float(report.get("min_similarity", 0.0)),
+        )
 
     def _fallback_embed(self, text: str) -> list[float]:
         """Deterministic hash-based pseudo-embedding when no model is available.
@@ -725,7 +922,7 @@ class EmbeddingEngine:
         Safe to call before or after the model is loaded; if the
         model isn't ready yet, the call no-ops and returns 0.
         """
-        if not self._ensure_loaded() or self._model is None:
+        if not self._ensure_loaded():
             return 0
         phrases = list(self._SEED_PHRASES)
         if extra:
@@ -735,13 +932,21 @@ class EmbeddingEngine:
             return 0
         try:
             t0 = time.monotonic()
-            raw = self._model.encode(
-                new_phrases,
-                normalize_embeddings=True,
-                show_progress_bar=False,
-                batch_size=64,
-            )
-            vecs = raw.tolist() if hasattr(raw, "tolist") else [list(r) for r in raw]
+            if self._provider is not None:
+                vecs = self._provider.encode_batch(new_phrases)
+            else:
+                if self._model is None:
+                    return 0
+                raw = self._model.encode(
+                    new_phrases,
+                    normalize_embeddings=True,
+                    show_progress_bar=False,
+                    batch_size=64,
+                )
+                vecs = raw.tolist() if hasattr(raw, "tolist") else [list(r) for r in raw]
+            if vecs and len(vecs[0]) != self._dimension:
+                self._dimension = len(vecs[0])
+                self._zero_vec = None
             for txt, vec in zip(new_phrases, vecs):
                 self._cache_put(txt, vec)
             elapsed = (time.monotonic() - t0) * 1000
@@ -767,6 +972,12 @@ class EmbeddingEngine:
             except Exception:
                 logger.debug("warm-file final persist failed", exc_info=True)
         self._model = None
+        if self._provider is not None:
+            try:
+                self._provider.shutdown()
+            except Exception:
+                logger.debug("Embedding provider shutdown failed", exc_info=True)
+        self._provider = None
         self._loaded = False
         self._cache.clear()
         self._zero_vec = None
