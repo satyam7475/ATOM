@@ -103,11 +103,13 @@ class GeminiClient:
                 self._buddy_model, self._reasoning_model,
                 self._timeout, self._timeout_reasoning,
             )
-        else:
-            logger.info(
-                "GeminiClient: no API key — cloud reasoning disabled. "
-                "Set cloud.gemini_api_key in settings.json or GEMINI_API_KEY env var.",
-            )
+        # Sprint Ω.1: deliberately do NOT log "no API key" here. The
+        # vault probe in main.py runs *after* GeminiClient.__init__,
+        # so the old log line was cosmetically misleading -- it
+        # claimed cloud reasoning was disabled and then 200ms later
+        # logged "API key configured". main.py owns the final
+        # "key missing" warning when both settings.json AND the vault
+        # come up empty, so the right call here is silence.
 
     def configure_api_key(self, key: str) -> None:
         """Set or update the API key at runtime (e.g., from vault)."""

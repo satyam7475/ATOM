@@ -31,11 +31,23 @@ import time
 from pathlib import Path
 
 from core.macos import AccessibilityAPI, AppleScriptEngine
-from core.security_policy import SecurityPolicy
+from core.security_policy import SecurityPolicy, get_global_policy
 
 logger = logging.getLogger("atom.desktop")
 
-_policy = SecurityPolicy()
+# Sprint Ω.1: lazy proxy. See core/router/app_actions.py for the
+# rationale; same fix applied here so module-import doesn't construct a
+# duplicate SecurityPolicy.
+
+
+class _PolicyProxy:
+    __slots__ = ()
+
+    def __getattr__(self, item: str):  # type: ignore[override]
+        return getattr(get_global_policy(), item)
+
+
+_policy: SecurityPolicy = _PolicyProxy()  # type: ignore[assignment]
 _IS_MACOS = sys.platform == "darwin"
 _APPLE_SCRIPT = AppleScriptEngine() if _IS_MACOS else None
 _ACCESSIBILITY = AccessibilityAPI() if _IS_MACOS else None

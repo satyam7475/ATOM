@@ -82,13 +82,19 @@ class SystemIndexer:
         self._executor.shutdown(wait=False)
         logger.info("System Indexer stopped")
 
+    # Sprint Ω.1: minimum gap between two index runs. If the supervisor
+    # re-enters after an inner cancel, or any other code path triggers a
+    # rebuild within this window, we skip silently. Eliminates the
+    # duplicate "System indexed in 83ms" boot-log line that fired ~20s
+    # apart on every cold start.
+    _MIN_REBUILD_INTERVAL_S = 60.0
+
     async def _index_loop(self) -> None:
         """Periodically update the system index."""
         loop = asyncio.get_running_loop()
-        
-        # Initial fast index
+
         await loop.run_in_executor(self._executor, self._build_index)
-        
+
         while self._running:
             try:
                 await asyncio.sleep(300)  # Refresh every 5 minutes
@@ -101,16 +107,31 @@ class SystemIndexer:
                 await asyncio.sleep(60)
 
     def _build_index(self) -> None:
-        """Build the full system index (runs in thread)."""
+        """Build the full system index (runs in thread).
+
+        Idempotent within ``_MIN_REBUILD_INTERVAL_S``: if we just
+        indexed less than that ago, skip silently. This guards against
+        supervisor re-entry, duplicate ``start()`` calls, and any
+        future caller that wants to "kick" a refresh.
+        """
+        now_wall = time.time()
+        if (
+            self._last_index_time
+            and (now_wall - self._last_index_time) < self._MIN_REBUILD_INTERVAL_S
+        ):
+            logger.debug(
+                "System index rebuild skipped (last=%.1fs ago)",
+                now_wall - self._last_index_time,
+            )
+            return
+
         t0 = time.monotonic()
-        
         self._index_apps()
         self._index_processes()
         self._index_user_dirs()
-        
-        self._last_index_time = time.time()
+        self._last_index_time = now_wall
         elapsed = (time.monotonic() - t0) * 1000
-        logger.info("System indexed in %.0fms (apps: %d, processes: %d)", 
+        logger.info("System indexed in %.0fms (apps: %d, processes: %d)",
                     elapsed, len(self._apps_index), len(self._process_index))
 
     def _index_apps(self) -> None:

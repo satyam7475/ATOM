@@ -234,6 +234,14 @@ async def main() -> None:
     conv_memory = ConversationMemory(config)
 
     security = SecurityPolicy(config)
+    # Sprint Ω.1: register as the canonical policy so module-level
+    # helpers (core/router/app_actions.py, core/desktop_control.py)
+    # share this exact instance instead of constructing zero-config
+    # duplicates at import time. This collapses the boot log from
+    # three "SecurityPolicy init" lines down to one and ensures the
+    # whole stack honours the same rate-limit + lock-mode + tier.
+    from core.security_policy import set_global_policy
+    set_global_policy(security)
 
     router = Router(
         bus, state, cache, memory,

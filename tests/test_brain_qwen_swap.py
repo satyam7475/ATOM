@@ -1,31 +1,17 @@
-"""v3.3 regression tests -- single-model brain (Qwen3-4B-Instruct-2507-4bit).
+"""Single-model brain regression tests -- Qwen3 family.
 
-ATOM was on Qwen2.5-7B-Instruct-MLX-4bit until 2026-04-24; the v3.3
-JARVIS-grade rewrite swapped to Qwen3-4B-Instruct-2507-4bit because the
-7B was the dominant cause of:
-  - 6.3 GB warm RAM on a 16 GB Apple Silicon machine
-  - 14 tok/s steady-state (3-4 s first-token latency)
-  - frequent ``memory_pressure`` degrade trips when Cursor + Chrome ran
-    alongside ATOM
+History:
+  - v3.3 (2026-04-24): swapped Qwen2.5-7B → Qwen3-4B-Instruct-2507-4bit
+    for JARVIS-grade responsiveness on the 16 GB Apple Silicon machines.
+  - Sprint Ω (2026-04-25): swapped Qwen3-4B → Qwen3-8B-4bit as the
+    primary brain on the M5 (10 GPU cores). The 4B is now the explicit
+    fallback (``brain.mlx_model_fallback``) for thermally constrained
+    or RAM-limited machines.
 
-Qwen3-4B-Instruct-2507-4bit lands at:
-  - 2.1 GB on disk (was 4.0 GB)
-  - ~2.4 GB warm RAM (was ~4.5 GB)
-  - higher steady-state tok/s with first-token < 1.5 s on the smoke run
-  - same single-model alias model: every role still resolves to one set
-    of weights, no extra memory for the 'fast' alias
-
-Pins:
-  1. Brain config points at the Qwen3-4B-Instruct-2507-4bit directory
-     via the single ``brain.mlx_model`` key.
-  2. ATOM is single-model: legacy ``mlx_primary_model`` /
-     ``mlx_fast_model`` / ``mlx_deep_model`` / ``mlx_default_role`` /
-     ``model_path`` keys are gone from the default settings.json but the
-     loader still accepts them for backwards compatibility.
-  3. MLXBrain tags every request with a role label (``primary`` |
-     ``fast``) for observability, but both resolve to the same weights
-     and the same in-memory tensors via the alias-on-first-use path.
-  4. The Qwen model directory exists on disk.
+Both Qwen3-8B-4bit and Qwen3-4B-Instruct-2507-4bit are accepted as the
+configured ``brain.mlx_model``; the loader transparently aliases the
+``fast`` role to the same weights as ``primary`` and pins the system
+prompt into the KV prefix on warmup.
 
 Live generation is exercised in ``scripts/smoke_metal_warmup.py`` (real
 MLX + real torch.mps + real cold-start) so this file stays fast and
@@ -40,11 +26,16 @@ import pytest
 
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-# Updated 2026-04-24 (v3.3): swapped 7B -> 4B for JARVIS-grade
-# responsiveness. Both names are kept here as constants because the
-# back-compat tests below have to reference the *current* on-disk model
-# directory (the legacy 7B dir is removed after the swap is verified).
-_QWEN_DIRNAME = "qwen3-4b-instruct-4bit"
+# Sprint Ω: 8B is the production primary on the M5; 4B remains a
+# supported fallback for thermal/RAM-constrained machines. Either is
+# acceptable as the configured brain.mlx_model.
+_QWEN_DIRNAMES = ("qwen3-8b-4bit", "qwen3-4b-instruct-4bit")
+_QWEN_DIRNAME = _QWEN_DIRNAMES[0]  # default for back-compat fixtures
+
+
+def _is_supported_qwen(model_path: str) -> bool:
+    needle = model_path.lower()
+    return any(name in needle for name in _QWEN_DIRNAMES)
 
 
 def _settings() -> dict:
@@ -57,12 +48,27 @@ def _settings() -> dict:
 # ─────────────────────────────────────────────────────────────────────
 
 
-def test_brain_mlx_model_is_qwen3_4b():
+def test_brain_mlx_model_is_supported_qwen3():
     cfg = _settings()
     model = cfg["brain"]["mlx_model"]
-    assert _QWEN_DIRNAME in model.lower(), (
-        f"Brain must load Qwen3-4B-Instruct-2507 via brain.mlx_model after "
-        f"the v3.3 lightweight rewrite. Got {model!r}"
+    assert _is_supported_qwen(model), (
+        f"Brain must load a supported Qwen3 variant ({_QWEN_DIRNAMES!r}). "
+        f"Sprint Ω promoted Qwen3-8B-4bit to primary; Qwen3-4B-Instruct-2507-4bit "
+        f"remains an accepted fallback. Got {model!r}."
+    )
+
+
+def test_brain_mlx_model_fallback_is_supported_qwen3():
+    """Sprint Ω introduced an explicit fallback brain for thermally
+    constrained machines. If present, it must also be a supported
+    Qwen3 variant -- not a mismatched legacy model."""
+    cfg = _settings()
+    fb = cfg.get("brain", {}).get("mlx_model_fallback")
+    if not fb:
+        pytest.skip("brain.mlx_model_fallback not configured (optional)")
+    assert _is_supported_qwen(fb), (
+        f"brain.mlx_model_fallback must be a supported Qwen3 variant. "
+        f"Got {fb!r}."
     )
 
 
@@ -88,34 +94,34 @@ def test_brain_legacy_keys_removed():
 def test_qwen_model_directory_exists():
     cfg = _settings()
     p = REPO_ROOT / cfg["brain"]["mlx_model"]
-    assert p.is_dir(), f"Qwen3-4B-Instruct model directory not found at {p}"
+    assert p.is_dir(), f"Qwen3 model directory not found at {p}"
     safetensors = list(p.glob("*.safetensors"))
     assert safetensors, f"No .safetensors weights found in {p}"
     assert (p / "tokenizer.json").exists(), f"Missing tokenizer.json in {p}"
     assert (p / "config.json").exists(), f"Missing config.json in {p}"
 
 
-def test_brain_watchdog_budgets_match_4b_class():
-    """v3.3: tighter watchdog/latency budgets for the 4B brain.
+def test_brain_watchdog_budgets_match_qwen3_class():
+    """Watchdog/latency budgets stay within the Qwen3 envelope.
 
-    The 7B's worst-case first-token was ~3-4 s, which forced a 28 s
-    LLM watchdog. The 4B replies in <1.5 s on the smoke and gets a
-    20 s brain timeout + 14 s LLM watchdog, which is what makes ATOM
-    feel snappier without false-positive recovery trips.
+    Sprint Ω's 8B sits between the 4B's <1.5 s first-token and the
+    legacy 7B's 3-4 s, so the brain timeout + LLM watchdog need to
+    accommodate the 8B's slightly heavier prefill while still staying
+    well below the 7B-era settings.
     """
     cfg = _settings()
-    assert cfg["brain"]["timeout_seconds"] <= 22, (
-        f"4B should not need the 7B's 28 s timeout; got "
+    assert cfg["brain"]["timeout_seconds"] <= 30, (
+        f"Qwen3 (4B or 8B) should not exceed a 30 s brain timeout; got "
         f"{cfg['brain']['timeout_seconds']}"
     )
     perf = cfg["performance"]
-    assert perf["watchdog_llm_timeout_s"] <= 16, (
-        f"watchdog_llm_timeout_s should tighten with the smaller brain; "
+    assert perf["watchdog_llm_timeout_s"] <= 20, (
+        f"watchdog_llm_timeout_s should stay well below 7B-era values; "
         f"got {perf['watchdog_llm_timeout_s']}"
     )
     lc = cfg["latency_controller"]
-    assert lc["quick_budget_ms"] <= 1100, (
-        f"quick_budget_ms should drop with the faster brain; got "
+    assert lc["quick_budget_ms"] <= 1500, (
+        f"quick_budget_ms should remain in the snappy range; got "
         f"{lc['quick_budget_ms']}"
     )
 
@@ -138,12 +144,11 @@ def test_mlx_brain_path_for_role_is_single_path():
 
     cfg = _settings()
     brain = MLXBrain(cfg)
-    # Every role -- including a historical "deep" label that callers
-    # might still pass -- must resolve to the same on-disk model path.
-    assert brain._path_for_role("primary").endswith(_QWEN_DIRNAME)
-    assert brain._path_for_role("fast").endswith(_QWEN_DIRNAME)
-    assert brain._path_for_role("deep").endswith(_QWEN_DIRNAME)
-    assert brain._path_for_role("nonsense").endswith(_QWEN_DIRNAME)
+    primary = brain._path_for_role("primary")
+    assert _is_supported_qwen(primary), primary
+    assert brain._path_for_role("fast") == primary
+    assert brain._path_for_role("deep") == primary
+    assert brain._path_for_role("nonsense") == primary
 
 
 def test_mlx_brain_single_model_path_attribute():
@@ -153,7 +158,7 @@ def test_mlx_brain_single_model_path_attribute():
     cfg = _settings()
     brain = MLXBrain(cfg)
     assert hasattr(brain, "_model_path")
-    assert _QWEN_DIRNAME in brain._model_path.lower()
+    assert _is_supported_qwen(brain._model_path)
     assert not hasattr(brain, "_fast_path"), (
         "single-model cleanup should have removed _fast_path"
     )
@@ -212,7 +217,7 @@ def test_mlx_brain_falls_back_to_default_when_all_keys_missing():
     from brain.mlx_llm import MLXBrain
 
     brain = MLXBrain({"brain": {}})
-    assert brain._model_path.endswith(_QWEN_DIRNAME)
+    assert _is_supported_qwen(brain._model_path), brain._model_path
 
 
 # ─────────────────────────────────────────────────────────────────────

@@ -17,14 +17,33 @@ import sys
 import time
 from pathlib import Path
 
-from core.security_policy import SecurityPolicy
+from core.security_policy import SecurityPolicy, get_global_policy
 
 logger = logging.getLogger("atom.router.app")
 
 _apps_cache_text: str | None = None
 _apps_cache_ts: float = 0.0
 
-_policy = SecurityPolicy()
+# Sprint Ω.1: lazy proxy so we don't construct a second SecurityPolicy
+# at module-load time. The first call routes through ``get_global_policy``
+# which returns the canonical instance set up in ``main.py``.
+
+
+class _PolicyProxy:
+    """Forward attribute access to the canonical SecurityPolicy.
+
+    Created at import time, but the underlying ``SecurityPolicy`` is
+    fetched lazily on first ``__getattr__`` call so we don't trigger
+    the duplicate "SecurityPolicy init" log line during boot.
+    """
+
+    __slots__ = ()
+
+    def __getattr__(self, item: str):  # type: ignore[override]
+        return getattr(get_global_policy(), item)
+
+
+_policy: SecurityPolicy = _PolicyProxy()  # type: ignore[assignment]
 
 
 _IS_MACOS = sys.platform == "darwin"

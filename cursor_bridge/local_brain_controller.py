@@ -1248,7 +1248,16 @@ class LocalBrainController:
                 logger.info("Local brain thermal clamp failed", exc_info=True)
 
     def set_action_executor(self, executor: "ActionExecutor") -> None:
-        """Inject the ActionExecutor after Router initialization."""
+        """Inject the ActionExecutor after Router initialization.
+
+        Idempotent: re-injecting the same executor is a no-op and does
+        not re-log. ``main.py`` legitimately calls this twice -- once
+        right after the controller is built and once after the tool
+        registry is populated -- but the second call passes the same
+        instance, so we only log on the first attach.
+        """
+        if self._action_executor is executor:
+            return
         self._action_executor = executor
         logger.info("Action executor connected to brain controller")
 

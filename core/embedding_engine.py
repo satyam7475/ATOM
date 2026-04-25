@@ -157,12 +157,41 @@ class EmbeddingEngine:
             if self._loaded:
                 return True
             try:
+                # Sprint Ω.1: silence the two cosmetic boot-log
+                # leaks that come out of the HF / sentence-transformers
+                # stack the first time we touch them:
+                #   1) "Warning: You are sending unauthenticated requests
+                #      to the HF Hub..." — printed *and* logged. We
+                #      re-inject HF_TOKEN from the in-process secret
+                #      snapshot if the secret-scrub blanked it, then
+                #      cap the noisy logger to ERROR.
+                #   2) "BertModel LOAD REPORT ... embeddings.position_ids
+                #      | UNEXPECTED" — a raw print() from
+                #      sentence-transformers' MiniLM loader. We capture
+                #      stdout + stderr during the actual load and replay
+                #      only meaningful lines through the logger.
+                self._silence_hf_boot_noise()
+
                 from sentence_transformers import SentenceTransformer
+                from contextlib import redirect_stdout, redirect_stderr
+                from io import StringIO
+
                 t0 = time.monotonic()
-                self._model = SentenceTransformer(
-                    self._model_name,
-                    device=self._device,
-                )
+                buf_out, buf_err = StringIO(), StringIO()
+                with redirect_stdout(buf_out), redirect_stderr(buf_err):
+                    self._model = SentenceTransformer(
+                        self._model_name,
+                        device=self._device,
+                    )
+                captured = (buf_out.getvalue() + buf_err.getvalue()).strip()
+                if captured:
+                    for line in captured.splitlines():
+                        ln = line.strip()
+                        if not ln or ln.startswith(("Key", "----", "Notes")):
+                            continue
+                        if "UNEXPECTED" in ln or "MISSING" in ln:
+                            logger.debug("HF loader: %s", ln)
+
                 self._dimension = (
                     self._model.get_embedding_dimension()
                     if hasattr(self._model, "get_embedding_dimension")
@@ -189,6 +218,38 @@ class EmbeddingEngine:
                 logger.exception("Failed to load embedding model")
                 self._load_failed = True
                 return False
+
+    @staticmethod
+    def _silence_hf_boot_noise() -> None:
+        """Suppress huggingface_hub anonymous-request boot warning.
+
+        Three layers, all idempotent:
+          1. Re-inject ``HF_TOKEN`` from the secret-scrub in-process
+             snapshot if the user actually had one set. This is the
+             *correct* fix because subsequent HF downloads then run
+             authenticated and faster.
+          2. Quiet the ``huggingface_hub.utils._http`` logger to ERROR
+             so the warning stops flooding the boot log on every
+             SentenceTransformer load.
+          3. Set ``HF_HUB_DISABLE_TELEMETRY=1`` so the hub stops
+             phoning home about model usage from a personal AI OS.
+        """
+        try:
+            from core.security_secret_scrub import get_secret_snapshot
+            snap = get_secret_snapshot()
+            for name in ("HF_TOKEN", "HUGGINGFACE_TOKEN", "HUGGING_FACE_HUB_TOKEN"):
+                if not os.environ.get(name) and snap.get(name):
+                    os.environ[name] = snap[name]
+                    break
+        except Exception:
+            logger.debug("HF token re-inject skipped", exc_info=True)
+
+        os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
+        try:
+            logging.getLogger("huggingface_hub.utils._http").setLevel(logging.ERROR)
+            logging.getLogger("huggingface_hub").setLevel(logging.WARNING)
+        except Exception:
+            pass
 
     def _cache_put(self, text: str, vec: list[float]) -> None:
         if text in self._cache:

@@ -38,6 +38,36 @@ _FALLBACK_MAX_PER_COLLECTION = 2000
 _FALLBACK_PERSIST_CAP = 500
 _STATS_CACHE_TTL_S = 30.0
 
+# Sprint Ω.1: shared-instance registry. Three subsystems
+# (memory_engine, second_brain, document_ingestion) each used to
+# instantiate their own ``VectorStore`` against the same on-disk
+# ChromaDB path, producing three "Vector store initialized" log lines
+# and three independent ChromaDB clients pointing at the same data
+# directory. ChromaDB's PersistentClient is process-safe, but having
+# three of them wastes ~80-120 MB resident memory and triples the
+# heartbeat/telemetry threads.
+#
+# ``get_shared_vector_store(config)`` keys on the resolved storage
+# path so different paths (e.g. tests) still get distinct instances.
+
+_SHARED_INSTANCES: "dict[str, VectorStore]" = {}
+
+
+def get_shared_vector_store(config: dict | None = None) -> "VectorStore":
+    """Return a shared VectorStore for the given config's storage path.
+
+    Subsequent callers with the same ``vector_store.path`` get the
+    exact same instance, eliminating duplicate ChromaDB clients.
+    """
+    cfg = (config or {}).get("vector_store", {})
+    path_key = str(Path(cfg.get("path", str(_STORE_DIR))).resolve())
+    cached = _SHARED_INSTANCES.get(path_key)
+    if cached is not None:
+        return cached
+    inst = VectorStore(config)
+    _SHARED_INSTANCES[path_key] = inst
+    return inst
+
 
 class VectorSearchResult:
     """Single search result from vector store."""

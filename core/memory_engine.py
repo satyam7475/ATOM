@@ -170,9 +170,9 @@ class MemoryEngine:
         self._batch_writer = None
         try:
             from core.embedding_engine import get_embedding_engine
-            from core.vector_store import VectorStore
+            from core.vector_store import get_shared_vector_store
             self._embedding_engine = get_embedding_engine(self._config)
-            self._vector_store = VectorStore(self._config)
+            self._vector_store = get_shared_vector_store(self._config)
             self._vectors_ready = True
             logger.info("Memory engine: semantic vectors enabled")
         except Exception:

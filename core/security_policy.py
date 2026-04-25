@@ -224,6 +224,52 @@ _RATE_LIMIT_WINDOW_S = 5.0
 _RATE_LIMIT_MAX_ACTIONS = 10
 
 
+# ── Global policy registry (Sprint Ω.1) ───────────────────────────────
+# Module-level helpers (``core.router.app_actions``, ``core.desktop_control``)
+# used to instantiate their own zero-config ``SecurityPolicy()`` at import
+# time. That produced THREE separate policies in memory, two of which were
+# completely uncoupled from settings.json (no ``mode``/``rate_limit`` from
+# the user). It also flooded the boot log with duplicate "SecurityPolicy
+# init" lines and caused subtle policy divergence between the Router gate
+# and the helper modules.
+#
+# ``set_global_policy()`` is called once during boot from ``main.py``
+# right after the canonical ``security = SecurityPolicy(config)`` line.
+# Helpers should call ``get_global_policy()`` lazily inside the function
+# body (NOT at module import time) so they always see the canonical
+# policy if boot has happened, and only fall back to a zero-config
+# instance during unit tests / scripts that import the helpers directly.
+
+_GLOBAL_POLICY: "SecurityPolicy | None" = None
+
+
+def set_global_policy(policy: "SecurityPolicy") -> None:
+    """Register the canonical SecurityPolicy created at boot.
+
+    Module-level helpers (app_actions, desktop_control) will adopt this
+    instance instead of building their own. Idempotent and no-ops if
+    ``policy`` is already registered.
+    """
+    global _GLOBAL_POLICY
+    if _GLOBAL_POLICY is policy:
+        return
+    _GLOBAL_POLICY = policy
+
+
+def get_global_policy() -> "SecurityPolicy":
+    """Return the canonical SecurityPolicy.
+
+    Falls back to a fresh zero-config instance the first time it's
+    called before ``set_global_policy()`` has run -- this preserves
+    backwards compatibility for tests and CLI scripts that exercise
+    helpers without booting the full app.
+    """
+    global _GLOBAL_POLICY
+    if _GLOBAL_POLICY is None:
+        _GLOBAL_POLICY = SecurityPolicy()
+    return _GLOBAL_POLICY
+
+
 class SecurityPolicy:
     """The single security gate for ATOM OS.
 

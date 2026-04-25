@@ -127,9 +127,21 @@ def reset_for_tests() -> None:
     _snapshot = {}
 
 
+def get_secret_snapshot() -> dict[str, str]:
+    """Return a copy of the in-process secret snapshot taken at scrub time.
+
+    Subsystems that legitimately need a token (e.g. ``huggingface_hub``
+    making authenticated downloads) can re-inject the secret into env
+    just-in-time without ever exposing it in ``os.environ`` long-term.
+    Returns an empty dict if the scrub hasn't run yet.
+    """
+    return dict(_snapshot)
+
+
 __all__ = [
     "scrub_sensitive_env",
     "snapshot_sensitive_env",
     "sensitive_env_vars",
+    "get_secret_snapshot",
     "reset_for_tests",
 ]

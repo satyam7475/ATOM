@@ -92,7 +92,16 @@ def setup_logging(level: int = logging.INFO) -> None:
 
     # Silence noisy third-party loggers
     for noisy in (
-        "httpx", "httpcore", "huggingface_hub", "huggingface_hub.utils._http",
+        "httpx", "httpcore", "huggingface_hub",
         "sentence_transformers", "urllib3", "filelock",
     ):
         logging.getLogger(noisy).setLevel(logging.WARNING)
+    # Sprint Ω.1: ``huggingface_hub.utils._http`` emits a WARNING on
+    # every anonymous request ("set HF_TOKEN to enable higher rate
+    # limits"). It floods the boot log every time a model is loaded
+    # via SentenceTransformer / mlx-vlm. The actual download still
+    # works fine without a token; we re-inject HF_TOKEN at use-time
+    # in core/embedding_engine.py if the secret-scrub snapshot has
+    # one. Cap this specific logger to ERROR so the "informational"
+    # warning stays out of the timeline.
+    logging.getLogger("huggingface_hub.utils._http").setLevel(logging.ERROR)

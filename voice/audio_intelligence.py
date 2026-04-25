@@ -578,7 +578,7 @@ class DeviceMemory:
 class VoicePresenceTracker:
     """Tracks speech density to classify conversation vs ambient mode."""
 
-    __slots__ = ("_bus", "_event_times", "_mode", "_last_event", "_window_s")
+    __slots__ = ("_bus", "_event_times", "_mode", "_last_event", "_window_s", "_wired")
 
     def __init__(self, bus: Any, *, window_s: float = 60.0) -> None:
         self._bus = bus
@@ -586,10 +586,14 @@ class VoicePresenceTracker:
         self._mode: str = "ambient"
         self._last_event: float = 0.0
         self._window_s = window_s
+        self._wired = False
 
     def wire(self) -> None:
+        if self._wired:
+            return
         self._bus.on("speech_partial", self._on_speech)
         self._bus.on("speech_final", self._on_speech)
+        self._wired = True
 
     async def _on_speech(self, *_a: Any, **_kw: Any) -> None:
         now = time.monotonic()
@@ -688,7 +692,13 @@ class AudioIntelligenceEngine:
         self._boot_time_ms: float = 0.0
         self._context_policy = _ContextPolicy()
         self._device_memory = DeviceMemory()
-        self._voice_presence: VoicePresenceTracker | None = None
+        # Sprint Ω.1: instantiate eagerly so the boot-time
+        # diagnostic_report() doesn't print "Voice presence: not wired".
+        # The tracker is a passive bus subscriber, so wiring it before
+        # device discovery is zero-cost. wire_context() (called later
+        # from voice_pipeline.start()) is now idempotent and only
+        # subscribes to the bus the first time.
+        self._voice_presence: VoicePresenceTracker | None = VoicePresenceTracker(self._bus)
         self._last_switch_time: float = 0.0
         self._stt_restart_times: deque[float] = deque(maxlen=10)
         self._switch_cooldown_s: float = 8.0
@@ -714,7 +724,8 @@ class AudioIntelligenceEngine:
         self._bus.on("speech_final", self._on_speech_final)
         self._bus.on("audio_device_switched", self._on_device_switched)
 
-        self._voice_presence = VoicePresenceTracker(self._bus)
+        if self._voice_presence is None:
+            self._voice_presence = VoicePresenceTracker(self._bus)
         self._voice_presence.wire()
         logger.info("Audio intelligence context wired")
 
