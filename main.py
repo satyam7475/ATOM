@@ -61,12 +61,14 @@ from pathlib import Path
 # avoids a class of fork-after-exec deadlocks on macOS.
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
-from core.boot.config_loader import load_config, set_config_overrides
+from core.boot.config_loader import set_config_overrides
 from core.boot.boot_timeline import (
     mark_boot_start as _bt_start,
     mark as _bt_mark,
     log_summary as _bt_log_summary,
 )
+from core.boot.event_loop import install_fast_event_loop
+from core.boot.startup import prepare_startup
 
 
 logger = logging.getLogger("atom.main")
@@ -91,50 +93,10 @@ async def main() -> None:
     runtime_watchdog = None
     priority_sched = None
 
-    config = load_config()
-
-    from core.config_schema import validate_and_log
-    if not validate_and_log(config):
-        logger.error("Invalid configuration — fix config/settings.json and restart.")
-        sys.exit(1)
-
-    from core.owner_gate import configure as _configure_owner_gate, owner_display_name
-    _configure_owner_gate(config)
-    try:
-        from core.identity.session_manager import configure as _configure_sessions
-        _configure_sessions(config)
-    except Exception:
-        logger.debug("Session manager configure skipped or failed", exc_info=True)
-    logger.info(
-        "ATOM owner binding: %s — access control via core/owner_gate.py",
-        owner_display_name(),
-    )
-    try:
-        # Security: ATOM has already loaded the dashboard token into the
-        # owner gate's in-memory state; everything else (HF_TOKEN, OPENAI_API_KEY,
-        # GEMINI_API_KEY, ...) gets snapshotted by the secret scrub and blanked
-        # in ``os.environ`` so child processes / crash dumps don't leak them.
-        from core.security_secret_scrub import scrub_sensitive_env
-
-        _secret_snapshot = scrub_sensitive_env(preserve=("ATOM_DASHBOARD_TOKEN",))
-    except Exception:
-        _secret_snapshot = {}
-        logger.debug("Secret scrub skipped or failed", exc_info=True)
-
-    from core.deployment_profile import (
-        deployment_dashboard_badge,
-        log_deployment_bootstrap,
-    )
-    log_deployment_bootstrap(config)
-
-    from core.adaptive_personality import set_owner as _set_owner
-    owner_cfg = config.get("owner", {})
-    _set_owner(
-        name=owner_cfg.get("name", "Satyam"),
-        title=owner_cfg.get("title", "Boss"),
-    )
-    # NOTE: _set_adaptive_owner was removed — set_owner() above is the
-    # correct and only API in adaptive_personality for setting owner info.
+    bootstrap = prepare_startup()
+    config = bootstrap.config
+    _secret_snapshot = bootstrap.secret_snapshot
+    deployment_dashboard_badge = bootstrap.deployment_dashboard_badge
 
     executor = ThreadPoolExecutor(
         max_workers=config.get("executor", {}).get("max_workers", 3),
@@ -4069,6 +4031,8 @@ def run_atom(config_overrides: dict | None = None) -> None:
         )
         set_config_overrides({})
         sys.exit(2)
+
+    install_fast_event_loop()
 
     MAX_RETRIES = 5
     MAX_BACKOFF_S = 30.0

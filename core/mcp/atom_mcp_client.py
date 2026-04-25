@@ -36,12 +36,13 @@ Owner: Satyam
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 from contextlib import AsyncExitStack
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
+
+from core import json_fast
 
 logger = logging.getLogger("atom.mcp.client")
 
@@ -101,7 +102,7 @@ def load_mcp_servers_from_config(
         logger.info("MCP server config %s missing -- no external MCP servers", p)
         return []
     try:
-        raw = json.loads(p.read_text())
+        raw = json_fast.loads(p.read_text(encoding="utf-8"))
     except Exception as exc:
         logger.warning("Failed to parse MCP server config %s: %s", p, exc)
         return []

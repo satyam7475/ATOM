@@ -23,12 +23,13 @@ Contract: CognitiveModuleContract (start, stop, persist)
 
 from __future__ import annotations
 
-import json
 import logging
 import time
 import uuid
 from pathlib import Path
 from typing import Any
+
+from core import json_fast
 
 logger = logging.getLogger("atom.vector_store")
 
@@ -93,7 +94,7 @@ class VectorStore:
     __slots__ = (
         "_backend", "_store_dir", "_client", "_collections", "_using_chromadb",
         "_fallback_data", "_fallback_dirty",
-        "_stats_cache", "_stats_cache_ts",
+        "_stats_cache", "_stats_cache_ts", "_embedding_meta",
     )
 
     def __init__(self, config: dict | None = None) -> None:
@@ -107,7 +108,32 @@ class VectorStore:
         self._fallback_dirty: bool = False
         self._stats_cache: dict[str, int] | None = None
         self._stats_cache_ts: float = 0.0
+        self._embedding_meta = self._build_embedding_meta(config or {})
         self._init_store()
+
+    @staticmethod
+    def _build_embedding_meta(config: dict) -> dict[str, Any]:
+        cfg = config.get("embedding", {}) if isinstance(config, dict) else {}
+        if not isinstance(cfg, dict):
+            cfg = {}
+        backend = str(cfg.get("backend") or cfg.get("runtime") or "sentence_transformers")
+        model = str(cfg.get("model") or "all-MiniLM-L6-v2")
+        dim = int(cfg.get("dimension") or 384)
+        version = str(cfg.get("provider_version") or "1")
+        signature = f"{backend}:{model}:{dim}:{version}"
+        return {
+            "_embedding_provider": backend,
+            "_embedding_model": model,
+            "_embedding_dim": dim,
+            "_embedding_provider_version": version,
+            "_embedding_signature": signature,
+        }
+
+    def _merge_embedding_meta(self, metadata: dict[str, Any]) -> dict[str, Any]:
+        meta = dict(metadata or {})
+        for key, value in self._embedding_meta.items():
+            meta.setdefault(key, value)
+        return meta
 
     def _init_store(self) -> None:
         try:
@@ -146,7 +172,7 @@ class VectorStore:
             self._fallback_data[name] = []
         if _FALLBACK_FILE.exists():
             try:
-                data = json.loads(_FALLBACK_FILE.read_text(encoding="utf-8"))
+                data = json_fast.loads(_FALLBACK_FILE.read_text(encoding="utf-8"))
                 for name in self._COLLECTIONS:
                     self._fallback_data[name] = data.get(name, [])
                 logger.info("Fallback vector store loaded from disk")
@@ -166,7 +192,7 @@ class VectorStore:
     ) -> str:
         """Add a document to a collection with its embedding."""
         doc_id = doc_id or uuid.uuid4().hex[:12]
-        meta = dict(metadata or {})
+        meta = self._merge_embedding_meta(metadata or {})
         meta["timestamp"] = time.time()
         meta["text_preview"] = text[:200]
 
@@ -217,7 +243,9 @@ class VectorStore:
         now = time.time()
         metas = []
         for i in range(n):
-            m = dict((metadatas[i] if metadatas and i < len(metadatas) else {}))
+            m = self._merge_embedding_meta(
+                dict((metadatas[i] if metadatas and i < len(metadatas) else {})),
+            )
             m["timestamp"] = now
             m["text_preview"] = texts[i][:200]
             metas.append(m)
@@ -446,7 +474,7 @@ class VectorStore:
                 for name, entries in self._fallback_data.items():
                     serializable[name] = entries[-_FALLBACK_PERSIST_CAP:]
                 _FALLBACK_FILE.write_text(
-                    json.dumps(serializable, separators=(",", ":")),
+                    json_fast.dumps(serializable, separators=(",", ":")),
                     encoding="utf-8",
                 )
                 self._fallback_dirty = False

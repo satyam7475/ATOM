@@ -154,11 +154,16 @@ class RagEngine:
         self._skip_embed_util = float(self._rag_cfg.get("skip_embed_gpu_util_above", 88))
         self._batch_min = int(self._rag_cfg.get("batch_embed_min", 2))
         self._fast_mode = bool(self._rag_cfg.get("fast_mode", False))
+        self._embed = get_embedding_engine(self._config)
+        embed_signature = str(
+            getattr(self._embed, "provider_signature", "default") or "default",
+        )
         self._disk_cache: PersistentEmbeddingCache | None = None
         if bool(self._rag_cfg.get("persistent_embed_cache", True)):
             try:
                 self._disk_cache = PersistentEmbeddingCache(
                     path=self._rag_cfg.get("embed_cache_path", "data/rag_embedding_cache.sqlite"),
+                    namespace=embed_signature,
                 )
             except Exception:
                 self._disk_cache = None
@@ -172,7 +177,6 @@ class RagEngine:
 
         self._vector_store = vector_store
         self._coord = coordinator
-        self._embed = get_embedding_engine(self._config)
         self._memory_graph: Any = None
         self._feedback: Any = None
         self._skip_graph_first_once: bool = False

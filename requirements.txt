@@ -34,6 +34,10 @@ jsonschema==4.26.0
 # Web dashboard
 aiohttp==3.13.3
 
+# Fast event loop + JSON for hot async/control-plane paths
+uvloop>=0.22.0; platform_system != "Windows"
+orjson>=3.11.0
+
 # Desktop capture (screenshot for Vision OCR)
 Pillow==12.1.1
 
@@ -65,6 +69,7 @@ mlx-vlm>=0.1.20
 # Embedding engine for semantic search (~260MB model)
 # Note: embedding_engine.py now detects MPS (Apple Silicon GPU) automatically
 sentence-transformers>=3.0.0
+fastembed>=0.7.0
 
 # Persistent vector database (falls back to in-memory JSON if not installed)
 chromadb>=0.5.0
