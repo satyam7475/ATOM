@@ -785,7 +785,7 @@ class Router:
             if self._runtime_watchdog is not None:
                 from core.intent_engine import IntentResult
 
-                classify_result = await self._runtime_watchdog.run_sync(
+                classify_result = self._runtime_watchdog.run_inline(
                     "intent_engine",
                     self._intent.classify,
                     clean_text,
@@ -837,7 +837,7 @@ class Router:
                     if self._runtime_watchdog is not None:
                         from core.intent_engine import IntentResult
 
-                        classify_result = await self._runtime_watchdog.run_sync(
+                        classify_result = self._runtime_watchdog.run_inline(
                             "intent_engine",
                             self._intent.classify,
                             clean_text,
@@ -1523,6 +1523,63 @@ class Router:
         )
         return f"Through {cam_name}: {caption} {timing}"
 
+    def _do_screen_describe(self, _action: str, args: dict) -> str:
+        """Native screen-describe path (Sprint C2).
+
+        Bypasses the LLM for "what's on my screen" / "describe my
+        screen" / "what am I doing" -- captures the active display via
+        ``core.perception.screen_reader.ScreenReader``, prefers the
+        cloud Vision client when available, and falls back to the
+        on-device VLM captioner. Returns a short spoken-friendly
+        sentence; never returns a stack trace or the legacy
+        "Gemini Client offline" string.
+        """
+        try:
+            from core.perception.screen_reader import ScreenReader
+        except Exception as exc:  # pragma: no cover -- missing deps
+            logger.warning("screen_describe: import failed: %s", exc)
+            return "Screen reader isn't available right now, Boss."
+
+        gemini = getattr(self, "_gemini_client", None)
+        if gemini is not None and not getattr(gemini, "is_available", False):
+            gemini = None
+
+        captioner = None
+        engine = self._vision_engine
+        if engine is not None:
+            captioner = getattr(engine, "_captioner", None) or getattr(
+                engine, "captioner", None,
+            )
+
+        reader = ScreenReader(gemini_client=gemini, vlm_captioner=captioner)
+        query = str(args.get("query") or args.get("question") or "").strip()
+        if not query:
+            query = (
+                "Describe the active screen for the user in one short sentence."
+            )
+
+        async def _run() -> str:
+            return await reader.analyze_screen(query)
+
+        try:
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                loop = None
+            if loop is not None and loop.is_running():
+                future = asyncio.run_coroutine_threadsafe(_run(), loop)
+                caption = future.result(timeout=15.0)
+            else:
+                caption = asyncio.run(_run())
+        except Exception as exc:
+            logger.warning("screen_describe failed: %s", exc, exc_info=True)
+            return "Screen describe failed, Boss — see logs for details."
+
+        text = (caption or "").strip()
+        if not text:
+            return "I can see the screen, Boss, but I couldn't summarise it."
+        return text
+
     def _do_set_brightness(self, _action: str, args: dict) -> str:
         actual = system_actions.set_brightness(args.get("percent"), args.get("delta"))
         return personality.action_done("set_brightness", str(actual))
@@ -2045,6 +2102,7 @@ class Router:
         "screenshot": _do_screenshot,
         "vision_look": _do_vision_look,
         "vision_describe": _do_vision_describe,
+        "screen_describe": _do_screen_describe,
         "set_brightness": _do_set_brightness,
         "shutdown_pc": _do_shutdown_pc,
         "restart_pc": _do_restart_pc,

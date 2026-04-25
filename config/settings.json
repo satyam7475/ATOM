@@ -200,7 +200,10 @@
         "prompt_cache_max_mb": 320,
         "prompt_cache_persist": true,
         "prompt_cache_persist_path": "data/prompt_cache_v33.safetensors",
-        "prompt_cache_persist_min_tokens": 256
+        "prompt_cache_persist_min_tokens": 256,
+        "kv_bits": 8,
+        "kv_group_size": 64,
+        "kv_quant_warmup_tokens": 512
     },
     "assistant_brain": {
         "active_profile": "optimal",

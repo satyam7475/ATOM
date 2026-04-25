@@ -42,6 +42,20 @@ if TYPE_CHECKING:
 logger = logging.getLogger("atom.command_loop")
 
 
+def _swallow_ack_exception(task: asyncio.Task[Any]) -> None:
+    """Done-callback for the C3 fire-and-forget ack task.
+
+    Drains the exception so Python's "Task exception was never
+    retrieved" warning does not pollute the logs whenever TTS
+    glitches mid-ack. The ack is best-effort UX, never load-bearing.
+    """
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc is not None:
+        logger.debug("ack overlap task raised: %s", exc, exc_info=exc)
+
+
 class CommandLoop:
     """Deterministic single-command controller wrapping the Router."""
 
@@ -55,6 +69,8 @@ class CommandLoop:
         "_suggestion_engine",
         "_pending_turn", "_last_response_text",
         "_turn_attached", "_turn_complete_count",
+        # Sprint C3: parallel ack-TTS overlap
+        "_tts", "_ack_task", "_ack_overlap_count",
     )
 
     def __init__(
@@ -86,6 +102,17 @@ class CommandLoop:
         self._last_response_text: str = ""
         self._turn_attached: bool = False
         self._turn_complete_count: int = 0
+        # Sprint C3: parallel ack-TTS overlap. ``_tts`` is wired by
+        # ``main.py`` after the TTS engine boots; when present we spawn
+        # ``speak_ack`` directly (instead of going through the bus) so
+        # the LLM call kicks off on the very next event-loop tick
+        # instead of waiting for the bus consumer to dequeue the
+        # ``voice_ack`` event. Saves ~50-200 ms of dispatch latency
+        # on each turn (atomLogs.txt L343/394/511 -- "Perceived
+        # latency 3.0-3.6s on simple turns").
+        self._tts: Any = None
+        self._ack_task: asyncio.Task[None] | None = None
+        self._ack_overlap_count: int = 0
 
     def attach_system_state(self, engine: Any) -> None:
         self._system_state_engine = engine
@@ -104,6 +131,26 @@ class CommandLoop:
 
     def attach_suggestion_engine(self, engine: Any) -> None:
         self._suggestion_engine = engine
+
+    def attach_tts(self, tts: Any) -> None:
+        """Wire the TTS engine for direct ack-overlap (Sprint C3).
+
+        When provided, ``submit()`` spawns ``tts.speak_ack`` as a
+        fire-and-forget task *before* awaiting any later stage so the
+        ack and the LLM call run in parallel. The bus event is still
+        emitted for indicator / dashboard subscribers.
+
+        ``tts`` may be ``None`` to detach (used by tests and for
+        graceful TTS-disabled fallback). The method is a no-op when
+        the supplied object lacks ``speak_ack``.
+        """
+        if tts is not None and not hasattr(tts, "speak_ack"):
+            logger.debug(
+                "attach_tts: object %r lacks speak_ack; ignored",
+                type(tts).__name__,
+            )
+            return
+        self._tts = tts
 
     def attach_turn_emitter(self) -> None:
         """Subscribe to bus events that drive ``turn_complete``.
@@ -187,14 +234,46 @@ class CommandLoop:
             )
 
             # ── Instant acknowledgement (sub-100ms) ──────────────────
+            # Sprint C3: parallel TTS-ack overlap. We launch the ack
+            # speak as a fire-and-forget task *before* the LLM/router
+            # call so the audio rolls while the brain prefills. The
+            # bus event still fires for indicator subscribers.
             budget.start_stage("ack")
+            self._ack_task = None
             if self._ack_engine is not None:
                 is_follow = False
                 if self._session_memory is not None:
                     is_follow = self._session_memory.is_follow_up(text)
                 ack_text = self._ack_engine.get_ack(text, is_follow_up=is_follow)
                 if ack_text:
-                    self._bus.emit_fast("voice_ack", text=ack_text)
+                    spoken_inline = False
+                    if self._tts is not None:
+                        try:
+                            self._ack_task = asyncio.create_task(
+                                self._tts.speak_ack(ack_text),
+                                name=f"ack_overlap_{trace_id}",
+                            )
+                            self._ack_task.add_done_callback(
+                                _swallow_ack_exception,
+                            )
+                            self._ack_overlap_count += 1
+                            spoken_inline = True
+                        except Exception:
+                            logger.debug(
+                                "[%s] ack overlap task spawn failed",
+                                trace_id, exc_info=True,
+                            )
+                            self._ack_task = None
+                    # Always emit the bus event so dashboard /
+                    # indicator subscribers see the ack. The
+                    # ``spoken_inline`` flag tells ``on_voice_ack``
+                    # in wiring.py NOT to double-speak when we already
+                    # spawned the ack task directly.
+                    self._bus.emit_fast(
+                        "voice_ack",
+                        text=ack_text,
+                        spoken_inline=spoken_inline,
+                    )
             budget.end_stage("ack")
 
             from core.state_manager import AtomState

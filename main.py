@@ -47,6 +47,7 @@ import time
 from datetime import datetime
 import psutil
 from concurrent.futures import ThreadPoolExecutor
+from functools import partial
 from pathlib import Path
 
 # Hugging Face tokenizers fork a worker pool the first time they're
@@ -1839,6 +1840,60 @@ async def main() -> None:
         cold_start_report.cached_commands,
     )
 
+    # ── Sprint C1 — pin the runtime persona as a stable KV prefix ──
+    # The atomLogs.txt audit (L336/392/509) showed prompt-cache reuse
+    # stuck at 67-75% because the ~600-token persona block was being
+    # prefilled cold most turns. We now run a one-shot prefill right
+    # after the FAST model finishes warming so the trie holds the
+    # persona-prefix KV state. Subsequent turns find it as the longest
+    # matching prefix, which collapses first-token latency on every
+    # FAST reply. The pin auto-refreshes when Boss edits
+    # ``config/atom_persona.md`` (mtime-watched in repin_persona_if_changed).
+    if (
+        brain_enabled
+        and local_brain is not None
+        and cold_start_report.fast_model_ready
+    ):
+        try:
+            mlx_brain_for_pin = getattr(local_brain, "_llm", None)
+            persona_cfg = (config.get("personality") or {})
+            persona_path_str = (
+                persona_cfg.get("persona_file")
+                or "config/atom_persona.md"
+            )
+            persona_path = Path(persona_path_str).expanduser()
+            if (
+                mlx_brain_for_pin is not None
+                and hasattr(mlx_brain_for_pin, "pin_prompt_prefix")
+                and persona_path.exists()
+            ):
+                persona_text = persona_path.read_text(encoding="utf-8")
+                if persona_text.strip():
+                    pin_result = await asyncio.get_running_loop().run_in_executor(
+                        None,
+                        partial(
+                            mlx_brain_for_pin.pin_prompt_prefix,
+                            persona_text,
+                            model_role="fast",
+                            source_path=str(persona_path),
+                        ),
+                    )
+                    if pin_result and pin_result.get("ok"):
+                        logger.info(
+                            "Persona pinned to KV prefix: %d tokens, %.0fms "
+                            "(source=%s)",
+                            int(pin_result.get("tokens", 0)),
+                            float(pin_result.get("elapsed_ms", 0.0)),
+                            persona_path.name,
+                        )
+                    else:
+                        logger.info(
+                            "Persona pin skipped: %s",
+                            (pin_result or {}).get("reason", "unknown"),
+                        )
+        except Exception:
+            logger.debug("persona KV pin failed", exc_info=True)
+
     _obs_v7 = (config.get("v7_intelligence") or {}).get("observability") or {}
     _snap_iv = float(_obs_v7.get("debug_snapshot_interval_s", 120.0))
     if _snap_iv > 0 and brain_enabled:
@@ -2084,6 +2139,15 @@ async def main() -> None:
     )
     command_loop.attach_ack_engine(ack_engine)
     command_loop.attach_pipeline_metrics(pipeline_metrics)
+    # Sprint C3: hand the TTS engine to CommandLoop so the ack
+    # ``speak_ack`` task is spawned directly from ``submit()`` --
+    # bypasses the bus dispatch step and lets the LLM call kick off
+    # immediately instead of waiting for ``on_voice_ack`` to drain.
+    if tts is not None:
+        try:
+            command_loop.attach_tts(tts)
+        except Exception:
+            logger.debug("attach_tts on CommandLoop failed", exc_info=True)
 
     # ── Wire context layer (system state + session + user memory) into Router
     router.attach_context_layer(

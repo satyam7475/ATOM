@@ -795,6 +795,23 @@ CONFIG_SCHEMA: dict[str, Any] = {
                     "maximum": 8192,
                     "description": "Don't persist cache snapshots smaller than this — saves disk on degenerate first turns.",
                 },
+                "kv_bits": {
+                    "type": "integer",
+                    "enum": [0, 4, 8],
+                    "description": "Sprint C5: KV cache quantisation bits (mlx-lm 0.22+). 0 disables; 8 halves KV memory and frees ~10-15% throughput on long prompts; 4 is even tighter but quality drops on the FAST role.",
+                },
+                "kv_group_size": {
+                    "type": "integer",
+                    "minimum": 16,
+                    "maximum": 256,
+                    "description": "KV quant group size (mlx-lm default 64). Smaller = better quality, larger = faster.",
+                },
+                "kv_quant_warmup_tokens": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 8192,
+                    "description": "Tokens to keep at full precision before switching to quantised KV cache. Higher = better quality on the first sentence; lower = bigger memory savings sooner.",
+                },
             },
             "additionalProperties": False,
         },

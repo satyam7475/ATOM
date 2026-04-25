@@ -311,6 +311,34 @@ class ToolRegistry:
                     "read the page in front of the camera",
                 ],
             ),
+            Tool(
+                "screen_describe",
+                (
+                    "Capture the active display and describe it in a single "
+                    "spoken-friendly sentence. Prefers the cloud Vision "
+                    "client (Gemini) when configured, falls back to the "
+                    "on-device SmolVLM captioner so the user always gets a "
+                    "real description -- never a 'Gemini offline' string. "
+                    "Use for 'describe my screen', 'what am I doing', "
+                    "'analyze my screen', 'what's on my display'."
+                ),
+                "perception",
+                "moderate",
+                [
+                    ToolParameter(
+                        "query", "string",
+                        "Optional steering question (e.g. 'what app is "
+                        "open' or 'read the highlighted text').",
+                        False, "",
+                    ),
+                ],
+                examples=[
+                    "describe my screen",
+                    "what am I doing",
+                    "analyze the screen",
+                    "what's on my display right now",
+                ],
+            ),
             Tool("focus_on",
                  "Turn on macOS Do Not Disturb / Focus via Apple Shortcuts",
                  "system", "safe",

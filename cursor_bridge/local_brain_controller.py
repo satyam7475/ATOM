@@ -2320,6 +2320,22 @@ class LocalBrainController:
             generate_kwargs["model_role"] = model_role
         if max_tokens_override:
             generate_kwargs["max_tokens_override"] = int(max_tokens_override)
+        # Sprint C4: kill stage-direction leaks at the token layer for
+        # the FAST/QUICK path. ``_FAST_PATH_STOP_SEQUENCES`` adds "("
+        # and "\n\n" so any leading parenthetical aborts generation
+        # before reaching the streaming sanitiser. The DEEP/primary
+        # path stays unrestricted because long answers legitimately
+        # use parens for citations.
+        if str(model_role or "").lower() == "fast":
+            try:
+                from brain.mlx_llm import _FAST_PATH_STOP_SEQUENCES
+                generate_kwargs["extra_stop_sequences"] = (
+                    _FAST_PATH_STOP_SEQUENCES
+                )
+            except Exception:
+                logger.debug(
+                    "FAST stop-sequences import failed", exc_info=True,
+                )
         generate_task = asyncio.create_task(
             self._llm.generate_streaming(prompt, **generate_kwargs)
         )

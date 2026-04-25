@@ -38,6 +38,7 @@ from . import (
     memory_recall_intents,
     productivity_intents,
     routine_intents,
+    vision_intents,
 )
 
 logger = logging.getLogger("atom.intent")
@@ -75,6 +76,7 @@ class IntentEngine:
             or music_intents.quick_match(t)
             or media_intents.quick_match(t)
             or system_intents.quick_match(t)
+            or vision_intents.quick_match(t)
             or app_intents.quick_match(t)
         )
 
@@ -115,6 +117,13 @@ class IntentEngine:
             or media_intents.check(text)
             or file_intents.check(text)
             or network_intents.check(text)
+            # Sprint C2: vision intents (see_me / describe_screen /
+            # what_am_i_doing) must run *before* os_intents.check so
+            # our native VLM-fallback ``screen_describe`` action wins
+            # over the legacy OCR-only ``screen_analyze`` path that
+            # ignores the on-device captioner. They also run before
+            # cognitive_intents so the LLM never sees these turns.
+            or vision_intents.check(text)
             or os_intents.check(text)
             or cognitive_intents.check(text)
             or app_intents.check(text)

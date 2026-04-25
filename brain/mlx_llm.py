@@ -76,6 +76,16 @@ if _HAS_MLX:
         _load_prompt_cache = None
 
 
+# Sprint C4: extra stop sequences applied ONLY when the caller is the
+# FAST/QUICK voice path. We hard-stop on a leading parenthesis so any
+# stage-direction leak (atomLogs.txt L301 ``'(in a.'``) is killed at
+# the token layer -- not after the speech sanitiser has tried to scrub
+# it. ``\n\n`` keeps a FAST reply to a single paragraph.
+_FAST_PATH_STOP_SEQUENCES: tuple[str, ...] = (
+    "(",
+    "\n\n",
+)
+
 _DEFAULT_STOP_SEQUENCES: tuple[str, ...] = (
     "\nUser:",
     "\nBoss:",
@@ -342,6 +352,24 @@ class MLXBrain:
         self._top_p = float(brain_cfg.get("top_p", 0.9))
         self._timeout = float(brain_cfg.get("timeout_seconds", 30))
 
+        # Sprint C5: KV cache quantisation. mlx-lm 0.22+ accepts
+        # ``kv_bits`` on ``stream_generate`` -- 8 halves KV memory and
+        # frees ~10-15% generation throughput on long prompts (mlx-lm
+        # release notes). 0/None disables quantisation. We start
+        # quantising after ``kv_quant_warmup_tokens`` so the first
+        # tokens (where quality matters most) keep full precision.
+        self._kv_bits: int = int(brain_cfg.get("kv_bits", 8))
+        self._kv_group_size: int = int(brain_cfg.get("kv_group_size", 64))
+        self._kv_quant_warmup: int = int(
+            brain_cfg.get("kv_quant_warmup_tokens", 512)
+        )
+        if self._kv_bits not in (0, 4, 8):
+            logger.warning(
+                "Unsupported kv_bits=%d (must be 0, 4, or 8) -- "
+                "falling back to 0 (disabled)", self._kv_bits,
+            )
+            self._kv_bits = 0
+
         self._models: dict[str, Any | None] = {role: None for role in self._ROLES}
         self._tokenizers: dict[str, Any | None] = {role: None for role in self._ROLES}
         self._fingerprints: dict[str, str | None] = {role: None for role in self._ROLES}
@@ -412,6 +440,23 @@ class MLXBrain:
         # ``max_tokens`` is multiplied by this ratio at request time.
         self._thermal_clamp_ratio: float = 1.0
         self._thermal_clamp_reason: str = ""
+
+        # Sprint C1 — runtime persona is pinned as a stable KV prefix.
+        # The atomLogs.txt audit showed KV reuse stuck at 67-75% because
+        # the persona block (~600 tokens) was being prefilled cold on
+        # most turns. We hold the persona file path + the mtime we
+        # pinned with so a single ``repin_persona_if_changed`` call at
+        # the start of every turn is O(1) when nothing changed and
+        # automatically re-runs the prefill if Boss has edited
+        # ``config/atom_persona.md``. The pin itself is implemented by
+        # warming the existing trie via a 1-token generation; the trie
+        # then holds the prefix KV state and ``_prepare_prompt_cache``
+        # finds it as the longest matching prefix on every later turn.
+        self._pinned_persona_path: Path | None = None
+        self._pinned_persona_mtime: float = 0.0
+        self._pinned_persona_role: str = "fast"
+        self._pinned_persona_token_count: int = 0
+        self._pinned_persona_lock = threading.Lock()
 
     def set_brain_mode_manager(self, mgr: "BrainModeManager | None") -> None:
         self._brain_mode_mgr = mgr
@@ -959,7 +1004,10 @@ class MLXBrain:
     def _stop_sequences(extra: list[str] | None = None) -> tuple[str, ...]:
         merged: list[str] = list(_DEFAULT_STOP_SEQUENCES)
         for seq in extra or []:
-            candidate = str(seq or "").strip()
+            # Sprint C4: do NOT ``.strip()`` here -- "\n\n" is a
+            # legitimate FAST-path stop sequence and stripping would
+            # discard it. Only filter out genuinely empty / None values.
+            candidate = str(seq) if seq is not None else ""
             if candidate and candidate not in merged:
                 merged.append(candidate)
         return tuple(sorted(merged, key=len, reverse=True))
@@ -1071,6 +1119,7 @@ class MLXBrain:
         *,
         model_role: str | None = None,
         max_tokens_override: int | None = None,
+        extra_stop_sequences: tuple[str, ...] | list[str] | None = None,
     ) -> tuple[str, bool]:
         eff = self._effective_inference(model_role)
         role = eff["model_role"]
@@ -1092,6 +1141,7 @@ class MLXBrain:
             return self._generate_sync_streaming_inner(
                 role, eff, model, tokenizer, prompt, on_token,
                 max_tokens_override=max_tokens_override,
+                extra_stop_sequences=extra_stop_sequences,
             )
         finally:
             with self._gen_lock:
@@ -1107,12 +1157,22 @@ class MLXBrain:
         on_token: Callable[[str, bool], None] | None = None,
         *,
         max_tokens_override: int | None = None,
+        extra_stop_sequences: tuple[str, ...] | list[str] | None = None,
     ) -> tuple[str, bool]:
         """Core stream loop (wrapped for active-generation accounting)."""
         my_gen = self._abort_generation
         sampler = self._make_sampler(eff["temperature"], eff["top_p"])
         logits_processors = self._make_logits_processors(eff["repeat_penalty"])
-        stop_sequences = self._stop_sequences(eff["extra_stop_sequences"])
+        # Sprint C4: merge per-call extra stop sequences (e.g. FAST
+        # path adds "(" + "\n\n") on top of the role-level ones from
+        # ``eff``. Per-call stops are NOT cached on the role -- they
+        # only apply to this generation.
+        merged_extra: list[str] = list(eff["extra_stop_sequences"])
+        if extra_stop_sequences:
+            for seq in extra_stop_sequences:
+                if seq and seq not in merged_extra:
+                    merged_extra.append(seq)
+        stop_sequences = self._stop_sequences(merged_extra)
 
         visible_text = ""
         raw_text = ""
@@ -1139,6 +1199,14 @@ class MLXBrain:
         stream_kwargs: dict[str, Any] = {}
         if prompt_cache_obj is not None:
             stream_kwargs["prompt_cache"] = prompt_cache_obj
+
+        # Sprint C5: pass KV-cache quantisation params so generation
+        # uses ``QuantizedKVCache`` once we cross the warmup threshold.
+        # ``kv_bits=0`` (or absence) keeps the legacy unquantised path.
+        if self._kv_bits in (4, 8):
+            stream_kwargs["kv_bits"] = int(self._kv_bits)
+            stream_kwargs["kv_group_size"] = int(self._kv_group_size)
+            stream_kwargs["quantized_kv_start"] = int(self._kv_quant_warmup)
 
         try:
             for resp in stream_generate(
@@ -1250,12 +1318,14 @@ class MLXBrain:
         *,
         model_role: str | None = None,
         max_tokens_override: int | None = None,
+        extra_stop_sequences: tuple[str, ...] | list[str] | None = None,
     ) -> tuple[str, bool]:
         return self._generate_sync_streaming(
             prompt,
             on_token=None,
             model_role=model_role,
             max_tokens_override=max_tokens_override,
+            extra_stop_sequences=extra_stop_sequences,
         )
 
     async def generate(
@@ -1264,6 +1334,7 @@ class MLXBrain:
         *,
         model_role: str | None = None,
         max_tokens_override: int | None = None,
+        extra_stop_sequences: tuple[str, ...] | list[str] | None = None,
     ) -> tuple[str, bool]:
         loop = asyncio.get_running_loop()
         timeout_s = float(self._effective_inference(model_role)["timeout_seconds"])
@@ -1276,6 +1347,7 @@ class MLXBrain:
                         prompt,
                         model_role=model_role,
                         max_tokens_override=max_tokens_override,
+                        extra_stop_sequences=extra_stop_sequences,
                     ),
                 ),
                 timeout=timeout_s,
@@ -1295,6 +1367,7 @@ class MLXBrain:
         *,
         model_role: str | None = None,
         max_tokens_override: int | None = None,
+        extra_stop_sequences: tuple[str, ...] | list[str] | None = None,
     ) -> tuple[str, bool]:
         loop = asyncio.get_running_loop()
         timeout_s = float(self._effective_inference(model_role)["timeout_seconds"])
@@ -1308,6 +1381,7 @@ class MLXBrain:
                         on_token,
                         model_role=model_role,
                         max_tokens_override=max_tokens_override,
+                        extra_stop_sequences=extra_stop_sequences,
                     ),
                 ),
                 timeout=timeout_s,
@@ -1319,6 +1393,148 @@ class MLXBrain:
         except Exception:
             logger.exception("MLX streaming generate error")
             return "", False
+
+    # ── Sprint C1 — persona-as-pinned-KV-prefix ──────────────────
+
+    def pin_prompt_prefix(
+        self,
+        prefix_text: str,
+        *,
+        model_role: str = "fast",
+        source_path: str | Path | None = None,
+    ) -> dict[str, Any]:
+        """Warm the prompt-cache trie with ``prefix_text`` as a stable
+        prefix that all later ``generate`` calls can reuse for free.
+
+        Returns a dict with keys ``ok``, ``tokens``, ``elapsed_ms`` and
+        (on failure) ``reason``. Safe to call multiple times --
+        successive calls with identical text are very cheap because the
+        trie's nearest-prefix lookup finds 100% of the prefix already
+        cached.
+
+        ``source_path`` (optional) registers a file whose mtime can be
+        watched via :py:meth:`repin_persona_if_changed`. The intended
+        use is ``source_path="config/atom_persona.md"`` so a Boss-
+        authored edit to the persona file invalidates and re-pins
+        without a process restart.
+        """
+        if not prefix_text or not isinstance(prefix_text, str):
+            return {"ok": False, "reason": "empty prefix"}
+        if not _HAS_MLX or not self.is_available():
+            return {"ok": False, "reason": "mlx unavailable"}
+
+        role = self._normalize_role(model_role)
+        try:
+            loaded = self._ensure_loaded(role)
+        except Exception:
+            logger.debug("pin_prompt_prefix: ensure_loaded raised", exc_info=True)
+            return {"ok": False, "reason": "ensure_loaded raised"}
+        if not loaded:
+            return {"ok": False, "reason": f"role {role!r} not loaded"}
+
+        token_count = 0
+        try:
+            tokenizer = self._tokenizers.get(role)
+            if tokenizer is not None:
+                tokens = self._encode_prompt_tokens(tokenizer, prefix_text) or []
+                token_count = len(tokens)
+        except Exception:
+            logger.debug("pin_prompt_prefix: tokenize raised", exc_info=True)
+
+        t0 = time.perf_counter()
+        try:
+            self._generate_sync(
+                prefix_text,
+                model_role=role,
+                max_tokens_override=1,
+            )
+        except Exception:
+            logger.exception("pin_prompt_prefix: prefill raised")
+            return {"ok": False, "reason": "prefill raised"}
+        elapsed_ms = (time.perf_counter() - t0) * 1000.0
+
+        with self._pinned_persona_lock:
+            self._pinned_persona_role = role
+            self._pinned_persona_token_count = token_count
+            if source_path is not None:
+                try:
+                    p = Path(str(source_path)).expanduser()
+                    self._pinned_persona_path = p
+                    self._pinned_persona_mtime = (
+                        p.stat().st_mtime if p.exists() else 0.0
+                    )
+                except Exception:
+                    logger.debug(
+                        "pin_prompt_prefix: source_path stat raised",
+                        exc_info=True,
+                    )
+
+        logger.info(
+            "MLX prompt prefix pinned: role=%s tokens=%d elapsed=%.0fms"
+            "%s",
+            role,
+            token_count,
+            elapsed_ms,
+            f" source={Path(str(source_path)).name}" if source_path else "",
+        )
+        return {
+            "ok": True,
+            "tokens": token_count,
+            "elapsed_ms": elapsed_ms,
+            "role": role,
+        }
+
+    def repin_persona_if_changed(self) -> bool:
+        """Re-pin the persona prefix if its source file's mtime moved.
+
+        Returns ``True`` iff a re-pin actually ran. The 99% case where
+        nothing has changed is a cheap ``stat()`` + a float compare and
+        bails immediately. Designed to be called at the start of every
+        turn from the cognitive kernel without measurable overhead.
+        """
+        with self._pinned_persona_lock:
+            path = self._pinned_persona_path
+            pinned_mtime = self._pinned_persona_mtime
+            role = self._pinned_persona_role
+        if path is None:
+            return False
+        try:
+            current_mtime = path.stat().st_mtime
+        except FileNotFoundError:
+            return False
+        except Exception:
+            logger.debug("repin_persona_if_changed: stat raised", exc_info=True)
+            return False
+        if current_mtime <= pinned_mtime:
+            return False
+        try:
+            text = path.read_text(encoding="utf-8")
+        except Exception:
+            logger.debug(
+                "repin_persona_if_changed: read raised", exc_info=True,
+            )
+            return False
+        logger.info(
+            "MLX persona file mtime moved (%.0f -> %.0f) -- re-pinning",
+            pinned_mtime, current_mtime,
+        )
+        result = self.pin_prompt_prefix(
+            text,
+            model_role=role,
+            source_path=str(path),
+        )
+        return bool(result.get("ok"))
+
+    @property
+    def pinned_persona_info(self) -> dict[str, Any]:
+        """Diagnostics surface for the cognitive_kernel UI / logs."""
+        with self._pinned_persona_lock:
+            return {
+                "path": str(self._pinned_persona_path) if self._pinned_persona_path else None,
+                "mtime": self._pinned_persona_mtime,
+                "role": self._pinned_persona_role,
+                "tokens": self._pinned_persona_token_count,
+            }
 
     def shutdown(self) -> None:
         with self._load_lock:

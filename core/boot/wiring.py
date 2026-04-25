@@ -1003,7 +1003,18 @@ def wire_events(
         if text.strip():
             indicator.add_log("info", f"[screen] {text.strip()}")
 
-    async def on_voice_ack(text: str = "", **_kw) -> None:
+    async def on_voice_ack(
+        text: str = "",
+        spoken_inline: bool = False,
+        **_kw,
+    ) -> None:
+        # Sprint C3: when ``CommandLoop._tts`` is wired the loop spawns
+        # ``speak_ack`` directly so the LLM call kicks off on the next
+        # event-loop tick (no bus dispatch latency). The loop sets
+        # ``spoken_inline=True`` in that case so we do NOT double-speak
+        # the same ack from this subscriber.
+        if spoken_inline:
+            return
         if text and tts is not None:
             asyncio.create_task(tts.speak_ack(text))
 

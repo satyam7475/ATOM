@@ -183,6 +183,60 @@ class RuntimeWatchdog:
             self._handle_budget_timeout(stage, timeout_s, metadata=metadata)
             return BudgetResult(value=default, elapsed_ms=elapsed_ms, timed_out=True)
 
+    def run_inline(
+        self,
+        stage: str,
+        func: Callable[..., Any],
+        *args: Any,
+        default: Any = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> BudgetResult:
+        """Run sync work synchronously (NO executor, NO asyncio dispatch).
+
+        Sprint C6 (atomLogs.txt L419/L453): the intent engine itself
+        runs at p99 ~0.1 ms across 18 representative phrases, but the
+        ``run_sync`` path inflates that into 150-300 ms wall time
+        whenever MLX or the vision worker holds the GIL — because
+        ``loop.run_in_executor`` has to wait for a thread pool slot
+        and asyncio scheduling overhead to settle. Those false breaches
+        flooded the watchdog log and tricked downstream observability
+        into thinking the regex paths were slow.
+
+        For stages where the work is reliably sub-millisecond (intent
+        classify, command-cache lookup), we now bypass the executor
+        entirely and run inline on the caller's thread. The wall-time
+        is still measured against the configured budget so a genuine
+        regression (e.g. someone adds a regex that does N**2 backtracking)
+        still surfaces a budget warning, but well-behaved fast paths
+        no longer produce phantom timeouts under contention.
+
+        Note: there is intentionally no asyncio cancellation here. If
+        ``func`` actually does block for >budget seconds the watchdog
+        will *log* the breach but cannot interrupt the synchronous call
+        — by design, because preempting arbitrary Python code is unsafe.
+        Callers must keep ``func`` cheap.
+        """
+        timeout_s = self.timeout_s(stage)
+        t0 = time.perf_counter()
+        try:
+            value = func(*args)
+        except Exception:
+            elapsed_ms = (time.perf_counter() - t0) * 1000
+            logger.warning(
+                "Inline budget run failed for %s after %.2f ms",
+                stage, elapsed_ms, exc_info=True,
+            )
+            return BudgetResult(
+                value=default, elapsed_ms=elapsed_ms, timed_out=False,
+            )
+        elapsed_ms = (time.perf_counter() - t0) * 1000
+        timed_out = timeout_s > 0 and (elapsed_ms / 1000.0) > timeout_s
+        if timed_out:
+            self._handle_budget_timeout(stage, timeout_s, metadata=metadata)
+        return BudgetResult(
+            value=value, elapsed_ms=elapsed_ms, timed_out=timed_out,
+        )
+
     async def run_async(
         self,
         stage: str,
