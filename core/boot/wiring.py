@@ -250,6 +250,43 @@ def wire_events(
         source="speech_ctrl.on_perception_adaptive",
     ))
 
+    # Sprint N7 — mood-driven prosody. mood_changed payload is
+    # {"mood": "focused"} from MoodInferenceEngine. We translate to a
+    # MoodProsody profile and push it into the SpeechController's third
+    # multiplier channel so it composes cleanly with perception/adaptive.
+    try:
+        from voice.mood_voice_profile import for_mood as _mood_prosody_for
+    except Exception:  # pragma: no cover - import shim
+        _mood_prosody_for = None  # type: ignore[assignment]
+
+    async def _on_mood_changed(mood: str | None = None, **_kw) -> None:
+        if _mood_prosody_for is None:
+            return
+        if not mood:
+            return
+        try:
+            profile = _mood_prosody_for(str(mood))
+            params = profile.to_speech_params()
+            speech_ctrl.set_mood(
+                rate_multiplier=params["rate_multiplier"],
+                pause_multiplier=params["pause_multiplier"],
+            )
+            _apply_merged_style()
+            logger.info(
+                "MOOD prosody applied: mood=%s rate=%.2f pause=%.2f preset=%s",
+                profile.mood,
+                profile.rate_multiplier,
+                profile.pause_multiplier,
+                profile.voice_preset,
+            )
+        except Exception:
+            logger.debug("mood prosody apply failed", exc_info=True)
+
+    bus.on("mood_changed", _guard_handler(
+        "mood_changed", _on_mood_changed,
+        source="speech_ctrl.on_mood_changed",
+    ))
+
     # Minimum word count before a perception-predicted interrupt is allowed
     # to cut off TTS. A single mis-heard token like ``Boss`` or ``mad`` is
     # almost always our own voice spilling into the mic; requiring at least

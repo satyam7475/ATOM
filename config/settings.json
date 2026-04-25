@@ -38,6 +38,19 @@
         "forward_partial_responses": true,
         "playground_dir": "ui/playground"
     },
+    "screen_perception_loop": {
+        "enabled": true,
+        "interval_s": 12.0,
+        "pause_during_speech": true,
+        "pause_during_listen": true,
+        "require_presence": true,
+        "max_rows": 5000,
+        "db_path": "data/screen_observations.sqlite",
+        "redact_passwords": true,
+        "min_text_chars": 24,
+        "significance_min_jaccard": 0.55,
+        "burst_when_idle_s": 60.0
+    },
     "vision": {
         "enabled": true,
         "preferred_camera": "auto",

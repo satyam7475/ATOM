@@ -388,11 +388,13 @@ class AtomRoomServer:
         host: str = "127.0.0.1",
         port: int = 8765,
         playground_dir: str | None = None,
+        metrics_broker: Any = None,
     ) -> None:
         self.room = room
         self.host = host
         self.port = port
         self.playground_dir = playground_dir
+        self.metrics_broker = metrics_broker
         self._runner: Any = None
         self._site: Any = None
         self._app: Any = None
@@ -403,6 +405,21 @@ class AtomRoomServer:
         app.router.add_get("/healthz", self._handle_healthz)
         app.router.add_get("/room/snapshot", self._handle_snapshot)
         app.router.add_get("/room/ws", self._handle_ws)
+        if self.metrics_broker is not None:
+            try:
+                # Sprint N4: production-grade Prometheus surface.
+                self.metrics_broker.register("room", self.room.snapshot)
+                app.router.add_get(
+                    "/metrics", self.metrics_broker.handle_metrics,
+                )
+                # Override /healthz with the rich rollup -- the original
+                # provides a simple {ok, room} response; the rollup adds
+                # every registered subsystem snapshot.
+                app.router.add_get(
+                    "/healthz/rollup", self.metrics_broker.handle_healthz,
+                )
+            except Exception:
+                logger.exception("failed to wire metrics broker routes")
         if self.playground_dir:
             from pathlib import Path
 

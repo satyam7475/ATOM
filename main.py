@@ -2272,6 +2272,26 @@ async def main() -> None:
     # Defaults to localhost only -- flip ``host`` to "0.0.0.0" in
     # config/settings.json -> "realtime" to expose on the LAN.
     realtime_handles: dict[str, object] = {}
+    metrics_broker = None
+    try:
+        # Sprint N4: production-grade Prometheus broker.
+        from core.observability import MetricsBroker
+
+        metrics_broker = MetricsBroker(namespace="atom")
+        if cloud_brain_router is not None:
+            try:
+                metrics_broker.register(
+                    "cloud_router", cloud_brain_router.stats,
+                )
+            except Exception:
+                logger.debug(
+                    "cloud_router metrics registration failed",
+                    exc_info=True,
+                )
+    except Exception:
+        logger.debug("MetricsBroker init failed", exc_info=True)
+        metrics_broker = None
+
     realtime_cfg = config.get("realtime") or {}
     if bool(realtime_cfg.get("enabled", True)):
         try:
@@ -2314,6 +2334,7 @@ async def main() -> None:
                 host=str(realtime_cfg.get("host", "127.0.0.1")),
                 port=int(realtime_cfg.get("port", 8770)),
                 playground_dir=playground_dir,
+                metrics_broker=metrics_broker,
             )
             await server.start()
             realtime_handles = {"room": room, "agent": agent, "server": server}
@@ -2324,6 +2345,84 @@ async def main() -> None:
         except Exception as exc:
             logger.warning("Realtime room failed to start: %s", exc, exc_info=True)
             realtime_handles = {}
+
+    # ── Sprint N1: Continuous desktop screen perception loop ───────
+    # Always-on rolling OCR of the active desktop, persisted to a
+    # small SQLite store + emitted on the bus. Pauses while ATOM is
+    # speaking / listening / Boss is away, so it never competes with
+    # the voice stack for the Neural Engine.
+    screen_loop = None
+    screen_loop_cfg = config.get("screen_perception_loop") or {}
+    if (
+        screen_reader is not None
+        and getattr(screen_reader, "is_available", False)
+        and bool(screen_loop_cfg.get("enabled", True))
+    ):
+        try:
+            from core.perception.screen_perception_loop import (
+                ScreenLoopConfig,
+                ScreenPerceptionLoop,
+            )
+
+            screen_loop = ScreenPerceptionLoop(
+                bus,
+                screen_reader,
+                state,
+                config=ScreenLoopConfig(
+                    enabled=True,
+                    interval_s=float(screen_loop_cfg.get("interval_s", 12.0)),
+                    pause_during_speech=bool(
+                        screen_loop_cfg.get("pause_during_speech", True),
+                    ),
+                    pause_during_listen=bool(
+                        screen_loop_cfg.get("pause_during_listen", True),
+                    ),
+                    require_presence=bool(
+                        screen_loop_cfg.get("require_presence", True),
+                    ),
+                    max_rows=int(screen_loop_cfg.get("max_rows", 5_000)),
+                    db_path=str(
+                        screen_loop_cfg.get(
+                            "db_path", "data/screen_observations.sqlite",
+                        ),
+                    ),
+                    redact_passwords=bool(
+                        screen_loop_cfg.get("redact_passwords", True),
+                    ),
+                    min_text_chars=int(
+                        screen_loop_cfg.get("min_text_chars", 24),
+                    ),
+                    significance_min_jaccard=float(
+                        screen_loop_cfg.get(
+                            "significance_min_jaccard", 0.55,
+                        ),
+                    ),
+                    burst_when_idle_s=float(
+                        screen_loop_cfg.get("burst_when_idle_s", 60.0),
+                    ),
+                ),
+            )
+            screen_loop.attach()
+            logger.info(
+                "Screen perception loop attached -- ATOM remembers your "
+                "desktop now, Boss.",
+            )
+            if metrics_broker is not None:
+                try:
+                    metrics_broker.register(
+                        "screen_loop", screen_loop.metrics,
+                    )
+                except Exception:
+                    logger.debug(
+                        "screen_loop metrics registration failed",
+                        exc_info=True,
+                    )
+        except Exception as exc:
+            logger.warning(
+                "Screen perception loop failed to start: %s",
+                exc, exc_info=True,
+            )
+            screen_loop = None
 
     if llm_queue is not None:
         llm_queue.start()
@@ -3660,6 +3759,11 @@ async def main() -> None:
                 await _rt_server.stop()  # type: ignore[union-attr]
         except Exception:
             logger.debug("realtime room stop failed", exc_info=True)
+        try:
+            if screen_loop is not None:
+                await screen_loop.stop()
+        except Exception:
+            logger.debug("screen perception loop stop failed", exc_info=True)
         bus.clear()
         stt.shutdown()
         await tts.shutdown()
