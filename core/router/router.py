@@ -691,6 +691,22 @@ class Router:
         if not clean_text:
             return
 
+        # ── Pending Jarvis offer (Sprint J: Offer Protocol) ───────────
+        # If ATOM just proposed an action ("Want me to open Chrome,
+        # Boss?") and Boss replies with a confirm/deny token, execute
+        # (or politely cancel) the staged action *before* the intent
+        # engine even runs -- saves ~150 ms and stops the user's "yes"
+        # from being mis-classified by the global confirmation manager
+        # (which only knows about dangerous-action staging, not casual
+        # offers). Any other utterance falls through; the offer's TTL
+        # cleans itself up so a stale "yes" 5 minutes later never
+        # accidentally fires.
+        try:
+            if await self._maybe_consume_pending_offer(clean_text):
+                return
+        except Exception:
+            logger.debug("offer-consume hook failed", exc_info=True)
+
         if self._timeline is not None:
             try:
                 self._timeline.append_event(
@@ -980,6 +996,88 @@ class Router:
             await self._handle_llm_fallback(raw_text, clean_text,
                                             clipboard_injected=clipboard_injected)
             return
+
+    # ── Jarvis Offer Protocol (Sprint J) ─────────────────────────────
+
+    async def _maybe_consume_pending_offer(self, clean_text: str) -> bool:
+        """Resolve a pending Jarvis offer if Boss confirmed/denied.
+
+        Returns ``True`` when the utterance was *handled* (action ran
+        or polite cancellation emitted) so the caller knows to skip
+        the rest of ``_route``. Returns ``False`` to indicate the
+        utterance is unrelated -- the caller continues with intent
+        classification, and the offer's TTL will eventually expire.
+
+        Why we don't reuse ``ConfirmationManager``:
+          * ``ConfirmationManager`` is for *security-staged* actions;
+            its prompt phrasing assumes the user explicitly requested
+            the action. Jarvis offers are unsolicited *proposals*, so
+            the cancellation copy and TTL semantics are different.
+          * ``ConfirmationManager`` runs after intent classification;
+            we want to short-circuit *before* the engine so a bare
+            "yes" can't be hijacked by a different pending tool call.
+
+        We *only* consume the offer when the user gives a clear
+        confirm or deny token. Any other utterance (a brand new
+        question, casual chatter, even a partial acknowledgement) is
+        treated as a topic switch -- the offer stays live until the
+        next assistant turn re-evaluates whether to re-offer.
+        """
+        from core.intent_engine import meta_intents
+        from core.router.offer_registry import get_offer_registry
+
+        registry = get_offer_registry()
+        if not registry.has_pending:
+            return False
+
+        is_confirm = bool(
+            meta_intents._CONFIRM.search(clean_text)
+            or meta_intents._is_confirm_dominant(clean_text),
+        )
+        is_deny = bool(
+            meta_intents._DENY.search(clean_text)
+            or meta_intents._is_deny_dominant(clean_text),
+        )
+
+        if not (is_confirm or is_deny):
+            return False
+
+        offer = registry.consume()
+        if offer is None:
+            return False
+
+        if is_deny:
+            logger.info(
+                "OfferProtocol: deny on '%s' (action=%s)",
+                clean_text[:60], offer.action,
+            )
+            self._emit_response("Got it, Boss — leaving it for now.")
+            return True
+
+        from core.intent_engine import IntentResult
+
+        logger.info(
+            "OfferProtocol: confirm on '%s' -> executing %s(%s)",
+            clean_text[:60], offer.action, list(offer.args.keys()),
+        )
+        staged = IntentResult(
+            intent="confirm_offer",
+            action=offer.action,
+            action_args=dict(offer.args),
+            confidence=1.0,
+        )
+        try:
+            await self._execute_action(staged)
+        except Exception:
+            logger.exception(
+                "OfferProtocol: execution failed for action=%s",
+                offer.action,
+            )
+            self._emit_response(
+                "Hmm — I tried but it didn't go through, Boss. "
+                "Want to try again?",
+            )
+        return True
 
     # ── Confirmation flow (delegated to ConfirmationManager) ───────────
 

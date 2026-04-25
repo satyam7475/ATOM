@@ -731,6 +731,44 @@ class LocalBrainController:
     def _compact_text(text: str) -> str:
         return re.sub(r"\s+", " ", (text or "").strip())
 
+    @staticmethod
+    def _append_offer_to_reply(reply: str, offer_text: str) -> str:
+        """Glue a Jarvis offer onto the LLM reply with sane spacing.
+
+        Sprint J: the synthesizer hands us a one-liner like
+        ``"Want me to open Chrome for you, Boss?"`` and we splice it
+        onto the end of the model's answer. Three small rules so the
+        result reads naturally on TTS:
+
+          * If the model already ends mid-thought (no ``.``/``!``/``?``)
+            we add a single period before the offer so the prosody
+            engine doesn't rush them together.
+          * If the LLM somehow already produced a "Want me to..." /
+            "Should I..." / "Shall I..." line, we DO NOT double-offer.
+            The synthesizer's deterministic offer is dropped from the
+            spoken text (the registry stash still happens upstream so
+            the next-turn confirm still works).
+          * We always insert a single space between the two so the
+            engine doesn't elide the question mark.
+        """
+        body = (reply or "").rstrip()
+        offer = (offer_text or "").strip()
+        if not offer:
+            return body
+        if not body:
+            return offer
+        lower_tail = body[-160:].lower()
+        # Heuristic: model already proposed an action -- don't echo.
+        for cue in (
+            "want me to", "would you like me to", "should i",
+            "shall i", "do you want me to",
+        ):
+            if cue in lower_tail:
+                return body
+        if body[-1] not in ".!?…":
+            body = body + "."
+        return f"{body} {offer}"
+
     def _sanitize_emittable_text(self, text: str) -> str:
         # Defense-in-depth: cut at any leaked ChatML / HF control token and
         # strip stray copies of them. This catches cloud-fallback paths and
@@ -2126,12 +2164,45 @@ class LocalBrainController:
             except Exception:
                 logger.debug("response_vetter failed", exc_info=True)
 
+        # Sprint J: Jarvis Offer Protocol -- synthesise an actionable
+        # follow-up offer ("Want me to do that for you, Boss?") from
+        # the user's original query, stash the matching action in the
+        # OfferRegistry so a single "yes" on the next turn fires it
+        # without an LLM round-trip, and append the offer line to the
+        # spoken reply. We deliberately keep the *cached* response
+        # bare (offer-free) so subsequent identical queries don't
+        # accumulate compounding offers from the cache.
+        spoken_text = final_text
+        try:
+            from core.cognitive.offer_synthesizer import synthesize_offer
+            from core.router.offer_registry import get_offer_registry
+
+            proposal = synthesize_offer(text, final_text)
+            if proposal is not None:
+                spoken_text = self._append_offer_to_reply(
+                    final_text, proposal.offer_text,
+                )
+                get_offer_registry().stash(
+                    action=proposal.action,
+                    args=proposal.args,
+                    offer_text=proposal.offer_text,
+                    source_query=text,
+                    source_response=final_text,
+                    metadata={
+                        "category": proposal.category,
+                        "source": "local_llm",
+                    },
+                )
+        except Exception:
+            logger.debug("Jarvis offer synth failed", exc_info=True)
+            spoken_text = final_text
+
         if should_buffer_response:
-            self._bus.emit_long("response_ready", text=final_text)
+            self._bus.emit_long("response_ready", text=spoken_text)
         elif react_step > 0:
             self._bus.emit_long(
                 "partial_response",
-                text=final_text,
+                text=spoken_text,
                 is_first=True,
                 is_last=True,
                 source="local",

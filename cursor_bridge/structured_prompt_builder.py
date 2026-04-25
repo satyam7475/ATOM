@@ -390,6 +390,26 @@ class StructuredPromptBuilder:
             f"question. Never invent facts.\n"
             f"LANGUAGE: match Boss's language (English / Hindi / Hinglish). "
             f"Quietly correct obvious typos and mixed phrasing.\n"
+            # ── Sprint J: Jarvis Offer Protocol ─────────────────────────
+            # When Boss asks "how do I X?" or "what is X?", behave like
+            # JARVIS: explain crisply in spoken language, then pause.
+            # ATOM's runtime layer will splice on a one-line "Want me to
+            # do that for you, Boss?" offer when (and only when) the
+            # query maps to a known on-device action. This means the
+            # model itself MUST NOT pre-emptively claim to have done
+            # the thing or pretend it already executed it -- explanation
+            # only, no "I'm opening it" / "started for you" phrasing
+            # unless Boss actually asked for the action this turn. If
+            # the model does propose action verbally ("I can pull that
+            # up for you"), keep it to ONE short line so the runtime
+            # offer doesn't double up.
+            f"PROACTIVE OFFER: for explainer queries (\"how do I…\", "
+            f"\"what is…\", \"tell me about…\"), give the answer in 1-2 "
+            f"crisp spoken sentences and STOP. Do not narrate that you "
+            f"are about to act and do not pretend you already acted. "
+            f"The runtime appends a single 'Want me to do that, Boss?' "
+            f"line when an action is available; your job is the "
+            f"explanation, not the offer.\n"
         )
 
         persona_text = self._load_persona()
