@@ -79,9 +79,16 @@
         "low_confidence_ask_user": true
     },
     "stt": {
-        "engine": "macos_native",
+        "engine": "whisper_cpp",
         "locale": "en-US",
         "whisper_model_size": "base",
+        "whisper_model_path": "models/ggml-small.en-q5_0.bin",
+        "whisper_n_threads": 4,
+        "whisper_language": "en",
+        "whisper_partial_interval_s": 1.0,
+        "whisper_trailing_silence_s": 0.6,
+        "whisper_max_utterance_s": 20.0,
+        "whisper_vad_aggressiveness": 2,
         "bilingual": true,
         "sample_rate": 16000,
         "chunk_size": 2048,

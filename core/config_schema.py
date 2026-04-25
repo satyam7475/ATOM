@@ -144,8 +144,56 @@ CONFIG_SCHEMA: dict[str, Any] = {
             "properties": {
                 "engine": {
                     "type": "string",
-                    "enum": ["auto", "macos_native", "faster_whisper", "google_online", "google"],
-                    "description": "STT: on macOS, auto and macos_native use SFSpeechRecognizer only; faster_whisper/google_* are for non-macOS or legacy configs (ignored on macOS).",
+                    "enum": [
+                        "auto",
+                        "macos_native",
+                        "whisper_cpp",
+                        "whispercpp",
+                        "whisper",
+                        "whisper.cpp",
+                        "faster_whisper",
+                        "google_online",
+                        "google",
+                    ],
+                    "description": "STT: whisper_cpp uses the Metal-accelerated whisper.cpp backend (Sprint B). On macOS, auto prefers whisper.cpp when its GGML model is present, then falls back to macos_native (SFSpeechRecognizer). faster_whisper/google_* are for non-macOS / legacy configs.",
+                },
+                "whisper_model_path": {
+                    "type": "string",
+                    "description": "Sprint B: ggml model path consumed by voice/stt_whisper.py. Relative names resolve under ./models/. Default: ggml-small.en-q5_0.bin.",
+                },
+                "whisper_n_threads": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 16,
+                    "description": "whisper.cpp inference threads (Metal parallelism). 4 is a good default on M-series.",
+                },
+                "whisper_language": {
+                    "type": "string",
+                    "description": "BCP-47 language code (e.g. 'en'). Used by the whisper.cpp transcribe call.",
+                },
+                "whisper_partial_interval_s": {
+                    "type": "number",
+                    "minimum": 0.25,
+                    "maximum": 5.0,
+                    "description": "Cadence at which whisper.cpp emits partial transcripts.",
+                },
+                "whisper_trailing_silence_s": {
+                    "type": "number",
+                    "minimum": 0.1,
+                    "maximum": 3.0,
+                    "description": "Trailing silence (seconds) after speech that triggers a final transcript.",
+                },
+                "whisper_max_utterance_s": {
+                    "type": "number",
+                    "minimum": 1.0,
+                    "maximum": 60.0,
+                    "description": "Hard cap on a single utterance length before forcing a final.",
+                },
+                "whisper_vad_aggressiveness": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 3,
+                    "description": "WebRTC VAD aggressiveness (0=permissive, 3=strict).",
                 },
                 "whisper_model_size": {
                     "type": "string",
@@ -2109,12 +2157,18 @@ def _basic_validation(config: dict) -> list[str]:
         if engine is not None and engine not in (
             "auto",
             "macos_native",
+            "whisper_cpp",
+            "whispercpp",
+            "whisper",
+            "whisper.cpp",
             "faster_whisper",
             "google_online",
             "google",
         ):
             errors.append(
-                f"stt.engine: must be auto/macos_native/faster_whisper/google_online/google, got {engine}"
+                "stt.engine: must be auto/macos_native/whisper_cpp/"
+                "faster_whisper/google_online/google, "
+                f"got {engine}",
             )
 
         chunk = stt.get("chunk_size")

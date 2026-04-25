@@ -398,6 +398,44 @@ class VoicePipeline:
             intent_engine=self._intent_engine,
         ), ""
 
+    def _build_whisper_cpp_stt(self) -> tuple[Any | None, str]:
+        """Construct the whisper.cpp Metal backend (Sprint B3).
+
+        Returns ``(stt, "")`` on success and ``(None, reason)`` if any
+        native dependency or the GGML model file is missing. The caller
+        is expected to fall back to ``_build_native_stt`` /
+        ``_build_disabled_stt`` on a non-empty reason.
+        """
+        try:
+            from voice.stt_whisper import WhisperSTT, is_whisper_available
+        except Exception as exc:
+            return None, (
+                f"whisper.cpp module import failed: {exc}; "
+                "did you `pip install pywhispercpp sounddevice webrtcvad`?"
+            )
+        if not is_whisper_available(self._config):
+            from voice.stt_whisper import _resolve_model_path  # noqa: PLC0415
+            model_path = _resolve_model_path(
+                (self._config.get("stt") or {}).get("whisper_model_path"),
+            )
+            if not model_path.exists():
+                return None, (
+                    f"Whisper model not found at {model_path} -- run "
+                    "`python scripts/install_whisper_model.py`"
+                )
+            return None, (
+                "whisper.cpp deps missing -- "
+                "`pip install pywhispercpp sounddevice webrtcvad`"
+            )
+        stt = WhisperSTT(
+            self._bus,
+            self._state,
+            self._config,
+            mic_manager=self._mic_manager,
+            intent_engine=self._intent_engine,
+        )
+        return stt, ""
+
     def _load_persisted_failover_reason(self) -> str:
         """Read data/atom_runtime.json, return the stored failover reason
         (empty string if none). Used to honor a prior session's decision
@@ -414,10 +452,21 @@ class VoicePipeline:
             logger.debug("failover flag load failed", exc_info=True)
             return ""
 
+    _WHISPER_CPP_ALIASES = ("whisper_cpp", "whispercpp", "whisper", "whisper.cpp")
+
     def _build_stt(self) -> None:
         stt_cfg = self._config.get("stt", {})
-        engine_pref = str(stt_cfg.get("engine", "macos_native") or "macos_native").strip().lower()
-        logger.info("STT engine preference: %s (platform=%s)", engine_pref, sys.platform)
+        engine_pref = str(
+            stt_cfg.get("engine", "macos_native") or "macos_native",
+        ).strip().lower()
+        # Sprint B3: alias collapse so "whisper", "whispercpp", "whisper.cpp"
+        # all map to the canonical whisper_cpp branch.
+        if engine_pref in self._WHISPER_CPP_ALIASES:
+            engine_pref = "whisper_cpp"
+        logger.info(
+            "STT engine preference: %s (platform=%s)",
+            engine_pref, sys.platform,
+        )
 
         # If a previous session failed over to Whisper due to unrecoverable
         # native breakage, honor that decision on this boot — unless the
@@ -441,7 +490,83 @@ class VoicePipeline:
             return
 
         if sys.platform == "darwin":
-            if engine_pref in ("macos_native", "auto"):
+            if engine_pref == "whisper_cpp":
+                whisper_stt, whisper_reason = self._build_whisper_cpp_stt()
+                if whisper_stt is not None:
+                    self.stt = whisper_stt
+                    self.stt_runtime_label = "whisper.cpp Metal (small.en-q5_0)"
+                    logger.info(
+                        "STT: whisper.cpp Metal (long-session reliable, "
+                        "no idle timeout)",
+                    )
+                else:
+                    self.stt_runtime_error = whisper_reason or ""
+                    self.stt_runtime_fallbacks.append(
+                        f"whisper.cpp unavailable: {whisper_reason}",
+                    )
+                    logger.warning(
+                        "whisper.cpp STT unavailable (%s) -- "
+                        "falling back to macOS Native", whisper_reason,
+                    )
+                    native_stt, native_reason = self._build_native_stt()
+                    if native_stt is not None:
+                        self.stt = native_stt
+                        self.stt_runtime_label = (
+                            "macOS Native (whisper.cpp fallback)"
+                        )
+                    else:
+                        self.stt_runtime_fallbacks.append(
+                            f"native unavailable: {native_reason}",
+                        )
+                        self.stt = self._build_disabled_stt(
+                            f"whisper.cpp unavailable ({whisper_reason}); "
+                            f"native unavailable ({native_reason})",
+                        )
+                        self.stt_runtime_label = "Disabled"
+            elif engine_pref == "auto":
+                # Sprint B3: prefer whisper.cpp when it's installed,
+                # because SFSpeechRecognizer suffers from the
+                # idle-timeout cliff documented in atomLogs.txt L310/437.
+                whisper_stt, whisper_reason = self._build_whisper_cpp_stt()
+                if whisper_stt is not None:
+                    self.stt = whisper_stt
+                    self.stt_runtime_label = (
+                        "whisper.cpp Metal (auto)"
+                    )
+                    logger.info(
+                        "STT auto: whisper.cpp selected -- model present",
+                    )
+                else:
+                    self.stt_runtime_fallbacks.append(
+                        f"whisper.cpp unavailable: {whisper_reason}",
+                    )
+                    native_stt, native_reason = self._build_native_stt()
+                    if native_stt is not None:
+                        self.stt = native_stt
+                        self.stt_runtime_label = (
+                            "macOS Native (auto fallback)"
+                        )
+                        logger.info(
+                            "STT auto: SFSpeechRecognizer (whisper.cpp "
+                            "missing: %s)", whisper_reason,
+                        )
+                    else:
+                        self.stt_runtime_error = native_reason or ""
+                        self.stt_runtime_fallbacks.append(
+                            f"native unavailable: {native_reason}",
+                        )
+                        logger.warning(
+                            "Native STT unavailable (%s) -- trying "
+                            "Faster-Whisper", native_reason,
+                        )
+                        self.stt = self._build_faster_whisper_stt()
+                        if isinstance(self.stt, _DisabledSTT):
+                            self.stt_runtime_label = "Disabled"
+                        else:
+                            self.stt_runtime_label = (
+                                "Faster-Whisper (auto fallback)"
+                            )
+            elif engine_pref == "macos_native":
                 native_stt, native_reason = self._build_native_stt()
                 if native_stt is not None:
                     self.stt = native_stt
@@ -449,14 +574,23 @@ class VoicePipeline:
                     logger.info("STT: macOS Native -- Apple stack only")
                 else:
                     self.stt_runtime_error = native_reason or ""
-                    self.stt_runtime_fallbacks.append(f"native unavailable: {native_reason}")
-                    logger.warning("Native STT unavailable (%s) -- trying Whisper fallback", native_reason)
+                    self.stt_runtime_fallbacks.append(
+                        f"native unavailable: {native_reason}",
+                    )
+                    logger.warning(
+                        "Native STT unavailable (%s) -- "
+                        "trying Faster-Whisper fallback", native_reason,
+                    )
                     self.stt = self._build_faster_whisper_stt()
                     if isinstance(self.stt, _DisabledSTT):
                         self.stt_runtime_label = "Disabled"
                     else:
-                        self.stt_runtime_label = "Faster-Whisper (native fallback)"
-                        logger.info("STT: Faster-Whisper (native STT unavailable)")
+                        self.stt_runtime_label = (
+                            "Faster-Whisper (native fallback)"
+                        )
+                        logger.info(
+                            "STT: Faster-Whisper (native STT unavailable)",
+                        )
             elif engine_pref == "faster_whisper":
                 self.stt = self._build_faster_whisper_stt()
                 self.stt_runtime_label = (
@@ -490,7 +624,40 @@ class VoicePipeline:
                     if type(self.stt).__name__ == "DisabledSTT" or isinstance(self.stt, _DisabledSTT)
                     else "Faster-Whisper (offline fallback)"
                 )
+        elif engine_pref == "whisper_cpp":
+            whisper_stt, whisper_reason = self._build_whisper_cpp_stt()
+            if whisper_stt is not None:
+                self.stt = whisper_stt
+                self.stt_runtime_label = "whisper.cpp (Metal/CPU)"
+            else:
+                self.stt_runtime_error = whisper_reason or ""
+                self.stt_runtime_fallbacks.append(
+                    f"whisper.cpp unavailable: {whisper_reason}",
+                )
+                self.stt = self._build_disabled_stt(
+                    f"whisper.cpp unavailable ({whisper_reason})",
+                )
+                self.stt_runtime_label = "Disabled"
         elif engine_pref == "auto":
+            whisper_stt, whisper_reason = self._build_whisper_cpp_stt()
+            if whisper_stt is not None:
+                self.stt = whisper_stt
+                self.stt_runtime_label = "whisper.cpp (auto)"
+                logger.info(
+                    "STT auto: whisper.cpp selected -- model present",
+                )
+                logger.info("STT backend selected: %s", type(self.stt).__name__)
+                logger.info(
+                    "VOICE_LAUNCH_DIAG: ATOM_LAUNCH_MODE=%s "
+                    "ATOM_APP_BUNDLE=%s label=%s",
+                    os.environ.get("ATOM_LAUNCH_MODE", ""),
+                    os.environ.get("ATOM_APP_BUNDLE", ""),
+                    self.stt_runtime_label,
+                )
+                return
+            self.stt_runtime_fallbacks.append(
+                f"whisper.cpp unavailable: {whisper_reason}",
+            )
             self.stt = self._build_faster_whisper_stt()
             if isinstance(self.stt, _DisabledSTT):
                 whisper_reason = getattr(self.stt, "_reason", "offline fallback unavailable")

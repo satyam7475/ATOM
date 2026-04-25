@@ -53,8 +53,9 @@ def test_config_settings_required_keys() -> None:
     # STT config
     stt = settings.get("stt", {})
     assert "engine" in stt, "STT missing engine"
-    assert stt["engine"] in ("macos_native", "whisper", "custom"), \
-        f"Invalid STT engine: {stt['engine']}"
+    assert stt["engine"] in (
+        "macos_native", "whisper", "whisper_cpp", "custom",
+    ), f"Invalid STT engine: {stt['engine']}"
     
     # TTS config
     tts = settings.get("tts", {})
