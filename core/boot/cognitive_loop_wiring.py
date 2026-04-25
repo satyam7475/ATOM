@@ -175,8 +175,24 @@ def wire_cognitive_loop(
                 except Exception:
                     logger.debug("reflective execute_emitter failed", exc_info=True)
 
+            # Sprint A1: pass the underlying MLXBrain (which is what
+            # ``make_default_llm_provider`` calls ``.generate()`` on),
+            # not the wrapping ``LocalBrainController``. The controller
+            # exposes the brain at ``_llm``; older test doubles pass the
+            # MLX-shaped object directly (have ``.generate`` themselves)
+            # so we honour both shapes.
+            mlx_brain = getattr(local_brain, "_llm", None)
+            if mlx_brain is None or not hasattr(mlx_brain, "generate"):
+                if hasattr(local_brain, "generate"):
+                    mlx_brain = local_brain
+                else:
+                    raise RuntimeError(
+                        "ReflectiveLoop needs the underlying MLXBrain "
+                        "(local_brain._llm). The wrapping "
+                        "LocalBrainController doesn't expose .generate()."
+                    )
             llm_provider = make_default_llm_provider(
-                local_brain,
+                mlx_brain,
                 model_role="fast",
                 max_tokens=int(refl_cfg.get("max_tokens", 220)),
             )

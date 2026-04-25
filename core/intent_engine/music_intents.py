@@ -103,16 +103,49 @@ _MUSIC_RESUME = re.compile(
 )
 
 
-# Generic "play music" / "play some music" without a song name and
-# without "on youtube" — should land on Spotify resume.
+# Genre / mood / language adjectives we accept as descriptors in
+# "play some pop songs" / "play me some lofi music" / "play hindi
+# songs". When a genre is captured we route to ``music_play_specific``
+# with ``kind="genre"`` so the Spotify search picks up the descriptor.
+_MUSIC_GENRE_TOKEN = (
+    r"(?:pop|rock|jazz|blues|edm|"
+    r"lofi|lo-?fi|chill|focus|study|workout|gym|party|sleep|relax|"
+    r"hindi|bollywood|punjabi|tamil|telugu|english|"
+    r"classical|instrumental|acoustic|romantic|sad|happy|"
+    r"hip[\s-]?hop|rap|indie|metal|punk|country|reggae|"
+    r"k-?pop|j-?pop|desi|sufi|bhajan|qawwali|ghazal)"
+)
+_MUSIC_GENRE_RE = re.compile(rf"\b{_MUSIC_GENRE_TOKEN}\b", re.I)
+
+
+# Generic "play music" / "play some music" / "can you play some music
+# for me" / "play some pop-up songs" etc. -- no specific song name
+# and no "on youtube". Lands on Spotify (resume if no genre, search
+# if a genre adjective is captured).
+#
+# The leading polite/wake-prefix block accepts:
+#   "hey atom", "atom", "can you", "could you", "would you", "please"
+#   in any order -- log line 318 ("Can you play some music for me")
+#   was the original miss.
 _MUSIC_GENERIC_PLAY = re.compile(
-    r"^\s*("
-    r"(?:hey\s+atom\s+)?(?:please\s+)?"
-    r"(?:play|put\s+on|start)\s+"
-    r"(?:some\s+|the\s+|my\s+)?(?:music|song|songs|tunes|spotify|gana|gaana|sangeet)"
-    r"(?:\s+for\s+me)?(?:\s+please)?"
-    r")\s*$",
-    re.I,
+    r"^\s*"
+    r"(?:hey\s+atom[,\s]+)?"
+    r"(?:atom[,\s]+)?"
+    r"(?:(?:can|could|would|will)\s+(?:you|u)\s+)?"
+    r"(?:please\s+)?"
+    r"(?:play|put\s+on|start|fire\s+up|spin\s+up|throw\s+on)\s+"
+    r"(?:me\s+)?"
+    r"(?:some\s+|the\s+|my\s+|a\s+(?:bit\s+of\s+)?)?"
+    r"(?:"
+    rf"  (?P<genre_with_noun>{_MUSIC_GENRE_TOKEN})(?:[\s-]+(?:up|out))?"
+    r"   \s+(?:music|songs?|tunes?|spotify|gana|gaana|sangeet|playlist|jams?|tracks?)"
+    r"|"
+    rf"  (?P<genre_only>{_MUSIC_GENRE_TOKEN})"
+    r"|"
+    r"  (?:music|songs?|tunes?|spotify|gana|gaana|sangeet|playlist|jams?|tracks?)"
+    r")"
+    r"(?:\s+(?:for\s+me|please|atom|boss))*\s*[?.!]?\s*$",
+    re.X | re.I,
 )
 
 
@@ -202,7 +235,20 @@ def check(text: str) -> IntentResult | None:
         return IntentResult("music_prev", action="music_prev",
                             action_args={})
 
-    if _MUSIC_RESUME.search(text) or _MUSIC_GENERIC_PLAY.search(text):
+    if _MUSIC_RESUME.search(text):
+        return IntentResult("music_play", action="music_play",
+                            action_args={})
+
+    m_generic = _MUSIC_GENERIC_PLAY.search(text)
+    if m_generic:
+        gd = m_generic.groupdict()
+        genre = clean_slot(gd.get("genre_with_noun") or gd.get("genre_only"))
+        if genre:
+            return IntentResult(
+                "music_play_specific",
+                action="music_play_specific",
+                action_args={"query": genre, "kind": "genre"},
+            )
         return IntentResult("music_play", action="music_play",
                             action_args={})
 

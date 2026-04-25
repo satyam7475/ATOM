@@ -1105,6 +1105,15 @@ async def main() -> None:
             semantic_cache=semantic_cache,
             preference_store=preference_store,
         )
+        # Sprint A4: hand the on-device VLM (SmolVLM by default) to the
+        # controller so the PERCEPTION branch falls through to a real
+        # caption when Gemini is offline -- no more "Gemini Client
+        # offline" string reaching TTS (atomLogs.txt L464, L485).
+        if _captioner is not None:
+            try:
+                local_brain.attach_vlm_captioner(_captioner)
+            except Exception:
+                logger.debug("attach_vlm_captioner failed", exc_info=True)
 
     logger.info(
         "v22 Hybrid Intelligence: SecurityGateway + GeminiClient(%s) + "

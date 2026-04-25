@@ -242,3 +242,75 @@ def test_engine_quick_match_returns_music_pause() -> None:
 )
 def test_non_music_phrases_do_not_match(phrase: str) -> None:
     assert music_intents.check(phrase) is None
+
+
+# ── A2 sprint: phrases the live log proves we used to miss ──────────
+
+
+@pytest.mark.parametrize(
+    "phrase",
+    [
+        "can you play some music for me",
+        "could you play some music",
+        "would you play some music please",
+        "can you play music",
+        "atom can you play some music",
+        "hey atom can you play some music for me",
+        "please play some music for me",
+        "fire up some music",
+        "throw on some tunes",
+        "play me some songs",
+        "spin up the playlist",
+        "put on a bit of music please",
+    ],
+)
+def test_polite_prefix_play_music_routes_to_music_play(phrase: str) -> None:
+    """All 12 phrases the atomLogs.txt sprint analysis flagged as
+    misclassified to LLM must now resolve to ``music_play`` natively."""
+    result = music_intents.check(phrase)
+    assert result is not None, f"no intent for {phrase!r}"
+    assert result.intent == "music_play", (
+        f"{phrase!r} -> {result.intent} (expected music_play)"
+    )
+
+
+@pytest.mark.parametrize(
+    "phrase, expected_genre",
+    [
+        ("play some pop songs", "pop"),
+        ("play some pop-up songs", "pop"),
+        ("play me some lofi music", "lofi"),
+        ("play some lo-fi tunes", "lo-fi"),
+        ("play some hindi songs", "hindi"),
+        ("can you play some bollywood music", "bollywood"),
+        ("put on some chill music for me", "chill"),
+        ("play some focus music", "focus"),
+        ("fire up some rock songs", "rock"),
+        ("play some classical music please", "classical"),
+        ("play some jazz", "jazz"),
+        ("play some workout music", "workout"),
+    ],
+)
+def test_genre_descriptor_routes_to_play_specific(
+    phrase: str, expected_genre: str,
+) -> None:
+    result = music_intents.check(phrase)
+    assert result is not None, f"no intent for {phrase!r}"
+    assert result.intent == "music_play_specific"
+    assert result.action_args is not None
+    assert result.action_args["kind"] == "genre"
+    assert result.action_args["query"].lower() == expected_genre.lower()
+
+
+def test_engine_classifies_polite_play_as_music_play() -> None:
+    engine = IntentEngine()
+    out = engine.classify("can you play some music for me")
+    assert out.intent == "music_play"
+
+
+def test_engine_classifies_genre_as_play_specific() -> None:
+    engine = IntentEngine()
+    out = engine.classify("play some lofi music")
+    assert out.intent == "music_play_specific"
+    assert out.action_args is not None
+    assert out.action_args.get("kind") == "genre"

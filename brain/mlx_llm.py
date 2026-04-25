@@ -236,72 +236,13 @@ _COT_PREFACE_RE = re.compile(
 )
 
 
-# Bare stage-direction parenthetical describing voice/tone/manner/action.
-# Smaller instruction-tuned models (Qwen3-4B in particular) parrot persona-
-# adjective phrases back as a stage direction. Length-capped + vocabulary-
-# anchored so that legitimate parentheticals like "(see line 12)" survive.
-_STAGE_LEAK_VOCAB = (
-    r"\b(?:tone|voice|manner|composed|composedly|calm(?:ly)?|softly|"
-    r"warmly|gently|firmly|politely|brief(?:ly)?|professional(?:ly)?|"
-    r"quietly|quickly|slowly|immediately|confidently|cheerful(?:ly)?|"
-    r"cheery|crisp(?:ly)?|relaxed|respectful(?:ly)?|measured|steady|"
-    r"steadily|chief\s+of\s+staff|friday[-\s]?style|jarvis[-\s]?style|"
-    r"respond(?:s|ed|ing)?|reply(?:ies|ied|ying)?|answer(?:s|ed|ing)?|"
-    r"pause(?:s|d|ing)?|nod(?:s|ded|ding)?|smile(?:s|d|ing)?|"
-    r"chuckle(?:s|d|ing)?|sigh(?:s|ed|ing)?|breathe(?:s|d|ing)?|"
-    r"speaks?|speaking|in\s+a\s+(?:tone|voice|manner))\b"
+# Stage-direction parenthetical sanitiser. Definition lives in the
+# shared brain._speech_sanitizer module so the streaming TTS path,
+# the batch LLM path and the LocalBrainController hot-text path all
+# use the same regex. Sprint A3 unified the three duplicate copies.
+from brain._speech_sanitizer import (  # noqa: E402  -- intentional rebinding
+    strip_stage_direction_leak as _strip_stage_direction_leak,
 )
-
-_STAGE_DIRECTION_LEAK_RE = re.compile(
-    r"""
-    ^\s*
-    \(\s*
-    [^()\n]{0,80}?
-    """ + _STAGE_LEAK_VOCAB + r"""
-    [^()\n]{0,80}?
-    \)
-    \s*[\.,;:\-\u2013\u2014]?\s*
-    """,
-    re.IGNORECASE | re.VERBOSE,
-)
-
-# Same leak shape but with NO closing paren -- the model truncated the
-# direction mid-clause, e.g. "(in a calm, composed tone" or
-# "(calm, composed tone." with the dot inside an unclosed paren.
-# The closing terminator is end-of-string or newline.
-_STAGE_DIRECTION_OPEN_LEAK_RE = re.compile(
-    r"""
-    ^\s*
-    \(\s*
-    [^()\n]{0,160}?
-    """ + _STAGE_LEAK_VOCAB + r"""
-    [^()\n]*?
-    (?:$|\n)
-    """,
-    re.IGNORECASE | re.VERBOSE,
-)
-
-
-def _strip_stage_direction_leak(text: str) -> str:
-    """Peel a leading bare parenthetical describing voice/tone/manner/action.
-
-    Handles three shapes the latest atom_log proved still leak:
-      - "(in a calm, composed tone). Boss…"   (closed, original Sprint A)
-      - "(in a calm, composed tone"            (open, L357)
-      - "(calm, composed tone."                 (open with inner dot, L554)
-      - "(responds immediately) Sure, Boss"    (closed, narration verb, L409)
-    """
-    if not text or "(" not in text[:160]:
-        return text
-    out = text
-    for _ in range(2):
-        new = _STAGE_DIRECTION_LEAK_RE.sub("", out, count=1).lstrip()
-        if new == out:
-            new = _STAGE_DIRECTION_OPEN_LEAK_RE.sub("", out, count=1).lstrip()
-        if new == out:
-            break
-        out = new
-    return out
 
 
 def _strip_cot_prefaces(text: str) -> str:

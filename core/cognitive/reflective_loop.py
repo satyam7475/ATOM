@@ -198,6 +198,9 @@ class ReflectiveLoop:
         "_total_attempts", "_total_advise", "_total_clarify",
         "_total_execute", "_total_silent",
         "_response_emitter", "_execute_emitter",
+        "_consecutive_failures", "_failure_threshold",
+        "_disabled_until", "_disable_cooldown_s",
+        "_total_provider_failures",
     )
 
     def __init__(
@@ -210,6 +213,8 @@ class ReflectiveLoop:
         state_provider: Callable[[], str] | None = None,
         response_emitter: Callable[[str], None] | None = None,
         execute_emitter: Callable[[str], None] | None = None,
+        failure_threshold: int = 3,
+        disable_cooldown_s: float = 600.0,
     ) -> None:
         self._bus = bus
         self._llm = llm
@@ -227,6 +232,14 @@ class ReflectiveLoop:
         self._total_silent = 0
         self._response_emitter = response_emitter
         self._execute_emitter = execute_emitter
+        # Circuit-breaker: after N consecutive provider failures, stop
+        # trying for `disable_cooldown_s` seconds. Stops the log spam
+        # we saw in atomLogs.txt when the wrong object was wired in.
+        self._consecutive_failures = 0
+        self._failure_threshold = max(1, int(failure_threshold))
+        self._disabled_until = 0.0
+        self._disable_cooldown_s = max(1.0, float(disable_cooldown_s))
+        self._total_provider_failures = 0
 
     # ── public API ───────────────────────────────────────────────
 
@@ -304,6 +317,8 @@ class ReflectiveLoop:
     async def _on_tts_complete(self, **_kw: Any) -> None:
         if self._in_flight:
             return
+        if self._breaker_open():
+            return
         if not self._cooldown_passed():
             return
         if not self._has_meaningful_turn():
@@ -339,7 +354,13 @@ class ReflectiveLoop:
             raw, ok = await self._llm(prompt)
         except Exception:
             logger.exception("ReflectiveLoop: LLM call raised")
+            self._note_provider_failure()
             return
+
+        if not ok:
+            self._note_provider_failure()
+        else:
+            self._consecutive_failures = 0
 
         decision = parse_decision(raw if ok else "")
         self._last_reflection_at = time.monotonic()
@@ -423,6 +444,34 @@ class ReflectiveLoop:
         except Exception:
             return True
         return state in ("", "idle", "listening")
+
+    # ── circuit-breaker ─────────────────────────────────────────
+
+    def _breaker_open(self) -> bool:
+        if self._disabled_until <= 0.0:
+            return False
+        if time.monotonic() >= self._disabled_until:
+            # Cooldown expired -- give the provider a fresh chance.
+            logger.info(
+                "ReflectiveLoop: breaker cooldown elapsed, re-enabling",
+            )
+            self._disabled_until = 0.0
+            self._consecutive_failures = 0
+            return False
+        return True
+
+    def _note_provider_failure(self) -> None:
+        self._total_provider_failures += 1
+        self._consecutive_failures += 1
+        if self._consecutive_failures >= self._failure_threshold:
+            self._disabled_until = (
+                time.monotonic() + self._disable_cooldown_s
+            )
+            logger.warning(
+                "ReflectiveLoop: %d consecutive provider failures -- "
+                "tripping breaker for %.0fs",
+                self._consecutive_failures, self._disable_cooldown_s,
+            )
 
 
 # ── factory helper for wiring.py ───────────────────────────────────

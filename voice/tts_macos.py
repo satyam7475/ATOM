@@ -32,6 +32,8 @@ import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from brain._speech_sanitizer import StreamingLeakBuffer
+
 logger = logging.getLogger("atom.tts_macos")
 
 if TYPE_CHECKING:
@@ -808,6 +810,10 @@ class MacOSTTSAsync:
         self._stream_generation: int = 0
         self._stream_speak_buffer: str = ""
         self._stream_start_t: float = 0.0
+        # Holds the first ~60 chars of every fresh stream so a leading
+        # stage-direction parenthetical leaked by the LLM never reaches
+        # the speaker. Cleared on every is_first chunk.
+        self._stream_leak_buffer: StreamingLeakBuffer = StreamingLeakBuffer()
         self._tts_interrupt_count: int = 0
         # Echo guard ring: lowercased, alpha-only word lists from the most
         # recent spoken slices. Lets ``is_echo()`` answer whether an STT
@@ -1701,6 +1707,10 @@ class MacOSTTSAsync:
             self._stream_speak_buffer = ""
             self._spoken_word_count = 0
             self._recent_spoken_chunks.clear()
+            # Reset the leading-leak buffer for the new utterance. Until
+            # this buffer "releases", we hold every slice off the queue
+            # so the LLM cannot speak its own stage direction.
+            self._stream_leak_buffer.reset()
             self._active_stream_id = stream_id or None
             self._stream_start_t = time.perf_counter()
             logger.info(
@@ -1740,6 +1750,28 @@ class MacOSTTSAsync:
             self._stream_task = asyncio.create_task(
                 self._play_stream_chunks(self._stream_generation)
             )
+
+        # ── Sprint A3: leading stage-direction guard ──────────────
+        # Run the slice through the StreamingLeakBuffer first. While
+        # the buffer is still accumulating, *no* audio is queued -- it
+        # waits for either a sentence-boundary or 60 chars before
+        # releasing the cleaned head. After release every subsequent
+        # slice passes straight through.
+        if not self._stream_leak_buffer.released and normalized_text:
+            cleaned_slices = self._stream_leak_buffer.feed(normalized_text)
+            if not cleaned_slices:
+                if is_last:
+                    cleaned_slices = self._stream_leak_buffer.flush()
+                    for cleaned in cleaned_slices:
+                        if cleaned:
+                            queue.put_nowait((cleaned, False))
+                    queue.put_nowait(("", True))
+                return
+            # Replace the raw slice with the sanitised head; the rest
+            # of the stream (after release) bypasses the buffer.
+            normalized_text = " ".join(s for s in cleaned_slices if s).strip()
+            if not normalized_text and not is_last:
+                return
 
         # Backpressure: when TTS is falling behind (queue depth > 5),
         # merge text directly into the speak buffer instead of queueing

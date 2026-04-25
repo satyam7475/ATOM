@@ -151,6 +151,50 @@ def test_wire_cognitive_loop_attaches_reflective_when_brain_present() -> None:
         assert _has_subscriber(bus, ev), f"{ev} must have a subscriber"
 
 
+def test_wire_cognitive_loop_unwraps_local_brain_controller() -> None:
+    """Sprint A1 regression: when the supplied object looks like a
+    ``LocalBrainController`` (no ``.generate`` itself, but a nested
+    ``_llm`` MLXBrain), the wiring must pull the inner brain so the
+    reflective loop's provider gets a real ``.generate()`` call --
+    otherwise it would log ``AttributeError: 'LocalBrainController'
+    has no 'generate'`` every turn (atomLogs.txt L304/L430/L546)."""
+
+    class _InnerMLX:
+        async def generate(self, prompt: str, **kw: Any) -> tuple[str, bool]:
+            return ("{\"decision\":\"none\"}", True)
+
+    class _ControllerLike:
+        def __init__(self) -> None:
+            self._llm = _InnerMLX()
+            # NB: deliberately no ``generate`` on the controller itself.
+
+    bus = AsyncEventBus()
+    handles = wire_cognitive_loop(
+        bus=bus, state=_StubState(), command_loop=_StubCommandLoop(),
+        config={"cognitive_loop": {"enabled": True}},
+        local_brain=_ControllerLike(),
+    )
+    assert handles.reflective is not None
+    assert handles.enabled_summary["reflective"] is True
+
+
+def test_reflective_loop_has_circuit_breaker_attrs() -> None:
+    """Sprint A1: ReflectiveLoop must expose the 3-fail breaker
+    attributes (``_failure_threshold`` defaults to 3,
+    ``_disable_cooldown_s`` defaults to 600s) so consecutive provider
+    failures detach gracefully instead of spamming logs."""
+    from core.cognitive.reflective_loop import ReflectiveLoop
+
+    rl = ReflectiveLoop(
+        AsyncEventBus(),
+        llm=lambda prompt: ("", False),  # type: ignore[arg-type]
+    )
+    assert rl._failure_threshold == 3
+    assert rl._disable_cooldown_s == 600.0
+    assert rl._consecutive_failures == 0
+    assert rl._disabled_until == 0.0
+
+
 def test_wire_cognitive_loop_skips_reflective_without_brain() -> None:
     bus = AsyncEventBus()
     handles = wire_cognitive_loop(

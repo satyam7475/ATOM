@@ -24,7 +24,12 @@ logger = logging.getLogger("atom.stt_watchdog")
 _SILENT_TIMEOUT_S = 8.0
 _STUCK_TIMEOUT_S = 15.0
 _MAX_RESTARTS_PER_WINDOW = 5
-_RESTART_WINDOW_S = 300.0
+# Sprint A5: shrink the breaker cooldown from 300s -> 60s. Five minutes
+# of forced deafness in the middle of a session is unacceptable -- the
+# Apple framework typically clears whatever made it choke within the
+# first minute, and the new audible "STT recovering" announcement
+# (`_speak_breaker_open`) means the user is no longer surprised.
+_RESTART_WINDOW_S = 60.0
 _CHECK_INTERVAL_S = 2.0
 # After this many consecutive chain restarts (with SFSpeechRecognizer
 # recreate) that still produce zero partials, escalate to a full engine
@@ -323,21 +328,61 @@ class STTWatchdog:
 
     def _can_restart(self) -> bool:
         now = time.monotonic()
+        before = len(self._restart_times)
         self._restart_times = [
             t for t in self._restart_times
             if now - t < _RESTART_WINDOW_S
         ]
+        # Detect the "breaker just closed" edge: previously OPEN (logged)
+        # and now back below the threshold. Tell the user so they know
+        # ATOM can hear them again -- the A5 user-experience fix.
+        breaker_was_open = getattr(self, "_circuit_open_logged", False)
         if len(self._restart_times) >= _MAX_RESTARTS_PER_WINDOW:
-            if not getattr(self, "_circuit_open_logged", False):
+            if not breaker_was_open:
                 logger.warning(
                     "STT Watchdog: circuit breaker OPEN — %d restarts in %.0fs window, "
                     "suppressing further restarts until window clears",
                     len(self._restart_times), _RESTART_WINDOW_S,
                 )
                 self._circuit_open_logged = True
+                self._speak_breaker_open()
             return False
+        if breaker_was_open and len(self._restart_times) < _MAX_RESTARTS_PER_WINDOW:
+            logger.info(
+                "STT Watchdog: circuit breaker CLOSED — %d/%d restarts in window, "
+                "STT recovery permitted again",
+                len(self._restart_times), _MAX_RESTARTS_PER_WINDOW,
+            )
+            self._speak_breaker_recovered()
+        if before > 0 and len(self._restart_times) == 0:
+            # Window cleared completely; suppress any stale flag.
+            pass
         self._circuit_open_logged = False
         return True
+
+    # ── audible breaker UX ──────────────────────────────────────
+
+    def _speak_breaker_open(self) -> None:
+        """Announce to the user that ATOM has stopped listening so the
+        long silence isn't mysterious. Best-effort -- never raises."""
+        try:
+            self._bus.emit_fast(
+                "tts_say",
+                text="STT recovering, give me a moment, Boss.",
+                source="stt_watchdog",
+            )
+        except Exception:
+            logger.debug("breaker_open speak failed", exc_info=True)
+
+    def _speak_breaker_recovered(self) -> None:
+        try:
+            self._bus.emit_fast(
+                "tts_say",
+                text="Listening again, Boss.",
+                source="stt_watchdog",
+            )
+        except Exception:
+            logger.debug("breaker_recovered speak failed", exc_info=True)
 
     async def _restart_stt(self, stt: Any, reason: str) -> None:
         from voice.recovery_lock import voice_recovery_lock

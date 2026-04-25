@@ -267,74 +267,13 @@ _COT_PREFACE_STRIP_PARTIAL_RE = re.compile(
 )
 
 
-# Bare stage-direction parentheticals leaked by smaller instruction-tuned
-# models (Qwen3-4B in particular) when the system prompt mentions tone/
-# manner adjectives. Length-capped + vocabulary-anchored so that legitimate
-# parentheticals like "(see line 12)" or "(2 of 3)" survive.
-_STAGE_LEAK_VOCAB = (
-    r"\b(?:tone|voice|manner|composed|composedly|calm(?:ly)?|softly|"
-    r"warmly|gently|firmly|politely|brief(?:ly)?|professional(?:ly)?|"
-    r"quietly|quickly|slowly|immediately|confidently|cheerful(?:ly)?|"
-    r"cheery|crisp(?:ly)?|relaxed|respectful(?:ly)?|measured|steady|"
-    r"steadily|chief\s+of\s+staff|friday[-\s]?style|jarvis[-\s]?style|"
-    r"respond(?:s|ed|ing)?|reply(?:ies|ied|ying)?|answer(?:s|ed|ing)?|"
-    r"pause(?:s|d|ing)?|nod(?:s|ded|ding)?|smile(?:s|d|ing)?|"
-    r"chuckle(?:s|d|ing)?|sigh(?:s|ed|ing)?|breathe(?:s|d|ing)?|"
-    r"speaks?|speaking|in\s+a\s+(?:tone|voice|manner))\b"
+# Stage-direction parenthetical sanitiser. Definition lives in the
+# shared brain._speech_sanitizer module so the streaming TTS path,
+# the batch LLM path and the LocalBrainController hot-text path all
+# use the same regex. Sprint A3 unified the three duplicate copies.
+from brain._speech_sanitizer import (  # noqa: E402
+    strip_stage_direction_leak as _strip_stage_direction_leak,
 )
-
-_STAGE_DIRECTION_LEAK_RE = re.compile(
-    r"""
-    ^\s*
-    \(\s*
-    [^()\n]{0,80}?
-    """ + _STAGE_LEAK_VOCAB + r"""
-    [^()\n]{0,80}?
-    \)
-    \s*[\.,;:\-\u2013\u2014]?\s*
-    """,
-    re.IGNORECASE | re.VERBOSE,
-)
-
-# Open-paren stage-direction leak (no closing paren). The model truncated
-# the direction mid-clause, e.g. "(in a calm, composed tone" or
-# "(calm, composed tone." with the dot inside an unclosed paren.
-# Terminates at end-of-string or newline.
-_STAGE_DIRECTION_OPEN_LEAK_RE = re.compile(
-    r"""
-    ^\s*
-    \(\s*
-    [^()\n]{0,160}?
-    """ + _STAGE_LEAK_VOCAB + r"""
-    [^()\n]*?
-    (?:$|\n)
-    """,
-    re.IGNORECASE | re.VERBOSE,
-)
-
-
-def _strip_stage_direction_leak(text: str) -> str:
-    """Peel a leading bare parenthetical describing voice/tone/manner/action.
-
-    Handles four shapes seen in atom_log:
-      - "(in a calm, composed tone). Boss…"   (closed, original Sprint A)
-      - "(in a calm, composed tone"            (open, L357)
-      - "(calm, composed tone."                 (open with inner dot, L554)
-      - "(responds immediately) Sure, Boss"    (closed, narration verb, L409)
-    Anchored at head + vocabulary-gated so factual asides like "(see line 12)"
-    pass through untouched.
-    """
-    if not text or "(" not in text[:160]:
-        return text
-    out = text
-    for _ in range(2):
-        new = _STAGE_DIRECTION_LEAK_RE.sub("", out, count=1).lstrip()
-        if new == out:
-            new = _STAGE_DIRECTION_OPEN_LEAK_RE.sub("", out, count=1).lstrip()
-        if new == out:
-            break
-        out = new
-    return out
 
 
 def _strip_cot_preface(text: str) -> str:
@@ -677,6 +616,11 @@ class LocalBrainController:
         self._gemini_client: Any = None
         self._semantic_cache: Any = None
         self._preference_store: Any = None
+        # Sprint A4: optional on-device VLM captioner (SmolVLM by
+        # default). When ``_gemini_client`` is None the PERCEPTION
+        # branch falls through to this captioner instead of speaking
+        # the legacy "Gemini Client offline" string.
+        self._vlm_captioner: Any = None
 
         # Optional vetter — invoked on the final LLM text before it leaves
         # the controller. Wired from the Router so it can apply verb-match
@@ -739,6 +683,17 @@ class LocalBrainController:
 
     def attach_second_brain(self, second_brain: Any) -> None:
         self._second_brain = second_brain
+
+    def attach_vlm_captioner(self, captioner: Any) -> None:
+        """Sprint A4: wire the on-device VLM (SmolVLM by default) for
+        the PERCEPTION branch fallback. Without this the controller
+        used to speak the legacy ``"Gemini Client offline"`` string
+        because the captioner stayed in main.py scope."""
+        self._vlm_captioner = captioner
+        if captioner is not None:
+            logger.info(
+                "VLM captioner attached to local brain (vision fallback ready)",
+            )
 
     def attach_cloud_intelligence(
         self,
@@ -1436,7 +1391,10 @@ class LocalBrainController:
         if intent.category.name == "PERCEPTION":
             logger.info("PERCEPTION isolated: Bypassing inference loop for Vision AI.")
             from core.perception.screen_reader import ScreenReader
-            vision = ScreenReader(gemini_client=self._gemini_client)
+            vision = ScreenReader(
+                gemini_client=self._gemini_client,
+                vlm_captioner=self._vlm_captioner,
+            )
             result = await vision.analyze_screen(text)
             if self._response_vetter is not None and isinstance(result, str) and result:
                 try:
