@@ -1,0 +1,849 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-title" content="ATOM" />
+  <meta name="theme-color" content="#04060d" />
+  <title>ATOM — Boss Console</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Ccircle cx='32' cy='32' r='28' fill='%2300d2ff'/%3E%3C/svg%3E" />
+  <style>
+    :root {
+      --bg-0: #04060d;
+      --bg-1: #0b1224;
+      --bg-2: #131c33;
+      --line: rgba(120, 160, 240, 0.18);
+      --text-0: #ecf2ff;
+      --text-1: #9eb0d3;
+      --text-2: #6479a4;
+      --accent: #00d2ff;
+      --accent-2: #6c63ff;
+      --good: #5ee2a5;
+      --warn: #ffb84d;
+      --bad: #ff6b6b;
+      --shadow: 0 30px 60px -25px rgba(0, 0, 0, 0.65);
+      --radius: 18px;
+    }
+
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    html, body {
+      height: 100%;
+      background: radial-gradient(ellipse at 20% 0%, #0e1a3a 0%, var(--bg-0) 55%, #02030a 100%);
+      color: var(--text-0);
+      font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", "Inter", "Segoe UI", Roboto, sans-serif;
+      overflow: hidden;
+    }
+
+    body {
+      display: grid;
+      grid-template-columns: 1.1fr 1fr;
+      grid-template-rows: auto 1fr;
+      grid-template-areas: "header header" "left right";
+      gap: 18px;
+      padding: 18px;
+    }
+
+    @media (max-width: 900px) {
+      body {
+        grid-template-columns: 1fr;
+        grid-template-rows: auto auto 1fr;
+        grid-template-areas: "header" "left" "right";
+        padding: 12px;
+        gap: 12px;
+      }
+    }
+
+    /* ── Header ─────────────────────────────────────────────────── */
+    header {
+      grid-area: header;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 12px 18px;
+      background: linear-gradient(180deg, rgba(20, 30, 60, 0.5), rgba(10, 16, 35, 0.3));
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      backdrop-filter: blur(18px);
+      -webkit-backdrop-filter: blur(18px);
+    }
+
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+
+    .brand-mark {
+      width: 38px;
+      height: 38px;
+      border-radius: 50%;
+      background: conic-gradient(from 0deg, var(--accent), var(--accent-2), var(--accent));
+      box-shadow: 0 0 20px rgba(0, 210, 255, 0.55);
+      animation: spin 14s linear infinite;
+    }
+
+    .brand-text {
+      display: flex;
+      flex-direction: column;
+      line-height: 1.1;
+    }
+
+    .brand-text strong { font-size: 18px; letter-spacing: 0.18em; }
+    .brand-text small { color: var(--text-2); letter-spacing: 0.18em; font-size: 11px; }
+
+    .header-meta {
+      display: flex;
+      gap: 12px;
+      align-items: center;
+      flex-wrap: wrap;
+    }
+
+    .pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 6px 12px;
+      border-radius: 999px;
+      background: rgba(255, 255, 255, 0.04);
+      border: 1px solid var(--line);
+      color: var(--text-1);
+      font-size: 12px;
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+    }
+
+    .pill-dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: var(--text-2);
+      box-shadow: 0 0 6px currentColor;
+    }
+    .pill[data-tone="ok"]    { color: var(--good); }
+    .pill[data-tone="warn"]  { color: var(--warn); }
+    .pill[data-tone="err"]   { color: var(--bad); }
+    .pill[data-tone="ok"]   .pill-dot { background: var(--good); }
+    .pill[data-tone="warn"] .pill-dot { background: var(--warn); }
+    .pill[data-tone="err"]  .pill-dot { background: var(--bad); }
+
+    /* ── Panels ─────────────────────────────────────────────────── */
+    .panel {
+      background: linear-gradient(180deg, rgba(18, 28, 60, 0.55), rgba(8, 12, 28, 0.55));
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      box-shadow: var(--shadow);
+      backdrop-filter: blur(18px);
+      -webkit-backdrop-filter: blur(18px);
+      display: flex;
+      flex-direction: column;
+      min-height: 0;
+      overflow: hidden;
+    }
+
+    .panel-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 14px 18px;
+      border-bottom: 1px solid var(--line);
+    }
+    .panel-title {
+      letter-spacing: 0.18em;
+      font-size: 12px;
+      color: var(--text-2);
+      text-transform: uppercase;
+    }
+
+    .panel-body {
+      flex: 1;
+      min-height: 0;
+      overflow: auto;
+      padding: 18px;
+    }
+
+    /* ── Left column (orb + state + telemetry) ─────────────────── */
+    #left-col {
+      grid-area: left;
+      display: grid;
+      grid-template-rows: auto 1fr auto;
+      gap: 18px;
+    }
+
+    .orb-wrap {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      padding: 24px 18px;
+      gap: 12px;
+    }
+
+    .orb {
+      position: relative;
+      width: 220px;
+      height: 220px;
+      border-radius: 50%;
+      background:
+        radial-gradient(circle at 30% 30%, rgba(0,210,255,0.95), rgba(108,99,255,0.35) 55%, rgba(0,0,0,0) 75%),
+        radial-gradient(circle at 70% 70%, rgba(108,99,255,0.85), rgba(0,210,255,0.0) 55%);
+      filter: blur(0.5px);
+      box-shadow:
+        0 0 60px rgba(0,210,255,0.45),
+        0 0 120px rgba(108,99,255,0.35),
+        inset 0 0 60px rgba(255,255,255,0.05);
+      transition: transform 0.4s ease;
+    }
+    .orb::before, .orb::after {
+      content: "";
+      position: absolute;
+      inset: -10%;
+      border-radius: 50%;
+      border: 1px solid rgba(255,255,255,0.06);
+      animation: orb-pulse 5s ease-in-out infinite;
+    }
+    .orb::after { inset: -22%; animation-duration: 7s; }
+
+    .orb[data-state="LISTENING"] { transform: scale(1.06); }
+    .orb[data-state="THINKING"]  { animation: orb-flicker 1.4s ease-in-out infinite; }
+    .orb[data-state="SPEAKING"]  { box-shadow: 0 0 80px rgba(94,226,165,0.55), 0 0 140px rgba(94,226,165,0.4); }
+    .orb[data-state="ERROR_RECOVERY"] { box-shadow: 0 0 80px rgba(255,107,107,0.55), 0 0 140px rgba(255,107,107,0.4); }
+
+    @keyframes orb-pulse { 0%,100% { opacity: 0.18; transform: scale(1); } 50% { opacity: 0.5; transform: scale(1.04); } }
+    @keyframes orb-flicker { 0%,100% { filter: brightness(1); } 50% { filter: brightness(1.45); } }
+    @keyframes spin { to { transform: rotate(1turn); } }
+
+    .state-line {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 4px;
+      text-align: center;
+    }
+    .state-line strong { font-size: 22px; letter-spacing: 0.2em; }
+    .state-line span { color: var(--text-2); font-size: 13px; }
+
+    /* ── Telemetry mini-grid ───────────────────────────────────── */
+    .telemetry {
+      display: grid;
+      grid-template-columns: repeat(2, 1fr);
+      gap: 10px;
+      padding: 0 18px 18px;
+    }
+    .telemetry .cell {
+      background: rgba(255,255,255,0.03);
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      padding: 12px 14px;
+    }
+    .telemetry .cell small { color: var(--text-2); letter-spacing: 0.16em; font-size: 10px; text-transform: uppercase; display: block; margin-bottom: 4px; }
+    .telemetry .cell strong { font-size: 18px; }
+
+    /* ── Right column (chat) ───────────────────────────────────── */
+    #right-col {
+      grid-area: right;
+      display: grid;
+      grid-template-rows: 1fr auto;
+      gap: 18px;
+    }
+
+    .chat-log {
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+      padding-bottom: 4px;
+    }
+    .msg {
+      max-width: 88%;
+      padding: 10px 14px;
+      border-radius: 16px;
+      font-size: 14px;
+      line-height: 1.45;
+      word-wrap: break-word;
+      animation: pop-in 0.18s ease;
+    }
+    @keyframes pop-in { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: translateY(0); } }
+    .msg.boss { align-self: flex-end; background: linear-gradient(135deg, var(--accent), var(--accent-2)); color: #04060d; }
+    .msg.atom { align-self: flex-start; background: rgba(255,255,255,0.05); border: 1px solid var(--line); }
+    .msg.system { align-self: center; background: transparent; color: var(--text-2); font-size: 12px; letter-spacing: 0.12em; text-transform: uppercase; }
+    .msg .meta { display: block; font-size: 10px; opacity: 0.7; margin-top: 4px; letter-spacing: 0.08em; }
+
+    .composer {
+      display: flex;
+      gap: 10px;
+      padding: 14px;
+      align-items: flex-end;
+    }
+    .composer textarea {
+      flex: 1;
+      resize: none;
+      background: rgba(255,255,255,0.04);
+      border: 1px solid var(--line);
+      color: var(--text-0);
+      padding: 12px 14px;
+      border-radius: 14px;
+      font-family: inherit;
+      font-size: 14px;
+      line-height: 1.4;
+      min-height: 44px;
+      max-height: 140px;
+      outline: none;
+    }
+    .composer textarea:focus { border-color: rgba(0,210,255,0.6); box-shadow: 0 0 0 3px rgba(0,210,255,0.15); }
+
+    .icon-btn {
+      width: 44px;
+      height: 44px;
+      border-radius: 14px;
+      border: 1px solid var(--line);
+      background: rgba(255,255,255,0.04);
+      color: var(--text-0);
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 18px;
+      transition: transform 0.1s ease, background 0.15s ease;
+    }
+    .icon-btn:hover { background: rgba(0,210,255,0.15); transform: translateY(-1px); }
+    .icon-btn[data-active="true"] { background: rgba(0,210,255,0.25); border-color: rgba(0,210,255,0.6); color: var(--accent); }
+    .icon-btn[data-tone="bad"][data-active="true"] { background: rgba(255,107,107,0.25); border-color: rgba(255,107,107,0.6); color: var(--bad); }
+
+    .composer .send {
+      background: linear-gradient(135deg, var(--accent), var(--accent-2));
+      color: #04060d;
+      border: none;
+      font-weight: 600;
+      letter-spacing: 0.08em;
+    }
+
+    .controls {
+      display: flex;
+      gap: 8px;
+      padding: 0 14px 14px;
+      flex-wrap: wrap;
+    }
+
+    /* ── Activity / suggestion strip ───────────────────────────── */
+    .ticker {
+      padding: 10px 18px;
+      border-top: 1px solid var(--line);
+      color: var(--text-2);
+      font-size: 12px;
+      letter-spacing: 0.1em;
+      text-transform: uppercase;
+      display: flex;
+      gap: 14px;
+      align-items: center;
+      overflow: hidden;
+    }
+    .ticker strong { color: var(--accent); }
+
+    /* hidden audio element keeps Safari iOS happy */
+    audio { display: none; }
+
+    /* mic-level bar */
+    .mic-bar {
+      width: 100%;
+      height: 4px;
+      background: rgba(255,255,255,0.05);
+      border-radius: 4px;
+      overflow: hidden;
+    }
+    .mic-bar > div {
+      height: 100%;
+      width: 0%;
+      background: linear-gradient(90deg, var(--accent), var(--accent-2));
+      transition: width 0.08s linear;
+    }
+
+    /* connection indicator dot pulse */
+    .pill[data-tone="ok"] .pill-dot { animation: pulse-dot 2s ease-in-out infinite; }
+    @keyframes pulse-dot { 0%,100% { transform: scale(1); opacity: 1; } 50% { transform: scale(1.4); opacity: 0.6; } }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="brand">
+      <div class="brand-mark"></div>
+      <div class="brand-text">
+        <strong>ATOM</strong>
+        <small>Boss Console · Friday Class</small>
+      </div>
+    </div>
+    <div class="header-meta">
+      <span class="pill" id="conn-pill" data-tone="warn"><span class="pill-dot"></span><span id="conn-text">connecting</span></span>
+      <span class="pill" id="mood-pill"><span class="pill-dot"></span><span id="mood-text">mood: --</span></span>
+      <span class="pill" id="participants-pill"><span class="pill-dot"></span><span id="participants-text">solo</span></span>
+    </div>
+  </header>
+
+  <section id="left-col" class="panel">
+    <div class="panel-header">
+      <span class="panel-title">ATOM Presence</span>
+      <span class="panel-title" id="latency-text">latency --</span>
+    </div>
+    <div class="orb-wrap">
+      <div class="orb" id="orb" data-state="IDLE"></div>
+      <div class="state-line">
+        <strong id="state-text">IDLE</strong>
+        <span id="state-status">Awaiting Boss</span>
+      </div>
+      <div class="mic-bar"><div id="mic-bar-fill"></div></div>
+    </div>
+    <div class="telemetry">
+      <div class="cell"><small>Last reply</small><strong id="cell-last-reply">--</strong></div>
+      <div class="cell"><small>Tokens / s</small><strong id="cell-tokens">--</strong></div>
+      <div class="cell"><small>STT engine</small><strong id="cell-stt">--</strong></div>
+      <div class="cell"><small>Brain</small><strong id="cell-brain">MLX</strong></div>
+    </div>
+  </section>
+
+  <section id="right-col">
+    <div class="panel">
+      <div class="panel-header">
+        <span class="panel-title">Conversation with Boss</span>
+        <span class="panel-title" id="ticker-suggestion">--</span>
+      </div>
+      <div class="panel-body chat-log" id="chat-log">
+        <div class="msg system">Booting Boss console…</div>
+      </div>
+      <div class="ticker">
+        <span><strong id="event-count">0</strong> events</span>
+        <span>·</span>
+        <span id="last-event">idle</span>
+      </div>
+    </div>
+
+    <div class="panel">
+      <div class="composer">
+        <button class="icon-btn" id="btn-mic"      title="Stream mic to ATOM">●</button>
+        <button class="icon-btn" id="btn-camera"   title="Stream camera to ATOM">◉</button>
+        <button class="icon-btn" id="btn-screen"   title="Share screen with ATOM">▣</button>
+        <textarea id="composer-input" placeholder="Talk to ATOM, Boss…" rows="1"></textarea>
+        <button class="icon-btn send" id="btn-send" title="Send">→</button>
+      </div>
+      <div class="controls">
+        <button class="icon-btn" id="btn-say"  title="Make ATOM speak the typed line out loud">SAY</button>
+        <button class="icon-btn" id="btn-stt"  title="Pretend the typed line was just transcribed">STT</button>
+        <button class="icon-btn" id="btn-clear" title="Clear chat log">CLEAR</button>
+      </div>
+    </div>
+  </section>
+
+  <audio id="atom-audio-out" autoplay></audio>
+
+<script>
+(() => {
+  // ── tiny helpers ────────────────────────────────────────────
+  const $ = (id) => document.getElementById(id);
+  const escape = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&":"&amp;", "<":"&lt;", ">":"&gt;", "\"":"&quot;", "'":"&#39;" }[c]));
+  const fmtTime = (t) => {
+    const d = t ? new Date(t * 1000) : new Date();
+    return d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+  };
+
+  // ── connection ──────────────────────────────────────────────
+  const params = new URLSearchParams(location.search);
+  const name   = params.get("name")  || localStorage.getItem("atom.name")  || "Boss";
+  const role   = params.get("role")  || "human";
+  const token  = params.get("token") || localStorage.getItem("atom.token") || "";
+  localStorage.setItem("atom.name", name);
+  if (token) localStorage.setItem("atom.token", token);
+
+  const wsProto = location.protocol === "https:" ? "wss" : "ws";
+  const wsHost  = location.host || "127.0.0.1:8765";
+  const qs = new URLSearchParams({ name, role });
+  if (token) qs.set("token", token);
+  const wsUrl = `${wsProto}://${wsHost}/room/ws?${qs.toString()}`;
+
+  let ws = null;
+  let backoff = 800;
+  let participantId = null;
+  let pingT0 = 0;
+  let eventCount = 0;
+  const STATE_LABELS = {
+    IDLE: "Awaiting Boss",
+    LISTENING: "Listening…",
+    THINKING: "Thinking…",
+    SPEAKING: "Speaking…",
+    ERROR_RECOVERY: "Recovering…",
+    SLEEP: "Asleep",
+  };
+
+  const setConn = (tone, text) => {
+    const pill = $("conn-pill");
+    pill.dataset.tone = tone;
+    $("conn-text").textContent = text;
+  };
+
+  const bumpEvent = (label) => {
+    eventCount += 1;
+    $("event-count").textContent = String(eventCount);
+    if (label) $("last-event").textContent = label;
+  };
+
+  // ── chat rendering ──────────────────────────────────────────
+  let lastMsg = null;
+  let lastPartialEl = null;
+
+  const addMsg = (kind, text, meta = "") => {
+    const el = document.createElement("div");
+    el.className = `msg ${kind}`;
+    el.innerHTML = escape(text) + (meta ? `<span class="meta">${escape(meta)}</span>` : "");
+    $("chat-log").appendChild(el);
+    el.scrollIntoView({ block: "end", behavior: "smooth" });
+    return el;
+  };
+
+  const addOrUpdatePartial = (text) => {
+    if (!lastPartialEl) lastPartialEl = addMsg("atom", text + " ▍");
+    else { lastPartialEl.innerHTML = escape(text) + " ▍"; lastPartialEl.scrollIntoView({ block: "end", behavior: "smooth" }); }
+  };
+
+  const finalisePartial = () => {
+    if (lastPartialEl) {
+      lastPartialEl.innerHTML = lastPartialEl.innerHTML.replace(/ ▍$/, "");
+      lastPartialEl = null;
+    }
+  };
+
+  // ── outbound senders ────────────────────────────────────────
+  const sendData = (event, data = {}) => {
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    ws.send(JSON.stringify({ type: "data", event, data }));
+  };
+
+  const sendBinary = (kindByte, payload) => {
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    const buf = new Uint8Array(payload.byteLength + 1);
+    buf[0] = kindByte;
+    buf.set(new Uint8Array(payload), 1);
+    ws.send(buf);
+  };
+
+  // ── inbound dispatch ────────────────────────────────────────
+  const handleDataMsg = (msg) => {
+    const ev = msg.event;
+    const d = msg.data || {};
+    switch (ev) {
+      case "room.welcome":
+        participantId = d.participant_id;
+        addMsg("system", `Connected to ${d.room || "atom-room"} as ${name}`);
+        if (d.snapshot) updateSnapshot(d.snapshot);
+        break;
+      case "atom.greeting":
+        addMsg("atom", `Hello Boss. ${d.persona || "ATOM at your service"}.`);
+        if (d.mood) updateMood(d.mood);
+        if (d.snapshot) updateSnapshot(d.snapshot);
+        break;
+      case "atom.state":
+        updateState(d);
+        bumpEvent(`state ${d.new_state || d.state || ""}`);
+        break;
+      case "atom.mood":
+        updateMood(d.mood || d.new_mood || d.value);
+        bumpEvent(`mood ${d.mood || d.new_mood || ""}`);
+        break;
+      case "atom.partial":
+        addOrUpdatePartial(d.text || "");
+        bumpEvent("partial");
+        break;
+      case "atom.response":
+        finalisePartial();
+        if (d.text) addMsg("atom", d.text, fmtTime(msg.ts));
+        $("cell-last-reply").textContent = fmtTime(msg.ts);
+        bumpEvent("response");
+        break;
+      case "atom.spoke":
+        bumpEvent("spoke");
+        break;
+      case "atom.suggestion":
+        $("ticker-suggestion").textContent = `suggestion: ${d.text || d.offer_text || "ATOM has an offer"}`;
+        break;
+      case "atom.thinking":
+        bumpEvent("thinking");
+        break;
+      case "boss.utterance":
+        if (d.text && d.source !== "room") addMsg("boss", d.text, "spoken");
+        break;
+      case "boss.chat":
+        if (d.participant_id !== participantId) addMsg("boss", `${d.name || "Boss"}: ${d.text}`, fmtTime(d.ts));
+        break;
+      case "atom.error":
+        addMsg("system", `[error] ${d.message || d.error}`);
+        break;
+      case "participant.joined":
+        addMsg("system", `${d.name || "guest"} joined (${d.count} in room)`);
+        $("participants-text").textContent = d.count > 1 ? `${d.count} in room` : "solo";
+        break;
+      case "participant.left":
+        addMsg("system", `${d.name || "guest"} left`);
+        $("participants-text").textContent = d.count > 1 ? `${d.count} in room` : "solo";
+        break;
+      case "pong":
+        if (pingT0) {
+          const ms = Math.max(0, Math.round(performance.now() - pingT0));
+          $("latency-text").textContent = `latency ${ms} ms`;
+        }
+        break;
+      case "snapshot.reply":
+        if (d.snapshot) updateSnapshot(d.snapshot);
+        break;
+      default:
+        bumpEvent(ev);
+    }
+  };
+
+  const updateState = (d) => {
+    const next = d.new_state || d.state || d.value || "IDLE";
+    const upper = String(next).toUpperCase();
+    $("state-text").textContent = upper;
+    $("state-status").textContent = STATE_LABELS[upper] || upper;
+    $("orb").dataset.state = upper;
+  };
+
+  const updateMood = (mood) => {
+    if (!mood) return;
+    $("mood-text").textContent = `mood: ${mood}`;
+    let tone = "ok";
+    if (mood === "stressed" || mood === "frustrated") tone = "warn";
+    if (mood === "idle" || mood === "absent") tone = "warn";
+    if (mood === "engaged" || mood === "happy") tone = "ok";
+    $("mood-pill").dataset.tone = tone;
+  };
+
+  const updateSnapshot = (snap) => {
+    if (snap.atom?.state)  updateState({ state: snap.atom.state });
+    if (snap.atom?.mood)   updateMood(snap.atom.mood);
+    if (snap.room?.participant_count) {
+      $("participants-text").textContent = snap.room.participant_count > 1
+        ? `${snap.room.participant_count} in room`
+        : "solo";
+    }
+  };
+
+  const handleStateMsg = (msg) => {
+    updateState({ state: msg.state, ...(msg.data || {}) });
+  };
+
+  // ── reconnect loop ──────────────────────────────────────────
+  const connect = () => {
+    setConn("warn", "connecting");
+    try {
+      ws = new WebSocket(wsUrl);
+    } catch (e) {
+      addMsg("system", `WebSocket error: ${e.message || e}`);
+      setTimeout(connect, backoff = Math.min(backoff * 1.5, 8000));
+      return;
+    }
+    ws.binaryType = "arraybuffer";
+
+    ws.addEventListener("open", () => {
+      setConn("ok", "online");
+      backoff = 800;
+      setInterval(() => { pingT0 = performance.now(); sendData("ping", { t: pingT0 }); }, 8000);
+    });
+
+    ws.addEventListener("message", (evt) => {
+      if (typeof evt.data === "string") {
+        try {
+          const msg = JSON.parse(evt.data);
+          if (msg.type === "data") handleDataMsg(msg);
+          else if (msg.type === "state") handleStateMsg(msg);
+        } catch (err) { console.warn("bad JSON", err); }
+      } else if (evt.data instanceof ArrayBuffer && evt.data.byteLength > 1) {
+        // Future: AUDIO_OUT routing into Web Audio. For now we just log.
+        bumpEvent(`audio ${evt.data.byteLength}b`);
+      }
+    });
+
+    ws.addEventListener("close", () => {
+      setConn("err", "offline");
+      setTimeout(connect, backoff = Math.min(backoff * 1.5, 8000));
+    });
+    ws.addEventListener("error", () => {
+      setConn("err", "error");
+    });
+  };
+  connect();
+
+  // ── composer ────────────────────────────────────────────────
+  const input = $("composer-input");
+  const sendChat = () => {
+    const text = input.value.trim();
+    if (!text) return;
+    addMsg("boss", text, "typed");
+    sendData("chat.message", { text });
+    input.value = "";
+    input.style.height = "44px";
+  };
+
+  $("btn-send").addEventListener("click", sendChat);
+  input.addEventListener("keydown", (e) => {
+    if (e.key === "Enter" && !e.shiftKey) {
+      e.preventDefault();
+      sendChat();
+    }
+  });
+  input.addEventListener("input", () => {
+    input.style.height = "44px";
+    input.style.height = `${Math.min(input.scrollHeight, 140)}px`;
+  });
+
+  $("btn-say").addEventListener("click", () => {
+    const text = input.value.trim();
+    if (!text) return;
+    sendData("say.text", { text });
+    addMsg("system", `force say: ${text}`);
+    input.value = "";
+  });
+
+  $("btn-stt").addEventListener("click", () => {
+    const text = input.value.trim();
+    if (!text) return;
+    sendData("stt.text", { text });
+    addMsg("boss", text, "stt");
+    input.value = "";
+  });
+
+  $("btn-clear").addEventListener("click", () => {
+    $("chat-log").innerHTML = "";
+    addMsg("system", "log cleared");
+  });
+
+  // ── mic streaming (PCM @ 16 kHz, mono) ─────────────────────
+  const MIC_SAMPLE_RATE = 16000;
+  const MIC_FRAME_BYTES = 4096;
+  let micCtx = null;
+  let micSource = null;
+  let micWorklet = null;
+  let micStream = null;
+  let micActive = false;
+
+  const downsampleTo16k = (buf, srcRate) => {
+    if (srcRate === MIC_SAMPLE_RATE) return buf;
+    const ratio = srcRate / MIC_SAMPLE_RATE;
+    const out = new Float32Array(Math.round(buf.length / ratio));
+    for (let i = 0; i < out.length; i++) {
+      const idx = Math.round(i * ratio);
+      out[i] = buf[Math.min(idx, buf.length - 1)];
+    }
+    return out;
+  };
+
+  const float32ToInt16 = (f32) => {
+    const i16 = new Int16Array(f32.length);
+    for (let i = 0; i < f32.length; i++) {
+      const v = Math.max(-1, Math.min(1, f32[i]));
+      i16[i] = v < 0 ? v * 0x8000 : v * 0x7FFF;
+    }
+    return i16;
+  };
+
+  const startMic = async () => {
+    try {
+      micStream = await navigator.mediaDevices.getUserMedia({ audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true } });
+    } catch (e) {
+      addMsg("system", `mic permission denied: ${e.message || e}`);
+      return false;
+    }
+    micCtx = new (window.AudioContext || window.webkitAudioContext)({ latencyHint: "interactive" });
+    micSource = micCtx.createMediaStreamSource(micStream);
+
+    // ScriptProcessor is deprecated but works everywhere including iOS Safari
+    const bufSize = 2048;
+    const proc = micCtx.createScriptProcessor(bufSize, 1, 1);
+    proc.onaudioprocess = (event) => {
+      if (!micActive) return;
+      const f32 = downsampleTo16k(event.inputBuffer.getChannelData(0), micCtx.sampleRate);
+      // mic level
+      let peak = 0;
+      for (let i = 0; i < f32.length; i++) { if (Math.abs(f32[i]) > peak) peak = Math.abs(f32[i]); }
+      $("mic-bar-fill").style.width = `${Math.min(100, peak * 240)}%`;
+      sendBinary(0x01, float32ToInt16(f32).buffer);
+    };
+    micSource.connect(proc);
+    proc.connect(micCtx.destination); // required for processing in some browsers
+    micWorklet = proc;
+    micActive = true;
+    return true;
+  };
+
+  const stopMic = () => {
+    micActive = false;
+    try { micWorklet?.disconnect(); } catch (_) {}
+    try { micSource?.disconnect(); } catch (_) {}
+    try { micCtx?.close(); } catch (_) {}
+    micStream?.getTracks().forEach(t => t.stop());
+    micStream = micCtx = micSource = micWorklet = null;
+    $("mic-bar-fill").style.width = "0%";
+  };
+
+  $("btn-mic").addEventListener("click", async () => {
+    const btn = $("btn-mic");
+    if (btn.dataset.active === "true") {
+      stopMic();
+      btn.dataset.active = "false";
+    } else {
+      const ok = await startMic();
+      btn.dataset.active = ok ? "true" : "false";
+      if (ok) addMsg("system", "streaming mic to ATOM");
+    }
+  });
+
+  // ── camera + screen frames ─────────────────────────────────
+  const startVideo = async (kind) => {
+    const constraints = kind === "camera" ? { video: { width: 640, height: 480 }, audio: false }
+                                          : { video: { width: 1280, height: 720 }, audio: false };
+    const stream = await (kind === "camera" ? navigator.mediaDevices.getUserMedia(constraints)
+                                            : navigator.mediaDevices.getDisplayMedia(constraints));
+    const video = document.createElement("video");
+    video.srcObject = stream;
+    video.muted = true;
+    await video.play();
+
+    const canvas = document.createElement("canvas");
+    canvas.width = video.videoWidth || 640;
+    canvas.height = video.videoHeight || 480;
+    const ctx = canvas.getContext("2d");
+
+    const tag = kind === "camera" ? 0x03 : 0x04;
+    const interval = setInterval(() => {
+      ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+      canvas.toBlob(async (blob) => {
+        if (!blob) return;
+        const buf = await blob.arrayBuffer();
+        sendBinary(tag, buf);
+      }, "image/jpeg", 0.6);
+    }, 1000);
+
+    return () => {
+      clearInterval(interval);
+      stream.getTracks().forEach(t => t.stop());
+    };
+  };
+
+  let stopCam = null, stopScreen = null;
+  $("btn-camera").addEventListener("click", async () => {
+    const btn = $("btn-camera");
+    if (stopCam) { stopCam(); stopCam = null; btn.dataset.active = "false"; return; }
+    try { stopCam = await startVideo("camera"); btn.dataset.active = "true"; addMsg("system", "camera live"); }
+    catch (e) { addMsg("system", `camera blocked: ${e.message || e}`); }
+  });
+  $("btn-screen").addEventListener("click", async () => {
+    const btn = $("btn-screen");
+    if (stopScreen) { stopScreen(); stopScreen = null; btn.dataset.active = "false"; return; }
+    try { stopScreen = await startVideo("screen"); btn.dataset.active = "true"; addMsg("system", "sharing screen"); }
+    catch (e) { addMsg("system", `screen share blocked: ${e.message || e}`); }
+  });
+
+  // unload
+  window.addEventListener("beforeunload", () => {
+    try { stopMic(); stopCam?.(); stopScreen?.(); } catch (_) {}
+    try { ws?.close(); } catch (_) {}
+  });
+})();
+</script>
+</body>
+</html>

@@ -1125,6 +1125,39 @@ async def main() -> None:
             except Exception:
                 logger.debug("attach_vlm_captioner failed", exc_info=True)
 
+    # Sprint M1: confidence-gated cloud brain router. Hot-path
+    # callable that decides whether a query should escalate from
+    # local MLX to Gemini-reasoning (or future Claude) based on the
+    # query shape, an explicit "deep:" prefix, or a local-fail signal.
+    cloud_brain_router: Any = None
+    try:
+        from core.cloud.cloud_brain_router import CloudBrainRouter, CloudBrainConfig
+
+        _cbr_cfg = (config.get("cloud_brain_router") or {}) if isinstance(config, dict) else {}
+        cloud_brain_router = CloudBrainRouter(
+            gemini_client=gemini_client,
+            config=CloudBrainConfig(
+                enabled=bool(_cbr_cfg.get("enabled", True)),
+                daily_quota=int(_cbr_cfg.get("daily_quota", 60)),
+                min_query_chars_for_auto_escalate=int(
+                    _cbr_cfg.get("min_query_chars_for_auto_escalate", 80),
+                ),
+                cooldown_after_failure_s=float(
+                    _cbr_cfg.get("cooldown_after_failure_s", 30.0),
+                ),
+                fallback_only=bool(_cbr_cfg.get("fallback_only", False)),
+                log_decisions=bool(_cbr_cfg.get("log_decisions", False)),
+            ),
+        )
+        logger.info(
+            "Cloud brain router ready: providers=%s available=%s",
+            ",".join([n for n in ("gemini",) if gemini_client is not None]) or "none",
+            cloud_brain_router.is_available,
+        )
+    except Exception as exc:
+        logger.warning("Cloud brain router wiring failed: %s", exc, exc_info=True)
+        cloud_brain_router = None
+
     logger.info(
         "v22 Hybrid Intelligence: SecurityGateway + GeminiClient(%s) + "
         "ConfidenceEngine + DecisionEngine + SearchTool + PreferenceStore + "
@@ -2233,6 +2266,64 @@ async def main() -> None:
         "Cognitive loop ready: %s",
         cognitive_handles.enabled_summary,
     )
+
+    # ── Sprint L: Realtime room (browser / iPhone interface) ───────
+    # Opt-in WebSocket room so Boss can talk to ATOM from any device.
+    # Defaults to localhost only -- flip ``host`` to "0.0.0.0" in
+    # config/settings.json -> "realtime" to expose on the LAN.
+    realtime_handles: dict[str, object] = {}
+    realtime_cfg = config.get("realtime") or {}
+    if bool(realtime_cfg.get("enabled", True)):
+        try:
+            from core.realtime import (
+                AtomRoom,
+                AtomRoomServer,
+                RoomAgent,
+                RoomAgentConfig,
+                RoomConfig,
+            )
+
+            playground_dir = realtime_cfg.get(
+                "playground_dir",
+                str(Path(__file__).parent / "ui" / "playground"),
+            )
+            room = AtomRoom(
+                RoomConfig(
+                    name=str(realtime_cfg.get("name", "atom-room")),
+                    max_participants=int(realtime_cfg.get("max_participants", 6)),
+                    auth_token=realtime_cfg.get("auth_token") or None,
+                    heartbeat_interval_s=float(realtime_cfg.get("heartbeat_s", 15.0)),
+                ),
+            )
+            agent = RoomAgent(
+                room,
+                bus,
+                command_loop=command_loop,
+                state_manager=state,
+                tts=tts,
+                cloud_brain_router=cloud_brain_router,
+                config=RoomAgentConfig(
+                    forward_partial_responses=bool(
+                        realtime_cfg.get("forward_partial_responses", True),
+                    ),
+                ),
+            )
+            agent.attach()
+            server = AtomRoomServer(
+                room,
+                host=str(realtime_cfg.get("host", "127.0.0.1")),
+                port=int(realtime_cfg.get("port", 8770)),
+                playground_dir=playground_dir,
+            )
+            await server.start()
+            realtime_handles = {"room": room, "agent": agent, "server": server}
+            logger.info(
+                "Realtime room ready -- open http://%s:%d/play/ in any browser, Boss.",
+                server.host, server.port,
+            )
+        except Exception as exc:
+            logger.warning("Realtime room failed to start: %s", exc, exc_info=True)
+            realtime_handles = {}
 
     if llm_queue is not None:
         llm_queue.start()
@@ -3563,6 +3654,12 @@ async def main() -> None:
             cognitive_handles.stop()
         except Exception:
             logger.debug("cognitive_handles.stop failed", exc_info=True)
+        try:
+            _rt_server = realtime_handles.get("server") if realtime_handles else None
+            if _rt_server is not None:
+                await _rt_server.stop()  # type: ignore[union-attr]
+        except Exception:
+            logger.debug("realtime room stop failed", exc_info=True)
         bus.clear()
         stt.shutdown()
         await tts.shutdown()

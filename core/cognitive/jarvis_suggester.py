@@ -258,6 +258,38 @@ class JarvisSuggester:
 
         self._emit(candidate)
 
+    async def consider_candidates(
+        self,
+        candidates: list[SuggestionCandidate],
+        *,
+        reason: str = "",
+    ) -> bool:
+        """Externally pushed candidates (Sprint F1: AwarenessLoop).
+
+        Honours every gate the regular ``_maybe_emit`` honours
+        (cooldown, daily cap, quiet hours, mood suppression,
+        per-category lockout, relevance threshold). Returns ``True``
+        iff a candidate actually fired.
+        """
+        if not candidates:
+            return False
+        self._roll_day_if_needed()
+        if not self._gate_passes():
+            self._total_blocked += 1
+            return False
+        candidate = max(candidates, key=lambda c: c.score)
+        self._total_attempts += 1
+        if candidate.score < self._relevance_threshold:
+            self._total_blocked += 1
+            return False
+        if not self._category_allowed(candidate.category):
+            self._total_blocked += 1
+            return False
+        if reason:
+            candidate.rationale = (candidate.rationale + " " + reason).strip()
+        self._emit(candidate)
+        return True
+
     def _gather_candidates(self) -> list[SuggestionCandidate]:
         try:
             return list(self._candidate_provider(

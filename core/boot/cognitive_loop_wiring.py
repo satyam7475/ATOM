@@ -40,11 +40,13 @@ class CognitiveLoopHandles:
     scene: Any = None
     mood: Any = None
     suggester: Any = None
+    awareness: Any = None
     enabled_summary: dict[str, bool] | None = None
 
     def stop(self) -> None:
         """Best-effort detach for clean shutdown."""
         for handle, name in (
+            (self.awareness, "awareness"),
             (self.suggester, "suggester"),
             (self.mood, "mood"),
             (self.scene, "scene"),
@@ -306,6 +308,52 @@ def wire_cognitive_loop(
         if scene_cfg.get("enabled", True) and captioner is None:
             logger.info("Cognitive loop: SceneContextEngine skipped -- no VLM captioner")
         handles.enabled_summary["scene"] = False
+
+    # ── F1: continuous awareness loop (mood + presence + scene + voice) ──
+    aw_cfg = cfg.get("awareness", {}) or {}
+    if aw_cfg.get("enabled", True):
+        try:
+            from core.cognitive.awareness_loop import (
+                AwarenessConfig,
+                AwarenessLoop,
+            )
+            handles.awareness = AwarenessLoop(
+                bus,
+                suggester=handles.suggester,
+                state_manager=state,
+                config=AwarenessConfig(
+                    welcome_back_after_absent_s=float(
+                        aw_cfg.get("welcome_back_after_absent_s", 240.0),
+                    ),
+                    silent_present_warn_s=float(
+                        aw_cfg.get("silent_present_warn_s", 1800.0),
+                    ),
+                    scene_dwell_warn_s=float(
+                        aw_cfg.get("scene_dwell_warn_s", 2400.0),
+                    ),
+                    welcome_back_score=float(
+                        aw_cfg.get("welcome_back_score", 0.95),
+                    ),
+                    silent_present_score=float(
+                        aw_cfg.get("silent_present_score", 0.78),
+                    ),
+                    scene_dwell_score=float(
+                        aw_cfg.get("scene_dwell_score", 0.72),
+                    ),
+                    min_emit_gap_s=float(aw_cfg.get("min_emit_gap_s", 90.0)),
+                    enable_direct_welcome_emit=bool(
+                        aw_cfg.get("enable_direct_welcome_emit", True),
+                    ),
+                ),
+            )
+            handles.awareness.attach()
+            handles.enabled_summary["awareness"] = True
+            logger.info("Cognitive loop: AwarenessLoop attached")
+        except Exception:
+            logger.exception("Cognitive loop: AwarenessLoop failed to attach")
+            handles.enabled_summary["awareness"] = False
+    else:
+        handles.enabled_summary["awareness"] = False
 
     logger.info("Cognitive loop wiring complete: %s", handles.enabled_summary)
     return handles

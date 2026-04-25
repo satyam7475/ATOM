@@ -164,6 +164,10 @@ async def test_engine_does_not_re_emit_same_mood() -> None:
 
 @pytest.mark.asyncio
 async def test_engine_emits_on_mood_change() -> None:
+    """Sprint K7: 'no face' is now debounced (3 samples + 90 s before
+    we declare 'idle'), so a single absent snapshot followed by an
+    engaged one should NOT flap to 'idle' mid-sentence -- but it MUST
+    still emit a mood transition when the visible state changes."""
     bus = _FakeBus()
     engine = MoodInferenceEngine(bus, min_consecutive=1)
     engine.attach()
@@ -172,7 +176,12 @@ async def test_engine_emits_on_mood_change() -> None:
     await bus.fire("presence.snapshot",
                    present=True, face_count=3, quality="good")
     moods = [p["mood"] for evt, p in bus.emitted_long if evt == "mood.state"]
-    assert moods[0] == "idle"
+    assert moods, "mood engine should emit at least one mood.state"
+    # No flap to "idle" on the very first absent sample (Sprint K7).
+    assert "idle" not in moods, (
+        f"single 'no face' sample must not flap to 'idle' "
+        f"(K7 debouncer): saw {moods}"
+    )
     assert moods[-1] == "distracted"
 
 

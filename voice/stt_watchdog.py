@@ -24,11 +24,11 @@ logger = logging.getLogger("atom.stt_watchdog")
 _SILENT_TIMEOUT_S = 8.0
 _STUCK_TIMEOUT_S = 15.0
 _MAX_RESTARTS_PER_WINDOW = 3
-# Sprint A5: shrink the breaker cooldown from 300s -> 60s. Five minutes
-# of forced deafness in the middle of a session is unacceptable -- the
-# Apple framework typically clears whatever made it choke within the
-# first minute, and the new audible "STT recovering" announcement
-# (`_speak_breaker_open`) means the user is no longer surprised.
+# Sprint A5 → K1: shrink the breaker cooldown from 300s → 60s → 30s.
+# Five minutes of forced deafness in the middle of a session is
+# unacceptable. The Apple framework typically clears whatever made it
+# choke within ~30 seconds, and the audible "STT recovering"
+# announcement (`_speak_breaker_open`) means Boss is never surprised.
 _RESTART_WINDOW_S = 30.0
 _CHECK_INTERVAL_S = 2.0
 # After this many consecutive chain restarts (with SFSpeechRecognizer

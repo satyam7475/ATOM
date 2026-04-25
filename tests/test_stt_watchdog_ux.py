@@ -41,11 +41,15 @@ def _ts_say_payloads(bus: _RecordingBus) -> list[str]:
     return [kw.get("text", "") for evt, kw in bus.events if evt == "tts_say"]
 
 
-# ── cooldown tightened to 60s ───────────────────────────────────────
+# ── cooldown tightened (Sprint K: 60s → 30s) ────────────────────────
 
 
-def test_restart_window_is_60s():
-    assert watchdog_mod._RESTART_WINDOW_S == 60.0
+def test_restart_window_is_30s_after_sprint_k():
+    """Sprint K: shrunk window further from 60s → 30s and lowered the
+    per-window restart budget to 3, so the breaker reopens faster
+    after a transient SFSpeechRecognizer hiccup."""
+    assert watchdog_mod._RESTART_WINDOW_S == 30.0
+    assert watchdog_mod._MAX_RESTARTS_PER_WINDOW == 3
 
 
 # ── breaker-open announcement ───────────────────────────────────────

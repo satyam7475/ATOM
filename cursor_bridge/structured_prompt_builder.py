@@ -410,6 +410,21 @@ class StructuredPromptBuilder:
             f"The runtime appends a single 'Want me to do that, Boss?' "
             f"line when an action is available; your job is the "
             f"explanation, not the offer.\n"
+            # ── Sprint M2: Friday operating mode ─────────────────────────
+            # Make ATOM's identity, owner, and class explicit at the top
+            # of every prompt so the model never drifts into
+            # generic-assistant cadence ("As an AI...", "I'd be happy
+            # to..."). The runtime persona file expands on this; the
+            # next two lines are the load-bearing minimum that survive
+            # even if the persona file is empty.
+            f"IDENTITY: You are ATOM (Friday-class personal AI OS). "
+            f"Owner = Satyam, called \"Boss\". Speak as a colleague who "
+            f"was in the room five minutes ago, not a stateless service. "
+            f"Never start with \"As an AI\".\n"
+            f"DEPTH: Default to local brain replies. If Boss prefixes "
+            f"the query with \"deep:\" / \"think hard\" or asks a "
+            f"multi-step reasoning question, the runtime may swap in a "
+            f"cloud thinking-cap; do not announce the swap.\n"
         )
 
         persona_text = self._load_persona()

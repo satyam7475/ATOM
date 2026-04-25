@@ -1091,20 +1091,26 @@ class MLXBrain:
 
         trimmed = _TRAILING_ASSISTANT_LOOP_RE.sub("", guarded).rstrip()
         if trimmed != guarded:
-            if len(trimmed.split()) < 30:
-                # Sprint K: short FAST replies can end with a harmless
-                # duplicated speaker label after already producing usable
-                # content. Treating a 10-20 word answer as a hard
-                # speaker-label loop caused "empty response" recoveries in
-                # atomlogs.txt. Strip the label, keep the answer.
-                return trimmed, None, False
-            # A speaker-label loop terminated generation early. If the pre-loop
-            # buffer is only a wrapper preface like `The answer is "..."` with
-            # almost no real content, treat it as unusable — small models
-            # produce exactly this pattern when they stall, and emitting it
-            # causes "ATOM invented an action" hallucinations downstream.
+            # P0c (test_mlx_speaker_label_loop_on_wrapper_returns_empty):
+            # *first* check whether the pre-loop buffer is only a wrapper
+            # preface like `The answer is "..."` with no real content. If
+            # so, treat as unusable speaker-label loop regardless of
+            # length -- shipping it produces "ATOM invented an action"
+            # hallucinations downstream.
             if _looks_like_wrapper_preface(trimmed):
                 return "", "speaker_label_loop_wrapper", True
+            # Sprint K: long replies that end with a duplicated speaker
+            # label have already produced usable content; we still flag
+            # the loop so the caller can stop streaming, but we hand the
+            # trimmed body back as visible text.
+            if len(trimmed.split()) >= 30:
+                return trimmed, "speaker_label_loop", True
+            # Sprint K: short FAST replies (<30 words) frequently end in
+            # a harmless duplicated `Assistant:` label after already
+            # delivering the answer. Treating those as a hard
+            # speaker-label loop caused "empty response" recoveries in
+            # atomlogs.txt. We *do* still report the loop (so streaming
+            # halts), but we keep the trimmed body.
             return trimmed, "speaker_label_loop", True
 
         stop_hit = cls._find_stop_hit(guarded, stop_sequences)

@@ -27,6 +27,17 @@
         "trusted_device_path": "data/trusted_iphone.json",
         "port_file_path": "logs/atom_bridge.port"
     },
+    "realtime": {
+        "enabled": true,
+        "name": "atom-room",
+        "host": "127.0.0.1",
+        "port": 8770,
+        "max_participants": 6,
+        "auth_token": null,
+        "heartbeat_s": 15.0,
+        "forward_partial_responses": true,
+        "playground_dir": "ui/playground"
+    },
     "vision": {
         "enabled": true,
         "preferred_camera": "auto",

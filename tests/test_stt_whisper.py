@@ -367,10 +367,13 @@ def test_pipeline_auto_prefers_whisper_when_available(monkeypatch):
 
 @pytest.mark.skipif(sys.platform != "darwin",
                     reason="macOS branch under test")
-def test_pipeline_auto_falls_back_to_native_when_whisper_missing(monkeypatch):
+def test_pipeline_auto_disables_stt_when_whisper_missing(monkeypatch):
+    """Sprint K hardening: engine=auto must NOT silently fall back to
+    SFSpeechRecognizer when whisper.cpp is missing -- it must surface a
+    disabled STT so Boss is told to install whisper.cpp."""
     from core.async_event_bus import AsyncEventBus
     from voice import voice_pipeline as vp
-    from voice.voice_pipeline import VoicePipeline
+    from voice.voice_pipeline import VoicePipeline, _DisabledSTT
 
     _stub_whisper_factory(monkeypatch, ok=False, reason="model missing")
 
@@ -388,16 +391,21 @@ def test_pipeline_auto_falls_back_to_native_when_whisper_missing(monkeypatch):
     pipeline = VoicePipeline(bus, state, config)
     pipeline._build_stt()
 
-    assert pipeline.stt is native_stub, \
-        "engine=auto must fall back to NativeSTT when whisper.cpp missing"
+    assert isinstance(pipeline.stt, _DisabledSTT), (
+        "engine=auto must surface a disabled STT (Sprint K) instead of a "
+        f"silent native fallback -- got {type(pipeline.stt).__name__}"
+    )
+    assert "whisper.cpp" in pipeline.stt_runtime_label.lower()
 
 
 @pytest.mark.skipif(sys.platform != "darwin",
                     reason="macOS branch under test")
-def test_pipeline_whisper_cpp_falls_back_to_native_when_unavailable(monkeypatch):
+def test_pipeline_whisper_cpp_disables_stt_when_unavailable(monkeypatch):
+    """Sprint K hardening: engine=whisper_cpp must NOT fall back to
+    SFSpeechRecognizer when whisper.cpp can't load."""
     from core.async_event_bus import AsyncEventBus
     from voice import voice_pipeline as vp
-    from voice.voice_pipeline import VoicePipeline
+    from voice.voice_pipeline import VoicePipeline, _DisabledSTT
 
     _stub_whisper_factory(monkeypatch, ok=False, reason="model missing")
     native_stub = MagicMock(name="NativeSTT")
@@ -414,8 +422,8 @@ def test_pipeline_whisper_cpp_falls_back_to_native_when_unavailable(monkeypatch)
     pipeline = VoicePipeline(bus, state, config)
     pipeline._build_stt()
 
-    assert pipeline.stt is native_stub
-    assert "fallback" in pipeline.stt_runtime_label.lower()
+    assert isinstance(pipeline.stt, _DisabledSTT)
+    assert "whisper.cpp" in pipeline.stt_runtime_label.lower()
 
 
 # ── 6. Schema validation ────────────────────────────────────────
