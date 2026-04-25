@@ -611,6 +611,17 @@ class MemoryEngine:
                     "Memory engine: embeddings warm-up ready in %.0fms",
                     (time.monotonic() - t0) * 1000,
                 )
+                # Sprint Ω.2 — pre-warm the curated seed phrases now,
+                # while the model is freshly loaded in the executor
+                # thread. The next user turn for any of these common
+                # intents skips the ~30-80 ms encode() and lands in
+                # the LRU instantly. Best-effort; failures stay quiet.
+                seed_fn = getattr(self._embedding_engine, "seed_warm_cache", None)
+                if callable(seed_fn):
+                    try:
+                        await loop.run_in_executor(None, seed_fn, None)
+                    except Exception:
+                        logger.debug("seed_warm_cache failed", exc_info=True)
             return bool(loaded)
         except Exception:
             logger.debug("Memory engine embeddings warm-up failed", exc_info=True)

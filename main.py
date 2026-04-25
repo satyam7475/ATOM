@@ -62,6 +62,11 @@ from pathlib import Path
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
 from core.boot.config_loader import load_config, set_config_overrides
+from core.boot.boot_timeline import (
+    mark_boot_start as _bt_start,
+    mark as _bt_mark,
+    log_summary as _bt_log_summary,
+)
 
 
 logger = logging.getLogger("atom.main")
@@ -76,6 +81,8 @@ from core.boot.cognitive_loop_wiring import wire_cognitive_loop
 async def main() -> None:
     global shutdown_event
     shutdown_event = asyncio.Event()
+
+    _bt_start()  # Sprint Ω.2 — anchor for the boot-timeline summary line
 
     from core.logging_setup import setup_logging
     setup_logging()
@@ -270,6 +277,20 @@ async def main() -> None:
     )
     voice_pipeline.build()
     voice_pipeline.build_audio_intelligence()
+
+    # Sprint Ω.2 — wire the voice round-trip latency probe immediately
+    # after the bus is live + STT/TTS engines exist. The probe is a
+    # pure subscriber; attaching it here means the very first
+    # speech_final/partial_response pair (boot greeting included)
+    # already produces a sample so we never miss the first turn.
+    try:
+        from core.observability.voice_latency_probe import (
+            get_voice_latency_probe,
+        )
+        get_voice_latency_probe(bus).attach()
+    except Exception:
+        logger.debug("voice latency probe wiring failed", exc_info=True)
+
     stt = voice_pipeline.stt
     tts = voice_pipeline.tts
     stt_runtime_label = voice_pipeline.stt_runtime_label
@@ -1844,9 +1865,41 @@ async def main() -> None:
         skills_registry=skills_reg,
     )
 
-    await tts.init_voice()
-    stt_preload_done = asyncio.Event()
+    # Sprint Ω.2 — TTS init (voice select + prewarm) used to block the
+    # boot before STT preload even started. Now it runs concurrently
+    # with STT preload, cold_start warmup, and the persona pin so the
+    # main task only blocks for the *slowest* of those, not the sum.
+    # The first speak() call awaits tts_ready_event below, so any race
+    # between bootstrap chatter and TTS init is impossible.
+    tts_ready_event = asyncio.Event()
     _bg_tasks: list[asyncio.Task] = []
+
+    async def _background_tts_init() -> None:
+        t0 = time.monotonic()
+        try:
+            await tts.init_voice()
+            elapsed = (time.monotonic() - t0) * 1000
+            logger.info("TTS ready (%.0fms: voice select + prewarm)", elapsed)
+            _bt_mark("tts_init", elapsed, parallel=True)
+        except Exception:
+            logger.exception("TTS init failed")
+        finally:
+            tts_ready_event.set()
+
+    _bg_tasks.append(asyncio.create_task(_background_tts_init()))
+
+    # Anything that calls speak() during bootstrap (e.g. _startup_greeting
+    # ~3000 lines below) awaits this gate so we never let a half-loaded
+    # synth paper over the very first spoken sentence.
+    async def _await_tts_ready(timeout: float = 8.0) -> bool:
+        try:
+            await asyncio.wait_for(tts_ready_event.wait(), timeout=timeout)
+            return True
+        except asyncio.TimeoutError:
+            logger.warning("TTS init >%.0fs — boot continuing without TTS", timeout)
+            return False
+
+    stt_preload_done = asyncio.Event()
 
     async def _background_stt_preload() -> None:
         t0 = time.monotonic()
@@ -1914,6 +1967,7 @@ async def main() -> None:
                 await stt.preload()
             elapsed = (time.monotonic() - t0) * 1000
             logger.info("STT pipeline ready (%.0fms: devices + model + preprocessor)", elapsed)
+            _bt_mark("stt_preload", elapsed, parallel=True)
         except Exception:
             logger.exception("STT preload failed")
         finally:
@@ -1933,6 +1987,7 @@ async def main() -> None:
         cold_start_report.restored_turns,
         cold_start_report.cached_commands,
     )
+    _bt_mark("cold_start", cold_start_report.elapsed_ms)
 
     # ── Sprint C1 — pin the runtime persona as a stable KV prefix ──
     # The atomLogs.txt audit (L336/392/509) showed prompt-cache reuse
@@ -1956,7 +2011,26 @@ async def main() -> None:
                 or "config/atom_persona.md"
             )
             persona_path = Path(persona_path_str).expanduser()
-            if (
+            # Sprint Ω.2 — when the per-model KV snapshot was already
+            # restored from disk during MLX warmup, the persona prefix
+            # is already pinned. Skip the 6 s re-prefill and just record
+            # the warm-cache hit so observability still sees the pin.
+            already_pinned = bool(
+                mlx_brain_for_pin is not None
+                and getattr(
+                    mlx_brain_for_pin, "_prompt_cache_persisted_role", {},
+                ).get("fast")
+                and not getattr(
+                    mlx_brain_for_pin, "_pinned_persona_path", None,
+                )
+            )
+            if already_pinned:
+                logger.info(
+                    "Persona pin: warm KV cache hit (skipped %d-token re-prefill)",
+                    int(getattr(mlx_brain_for_pin, "_pinned_persona_token_count", 0)),
+                )
+                _bt_mark("persona_pin", 0.0)
+            elif (
                 mlx_brain_for_pin is not None
                 and hasattr(mlx_brain_for_pin, "pin_prompt_prefix")
                 and persona_path.exists()
@@ -1980,6 +2054,7 @@ async def main() -> None:
                             float(pin_result.get("elapsed_ms", 0.0)),
                             persona_path.name,
                         )
+                        _bt_mark("persona_pin", float(pin_result.get("elapsed_ms", 0.0)))
                     else:
                         logger.info(
                             "Persona pin skipped: %s",
@@ -3395,6 +3470,12 @@ async def main() -> None:
 
         logger.info("Startup greeting: %s", greeting[:200])
 
+        # Sprint Ω.2 — TTS init now runs in parallel with cold_start so
+        # we have to make sure the synth is fully prewarmed before the
+        # first speak goes out, otherwise NSSpeechSynthesizer truncates
+        # the opening word ("...oss" instead of "Boss").
+        await _await_tts_ready(timeout=8.0)
+
         # Speak the boot greeting; partial_response handler will push state
         # to SPEAKING while TTS plays, then back to LISTENING when done.
         bus.emit_long(
@@ -3408,6 +3489,7 @@ async def main() -> None:
 
         await stt_preload_done.wait()
         logger.info("STT ready -- ATOM fully operational")
+        _bt_log_summary()
 
         # Once TTS has finished the boot greeting, ensure we land in
         # LISTENING so the STT loop opens the mic. If state machine already

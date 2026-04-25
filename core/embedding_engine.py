@@ -173,23 +173,36 @@ class EmbeddingEngine:
                 self._silence_hf_boot_noise()
 
                 from sentence_transformers import SentenceTransformer
-                from contextlib import redirect_stdout, redirect_stderr
-                from io import StringIO
 
                 t0 = time.monotonic()
-                buf_out, buf_err = StringIO(), StringIO()
-                with redirect_stdout(buf_out), redirect_stderr(buf_err):
-                    self._model = SentenceTransformer(
+                # Sprint Ω.2 — `transformers.modeling_utils` prints the
+                # "BertModel LOAD REPORT" via the Python-level stdout
+                # but with a manual `flush=True` that races our
+                # `contextlib.redirect_stdout` block. The redirect was
+                # working for some lines and missing others on every
+                # boot. Clamp at the *file-descriptor* level instead so
+                # nothing — flushed prints, C-extension fprintf, raw
+                # syscalls — can leak past us.
+                captured = self._capture_fd_load(
+                    lambda: SentenceTransformer(
                         self._model_name,
                         device=self._device,
-                    )
-                captured = (buf_out.getvalue() + buf_err.getvalue()).strip()
-                if captured:
-                    for line in captured.splitlines():
+                    ),
+                )
+                self._model = captured["result"]
+                noisy = captured["output"].strip()
+                if noisy:
+                    for line in noisy.splitlines():
                         ln = line.strip()
-                        if not ln or ln.startswith(("Key", "----", "Notes")):
+                        if not ln:
                             continue
-                        if "UNEXPECTED" in ln or "MISSING" in ln:
+                        # Drop the cosmetic header rows; surface the
+                        # actually-informative lines at DEBUG so a
+                        # genuine model-config mismatch is still
+                        # discoverable when troubleshooting.
+                        if ln.startswith(("Key", "----", "Notes", "- UNEXPECTED")):
+                            continue
+                        if "UNEXPECTED" in ln or "MISSING" in ln or "BertModel" in ln:
                             logger.debug("HF loader: %s", ln)
 
                 self._dimension = (
@@ -218,6 +231,92 @@ class EmbeddingEngine:
                 logger.exception("Failed to load embedding model")
                 self._load_failed = True
                 return False
+
+    @staticmethod
+    def _capture_fd_load(fn: Any) -> dict:
+        """Run ``fn()`` while redirecting fd 1 + fd 2 to a temp file,
+        then return ``{"result": fn_result, "output": captured_text}``.
+
+        Why fd-level: ``transformers`` and other CPython extensions
+        sometimes write directly to the underlying file descriptor (or
+        flush right after a redirect was undone), so the standard
+        ``contextlib.redirect_stdout`` reassign-sys.stdout trick misses
+        a portion of the output. Dup'ing the fds is the only sealed
+        capture path on POSIX. On platforms where ``os.dup2`` raises
+        (Windows quirks, locked-down sandboxes) we degrade gracefully
+        to a no-capture run.
+        """
+        import tempfile
+
+        result: Any = None
+        captured: str = ""
+        old_out_fd: int | None = None
+        old_err_fd: int | None = None
+        spool: Any = None
+        try:
+            spool = tempfile.TemporaryFile(mode="w+b")
+            old_out_fd = os.dup(1)
+            old_err_fd = os.dup(2)
+            os.dup2(spool.fileno(), 1)
+            os.dup2(spool.fileno(), 2)
+            try:
+                result = fn()
+            finally:
+                # Restore real stdio first so any later print() shows
+                # up where the operator expects it, even if the spool
+                # read below explodes.
+                if old_out_fd is not None:
+                    try:
+                        os.dup2(old_out_fd, 1)
+                    finally:
+                        os.close(old_out_fd)
+                        old_out_fd = None
+                if old_err_fd is not None:
+                    try:
+                        os.dup2(old_err_fd, 2)
+                    finally:
+                        os.close(old_err_fd)
+                        old_err_fd = None
+            spool.flush()
+            spool.seek(0)
+            try:
+                captured = spool.read().decode("utf-8", errors="ignore")
+            except Exception:
+                captured = ""
+        except Exception:
+            # Any restoration error means we can't trust the redirect
+            # chain — fall back to running fn directly so the caller
+            # still gets a model.
+            if result is None:
+                try:
+                    result = fn()
+                except Exception:
+                    raise
+        finally:
+            if old_out_fd is not None:
+                try:
+                    os.dup2(old_out_fd, 1)
+                except Exception:
+                    pass
+                try:
+                    os.close(old_out_fd)
+                except Exception:
+                    pass
+            if old_err_fd is not None:
+                try:
+                    os.dup2(old_err_fd, 2)
+                except Exception:
+                    pass
+                try:
+                    os.close(old_err_fd)
+                except Exception:
+                    pass
+            if spool is not None:
+                try:
+                    spool.close()
+                except Exception:
+                    pass
+        return {"result": result, "output": captured}
 
     @staticmethod
     def _silence_hf_boot_noise() -> None:
@@ -572,6 +671,93 @@ class EmbeddingEngine:
     def preload(self) -> bool:
         """Pre-load the model at startup (synchronous)."""
         return self._ensure_loaded()
+
+    # ── Seed-warm (Sprint Ω.2) ────────────────────────────────────
+    # The atomLogs.txt boot showed "Embedding warm-file restored:
+    # 18 entries" — fine on its own, but the first ten user turns
+    # still pay the model.encode() cost (~30-80 ms each) for every
+    # phrase that isn't yet in the LRU. Pre-seeding the warm-file
+    # with the ~120 most-used internal phrases (intent triggers,
+    # routing keys, common Boss greetings) means a fresh boot now
+    # has near-zero embed latency on the typical hot path.
+
+    _SEED_PHRASES: tuple[str, ...] = (
+        # Greetings + acknowledgements (Jarvis-class small talk)
+        "hi atom", "hello atom", "good morning", "good evening", "good night",
+        "thanks", "thank you", "thank you boss", "yes please", "no thanks",
+        "got it", "understood", "copy that", "you up", "are you there",
+        # System control intents
+        "open spotify", "open chrome", "open finder", "open mail", "open notes",
+        "close spotify", "play music", "pause music", "next track", "previous track",
+        "skip song", "mute volume", "unmute", "volume up", "volume down",
+        "set volume to fifty percent", "increase brightness", "decrease brightness",
+        # Time / status / weather
+        "what time is it", "what's the weather", "what is today's date",
+        "what day is it", "how's the weather", "current temperature",
+        # Memory + reasoning
+        "what did we talk about earlier", "remind me what i said",
+        "summarise this", "summarize this", "remember this", "save this",
+        "what's on my schedule", "what are my goals", "what's my next task",
+        # Vision / context
+        "what do you see", "describe what's on screen", "what am i doing",
+        "look at this", "screenshot this", "read this to me",
+        # Cognitive / planning
+        "plan my day", "plan my morning", "brief me", "what should i do next",
+        "what's the priority", "give me a status update", "what's new",
+        # File / app management
+        "find the file", "search for", "open the document", "show me",
+        "delete this", "move this", "create a new note", "draft an email",
+        # Compound / multi-step common cases (forces the planner path)
+        "open spotify and play focus", "summarise this and email it",
+        "open chrome then search for", "remind me to and then",
+        # Personal / ownership
+        "boss", "satyam", "atom", "friday", "jarvis",
+        # Stop / interrupt phrases
+        "stop", "wait", "cancel that", "never mind", "go back",
+    )
+
+    def seed_warm_cache(self, extra: list[str] | None = None) -> int:
+        """Embed the curated seed list once, populating both the LRU
+        cache and (via auto-persist) the warm-file. Idempotent — any
+        phrase already cached is skipped.
+
+        Returns the number of *new* embeddings actually computed.
+        Safe to call before or after the model is loaded; if the
+        model isn't ready yet, the call no-ops and returns 0.
+        """
+        if not self._ensure_loaded() or self._model is None:
+            return 0
+        phrases = list(self._SEED_PHRASES)
+        if extra:
+            phrases.extend(p.strip() for p in extra if p and p.strip())
+        new_phrases = [p for p in phrases if p and p not in self._cache]
+        if not new_phrases:
+            return 0
+        try:
+            t0 = time.monotonic()
+            raw = self._model.encode(
+                new_phrases,
+                normalize_embeddings=True,
+                show_progress_bar=False,
+                batch_size=64,
+            )
+            vecs = raw.tolist() if hasattr(raw, "tolist") else [list(r) for r in raw]
+            for txt, vec in zip(new_phrases, vecs):
+                self._cache_put(txt, vec)
+            elapsed = (time.monotonic() - t0) * 1000
+            logger.info(
+                "Embedding seed: warmed %d new phrase(s) in %.0fms (cache=%d)",
+                len(new_phrases), elapsed, len(self._cache),
+            )
+            try:
+                if self._warm_enabled:
+                    self._persist_warm_file()
+            except Exception:
+                logger.debug("seed warm-file persist failed", exc_info=True)
+            return len(new_phrases)
+        except Exception:
+            logger.debug("seed_warm_cache encode failed", exc_info=True)
+            return 0
 
     def shutdown(self) -> None:
         """Release model memory (and flush warm-file to disk)."""

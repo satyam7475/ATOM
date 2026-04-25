@@ -420,6 +420,8 @@ class MLXBrain:
         self._prompt_cache_restore_attempted: dict[str, bool] = {
             role: False for role in self._ROLES
         }
+        if self._prompt_cache_persist_enabled:
+            self._gc_stale_prompt_caches()
 
         # Lifetime perf counters used by the periodic perf snapshot (logged
         # every ~60s by the main loop). We track totals rather than a
@@ -899,11 +901,59 @@ class MLXBrain:
     # ── Cross-boot prompt-cache persistence (B7) ─────────────────────
 
     def _persist_path_for_role(self, role: str) -> Path:
-        """Per-role snapshot path. Each role gets its own .safetensors so
-        a primary/fast cache mismatch can never cross-pollute."""
+        """Per-role + per-model snapshot path.
+
+        Sprint Ω.2: previously the file name was role-only
+        (``prompt_cache_v33-fast.safetensors``). When the brain swapped
+        from Qwen3-4B → Qwen3-8B, the metadata's ``model_path``
+        no longer matched, so ``_restore_persisted_prompt_cache``
+        silently bailed and every cold boot paid the full ~6.3 s
+        persona prefill again. Worse, the stale 42 MB file kept
+        squatting on disk forever.
+
+        Now we suffix the model directory's basename so the 4B and 8B
+        caches live in distinct files. The first cold boot on a new
+        model still pays the prefill once, then every subsequent boot
+        reuses its own cache. Old role-only files become orphaned and
+        get garbage-collected by ``_gc_stale_prompt_caches`` below.
+        """
         base = self._prompt_cache_persist_path
         suffix = base.suffix or ".safetensors"
-        return base.with_name(f"{base.stem}-{role}{suffix}")
+        model_tag = Path(self._model_path).name.lower().replace("/", "_") or "default"
+        return base.with_name(f"{base.stem}-{role}-{model_tag}{suffix}")
+
+    def _gc_stale_prompt_caches(self) -> None:
+        """Remove role-only / wrong-model snapshot files left over from
+        an earlier brain. Keeps the disk tidy and prevents the legacy
+        v33 layout from confusing operators inspecting ``data/``.
+
+        Best-effort: a missing file or a permissions issue is fine; we
+        log at DEBUG and move on. Runs once at MLXBrain construction so
+        the cleanup never re-races with a write.
+        """
+        try:
+            base = self._prompt_cache_persist_path
+            if not base.parent.exists():
+                return
+            valid_paths = {
+                self._persist_path_for_role(role).name for role in self._ROLES
+            }
+            stem = base.stem
+            for path in base.parent.glob(f"{stem}*{base.suffix or '.safetensors'}"):
+                if path.name in valid_paths:
+                    continue
+                try:
+                    size_mb = path.stat().st_size / (1024 * 1024)
+                    path.unlink()
+                    logger.info(
+                        "MLX prompt-cache GC: removed stale snapshot %s (%.1f MB) -- "
+                        "wrong model fingerprint",
+                        path.name, size_mb,
+                    )
+                except Exception:
+                    logger.debug("prompt_cache GC unlink failed", exc_info=True)
+        except Exception:
+            logger.debug("prompt_cache GC scan failed", exc_info=True)
 
     def _persist_prompt_cache(
         self,

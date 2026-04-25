@@ -92,6 +92,12 @@ class ColdStartOptimizer:
         self._boot_time = 0.0
         self._restored_snapshot: dict[str, Any] = {}
         self._restored_context_emitted = False
+        # Sprint Ω.2 — flipped to True by ``_load_snapshot`` when the
+        # persisted snapshot was found but expired. ``warm_up`` then
+        # schedules a fresh persist in the background so the *next*
+        # boot lands on a current snapshot instead of the same stale
+        # one we just dropped.
+        self._snapshot_was_stale = False
 
         persistence_manager.register(_SNAPSHOT_KEY, self._snapshot_path)
 
@@ -194,6 +200,29 @@ class ColdStartOptimizer:
             vlm_ms,
         )
 
+        if self._snapshot_was_stale:
+            # Background-refresh the snapshot so the *next* boot has a
+            # current context payload to land on. Done as a fire-and-
+            # forget task with a small initial sleep so the system is
+            # quiescent (CPU/RAM steady-state) when we sample it.
+            async def _background_refresh_snapshot() -> None:
+                try:
+                    await asyncio.sleep(2.5)
+                    self.persist_snapshot()
+                    logger.debug(
+                        "Cold start snapshot refreshed in background "
+                        "(stale on this boot, fresh for the next)",
+                    )
+                except Exception:
+                    logger.debug(
+                        "Background snapshot refresh failed", exc_info=True,
+                    )
+            try:
+                asyncio.create_task(_background_refresh_snapshot())
+            except RuntimeError:
+                # No running loop (test harness); skip silently.
+                pass
+
         return ColdStartReport(
             elapsed_ms=elapsed_ms,
             fast_model_ready=fast_model_ready,
@@ -260,11 +289,18 @@ class ColdStartOptimizer:
             # so the snapshot still showed up as ``context=True`` for the
             # whole boot even when it was actually skipped.
             if age_s > _MAX_RESTORED_CONTEXT_AGE_S:
-                logger.info(
-                    "Cold start snapshot too old (age %.0fs > %.0fs); discarding",
+                # Sprint Ω.2 — log at DEBUG (was INFO) so the boot log
+                # doesn't carry a misleading "discarding" line every
+                # time Boss takes a long break. We schedule a fresh
+                # snapshot in :py:meth:`warm_up` so the next cold
+                # start lands on a current snapshot instead of the
+                # already-stale-on-arrival one we just dropped.
+                logger.debug(
+                    "Cold start snapshot stale (age %.0fs > %.0fs); will refresh",
                     age_s,
                     _MAX_RESTORED_CONTEXT_AGE_S,
                 )
+                self._snapshot_was_stale = True
                 return {}
             logger.info("Cold start snapshot found (age %.0fs)", age_s)
         return loaded

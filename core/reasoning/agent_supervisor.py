@@ -103,7 +103,22 @@ _MULTI_STEP_RE = re.compile("|".join(_MULTI_STEP_HINTS), re.I)
 _ACTION_VERBS = re.compile(
     r"\b(open|play|pause|set|search|find|create|write|send|post|"
     r"delete|move|copy|run|launch|close|increase|decrease|mute|"
-    r"compose|draft|schedule|remind|book|cancel)\b",
+    r"compose|draft|schedule|remind|book|cancel|summari[sz]e|"
+    r"email|message|text|call|fetch|download|install|update)\b",
+    re.I,
+)
+
+
+# Sprint Ω.2 — match an action verb followed by a coordinating
+# conjunction within 40 chars. Catches "open spotify and play X",
+# "summarise this then send it", "fetch logs plus diff them" without
+# tripping on conversational fillers like "hi and how are you".
+_COMPOUND_AFTER_VERB_RE = re.compile(
+    r"\b(open|play|pause|set|search|find|create|write|send|post|"
+    r"delete|move|copy|run|launch|close|increase|decrease|mute|"
+    r"compose|draft|schedule|remind|book|cancel|summari[sz]e|"
+    r"email|message|text|call|fetch|download|install|update)\b"
+    r"[^.?!]{0,40}\b(?:and|then|plus|also|after that|followed by)\b",
     re.I,
 )
 
@@ -219,20 +234,34 @@ class AgentSupervisor:
         if not clean:
             return self._record(Triage(False, "empty_query", 0.0))
 
-        if _LIGHT_INTENT_RE.search(clean):
-            return self._record(Triage(False, "light_intent", 0.95))
+        # Sprint Ω.2 — order matters. The previous flow checked
+        # ``_LIGHT_INTENT_RE`` first, which matched "open spotify" at the
+        # *start* of "open spotify and play focus playlist" and silently
+        # short-circuited compound queries straight to a single-shot
+        # dispatch. We now compute the multi-step signals first and only
+        # honour the light shortcut when the query is genuinely a
+        # single-verb micro-intent.
+        verb_hits = len(_ACTION_VERBS.findall(clean))
 
-        # Multi-step linguistic markers always trigger the planner.
         if _MULTI_STEP_RE.search(clean):
             return self._record(Triage(True, "multi_step_hint", 0.9))
 
-        # Multiple action verbs in one short query usually means a
-        # plan ("open Spotify play Focus dim screen").
-        verb_hits = len(_ACTION_VERBS.findall(clean))
         if verb_hits >= 2:
             return self._record(
                 Triage(True, "multi_action_verbs", 0.7),
             )
+
+        # Compound conjunction without an explicit "then" still implies
+        # >1 step ("open spotify and play X", "summarise this and email it").
+        # We only trip on conjunctions that come *after* a recognised
+        # action verb so chit-chat ("hi and how are you") stays light.
+        if verb_hits >= 1 and _COMPOUND_AFTER_VERB_RE.search(clean):
+            return self._record(
+                Triage(True, "compound_after_verb", 0.75),
+            )
+
+        if _LIGHT_INTENT_RE.search(clean):
+            return self._record(Triage(False, "light_intent", 0.95))
 
         # Long, prose-y queries are the planner's bread and butter.
         if len(clean) >= self.config.min_query_chars_for_plan and "?" not in clean:
