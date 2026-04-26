@@ -118,7 +118,7 @@
         "low_confidence_ask_user": true
     },
     "stt": {
-        "engine": "whisper_cpp",
+        "engine": "whisperkit",
         "locale": "en-US",
         "whisper_model_size": "large-v3-turbo",
         "whisper_model_path": "models/ggml-large-v3-turbo-q5_0.bin",
@@ -174,11 +174,11 @@
             "min_text_chars": 3
         },
         "whisperkit": {
-            "model": "openai_whisper-large-v3-v20240930",
+            "model": "whisper-large-v3-v20240930_turbo_632MB",
             "host": "127.0.0.1",
             "port": 50060,
             "auto_download": true,
-            "startup_timeout_s": 30.0,
+            "startup_timeout_s": 60.0,
             "model_dir": null
         }
     },
