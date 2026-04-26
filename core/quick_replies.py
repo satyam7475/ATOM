@@ -49,6 +49,35 @@ _FILLER_ACTION_TOKENS: frozenset[str] = frozenset({
     "kaha", "kab", "kyun",
 })
 _FILLER_MAX_WORDS = 6
+
+# ── Sprint Ω.9 (Apr 26 2026) — explanatory-intent gate ──────────────
+# Even after the Ω.8 filler-action fix, queries like "explain unified
+# memory in detail", "how does WhisperKit run on the ANE", or
+# "compare optimal vs full performance" still occasionally drifted
+# into a chatty pattern reply because the surface tokens overlapped
+# with greetings or domain regexes. We now veto *all* tier-1/tier-2
+# matches when the query carries a real explanatory intent and is
+# longer than four words. Domain-tier replies remain allowed because
+# they are already curated for explanation requests (unified memory,
+# mode diff). Topic-on-self ("tell me about yourself") slips past
+# the gate because it is ≤4 words.
+_EXPLAIN_GATE_RE = re.compile(
+    r"\b(?:"
+    r"explain|describe|elaborate|"
+    r"how (?:do|does|is|are|much|many|to|come|long)|"
+    r"what (?:is|are|does|did|was|were|means|do|happens)|"
+    r"why (?:is|does|did|do|are|was|were)|"
+    r"compare|comparison|difference between|"
+    r"tell me how|tell me why|"
+    r"break (?:it|this|that) down|walk me through|"
+    r"kya hai|kya hota|kya hoga|"
+    r"kaise (?:kaam|chalta|chalti|hota|hoti|samjh|karein|karta|karti)|"
+    r"samjhao|samjha do|samajhao"
+    r")\b",
+    re.I,
+)
+_EXPLAIN_GATE_MIN_WORDS = 4
+
 _COMPARE_SAFARI_ARC_RE = re.compile(r"\bcompare\b.*\bsafari\b.*\barc\b|\barc\b.*\bsafari\b", re.I)
 _UNIFIED_MEMORY_RE = re.compile(r"\bunified memory\b", re.I)
 _MODE_DIFF_RE = re.compile(
@@ -330,6 +359,18 @@ def try_quick_reply(user_text: str, config: dict | None) -> str | None:
         return domain_hit
 
     if explicit_depth:
+        return None
+
+    # Sprint Ω.9 explanatory-intent gate: defer to the LLM whenever
+    # the user is asking for an explanation/comparison and the query
+    # is long enough that a one-liner pattern reply would be wrong.
+    if (
+        len(norm.split()) > _EXPLAIN_GATE_MIN_WORDS
+        and _EXPLAIN_GATE_RE.search(norm)
+    ):
+        logger.debug(
+            "Quick reply suppressed by explain gate for: %s", norm[:80],
+        )
         return None
 
     # Tier 1: pattern-based

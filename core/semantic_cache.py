@@ -492,11 +492,18 @@ class SemanticCache:
 
     # ── Public API (unchanged contract) ──────────────────────────────
 
-    def get(self, query: str) -> str | None:
+    def get(self, query: str, *, exact_only: bool = False) -> str | None:
         """Look up a query in the semantic cache.
 
         First tries exact match, then falls back to semantic similarity.
         Returns the cached response or ``None``.
+
+        Sprint Ω.9 (Apr 26 2026): callers can pass ``exact_only=True`` to
+        skip the embedding-similarity branch. Used by the cognitive
+        kernel for short identity/meta queries where a fuzzy embedding
+        match would cause cross-turn bleed (e.g. "who are you" landing
+        on a cached "what time is it" response just because both
+        embed near the chat-meta cluster).
         """
         if not self._enabled or not query or not query.strip():
             return None
@@ -516,6 +523,9 @@ class SemanticCache:
                 return exact.response
 
             # Step 2: Semantic similarity match (if embeddings available)
+            if exact_only:
+                self._total_misses += 1
+                return None
             if not self._has_embeddings or self._embedding_engine is None:
                 self._total_misses += 1
                 return None

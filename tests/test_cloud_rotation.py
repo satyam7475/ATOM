@@ -312,16 +312,24 @@ async def test_diagnostics_shape_stable(monkeypatch: pytest.MonkeyPatch) -> None
     assert diag["provider"] == "rotating"
     assert diag["enabled"] is True
     assert diag["available"] is True
-    assert isinstance(diag["cursor"], int)
+    # Sprint Ω.10: tiered round-robin replaces the single cursor with
+    # one cursor per tier. The shape contract is "a dict of int→int".
+    assert isinstance(diag["tier_cursors"], dict)
+    for tier, cursor in diag["tier_cursors"].items():
+        assert isinstance(tier, int)
+        assert isinstance(cursor, int)
     assert {s["name"] for s in diag["slots"]} == {"groq", "nvidia", "cerebras"}
     for s in diag["slots"]:
         for key in (
-            "fast_model", "deep_model", "has_key", "warm",
-            "cooldown_remaining_s", "rpm_used", "soft_rpm",
+            "fast_model", "deep_model", "tier", "provider_kind",
+            "has_key", "warm", "cooldown_remaining_s",
+            "rpm_used", "soft_rpm",
             "total_requests", "total_successes", "total_failures",
             "avg_latency_ms", "last_error",
         ):
             assert key in s, f"missing diag key: {key} on {s['name']}"
+        assert isinstance(s["tier"], int) and s["tier"] >= 1
+        assert s["provider_kind"] in {"openai", "anthropic", "gemini"}
 
 
 # ── duck-typed deep/buddy ------------------------------------------
@@ -358,3 +366,279 @@ async def test_deep_routes_to_deep_model(monkeypatch: pytest.MonkeyPatch) -> Non
     # First call: fast model on cursor=0 (groq); second: deep model on cursor=1 (nvidia).
     assert seen[0] == "llama-3.1-8b-instant"
     assert seen[1] == "meta/llama-3.3-70b-instruct"
+
+
+# ── Sprint Ω.11: tier fallback + multi-vendor dispatch ──────────────
+
+
+def _multi_tier_config() -> dict:
+    """Three tiers across three vendor kinds, mirroring the production
+    settings.json layout post-Sprint-Ω.11.
+    """
+    return {
+        "cloud": {
+            "enabled": True,
+            "rotation": {
+                "enabled": True,
+                "cooldown_429_s": 60.0,
+                "cooldown_5xx_s": 30.0,
+                "cooldown_hard_s": 300.0,
+                "soft_rpm_per_slot": 25,
+                "providers": [
+                    {
+                        "name": "claude",
+                        "provider_kind": "anthropic",
+                        "base_url": "https://anthropic.test/v1",
+                        "credential_id": "anthropic",
+                        "fast_model": "claude-haiku-4-5",
+                        "deep_model": "claude-sonnet-4-5",
+                        "tier": 1,
+                    },
+                    {
+                        "name": "groq",
+                        "provider_kind": "openai",
+                        "base_url": "https://groq.test/v1",
+                        "credential_id": "groq",
+                        "fast_model": "llama-3.1-8b-instant",
+                        "deep_model": "llama-3.3-70b-versatile",
+                        "tier": 1,
+                    },
+                    {
+                        "name": "gemini",
+                        "provider_kind": "gemini",
+                        "base_url": "https://gemini.test/v1beta",
+                        "credential_id": "gemini_fast",
+                        "fast_model": "gemini-2.5-flash-lite",
+                        "deep_model": "gemini-2.5-flash",
+                        "tier": 1,
+                    },
+                    {
+                        "name": "cerebras",
+                        "provider_kind": "openai",
+                        "base_url": "https://cerebras.test/v1",
+                        "credential_id": "cerebras",
+                        "fast_model": "llama3.1-8b",
+                        "deep_model": "llama-3.3-70b",
+                        "tier": 2,
+                    },
+                    {
+                        "name": "nvidia",
+                        "provider_kind": "openai",
+                        "base_url": "https://nvidia.test/v1",
+                        "credential_id": "nvidia",
+                        "fast_model": "meta/llama-3.1-8b-instruct",
+                        "deep_model": "meta/llama-3.3-70b-instruct",
+                        "tier": 3,
+                    },
+                ],
+            },
+        },
+    }
+
+
+def _build_multi_tier(monkeypatch: pytest.MonkeyPatch) -> RotatingOpenAIClient:
+    monkeypatch.setattr(
+        "core.cloud.rotating_openai_client.RotatingOpenAIClient._hydrate_keys_from_vault",
+        lambda self: None,
+    )
+    client = RotatingOpenAIClient(_multi_tier_config(), security_gateway=None)
+    for slot in client._slots:
+        slot.api_key = f"test-{slot.name}-key"
+    return client
+
+
+@pytest.mark.asyncio
+async def test_tier1_round_robin_never_touches_lower_tiers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """While every tier-1 slot is warm, tier 2 + tier 3 must stay cold."""
+    client = _build_multi_tier(monkeypatch)
+    record: list[str] = []
+    _install_slot_responses(
+        monkeypatch, client,
+        responses={
+            "claude":   [("c", True, 200, False)] * 4,
+            "groq":     [("g", True, 200, False)] * 4,
+            "gemini":   [("m", True, 200, False)] * 4,
+            "cerebras": [("x", True, 200, False)] * 4,
+            "nvidia":   [("y", True, 200, False)] * 4,
+        },
+        record=record,
+    )
+
+    for _ in range(6):
+        text, ok = await client.ask("hi")
+        assert ok and text
+
+    # Six turns must hit ONLY tier-1 slots, perfectly round-robin.
+    assert record == ["claude", "groq", "gemini", "claude", "groq", "gemini"]
+    assert "cerebras" not in record
+    assert "nvidia" not in record
+
+
+@pytest.mark.asyncio
+async def test_tier2_takes_over_when_tier1_quarantined(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When all tier-1 slots 429, the next turn must go to tier 2 — and
+    only when tier 2 is also down do we fall to tier 3.
+    """
+    client = _build_multi_tier(monkeypatch)
+    record: list[str] = []
+    _install_slot_responses(
+        monkeypatch, client,
+        responses={
+            # Each tier-1 slot 429s once on its first turn.
+            "claude":   [("", False, 429, True), ("c2", True, 200, False)],
+            "groq":     [("", False, 429, True), ("g2", True, 200, False)],
+            "gemini":   [("", False, 429, True), ("m2", True, 200, False)],
+            # Tier 2 succeeds when it gets a turn.
+            "cerebras": [("cer", True, 200, False)] * 4,
+            # Tier 3 succeeds when it gets a turn.
+            "nvidia":   [("nv", True, 200, False)] * 4,
+        },
+        record=record,
+    )
+
+    text, ok = await client.ask("first turn")
+    # Within ONE call, exhaust tier 1 (3 × 429), then drop to tier 2.
+    assert ok and text == "cer"
+    assert record[:4] == ["claude", "groq", "gemini", "cerebras"]
+
+
+@pytest.mark.asyncio
+async def test_tier3_picked_only_when_tier1_and_tier2_cold(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = _build_multi_tier(monkeypatch)
+    record: list[str] = []
+    _install_slot_responses(
+        monkeypatch, client,
+        responses={
+            "claude":   [("", False, 429, True)],
+            "groq":     [("", False, 429, True)],
+            "gemini":   [("", False, 429, True)],
+            "cerebras": [("", False, 429, True)],
+            "nvidia":   [("nv", True, 200, False)],
+        },
+        record=record,
+    )
+
+    text, ok = await client.ask("only nvidia survives")
+    assert ok and text == "nv"
+    assert record == ["claude", "groq", "gemini", "cerebras", "nvidia"]
+
+
+# ── Sprint Ω.11: per-kind dispatch correctness ──────────────────────
+
+
+def test_anthropic_request_shape(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Verify _call_anthropic builds the right URL, headers, and body."""
+    captured: dict[str, Any] = {}
+
+    class FakeResp:
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def read(self) -> bytes:
+            return (
+                b'{"content": [{"type": "text", "text": "hello"}],'
+                b' "stop_reason": "end_turn"}'
+            )
+
+    def fake_urlopen(req, timeout=None):
+        captured["url"] = req.full_url
+        captured["headers"] = dict(req.headers)
+        captured["body"] = json.loads(req.data.decode())
+        captured["timeout"] = timeout
+        return FakeResp()
+
+    import json
+    import urllib.request as ur
+    monkeypatch.setattr(ur, "urlopen", fake_urlopen)
+
+    slot = _Slot(
+        name="claude",
+        base_url="https://anthropic.test/v1",
+        credential_id="anthropic",
+        fast_model="claude-haiku-4-5",
+        deep_model="claude-sonnet-4-5",
+        api_key="sk-ant-FAKE",
+        provider_kind="anthropic",
+    )
+    text, ok, status, quota = RotatingOpenAIClient._call_anthropic(
+        slot,
+        query="What is up?",
+        model="claude-haiku-4-5",
+        max_tokens=128,
+        timeout_s=10.0,
+        system_instruction="Be brief.",
+        temperature=0.5,
+    )
+    assert ok and text == "hello" and status == 200 and not quota
+    assert captured["url"] == "https://anthropic.test/v1/messages"
+    # Headers normalized to title-case by urllib.request.Request.
+    assert captured["headers"].get("X-api-key") == "sk-ant-FAKE"
+    assert captured["headers"].get("Anthropic-version") == "2023-06-01"
+    assert captured["headers"].get("Authorization") is None  # NOT Bearer
+    body = captured["body"]
+    assert body["model"] == "claude-haiku-4-5"
+    assert body["max_tokens"] == 128
+    assert body["system"] == "Be brief."
+    assert body["messages"] == [{"role": "user", "content": "What is up?"}]
+
+
+def test_gemini_request_shape(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Verify _call_gemini builds the right URL with key in query
+    string, no Authorization header, and contents/parts body shape.
+    """
+    captured: dict[str, Any] = {}
+
+    class FakeResp:
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def read(self) -> bytes:
+            return (
+                b'{"candidates": [{"content": {"parts":'
+                b' [{"text": "hi from gemini"}]},'
+                b' "finishReason": "STOP"}]}'
+            )
+
+    def fake_urlopen(req, timeout=None):
+        captured["url"] = req.full_url
+        captured["headers"] = dict(req.headers)
+        captured["body"] = json.loads(req.data.decode())
+        return FakeResp()
+
+    import json
+    import urllib.request as ur
+    monkeypatch.setattr(ur, "urlopen", fake_urlopen)
+
+    slot = _Slot(
+        name="gemini",
+        base_url="https://gemini.test/v1beta",
+        credential_id="gemini_fast",
+        fast_model="gemini-2.5-flash-lite",
+        deep_model="gemini-2.5-flash",
+        api_key="AIzaTEST",
+        provider_kind="gemini",
+    )
+    text, ok, status, quota = RotatingOpenAIClient._call_gemini(
+        slot,
+        query="hello",
+        model="gemini-2.5-flash-lite",
+        max_tokens=64,
+        timeout_s=10.0,
+        system_instruction="Be brief.",
+        temperature=0.4,
+    )
+    assert ok and text == "hi from gemini" and status == 200 and not quota
+    assert captured["url"] == (
+        "https://gemini.test/v1beta/models/gemini-2.5-flash-lite"
+        ":generateContent?key=AIzaTEST"
+    )
+    assert captured["headers"].get("Authorization") is None
+    assert captured["headers"].get("X-api-key") is None
+    body = captured["body"]
+    assert body["contents"][0]["parts"][0]["text"] == "hello"
+    assert body["systemInstruction"]["parts"][0]["text"] == "Be brief."
+    assert body["generationConfig"]["maxOutputTokens"] == 64

@@ -1,16 +1,27 @@
 #!/usr/bin/env python3
 """ATOM — One-shot setup for the rotating cloud lane keys.
 
-Sprint Ω.9 (Apr 26 2026). Boss runs three free OpenAI-compatible cloud
-providers in a round-robin: Groq, NVIDIA NIM, Cerebras. This helper
-encrypts the three keys via :class:`core.secure_credentials.CredentialManager`
-so they never sit in plaintext on disk.
+Sprint Ω.9 (Apr 26 2026): three free OpenAI-compatible cloud providers
+(Groq, NVIDIA NIM, Cerebras) in a round-robin.
+
+Sprint Ω.11 (Apr 26 2026): rotation extended to multi-vendor — Gemini
+(Google generateContent) joined the tier-1 pool alongside Groq. The
+Anthropic/Claude slot was retired on 2026-04-27 (owner does not hold an
+``sk-ant-`` key); add it back here if a key is ever provisioned.
+
+This helper accepts the supported vendors via env vars and encrypts
+each one via :class:`core.secure_credentials.CredentialManager` so they
+never sit in plaintext on disk.
 
 Usage:
-    GROQ_API_KEY=gsk_...        \\
-    NVIDIA_API_KEY=nvapi-...    \\
-    CEREBRAS_API_KEY=csk-...    \\
+    GROQ_API_KEY=gsk_...           \\
+    GOOGLE_API_KEY=AIza...         \\
+    NVIDIA_API_KEY=nvapi-...       \\
+    CEREBRAS_API_KEY=csk-...       \\
         python3 scripts/configure_rotating_keys.py
+
+Any subset is fine — slots without a key stay cold and the picker skips
+them transparently.
 
 Requires:
     ATOM_MASTER_PASSWORD set in the environment (same vault used by
@@ -18,9 +29,9 @@ Requires:
     never set up the vault.
 
 Behaviour:
-    - Reads the three keys from environment variables.
-    - Validates the prefix on each (gsk_ / nvapi- / csk-).
-    - Stores them under credential ids ``groq``, ``nvidia``, ``cerebras``.
+    - Reads each key from its env variable.
+    - Validates the prefix on each (gsk_ / AIza / nvapi- / csk-).
+    - Stores them under canonical credential ids.
     - Re-running is idempotent and safe — overwrites existing entries.
     - Never prints the key value; only the prefix and length.
 """
@@ -39,13 +50,25 @@ from core.secrets_manager import (  # noqa: E402
     GROQ,
     NVIDIA_NIM,
     CEREBRAS,
+    GEMINI_FAST,
+    GEMINI_PRO,
 )
 
+# (label, env var, credential id, allowed prefixes). Tier-1 vendors come
+# first so the on-screen list reflects rotation priority.
 _PROVIDERS = (
-    ("Groq",     "GROQ_API_KEY",     GROQ,       ("gsk_",)),
-    ("NVIDIA",   "NVIDIA_API_KEY",   NVIDIA_NIM, ("nvapi-",)),
-    ("Cerebras", "CEREBRAS_API_KEY", CEREBRAS,   ("csk-",)),
+    ("Groq",     "GROQ_API_KEY",      GROQ,       ("gsk_",)),
+    ("Gemini",   "GOOGLE_API_KEY",    GEMINI_FAST, ("AIza",)),
+    ("Cerebras", "CEREBRAS_API_KEY",  CEREBRAS,   ("csk-",)),
+    ("NVIDIA",   "NVIDIA_API_KEY",    NVIDIA_NIM, ("nvapi-",)),
 )
+
+# Gemini key gets mirrored to gemini_pro too so the standalone
+# GeminiClient lane (cloud.provider="gemini") works without a second
+# setup step.
+_KEY_MIRRORS = {
+    GEMINI_FAST: (GEMINI_PRO,),
+}
 
 
 def _mask(key: str) -> str:
@@ -89,6 +112,9 @@ def main() -> int:
         cm.set_credential(cred_id, raw)
         print(f"  {label:<8} | {env_var:<18} | stored {_mask(raw)}")
         stored += 1
+        for mirror_id in _KEY_MIRRORS.get(cred_id, ()):
+            cm.set_credential(mirror_id, raw)
+            print(f"  {'':<8} | {'':<18} |   mirrored → {mirror_id}")
 
     if stored == 0:
         print("\nNo keys stored. Set the env vars and try again.", file=sys.stderr)

@@ -144,6 +144,42 @@ _REALTIME_HINTS = re.compile(
     re.I,
 )
 
+# ── Sprint Ω.9 (Apr 26 2026) — semantic-cache class gate ────────────
+# Short identity/meta queries embed into vectors that fuzzy-match each
+# other at the chat-meta cluster (e.g. "who are you" vs "what time is
+# it" both 4-word meta probes). The Jaccard guard inside SemanticCache
+# catches some of this, but the safer bet is to refuse the semantic
+# branch entirely for queries below this length AND for canonical
+# identity/meta patterns. Exact match still works, so a literal repeat
+# still hits the cache in <10ms.
+_SEM_CACHE_FORCE_EXACT_RE = re.compile(
+    r"^(?:"
+    r"who\s+are\s+you|what\s+are\s+you|what['\u2019]?s\s+your\s+name|"
+    r"what\s+time\s+is\s+it|what['\u2019]?s\s+the\s+time|"
+    r"what['\u2019]?s\s+the\s+date|what\s+day\s+is\s+it|"
+    r"what['\u2019]?s\s+up|how\s+are\s+you|"
+    r"hello|hi|hey|namaste|namaskar|"
+    r"good\s*(?:morning|afternoon|evening|night)|"
+    r"thanks|thank\s+you|bye|goodbye"
+    r")\b",
+    re.I,
+)
+_SEM_CACHE_FORCE_EXACT_MAX_WORDS = 3
+
+
+def _force_exact_semantic_cache(query: str) -> bool:
+    """True when the query is short or matches an identity/meta probe
+    that should require an *exact* cache key for a hit.
+    """
+    q = (query or "").strip()
+    if not q:
+        return False
+    if len(q.split()) <= _SEM_CACHE_FORCE_EXACT_MAX_WORDS:
+        return True
+    if _SEM_CACHE_FORCE_EXACT_RE.search(q):
+        return True
+    return False
+
 _BUDGET_PROFILES: dict[CognitiveBudgetTier, _BudgetProfile] = {
     CognitiveBudgetTier.COMMAND: _BudgetProfile(
         llm=False,
@@ -317,8 +353,8 @@ class CognitiveKernel:
         self._latency = LatencyController(self._config)
 
         ck = self._config.get("cognitive_kernel", {})
-        self._quick_model = ck.get("quick_model", "qwen3-8b-4bit")
-        self._full_model = ck.get("full_model", "qwen3-8b-4bit")
+        self._quick_model = ck.get("quick_model", "qwen3-4b-instruct-4bit")
+        self._full_model = ck.get("full_model", "qwen3-4b-instruct-4bit")
         self._deep_query_min_chars = int(ck.get("deep_query_min_chars", 120))
         self._simple_query_max_chars = int(ck.get("simple_query_max_chars", 50))
         self._battery_degrade = bool(ck.get("battery_degrade", True))
@@ -541,10 +577,15 @@ class CognitiveKernel:
             self._record(plan, t0)
             return plan
 
-        # Path 2.5: SEMANTIC CACHE — embedding-based similarity (v22)
+        # Path 2.5: SEMANTIC CACHE — embedding-based similarity (v22).
+        # Sprint Ω.9 class gate: short identity/meta queries force the
+        # exact-match-only path so we never bleed a "what time is it"
+        # answer onto a "who are you" turn (or vice versa) just because
+        # both vectors live near the chat-meta cluster.
         if self._semantic_cache is not None:
             try:
-                sem_hit = self._semantic_cache.get(query)
+                exact_only = _force_exact_semantic_cache(query)
+                sem_hit = self._semantic_cache.get(query, exact_only=exact_only)
                 if sem_hit:
                     plan = QueryPlan(
                         path=ExecPath.CACHE,

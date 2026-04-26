@@ -1737,6 +1737,77 @@ CONFIG_SCHEMA: dict[str, Any] = {
             },
             "additionalProperties": False,
         },
+        "idle_maintenance": {
+            "type": "object",
+            "description": "Proactive memory hygiene during idle windows "
+            "(Sprint \u03a9.12, Apr 27 2026). One-shot gc.freeze after boot, "
+            "periodic gen-1 collect + mx.clear_cache when ATOM has been "
+            "idle long enough. Complements memory_governor (which reacts "
+            "to pressure) by keeping steady-state RSS low before pressure "
+            "ever builds.",
+            "properties": {
+                "enabled": {"type": "boolean"},
+                "freeze_after_boot_s": {
+                    "type": "number",
+                    "minimum": 0,
+                    "maximum": 600,
+                    "description": "Delay before the one-shot gc.freeze() runs. "
+                    "Long enough that heavy modules (MLX, tokenizers, "
+                    "system_profile) have settled but short enough to catch "
+                    "them before user activity grows the working set.",
+                },
+                "idle_threshold_s": {
+                    "type": "number",
+                    "minimum": 10,
+                    "maximum": 3600,
+                    "description": "Minimum idle window before a maintenance "
+                    "action runs. Default 120 s avoids interfering with "
+                    "back-to-back voice turns.",
+                },
+                "tick_interval_s": {
+                    "type": "number",
+                    "minimum": 5,
+                    "maximum": 600,
+                    "description": "Advisory cadence. The actual cadence is "
+                    "driven by the periodic_maintenance loop in main.py; this "
+                    "is kept here for diagnostics + future direct scheduling.",
+                },
+                "min_action_interval_s": {
+                    "type": "number",
+                    "minimum": 10,
+                    "maximum": 3600,
+                    "description": "Minimum gap between two maintenance actions, "
+                    "even if idle stays high. Prevents back-to-back "
+                    "gc.collect / mx.clear_cache calls during a long idle.",
+                },
+                "gc_threshold_gen0": {
+                    "type": "integer",
+                    "minimum": 100,
+                    "maximum": 100000,
+                    "description": "gc.set_threshold gen-0 value. Default 2000 "
+                    "(Python default 700) cuts cycle-collector frequency in "
+                    "half during active turns.",
+                },
+                "gc_threshold_gen1": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 1000,
+                },
+                "gc_threshold_gen2": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 1000,
+                },
+                "clear_mlx_cache_on_idle": {
+                    "type": "boolean",
+                    "description": "If true, calls local_brain.clear_metal_cache "
+                    "during an idle action so MLX returns its high-water-mark "
+                    "buffer pool to macOS.",
+                },
+                "log_actions": {"type": "boolean"},
+            },
+            "additionalProperties": False,
+        },
         "latency_controller": {
             "type": "object",
             "properties": {

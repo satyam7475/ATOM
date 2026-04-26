@@ -1396,11 +1396,20 @@ async def main() -> None:
                 get_groq_key,
                 get_nvidia_key,
                 get_cerebras_key,
+                get_gemini_fast_key,
             )
+            # Sprint Ω.11 (Apr 26 2026): rotation expanded to multi-vendor.
+            # Tier 1 round-robins Groq + Gemini (generateContent); tier 2
+            # = Cerebras; tier 3 = NVIDIA. The Anthropic/Claude slot was
+            # retired on 2026-04-27 (no key on file). Each slot pulls its
+            # key from the encrypted vault first, falls back to its env
+            # var. Slots whose key is missing stay cold; the picker
+            # skips them transparently.
             for slot_name, vault_getter, env_var in (
-                ("groq",     get_groq_key,     "GROQ_API_KEY"),
-                ("nvidia",   get_nvidia_key,   "NVIDIA_API_KEY"),
-                ("cerebras", get_cerebras_key, "CEREBRAS_API_KEY"),
+                ("groq",     get_groq_key,        "GROQ_API_KEY"),
+                ("gemini",   get_gemini_fast_key, "GOOGLE_API_KEY"),
+                ("cerebras", get_cerebras_key,    "CEREBRAS_API_KEY"),
+                ("nvidia",   get_nvidia_key,      "NVIDIA_API_KEY"),
             ):
                 key = ""
                 try:
@@ -1415,21 +1424,22 @@ async def main() -> None:
                 if key:
                     gemini_client.configure_slot_key(slot_name, key)
             if gemini_client.is_available:
+                ready_names = [
+                    s.get("name") for s in gemini_client.diagnostics().get("slots", [])
+                    if s.get("has_key")
+                ]
                 logger.info(
-                    "Cloud provider=rotating: %d slot(s) ready "
-                    "(round-robin with 429 quarantine + soft RPM)",
-                    sum(
-                        1
-                        for s in gemini_client.diagnostics().get("slots", [])
-                        if s.get("has_key")
-                    ),
+                    "Cloud provider=rotating: %d slot(s) ready %s "
+                    "(tiered round-robin with 429 quarantine + soft RPM)",
+                    len(ready_names), ready_names,
                 )
             else:
                 logger.warning(
                     "Cloud provider=rotating but no slot has a key. "
-                    "Run: python scripts/setup_api_keys.py  (or set "
-                    "GROQ_API_KEY / NVIDIA_API_KEY / CEREBRAS_API_KEY env "
-                    "vars). ATOM will run local-only until then."
+                    "Run: python scripts/setup_api_keys.py  (or set any of "
+                    "GROQ_API_KEY / GOOGLE_API_KEY / "
+                    "CEREBRAS_API_KEY / NVIDIA_API_KEY env vars). ATOM "
+                    "will run local-only until then."
                 )
         elif cloud_provider == "groq":
             gemini_client = GroqClient(config, security_gateway=security_gateway)
@@ -2228,6 +2238,70 @@ async def main() -> None:
         except asyncio.TimeoutError:
             logger.warning("TTS init >%.0fs — boot continuing without TTS", timeout)
             return False
+
+    # ── Sprint Ω.9 (Apr 26 2026) — async boot warm pass ────────────
+    # Three slow boot stages were running serially despite each
+    # being independent: WhisperKit serve spawn (~1.5s), embedding
+    # cache seed (~0.3s), TTS synth preflight (~0.6s). They are now
+    # kicked in parallel here; the heavy STT preload below sees a
+    # serve subprocess already binding the port (saving ~1s on
+    # _wait_for_serve_ready), the first speech_final hits a
+    # pre-compiled embedding graph (~120ms vs ~820ms cold), and a
+    # wedged NSSpeechSynthesizer is detected before the greeting.
+    async def _background_boot_warm() -> None:
+        t0 = time.monotonic()
+        kick_ok = False
+        preflight_ok = False
+        seeded = 0
+        try:
+            kick = getattr(stt, "kick_serve_async", None)
+            if callable(kick):
+                try:
+                    kick_ok = bool(await kick())
+                    logger.info(
+                        "Boot warm: STT serve kicked (ok=%s, %.0fms)",
+                        kick_ok,
+                        (time.monotonic() - t0) * 1000,
+                    )
+                except Exception:
+                    logger.debug("Boot warm: STT kick raised", exc_info=True)
+        finally:
+            try:
+                from core.embedding_engine import get_embedding_engine
+
+                t_e = time.monotonic()
+                emb = get_embedding_engine(config)
+                loop = asyncio.get_running_loop()
+                seeded = int(
+                    await loop.run_in_executor(None, emb.seed_warm_cache)
+                )
+                logger.info(
+                    "Boot warm: embedding seed (new=%d, %.0fms)",
+                    seeded, (time.monotonic() - t_e) * 1000,
+                )
+            except Exception:
+                logger.debug("Boot warm: embedding seed raised", exc_info=True)
+            try:
+                gate = await _await_tts_ready(timeout=10.0)
+                if gate and hasattr(tts, "preflight_speak"):
+                    t_p = time.monotonic()
+                    preflight_ok = bool(await tts.preflight_speak())
+                    logger.info(
+                        "Boot warm: TTS preflight (ok=%s, %.0fms)",
+                        preflight_ok,
+                        (time.monotonic() - t_p) * 1000,
+                    )
+            except Exception:
+                logger.debug("Boot warm: TTS preflight raised", exc_info=True)
+            elapsed = (time.monotonic() - t0) * 1000
+            _bt_mark("boot_warm", elapsed, parallel=True)
+            logger.info(
+                "Boot warm pass: %.0fms (stt_kick=%s, embed_seeded=%d, "
+                "tts_preflight=%s)",
+                elapsed, kick_ok, seeded, preflight_ok,
+            )
+
+    _bg_tasks.append(asyncio.create_task(_background_boot_warm()))
 
     stt_preload_done = asyncio.Event()
 
@@ -3563,6 +3637,39 @@ async def main() -> None:
     if memory_governor is not None:
         memory_governor.start()
 
+    # ── Idle maintenance (Sprint Ω.12, Apr 27 2026) ─────────────
+    # Proactive memory hygiene that complements the pressure-driven
+    # memory_governor: gc.set_threshold tweak, one-shot gc.freeze
+    # after boot, periodic gen-1 collect + mx.clear_cache on long
+    # idle windows. Cheap, safe, idempotent; no-op when ATOM is busy.
+    idle_maintenance = None
+    try:
+        from core.idle_maintenance import IdleMaintenance
+
+        def _is_atom_busy() -> bool:
+            try:
+                return state.current.value not in {"idle", "listening"}
+            except Exception:
+                return False
+
+        def _clear_metal_cache_for_idle() -> None:
+            if local_brain is not None:
+                fn = getattr(local_brain, "clear_metal_cache", None)
+                if callable(fn):
+                    fn()
+
+        idle_maintenance = IdleMaintenance(
+            config=config,
+            bus=bus,
+            clear_metal_cache=_clear_metal_cache_for_idle,
+            is_busy=_is_atom_busy,
+        )
+        idle_maintenance.start()
+        idle_maintenance.schedule_freeze_after_boot()
+    except Exception:
+        logger.info("IdleMaintenance wiring failed", exc_info=True)
+        idle_maintenance = None
+
     # ── Start JARVIS-level modules ──────────────────────────────
     system_scanner.start()
     owner_understanding.start()
@@ -4204,6 +4311,13 @@ async def main() -> None:
                 except Exception:
                     logger.debug("Self-tune error", exc_info=True)
 
+            # Sprint Ω.12: idle-window memory hygiene.
+            if idle_maintenance is not None:
+                try:
+                    idle_maintenance.maybe_tick()
+                except Exception:
+                    logger.debug("Idle maintenance tick failed", exc_info=True)
+
             snapshot_cycles = max(1, 1800 // maint_interval)
             if cycle % snapshot_cycles == 0:
                 try:
@@ -4244,17 +4358,16 @@ async def main() -> None:
 
     maintenance_task = asyncio.create_task(_periodic_maintenance())
 
-    # ── V22 Convergence: Advanced Proactive Daemon ──
-    from core.background.proactive_agent import ProactiveDaemon
-    from core.cognition.state_graph import SystemStateGraph
-    try:
-        convergence_daemon = ProactiveDaemon()
-        convergence_daemon.wire(state_graph=SystemStateGraph(), tts=tts)
-        convergence_daemon.start()
-        logger.info("V22 Convergence Daemon started.")
-    except Exception as e:
-        logger.error(f"Failed to start convergence daemon: {e}")
-        convergence_daemon = None
+    # NOTE (Sprint Ω.10 cleanup, Apr 27 2026): the V22 ``ProactiveDaemon``
+    # wiring used to live here. It was removed because it was a pure
+    # dead loop — ``BackgroundTaskManager.submit()`` was never called by
+    # any caller, ``SystemStateGraph.system_load`` was permanently 0.0
+    # (no writer anywhere in the repo), and the ``system_alert`` /
+    # ``background_task_complete`` events it could emit had zero
+    # subscribers. Removing it frees one 60s asyncio task tick + the
+    # ``BackgroundTaskManager`` / ``SystemStateGraph`` instances. The
+    # underlying modules stay on disk in case a future sprint plugs
+    # real submitters into them.
 
     try:
         await shutdown_event.wait()
@@ -4262,8 +4375,6 @@ async def main() -> None:
         logger.info("Interrupt received")
     finally:
         logger.info("Cleaning up...")
-        if convergence_daemon:
-            convergence_daemon.stop()
         power_governor.stop()
         scheduler.stop()
         system_watcher.stop()
@@ -4291,6 +4402,11 @@ async def main() -> None:
                 memory_governor.shutdown()
             except Exception:
                 logger.debug("MemoryGovernor shutdown failed", exc_info=True)
+        if idle_maintenance is not None:
+            try:
+                idle_maintenance.stop()
+            except Exception:
+                logger.debug("IdleMaintenance stop failed", exc_info=True)
         if workflow_engine is not None:
             workflow_engine.persist()
         if document_engine is not None:

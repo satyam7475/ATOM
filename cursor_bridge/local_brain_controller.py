@@ -645,13 +645,18 @@ class LocalBrainController:
         weak. Set to None to disable."""
         self._response_vetter = vetter
 
+        # Sprint Ω.10 cleanup (Apr 27 2026): kept the lightweight
+        # ``IntentClassifier`` because the PERCEPTION branch in
+        # ``query_with_context`` actually uses it to short-circuit
+        # vision queries to the screen reader / camera. Dropped the
+        # ``PlannerEngine`` and ``SystemStateGraph`` imports — they
+        # were attached here but only ever fed the dead REASONING
+        # ``MACRO EXECUTION PLAN`` prompt-bloat injection (which has
+        # also been removed below) and a write-only
+        # ``last_query_time`` attribute that no consumer ever read.
         from core.cognition.intent_classifier import IntentClassifier
-        from core.cognition.planner import PlannerEngine
-        from core.cognition.state_graph import SystemStateGraph
-        
+
         self._intent_classifier = IntentClassifier()
-        self._planner = PlannerEngine(ai_client=self._llm)
-        self._state_graph = SystemStateGraph()
 
     def _prediction_prefetch_enabled(self) -> bool:
         if self._brain_mode_manager is None:
@@ -1231,6 +1236,29 @@ class LocalBrainController:
             except Exception:
                 logger.info("Local brain prompt-cache drop failed", exc_info=True)
 
+    def clear_metal_cache(self) -> bool:
+        """Release the MLX Metal allocator's high-water-mark buffer pool.
+
+        Sprint Ω.12 (Apr 27 2026): public hook for
+        :class:`core.idle_maintenance.IdleMaintenance` so we can return
+        unified memory to macOS during long idle windows without
+        unloading the model. Cheap (sub-50 ms re-mmap on next turn);
+        the user-perceived latency cost is zero because the next turn
+        was going to allocate fresh tensors anyway. Returns ``True``
+        when a clear was attempted, ``False`` for backends without an
+        MLX runtime (so callers can suppress no-op log lines).
+        """
+        llm = self._llm
+        fn = getattr(llm, "_clear_mlx_cache", None)
+        if not callable(fn):
+            return False
+        try:
+            fn()
+            return True
+        except Exception:
+            logger.debug("Local brain metal cache clear failed", exc_info=True)
+            return False
+
     def get_perf_snapshot(self) -> dict[str, Any]:
         """Forward the brain's lifetime perf snapshot for periodic logging.
 
@@ -1455,10 +1483,13 @@ class LocalBrainController:
 
         from context.privacy_filter import redact as _redact
         logger.info("Agentic brain query: '%s'", _redact(text[:120]))
-        
+
         # ── Jarvis Convergence: Cognitive Pre-processing ──
-        import time
-        self._state_graph.last_query_time = time.time()
+        # Sprint Ω.10 cleanup: dropped the ``state_graph.last_query_time``
+        # write — it was the only writer in the codebase and no consumer
+        # ever read it back. The ``IntentClassifier`` pass below stays
+        # because the PERCEPTION branch genuinely uses it to bypass the
+        # LLM for "describe my screen" / "show me the camera" queries.
         intent = self._intent_classifier.classify(text)
         logger.info("Cognitive Intent detected: %s (conf: %.2f)", intent.category.name, intent.confidence)
         
@@ -1548,15 +1579,16 @@ class LocalBrainController:
             self._bus.emit_long("response_ready", text=result)
             return
             
-        if intent.category.name == "REASONING":
-            logger.info("REASONING isolated: Building topological plan graph.")
-            plan = await self._planner.generate_plan(text, "")
-            if plan.steps:
-                plan_text = "MACRO EXECUTION PLAN:\n" + "\n".join([f"- Step {s.step_num}: {s.description} (use tool: {s.target_tool})" for s in plan.steps])
-                if context is None:
-                    context = {}
-                context["planner_directive"] = plan_text
-                text = f"You are executing a macro plan. Please follow these steps exactly:\n{plan_text}\n\nUser request: {text}"
+        # Sprint Ω.10 cleanup (Apr 27 2026): the REASONING branch used
+        # to call ``self._planner.generate_plan(text, "")`` and prepend
+        # a ``MACRO EXECUTION PLAN`` header to the user's query. That
+        # path was structurally dead — ``PlannerEngine`` was constructed
+        # without ``bus=`` so the LLM-driven plan path always returned
+        # ``None`` and we fell back to a heuristic that emitted a single
+        # ``router_dispatch`` stub for every "why / how / analyze"
+        # question. The result was 50+ junk prompt tokens per matched
+        # turn (slower prefill, confused framing) for zero useful work,
+        # so the whole branch is gone. PERCEPTION above still runs.
         # ──────────────────────────────────────────────────
 
         trace_id = _kw.get("trace_id")

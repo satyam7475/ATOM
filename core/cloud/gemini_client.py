@@ -36,8 +36,18 @@ from typing import Any, Callable
 logger = logging.getLogger("atom.cloud.gemini")
 
 _GEMINI_API_URL = "https://generativelanguage.googleapis.com/v1beta/models"
-_DEFAULT_MODEL = "gemini-2.0-flash"
-_BUDDY_MODEL = "gemini-2.0-flash"       # Fast, conversational, buddy-like
+# Sprint Ω.10 (Apr 26 2026): Google moved gemini-2.0-flash to paid-only on
+# unbilled accounts (every free key now returns 429 RESOURCE_EXHAUSTED on
+# 2.0-* models). Confirmed live against the new vault key:
+#   - gemini-2.5-flash-lite : ~1.2s, free tier active        ← buddy
+#   - gemini-2.5-flash      : ~1.0s, thinking-budget free    ← reasoning
+#   - gemini-2.0-flash*     : 429 RESOURCE_EXHAUSTED         ← gone
+# Defaults updated accordingly. Settings.json may override via
+# ``cloud.gemini.{buddy_model,reasoning_model}`` (preferred, isolates the
+# Gemini lane from the rotating lane's Llama model ids) or the legacy
+# top-level ``cloud.{buddy_model,reasoning_model}`` for backward compat.
+_DEFAULT_MODEL = "gemini-2.5-flash-lite"
+_BUDDY_MODEL = "gemini-2.5-flash-lite"  # Fast, conversational, buddy-like
 _REASONING_MODEL = "gemini-2.5-flash"   # Deep reasoning, thinking, complex
 _TIMEOUT_S = 8
 _TIMEOUT_REASONING_S = 30
@@ -61,10 +71,26 @@ class GeminiClient:
         security_gateway: Any = None,
     ) -> None:
         cfg = (config or {}).get("cloud", {})
-        self._api_key: str = cfg.get("gemini_api_key", "")
-        self._model = cfg.get("model", _DEFAULT_MODEL)
-        self._buddy_model = cfg.get("buddy_model", _BUDDY_MODEL)
-        self._reasoning_model = cfg.get("reasoning_model", _REASONING_MODEL)
+        # Gemini-specific overrides isolate the Gemini lane from the
+        # rotating lane's Llama model ids. Fallback chain:
+        #   cloud.gemini.X  →  cloud.X  →  hard-coded default.
+        gem_cfg = cfg.get("gemini", {}) or {}
+        self._api_key: str = gem_cfg.get("api_key", cfg.get("gemini_api_key", ""))
+        self._model = gem_cfg.get("model", cfg.get("model", _DEFAULT_MODEL))
+        self._buddy_model = gem_cfg.get(
+            "buddy_model", cfg.get("buddy_model", _BUDDY_MODEL),
+        )
+        self._reasoning_model = gem_cfg.get(
+            "reasoning_model", cfg.get("reasoning_model", _REASONING_MODEL),
+        )
+        # If the buddy/reasoning model id doesn't look like a Gemini model
+        # (e.g. settings.json was overridden for the rotating lane to use
+        # ``llama-3.1-8b-instant``), fall back to the hard-coded Gemini
+        # defaults instead of forwarding a Llama id to Google.
+        if not str(self._buddy_model).startswith("gemini"):
+            self._buddy_model = _BUDDY_MODEL
+        if not str(self._reasoning_model).startswith("gemini"):
+            self._reasoning_model = _REASONING_MODEL
         self._timeout = float(cfg.get("timeout_seconds", _TIMEOUT_S))
         self._timeout_reasoning = float(cfg.get("timeout_reasoning_seconds", _TIMEOUT_REASONING_S))
         self._max_tokens = int(cfg.get("max_tokens", _MAX_TOKENS))

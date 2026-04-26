@@ -922,6 +922,66 @@ class MacOSTTSAsync:
                 self._voice_request, self._rate,
             )
 
+    async def preflight_speak(self) -> bool:
+        """Speak a silent token through the active backend to flush the
+        first-word audio path.
+
+        Sprint Ω.9 (Apr 26 2026): the boot greeting is the only utterance
+        that ever pays the *cold* NSSpeechSynthesizer warmup. If the
+        synth wedges on that first call (memory pressure paged out the
+        voice, audio session held by another process), Boss hears
+        nothing at all because the deadman fires AFTER the greeting was
+        meant to play. Running a half-second silent string during the
+        boot warm pass fails this race early: if ``speak_blocking``
+        bumps ``stuck_starts``, we flip the backend to ``say`` so the
+        very first user-visible greeting goes through the never-wedge
+        subprocess fallback instead.
+
+        Idempotent. Returns True if the preflight succeeded (or backend
+        is ``say`` already), False if we couldn't run it (e.g. no
+        loop, init_voice not called yet).
+        """
+        if not self._available:
+            return False
+        if self._backend != "NSSpeechSynthesizer" or self._native_synth is None:
+            return True
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return False
+        stuck_before = self._native_synth.stuck_starts
+        try:
+            # 2 s deadman so a wedged synth can't keep us in the boot
+            # warm pass forever. The native preflight string is just a
+            # space — NSSpeechSynthesizer treats it as a no-op render
+            # but still allocates the audio session.
+            await asyncio.wait_for(
+                loop.run_in_executor(
+                    None, self._native_synth.speak_blocking, " ",
+                ),
+                timeout=2.0,
+            )
+        except asyncio.TimeoutError:
+            self._backend = "say"
+            logger.warning(
+                "TTS preflight timed out >2s — flipping to `say` backend "
+                "before first greeting",
+            )
+            return False
+        except Exception:
+            logger.debug("TTS preflight raised", exc_info=True)
+        stuck_after = self._native_synth.stuck_starts
+        if stuck_after > stuck_before:
+            self._backend = "say"
+            logger.warning(
+                "TTS preflight: native synth wedged (stuck_starts=%d) — "
+                "flipping to `say` backend before first greeting",
+                stuck_after,
+            )
+            return False
+        logger.info("TTS preflight passed (backend=%s)", self._backend)
+        return True
+
     # ── Core speech dispatch ───────────────────────────────────────
 
     async def _speak_one(self, text: str) -> None:

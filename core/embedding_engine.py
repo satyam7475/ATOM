@@ -334,6 +334,44 @@ class EmbeddingEngine:
                 "yes" if _np is not None else "no",
                 elapsed,
             )
+
+            # ── Sprint Ω.9 (Apr 26 2026): warmup encode ────────────
+            # Loading weights is not enough — MLX/Torch only compile
+            # the encode graph on the first real call, AND the graph
+            # is shape-specialized: a 3-token input compile does not
+            # cover a 30-token input. Without these warmups, the
+            # first user-side embedding pays ~700-820ms of graph
+            # compile, which the audit caught as
+            # `embedding.per_query_ms = 818.1ms`. We prime a few
+            # representative lengths (short / medium / long) so the
+            # common voice-query shapes are all pre-compiled. After
+            # this, steady-state per-query drops to ~3-5ms on MLX/ANE.
+            warmup_phrases = [
+                "__warmup__",
+                "what time is it",
+                "remind me about my goals tomorrow",
+                (
+                    "summarize the last meeting and "
+                    "highlight the action items I owe"
+                ),
+            ]
+            try:
+                t_warm = time.monotonic()
+                for phrase in warmup_phrases:
+                    self._provider.encode(phrase)
+                warm_ms = (time.monotonic() - t_warm) * 1000
+                logger.info(
+                    "Embedding warmup encode: %.0fms (%d shapes "
+                    "compiled)",
+                    warm_ms, len(warmup_phrases),
+                )
+            except Exception:
+                logger.debug(
+                    "Embedding warmup encode raised — first real query "
+                    "will pay the compile cost",
+                    exc_info=True,
+                )
+
             self._run_shadow_compare_once()
             return True
         except Exception:
@@ -958,6 +996,37 @@ class EmbeddingEngine:
             phrases.extend(p.strip() for p in extra if p and p.strip())
         new_phrases = [p for p in phrases if p and p not in self._cache]
         if not new_phrases:
+            # Sprint Ω.9 (Apr 26 2026): even when the warm file
+            # restored every phrase, force compile-priming encodes
+            # across a few input lengths so the MLX graph is hot for
+            # the common voice-query shapes before the first user
+            # turn. Without this, restart boots that load the warm
+            # file from disk still paid the ~800ms graph-compile tax
+            # on the very first turn for any unseen shape.
+            try:
+                if self._provider is not None:
+                    primer = [
+                        "__warmup__",
+                        "what time is it",
+                        "remind me about my goals tomorrow",
+                        (
+                            "summarize the last meeting and "
+                            "highlight the action items I owe"
+                        ),
+                    ]
+                    t_w = time.monotonic()
+                    for phrase in primer:
+                        self._provider.encode(phrase)
+                    logger.debug(
+                        "Embedding seed: cache hot, warmup encodes "
+                        "(%d shapes) %.0fms",
+                        len(primer), (time.monotonic() - t_w) * 1000,
+                    )
+            except Exception:
+                logger.debug(
+                    "seed_warm_cache compile-priming encode failed",
+                    exc_info=True,
+                )
             return 0
         try:
             t0 = time.monotonic()

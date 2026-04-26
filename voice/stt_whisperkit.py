@@ -540,15 +540,77 @@ class WhisperKitSTT:
         loop = asyncio.get_running_loop()
         return bool(await loop.run_in_executor(None, self.preload))
 
+    async def kick_serve_async(self) -> bool:
+        """Spawn ``whisperkit-cli serve`` *without* awaiting `/health`.
+
+        Sprint Ω.9 (Apr 26 2026): the existing ``preload()`` wraps the
+        Popen + 13.6 s wait-for-health into one synchronous block, which
+        forced boot to stall on STT before greeting. Splitting the work
+        means main.py can fire-and-forget the subprocess during boot
+        warm-up; by the time the awaited ``preload()`` runs (after the
+        first greeting), ``_port_is_open + _serve_health_ok`` already
+        return True and the wait collapses to <100 ms.
+
+        Idempotent. Safe to call before or instead of ``preload()`` —
+        ``preload()`` checks the live port and attaches if it finds a
+        healthy listener. Returns True if the spawn was attempted (or
+        a healthy serve was already running), False if prerequisites
+        are missing (no CLI, missing native deps).
+        """
+        if self._cli_path is None:
+            self._last_error = (
+                "whisperkit-cli not on $PATH; "
+                "run `brew install whisperkit-cli`"
+            )
+            logger.debug("kick_serve_async: %s", self._last_error)
+            return False
+        if _sd is None or _webrtcvad is None or _np is None:
+            logger.debug("kick_serve_async: native STT deps missing; skipping")
+            return False
+        # If the port already has a healthy listener, nothing to do.
+        if _port_is_open(self._serve_host, self._serve_port):
+            if self._serve_health_ok(timeout_s=0.4):
+                return True
+        loop = asyncio.get_running_loop()
+
+        def _spawn() -> bool:
+            try:
+                self._maybe_start_serve()
+                return True
+            except Exception:
+                logger.debug(
+                    "WhisperKitSTT.kick_serve_async: spawn raised",
+                    exc_info=True,
+                )
+                return False
+
+        return bool(await loop.run_in_executor(None, _spawn))
+
     # ── serve lifecycle ─────────────────────────────────────────
 
     def _maybe_start_serve(self) -> None:
         """Launch ``whisperkit-cli serve`` if not already running."""
+        # Sprint Ω.9 (Apr 26 2026): if we already kicked the serve via
+        # ``kick_serve_async`` and the subprocess is still alive, skip
+        # the reap branch entirely — it would kill our own warming
+        # serve and force a re-spawn. Trust ``_wait_for_serve_ready``
+        # to gate on /health.
+        own_proc = self._serve_proc
+        own_proc_alive = (
+            own_proc is not None and own_proc.poll() is None
+        )
         if _port_is_open(self._serve_host, self._serve_port):
             if self._serve_health_ok(timeout_s=0.5):
                 logger.info(
                     "WhisperKit: healthy serve already up on %s:%d -- attaching",
                     self._serve_host, self._serve_port,
+                )
+                return
+            if own_proc_alive:
+                logger.info(
+                    "WhisperKit: own serve pid=%d still warming on %s:%d "
+                    "-- continuing to readiness wait",
+                    own_proc.pid, self._serve_host, self._serve_port,
                 )
                 return
             logger.warning(
@@ -571,6 +633,23 @@ class WhisperKitSTT:
                     f"WhisperKit stale serve on {self._serve_host}:"
                     f"{self._serve_port} did not release its port"
                 )
+        # Port not bound. If our kicked proc is alive but still
+        # spawning the listener, wait a short window for the bind so
+        # we don't double-spawn.
+        if own_proc_alive:
+            deadline = time.monotonic() + 1.5
+            while time.monotonic() < deadline:
+                if _port_is_open(self._serve_host, self._serve_port):
+                    return
+                time.sleep(0.05)
+            if _port_is_open(self._serve_host, self._serve_port):
+                return
+            logger.info(
+                "WhisperKit: kicked serve pid=%d has not yet bound; "
+                "continuing to readiness wait",
+                own_proc.pid,
+            )
+            return
         if self._cli_path is None:
             raise RuntimeError("whisperkit-cli not available")
 

@@ -26,7 +26,7 @@
         }
     },
     "cross_device": {
-        "enabled": false,
+        "enabled": true,
         "bridge_port": 8787,
         "bind_host": "127.0.0.1",
         "faceid_freshness_s": 300,
@@ -442,7 +442,7 @@
         "goals_enabled": true,
         "predictions_enabled": true,
         "behavior_model_enabled": false,
-        "self_optimizer_enabled": true,
+        "self_optimizer_enabled": false,
         "prediction_check_interval_s": 300,
         "behavior_update_interval_s": 1800,
         "goal_evaluation_interval_s": 3600,
@@ -589,9 +589,21 @@
             "persona_kv_cache"
         ]
     },
+    "idle_maintenance": {
+        "enabled": true,
+        "freeze_after_boot_s": 60,
+        "idle_threshold_s": 120,
+        "tick_interval_s": 30,
+        "min_action_interval_s": 60,
+        "gc_threshold_gen0": 2000,
+        "gc_threshold_gen1": 25,
+        "gc_threshold_gen2": 25,
+        "clear_mlx_cache_on_idle": true,
+        "log_actions": true
+    },
     "cognitive_kernel": {
-        "quick_model": "qwen3-8b-4bit",
-        "full_model": "qwen3-8b-4bit",
+        "quick_model": "qwen3-4b-instruct-4bit",
+        "full_model": "qwen3-4b-instruct-4bit",
         "simple_query_max_chars": 48,
         "deep_query_min_chars": 140,
         "battery_degrade": true,
@@ -642,7 +654,7 @@
             "significant_gpu_delta": 15.0
         },
         "observability": {
-            "debug_snapshot_interval_s": 120.0,
+            "debug_snapshot_interval_s": 0.0,
             "debug_snapshot_cache_ttl_s": 3.0
         },
         "prefetch": {
@@ -766,6 +778,10 @@
         ],
         "smart_route_min_query_words": 18,
         "smart_route_local_confidence_floor": 0.5,
+        "gemini": {
+            "buddy_model": "gemini-2.5-flash-lite",
+            "reasoning_model": "gemini-2.5-flash"
+        },
         "rotation": {
             "enabled": true,
             "cooldown_429_s": 60,
@@ -776,33 +792,53 @@
             "providers": [
                 {
                     "name": "groq",
+                    "provider_kind": "openai",
                     "base_url": "https://api.groq.com/openai/v1",
                     "credential_id": "groq",
                     "fast_model": "llama-3.1-8b-instant",
                     "deep_model": "llama-3.3-70b-versatile",
+                    "tier": 1,
                     "soft_rpm": 28,
                     "timeout_seconds": 10,
                     "timeout_reasoning_seconds": 25
                 },
                 {
+                    "name": "gemini",
+                    "provider_kind": "gemini",
+                    "base_url": "https://generativelanguage.googleapis.com/v1beta",
+                    "credential_id": "gemini_fast",
+                    "fast_model": "gemini-2.5-flash-lite",
+                    "deep_model": "gemini-2.5-flash",
+                    "tier": 1,
+                    "soft_rpm": 12,
+                    "timeout_seconds": 12,
+                    "timeout_reasoning_seconds": 30,
+                    "max_tokens_reasoning": 2048
+                },
+                {
+                    "name": "cerebras",
+                    "provider_kind": "openai",
+                    "base_url": "https://api.cerebras.ai/v1",
+                    "credential_id": "cerebras",
+                    "fast_model": "llama3.1-8b",
+                    "deep_model": "gpt-oss-120b",
+                    "tier": 2,
+                    "soft_rpm": 25,
+                    "timeout_seconds": 10,
+                    "timeout_reasoning_seconds": 20
+                },
+                {
                     "name": "nvidia",
+                    "provider_kind": "openai",
                     "base_url": "https://integrate.api.nvidia.com/v1",
                     "credential_id": "nvidia",
                     "fast_model": "meta/llama-3.1-8b-instruct",
                     "deep_model": "meta/llama-3.3-70b-instruct",
+                    "tier": 3,
                     "soft_rpm": 35,
-                    "timeout_seconds": 12,
-                    "timeout_reasoning_seconds": 30
-                },
-                {
-                    "name": "cerebras",
-                    "base_url": "https://api.cerebras.ai/v1",
-                    "credential_id": "cerebras",
-                    "fast_model": "llama3.1-8b",
-                    "deep_model": "llama-3.3-70b",
-                    "soft_rpm": 25,
-                    "timeout_seconds": 10,
-                    "timeout_reasoning_seconds": 20
+                    "timeout_seconds": 8,
+                    "timeout_reasoning_seconds": 30,
+                    "prefer_streaming": true
                 }
             ]
         }

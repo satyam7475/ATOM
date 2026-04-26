@@ -129,7 +129,18 @@ class ParallelPipeline:
     can speculatively start intent classification and cache lookup in
     parallel, so by the time ``speech_final`` fires, the intent result
     is already available.
+
+    Sprint Ω.9 (Apr 26 2026): the speculative classify used to ride the
+    default ThreadPoolExecutor (~14 workers shared with every cloud /
+    LLM handler). Under load that pool serialised behind a single brain
+    turn, so ``on_speech_partial`` regularly logged 9.7 s
+    "Slow handler" warnings. We now route through the LIGHT bus pool
+    (2 workers, voice/UI only) and bound each call with an 0.8 s
+    deadline — losing the prefetch is harmless (the real classify still
+    runs on `speech_final`); blocking the partial firehose is not.
     """
+
+    _PARTIAL_PREFETCH_TIMEOUT_S: float = 0.8
 
     def __init__(self, intent_engine: Any, cache: Any) -> None:
         self._intent = intent_engine
@@ -137,10 +148,14 @@ class ParallelPipeline:
         self._prefetched: dict[str, Any] = {}
         self._prefetch_count = 0
         self._hit_count = 0
+        self._prefetch_timeouts = 0
+        self._prefetch_errors = 0
 
     async def on_speech_partial(self, text: str = "", confidence: float = 0.0, **_kw: Any) -> None:
         """Called on partial STT results. Pre-classifies if confidence is high."""
         import asyncio
+
+        from core.async_event_bus import get_light_executor
 
         text = (text or "").strip()
         if not text or len(text) < 4 or confidence < 0.7:
@@ -152,13 +167,25 @@ class ParallelPipeline:
 
         loop = asyncio.get_running_loop()
         try:
-            result = await loop.run_in_executor(None, self._intent.classify, text)
+            result = await asyncio.wait_for(
+                loop.run_in_executor(
+                    get_light_executor(), self._intent.classify, text,
+                ),
+                timeout=self._PARTIAL_PREFETCH_TIMEOUT_S,
+            )
             self._prefetched[norm] = result
             self._prefetch_count += 1
             if len(self._prefetched) > 20:
                 oldest = next(iter(self._prefetched))
                 del self._prefetched[oldest]
+        except asyncio.TimeoutError:
+            self._prefetch_timeouts += 1
+            logger.debug(
+                "ParallelPipeline.on_speech_partial: prefetch timed out (>%.2fs) for %r",
+                self._PARTIAL_PREFETCH_TIMEOUT_S, text[:40],
+            )
         except Exception:
+            self._prefetch_errors += 1
             logger.debug('core fast path optional step failed', exc_info=True)
 
     def get_prefetched(self, text: str) -> Any:
@@ -174,4 +201,6 @@ class ParallelPipeline:
             "prefetch_count": self._prefetch_count,
             "hit_count": self._hit_count,
             "pending": len(self._prefetched),
+            "prefetch_timeouts": self._prefetch_timeouts,
+            "prefetch_errors": self._prefetch_errors,
         }

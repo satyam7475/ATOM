@@ -25,6 +25,7 @@ import logging
 import time
 import weakref
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable, Coroutine
 
 logger = logging.getLogger("atom.event_bus")
@@ -34,6 +35,69 @@ EventHandler = Callable[..., Coroutine[Any, Any, None]]
 HANDLER_TIMEOUT_S = 10.0
 SLOW_HANDLER_WARN_S = 5.0
 LONG_HANDLER_TIMEOUT_S = 60.0
+
+
+# ── Sprint Ω.9 (Apr 26 2026): executor isolation ─────────────────────
+# The shared default ThreadPoolExecutor on M5 has ~14 workers. A single
+# brain inference + 4-5 wire_*.py handlers saturate it, so lightweight
+# speculative tasks (intent.classify on STT partials, dashboard renders)
+# wait 9-10 s in the queue and trip the slow-handler warning at 5 s.
+#
+# Two named pools, sized for M5's 10 perf cores: a 2-worker LIGHT pool
+# for sub-100 ms speculative work that must never queue behind LLM I/O,
+# and a 3-worker HEAVY pool for cloud/LLM/IO calls that don't care about
+# tail latency. Both are module-level so they outlive any single bus
+# instance and survive pytest reloads.
+_LIGHT_EXEC: ThreadPoolExecutor | None = None
+_HEAVY_EXEC: ThreadPoolExecutor | None = None
+_EXEC_LOCK_LIGHT = False
+_EXEC_LOCK_HEAVY = False
+
+
+def get_light_executor() -> ThreadPoolExecutor:
+    """Return the shared 2-worker pool for sub-100 ms speculative tasks.
+
+    Use this for: intent classification on STT partials, dashboard route
+    handlers, regex-only filters, anything that must NOT queue behind a
+    cloud LLM round-trip. Lazy-initialised so import is cheap.
+    """
+    global _LIGHT_EXEC
+    if _LIGHT_EXEC is None or getattr(_LIGHT_EXEC, "_shutdown", False):
+        _LIGHT_EXEC = ThreadPoolExecutor(
+            max_workers=2,
+            thread_name_prefix="atom-bus-light",
+        )
+    return _LIGHT_EXEC
+
+
+def get_heavy_executor() -> ThreadPoolExecutor:
+    """Return the shared 3-worker pool for slow/cloud/IO work.
+
+    Use this for: cloud LLM calls, RAG retrievals, anything > 200 ms.
+    Keeps tail latency off the LIGHT pool so voice partials stay snappy.
+    """
+    global _HEAVY_EXEC
+    if _HEAVY_EXEC is None or getattr(_HEAVY_EXEC, "_shutdown", False):
+        _HEAVY_EXEC = ThreadPoolExecutor(
+            max_workers=3,
+            thread_name_prefix="atom-bus-heavy",
+        )
+    return _HEAVY_EXEC
+
+
+def shutdown_bus_executors(timeout_s: float = 2.0) -> None:
+    """Drain the named pools at process teardown. Idempotent."""
+    global _LIGHT_EXEC, _HEAVY_EXEC
+    for ref_name in ("_LIGHT_EXEC", "_HEAVY_EXEC"):
+        ex = globals().get(ref_name)
+        if ex is None:
+            continue
+        try:
+            ex.shutdown(wait=True, cancel_futures=True)
+        except Exception:
+            logger.debug("bus executor %s shutdown raised", ref_name, exc_info=True)
+    _LIGHT_EXEC = None
+    _HEAVY_EXEC = None
 
 
 class PriorityEventBus:

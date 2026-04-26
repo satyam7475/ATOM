@@ -26,10 +26,17 @@ GEMINI_PRO = "gemini_pro"
 
 # Sprint Ω.9 (Apr 26 2026): rotating OpenAI-compatible cloud lane.
 # Each provider stores its raw API key under one credential id; the
-# RotatingOpenAIClient pulls them on init via ``get_api_key(<id>)``.
+# RotatingCloudClient pulls them on init via ``get_api_key(<id>)``.
 GROQ = "groq"
 NVIDIA_NIM = "nvidia"
 CEREBRAS = "cerebras"
+
+# Sprint Ω.11 (Apr 26 2026): multi-vendor rotation. The rotating client
+# can carry non-OpenAI-compatible slots (Gemini) alongside the
+# OpenAI-compatible ones; Gemini reuses ``gemini_fast`` for the
+# rotating-lane key. The Anthropic/Claude slot was retired on
+# 2026-04-27 — owner does not hold an ``sk-ant-`` key, so the slot
+# was removed from the rotation to keep the boot log clean.
 
 # Backward-compat: older callsites and ``main.py`` use ``groq_api_key``
 # for the single-provider Groq lane. We mirror it to the canonical id.
