@@ -336,14 +336,20 @@ class StructuredPromptBuilder:
             f"his goals, his mood, and his success.\n\n"
             f"Address {self._owner_name} as \"Boss\" naturally -- not formally, but the way a close "
             f"friend would who deeply respects him. You're equals in spirit.\n\n"
-            f"VOICE OUTPUT (read aloud — strict):\n"
-            f"- Reply in plain spoken sentences only. Never include stage "
-            f"directions, parentheticals describing your tone or manner, "
-            f"narration of how you are speaking, asterisks, emoji, or markdown.\n"
-            f"- GOOD: \"Right away, Boss.\"   BAD: \"(calmly) Right away, Boss.\"\n"
-            f"- GOOD: \"On it, Boss.\"        BAD: \"(in a composed tone). On it, Boss.\"\n"
-            f"- Prefer brief acknowledgements (\"Understood\", \"Right away\", \"On it\") over exclamations.\n"
-            f"- No slang, no sarcasm, no filler enthusiasm.\n\n"
+            # Sprint Ω.5.D (Apr 26 2026): the previous "VOICE OUTPUT
+            # (read aloud — strict)" block contained imperatives plus
+            # quoted GOOD/BAD examples ("Right away, Boss.", "(calmly)
+            # Right away, Boss."). Qwen3 can parrot any of those
+            # verbatim under high instruction-following. Replaced with a
+            # single negative-noun-phrase line per invariant I-01 in
+            # .cursor/skills/atom-systems-engineer/INVARIANTS.md and the
+            # parroted-phrase blacklist in tests/test_prompt_leak_v3.py.
+            # The separate "OUTPUT STYLE" block lower in this prompt
+            # covers markdown / labels / opener-fillers, so this line
+            # only adds parenthetical / stage-direction / sarcasm bans.
+            f"DELIVERY: no stage directions, no parentheticals describing "
+            f"tone, no asterisks, no emoji, no slang, no sarcasm, "
+            f"no exaggerated enthusiasm.\n\n"
             f"BUDDY PERSONALITY:\n"
             f"- Be genuinely warm. Not robotic-warm. Actually warm, like you mean it.\n"
             f"- Be sharp and witty. A touch of dry humor when appropriate. Never forced.\n"

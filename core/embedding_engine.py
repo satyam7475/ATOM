@@ -993,6 +993,36 @@ class EmbeddingEngine:
             logger.debug("seed_warm_cache encode failed", exc_info=True)
             return 0
 
+    def evict_warm_cache(self) -> int:
+        """Drop the in-RAM phrase-embedding LRU.
+
+        Sprint Ω.4.C (Apr 26 2026): exposed for the memory governor.
+        This frees a few MB at most, but more importantly it lets the
+        next retrieval refresh the cache with phrases relevant to the
+        new working set instead of staying anchored to whatever was hot
+        when memory pressure began. The warm-file on disk is preserved
+        so a future cold start still benefits from the persisted
+        embeddings; only the in-memory copy is cleared.
+
+        Returns the number of cached embeddings dropped.
+        """
+        size = len(self._cache)
+        if size == 0:
+            return 0
+        if self._warm_enabled:
+            try:
+                self._persist_warm_file()
+            except Exception:
+                logger.debug(
+                    "evict_warm_cache: warm-file persist failed", exc_info=True,
+                )
+        self._cache.clear()
+        logger.info(
+            "EmbeddingEngine: evicted %d in-memory phrase embedding(s) "
+            "(warm-file preserved on disk)", size,
+        )
+        return size
+
     def shutdown(self) -> None:
         """Release model memory (and flush warm-file to disk)."""
         if self._warm_enabled:

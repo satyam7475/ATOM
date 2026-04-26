@@ -964,6 +964,50 @@ class MLXBrain:
         with self._gen_lock:
             return self._streaming_depth > 0
 
+    # ── Memory governor hooks (Sprint Ω.4.C, Apr 26 2026) ───────────
+
+    def unload_draft(self) -> bool:
+        """Drop the speculative-decoding draft model from RAM.
+
+        Returns True if a model was actually unloaded; False if no draft
+        was loaded (and so nothing changed). Safe to call repeatedly and
+        from any thread; eviction completes synchronously and the next
+        ``stream_generate`` call simply runs without speculation.
+        """
+        if not self._draft_loaded and self._draft_model is None:
+            return False
+        prior_state = self._draft_loaded
+        self._draft_model = None
+        self._draft_tokenizer = None
+        self._draft_loaded = False
+        self._draft_load_failed = False
+        self._clear_mlx_cache()
+        if prior_state:
+            logger.info(
+                "MLX: speculative draft model unloaded (memory governor)",
+            )
+        return prior_state
+
+    def clear_prompt_caches(self) -> int:
+        """Drop all persona / prompt-prefix KV caches from RAM.
+
+        This is the *sacred* eviction lever -- only the memory governor's
+        tier 3 should reach for it, because losing the persona-pin warm
+        cache costs ~8 s on the next turn (re-prefill of the persona
+        prefix). Returns the number of role caches cleared.
+        """
+        cleared = 0
+        with self._prompt_cache_lock:
+            cleared = len(self._prompt_caches)
+            self._prompt_caches = {}
+        self._clear_mlx_cache()
+        if cleared:
+            logger.warning(
+                "MLX: cleared %d persona prompt cache(s) (memory governor)",
+                cleared,
+            )
+        return cleared
+
     def save_kv_cache(self, system_prompt_hash: int) -> None:
         """Compatibility no-op: MLX wrapper does not persist KV cache yet."""
         del system_prompt_hash

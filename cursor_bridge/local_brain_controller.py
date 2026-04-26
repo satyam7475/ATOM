@@ -1035,6 +1035,20 @@ class LocalBrainController:
             candidate = self._strip_model_artifacts(query, raw_response)
         if not candidate:
             return ""
+        if self._turn_vetter_rewrote and self._turn_emitted_sentences:
+            # Sprint Ω.5.D (Apr 26 2026) — Invariant I-04 enforcement.
+            # The stream vetter already rewrote and SPOKE a clarifier
+            # this turn; re-rejecting that clarifier as "low quality"
+            # is exactly the cascade documented in PB-05 (it leads to
+            # "I lost that answer, Boss" speaking on top of the
+            # clarifier the user already heard). A vetter rewrite is
+            # accepted by definition.
+            logger.debug(
+                "Quality reject skipped — vetter already rewrote and "
+                "delivered (%d sentence(s)) (I-04)",
+                len(self._turn_emitted_sentences),
+            )
+            return candidate
         if self._reject_low_quality_answer(query, candidate):
             logger.warning("Rejected low-quality candidate response: %s", candidate[:200])
             self._bus.emit("metrics_event", counter="llm_response_rejected")

@@ -1625,6 +1625,50 @@ CONFIG_SCHEMA: dict[str, Any] = {
             },
             "additionalProperties": False,
         },
+        "memory_governor": {
+            "type": "object",
+            "description": "Per-role tunable eviction order on top of SiliconGovernor "
+            "(Sprint \u03a9.4.C, Apr 26 2026). Roles are evicted in declared order "
+            "as unified-memory pressure escalates through three tiers; the last "
+            "role is sacred and only released at tier 3.",
+            "properties": {
+                "enabled": {"type": "boolean"},
+                "tier1_threshold_pct": {
+                    "type": "number",
+                    "minimum": 40,
+                    "maximum": 95,
+                    "description": "Memory % that triggers first eviction wave.",
+                },
+                "tier2_threshold_pct": {
+                    "type": "number",
+                    "minimum": 50,
+                    "maximum": 97,
+                    "description": "Memory % that triggers second eviction wave.",
+                },
+                "tier3_threshold_pct": {
+                    "type": "number",
+                    "minimum": 60,
+                    "maximum": 99,
+                    "description": "Memory % that triggers final eviction wave "
+                    "(everything except the sacred last role).",
+                },
+                "rewarm_hysteresis_pct": {
+                    "type": "number",
+                    "minimum": 0,
+                    "maximum": 30,
+                    "description": "Drop-below offset before a tier is considered "
+                    "relaxed; prevents flapping when pressure dances at a threshold.",
+                },
+                "eviction_order": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "minItems": 1,
+                    "description": "Roles in declared eviction priority. The last "
+                    "entry is treated as sacred and only evicted at tier 3.",
+                },
+            },
+            "additionalProperties": False,
+        },
         "latency_controller": {
             "type": "object",
             "properties": {

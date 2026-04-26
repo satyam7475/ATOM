@@ -45,6 +45,34 @@ Every class-level failure (port bound, aiohttp missing, network
 unreachable) logs CRITICAL and returns without raising -- ATOM keeps
 booting without cross-device, never crashes because a bridge couldn't
 start.
+
+iPhone connectivity (Sprint Ω.5.E, Apr 26 2026)
+------------------------------------------------
+The OpenAI-compat ``/v1/*`` shim lets the stock iPhone "Enchanted" app
+(or any OpenAI-protocol client) talk to ATOM's local brain. Because the
+bridge defaults to ``bind_host=127.0.0.1``, the phone needs one of the
+postures below to actually reach the laptop:
+
+* **Tailscale (recommended).** Install Tailscale on the MacBook and the
+  iPhone, sign into the same tailnet, and set ``cross_device.bind_host``
+  to the laptop's tailnet IP (``100.x.y.z``). The iPhone reaches ATOM
+  via that IP from anywhere -- coffee shop, cellular, parents' Wi-Fi.
+  No firewall holes; tailnet ACLs do the auth on top of the bridge token.
+* **LAN-only.** Set ``cross_device.bind_host`` to ``0.0.0.0`` (or the
+  Mac's LAN IP). Anyone on the same Wi-Fi can hit ``/v1/*``; the bridge
+  token is the only barrier. Fine for a home lab, not for a hotel.
+* **SSH local-forward.** Keep ``bind_host=127.0.0.1`` and run an SSH
+  local-forward from the iPhone (Termius / Blink) to the laptop's
+  loopback. Most secure; requires SSH keys on the phone.
+
+The Enchanted iOS app expects ``http://<host>:<port>/v1`` as its
+endpoint with the bridge token in the ``X-ATOM-Token`` (or ``Bearer``)
+header. ATOM logs the token's six-char prefix at boot; the full token
+lives in ``config/bridge_token`` (mode 0600).
+
+Apple Shortcuts (no Xcode required) can POST to the same bridge for
+Face ID, presence, and trigger events. The Shortcuts URL is the same
+host:port the OpenAI client uses; auth is identical.
 """
 
 from __future__ import annotations
@@ -291,6 +319,32 @@ class IPhoneBridge:
             "iPhone bridge listening on %s:%d (token=%s…)",
             self._host, bound_port, self._token[:6],
         )
+        if self._openai_enabled and self._host in (
+            "127.0.0.1", "localhost", "::1",
+        ):
+            # Sprint Ω.5.E (Apr 26 2026) — Jarvis-mode connectivity hint.
+            # The OpenAI-compat /v1/* shim is wired (so the user wants
+            # the iPhone Enchanted app or Shortcuts to talk to ATOM),
+            # but the listener is bound to loopback only. The phone
+            # cannot route to 127.0.0.1 on the laptop without a tunnel.
+            # Three working postures, in increasing security strength:
+            #   1. Tailscale: install on both, set bind_host to the
+            #      laptop's tailnet IP (100.x.y.z). Zero firewall holes,
+            #      device-level auth.
+            #   2. LAN-only: set bind_host to 0.0.0.0 (or the laptop's
+            #      LAN IP). Token-protected, but anyone on the same
+            #      Wi-Fi can hit /v1/*.
+            #   3. SSH local-forward from the iPhone (Termius/Blink)
+            #      onto loopback. Most secure, requires SSH keys on
+            #      iPhone.
+            logger.warning(
+                "iPhone bridge bound to %s:%d but /v1/* chat is wired -- "
+                "iPhone clients cannot reach loopback. Set "
+                "cross_device.bind_host to your Tailscale IP (100.x.y.z) "
+                "or LAN IP in config/settings.json, or use an SSH "
+                "local-forward. See module docstring for posture trade-offs.",
+                self._host, bound_port,
+            )
         return True
 
     async def stop(self) -> None:

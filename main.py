@@ -436,6 +436,9 @@ async def main() -> None:
     # Opt-in via config["stt"]["whisper_confirm"]["enabled"]=true. Lazy
     # model load so cold boot stays fast. Wired only if the active STT
     # backend supports attach_whisper_confirmer (currently macOS native).
+    # Hoisted to outer scope (Sprint Ω.4.C) so the memory governor can
+    # register its `unload()` callback once SiliconGovernor is up.
+    whisper_confirmer = None
     try:
         _stt_cfg = config.get("stt") or {}
         if (_stt_cfg.get("whisper_confirm") or {}).get("enabled", False):
@@ -443,6 +446,7 @@ async def main() -> None:
                 from voice.whisper_confirmer import WhisperConfirmer
                 _wc = WhisperConfirmer(_stt_cfg)
                 stt.attach_whisper_confirmer(_wc)
+                whisper_confirmer = _wc
                 logger.info(
                     "WhisperConfirmer attached to STT (model=%s, ring=%.1fs, decode=%.1fs)",
                     _wc._model_size, _wc._ring_seconds, _wc._decode_seconds,
@@ -484,6 +488,50 @@ async def main() -> None:
         if silicon_governor.is_available:
             logger.info("Silicon Governor: monitoring active (%s)", silicon_governor.gpu_name)
 
+    # ── Memory Governor (Sprint Ω.4.C, Apr 26 2026) ────────────────
+    # Per-role tunable eviction order layered on top of SiliconGovernor.
+    # Built early so subsystems (whisper_confirmer, MLX brain, embedding
+    # engine, SmolVLM) can each register their evict callback as they come
+    # online. ``start()`` (subscribe to silicon_stats_update) happens later,
+    # at the same time SiliconGovernor.start() fires.
+    memory_governor = None
+    if (config.get("memory_governor") or {}).get("enabled", True):
+        from core.memory_governor import MemoryGovernor
+        memory_governor = MemoryGovernor(bus, config)
+        if whisper_confirmer is not None and hasattr(whisper_confirmer, "unload"):
+            memory_governor.register(
+                "whisper_confirmer",
+                evict=whisper_confirmer.unload,
+            )
+        # Embedding engine is a process-singleton; registering by lazy
+        # lookup means we don't depend on RAG / LocalBrain being up yet
+        # and we never accidentally evict a not-yet-built cache.
+        try:
+            from core.embedding_engine import get_embedding_engine
+
+            def _evict_embeddings_warm_cache() -> None:
+                try:
+                    get_embedding_engine(config).evict_warm_cache()
+                except Exception:
+                    logger.debug(
+                        "MemoryGovernor: embedding warm-cache evict failed",
+                        exc_info=True,
+                    )
+
+            memory_governor.register(
+                "embeddings_warm_cache",
+                evict=_evict_embeddings_warm_cache,
+            )
+        except Exception:
+            logger.debug(
+                "MemoryGovernor: failed to register embeddings_warm_cache",
+                exc_info=True,
+            )
+        logger.info(
+            "Memory Governor: ready (order=%s)",
+            list(memory_governor.eviction_order),
+        )
+
     from core.cognitive_kernel import CognitiveKernel, ExecPath
 
     cognitive_kernel = CognitiveKernel(
@@ -522,6 +570,32 @@ async def main() -> None:
         # sanitiser so Gemini output is cleaned with the same rules as
         # the local brain (CoT preface, prompt-leak, ChatML tokens).
         router.attach_local_brain_controller(local_brain)
+
+        # Sprint Ω.4.C (Apr 26 2026): expose the MLX-grade evict levers to
+        # the memory governor. Speculative draft is the cheapest to drop
+        # (~1.5 GB freed, no UX hit when the next turn falls back to
+        # standard decode). Persona KV cache is "sacred" -- only released
+        # at tier 3 because the next turn will pay ~8 s of re-prefill.
+        if memory_governor is not None:
+            try:
+                _underlying_llm = getattr(local_brain, "_llm", None)
+                if _underlying_llm is not None:
+                    if hasattr(_underlying_llm, "unload_draft"):
+                        memory_governor.register(
+                            "draft_model",
+                            evict=_underlying_llm.unload_draft,
+                        )
+                    if hasattr(_underlying_llm, "clear_prompt_caches"):
+                        memory_governor.register(
+                            "persona_kv_cache",
+                            evict=_underlying_llm.clear_prompt_caches,
+                        )
+            except Exception:
+                logger.warning(
+                    "MemoryGovernor: failed to register MLX brain evict hooks",
+                    exc_info=True,
+                )
+
         local_brain.attach_feedback_engine(feedback_engine)
         local_brain.attach_system_monitor(system_monitor)
         local_brain.attach_suggester(suggester_engine)
@@ -1189,6 +1263,14 @@ async def main() -> None:
                             "VLM captioner ready (path=%s, repo=%s)",
                             _captioner.model_path,
                             _vlm_repo or "<none>",
+                        )
+                    if (
+                        memory_governor is not None
+                        and hasattr(_captioner, "unload")
+                    ):
+                        memory_governor.register(
+                            "smolvlm",
+                            evict=_captioner.unload,
                         )
                 except Exception:
                     logger.warning(
@@ -3313,6 +3395,8 @@ async def main() -> None:
 
     if silicon_governor is not None and silicon_governor.is_available:
         silicon_governor.start()
+    if memory_governor is not None:
+        memory_governor.start()
 
     # ── Start JARVIS-level modules ──────────────────────────────
     system_scanner.start()
@@ -4032,6 +4116,11 @@ async def main() -> None:
         voice_pipeline.shutdown()
         if silicon_governor is not None:
             silicon_governor.shutdown()
+        if memory_governor is not None:
+            try:
+                memory_governor.shutdown()
+            except Exception:
+                logger.debug("MemoryGovernor shutdown failed", exc_info=True)
         if workflow_engine is not None:
             workflow_engine.persist()
         if document_engine is not None:

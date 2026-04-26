@@ -741,7 +741,13 @@ class MacOSTTSAsync:
     Public API matches EdgeTTSAsync / TTSAsync for drop-in replacement.
     """
 
-    _SPEAK_WORD_LIMIT: int = 80
+    # Sprint Ω.5.C (Apr 26 2026): the cap WAS 80 words to defend against
+    # runaway LLMs. With ``brain.max_tokens=320`` (I-06) the LLM cannot
+    # produce more than ~250 words anyway, so an 80-word cap silently
+    # truncated 1/3 of a substantive reply to ``screen_buffer`` and never
+    # spoke it. Raised to 250 so ATOM speaks the FULL response while
+    # still honouring the deadman / watchdog budgets above.
+    _SPEAK_WORD_LIMIT: int = 250
     # Coalesce tiny stream fragments so NSSpeechSynthesizer does not speak word-by-word.
     # Lowered from 8/14 for faster first-audio on the streaming LLM path.
     _STREAM_UNPUNCT_MIN_WORDS: int = 5
@@ -982,12 +988,25 @@ class MacOSTTSAsync:
         cleaned = re.sub(r"\s+", " ", cleaned)
         label_hits = len(_RE_TRANSCRIPT_LABEL.findall(cleaned))
         if label_hits >= 2:
+            # Sprint Ω.5.C (Apr 26 2026): two or more "User:" / "Assistant:"
+            # labels in one chunk is almost always a transcript-style
+            # CoT leak; speaking it would parrot the prompt rules. Log
+            # so we can audit silent drops if the pattern triggers on
+            # legit content.
+            logger.debug(
+                "TTS stream chunk dropped (transcript-label leak, %d hits): '%s'",
+                label_hits, cleaned[:80],
+            )
             return ""
         cleaned = _RE_TRANSCRIPT_LABEL.sub("", cleaned).strip(" -:>")
         if not cleaned or _RE_TRANSCRIPT_ONLY.match(cleaned):
             return ""
         words = cleaned.lower().replace(":", " ").split()
         if len(words) >= 3 and len(set(words)) == 1 and words[0] in {"atom", "user", "assistant", "boss"}:
+            logger.debug(
+                "TTS stream chunk dropped (single-token repeat): '%s'",
+                cleaned[:80],
+            )
             return ""
         return cleaned
 
@@ -1066,12 +1085,31 @@ class MacOSTTSAsync:
         meaningful word in the partial appears in the last few spoken
         slices and we spoke recently. The interrupt handler uses this to
         suppress self-feedback barge-ins.
+
+        Sprint Ω.5.B (Apr 26 2026): tightened the temporal gate. The
+        previous router-side guard ran with ``window_s=12.0`` which
+        meant a fresh user turn 10 s after ATOM finished could be
+        false-flagged as echo if it shared 80 % bag-of-words. The
+        floor is now bounded to ``min(window_s, 4.0)`` once the state
+        machine has left SPEAKING -- after that, it's almost certainly
+        the user, not the speaker tail.
         """
         if not partial_text:
             return False
         if not self._spoken_echo_window:
             return False
-        if (time.monotonic() - self._last_spoke_t) > max(0.5, float(window_s)):
+        elapsed_since_speech = time.monotonic() - self._last_spoke_t
+        try:
+            from core.state_manager import AtomState
+            currently_speaking = (
+                self._state.current is AtomState.SPEAKING
+            )
+        except Exception:
+            currently_speaking = False
+        effective_window = float(window_s)
+        if not currently_speaking:
+            effective_window = min(effective_window, 4.0)
+        if elapsed_since_speech > max(0.5, effective_window):
             return False
         key = self._chunk_key(partial_text)
         if not key:
@@ -1291,11 +1329,44 @@ class MacOSTTSAsync:
             if self._stream_task is asyncio.current_task():
                 self._stream_task = None
             if generation != self._stream_generation:
+                # Sprint Ω.5.C (Apr 26 2026): the streaming worker bailed
+                # because barge-in / stop() bumped the generation. Without
+                # a terminal event, downstream listeners (voice pipeline
+                # passive-revert timer, interrupt handler, command loop,
+                # iPhone bridge SSE proxies) sit waiting forever for a
+                # ``tts_complete`` that never arrives. Emit one bounded
+                # interrupted-completion event so the state machine
+                # reliably returns to LISTENING and the next user turn
+                # is never silently swallowed. We deliberately keep the
+                # delivery-metrics emission so the latency dashboard
+                # accounts for partial-speech duration.
+                stream_duration_ms = (
+                    (time.perf_counter() - self._stream_start_t) * 1000
+                    if self._stream_start_t > 0 else 0.0
+                )
+                try:
+                    self._bus.emit(
+                        "tts_delivery_metrics",
+                        words_spoken=self._spoken_word_count,
+                        duration_ms=round(stream_duration_ms, 1),
+                        backend=self._backend,
+                        interrupt_count=self._tts_interrupt_count,
+                        interrupted=True,
+                    )
+                except Exception:
+                    logger.debug(
+                        "tts_delivery_metrics (interrupt) emit failed",
+                        exc_info=True,
+                    )
+                try:
+                    self._bus.emit("tts_complete", interrupted=True)
+                except Exception:
+                    logger.debug(
+                        "tts_complete (interrupt) emit failed",
+                        exc_info=True,
+                    )
                 return
 
-            # The streaming utterance ended cleanly (or via stop/force-
-            # stop that already reset the deadman). Best-effort cancel
-            # to be sure we never leak a pending check.
             self._stop_deadman()
 
             overflow_text = " ".join(self._screen_buffer).strip()
@@ -1307,12 +1378,30 @@ class MacOSTTSAsync:
             self._active_stream_id = None
 
             if overflow_text:
+                # Sprint Ω.5.C (Apr 26 2026): with the spoken cap raised
+                # to 250 words this branch should be cold for any
+                # well-formed turn. If we still hit it (e.g. report mode
+                # generated a 600-word block), surface the rest on screen
+                # AND emit a short audible cue so Boss isn't left
+                # wondering whether the answer ended -- silent screen
+                # writes feel like the response was lost.
                 logger.info(
-                    "Screen-only (%d words): '%s'",
+                    "Screen-only overflow (%d words after spoken cap %d): '%s'",
                     len(overflow_text.split()),
+                    self._SPEAK_WORD_LIMIT,
                     overflow_text[:100],
                 )
                 self._bus.emit("text_display", text=overflow_text)
+                try:
+                    self._bus.emit(
+                        "tts_overflow_screen",
+                        words=len(overflow_text.split()),
+                        preview=overflow_text[:120],
+                    )
+                except Exception:
+                    logger.debug(
+                        "tts_overflow_screen emit failed", exc_info=True,
+                    )
 
             stream_duration_ms = (
                 (time.perf_counter() - self._stream_start_t) * 1000

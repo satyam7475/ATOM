@@ -282,9 +282,45 @@ class WhisperConfirmer:
 
         decoded = decoded.strip()
         if not decoded:
-            # Whisper agreed there was nothing here -- trust the empty
-            # over the noise-token streaming output.
+            # Sprint Ω.5.B (Apr 26 2026): a previous version trusted the
+            # empty decode unconditionally -- which silently wiped real
+            # user turns whenever Whisper happened to fail or the audio
+            # ring buffer was thinner than the streaming utterance (e.g.
+            # network mic, BT codec hiccup). The contract now is:
+            #
+            #   * suspect-by-noise / suspect-by-short  -> trust empty
+            #     (the streaming output was a noise token to begin with)
+            #   * suspect-by-low_conf with substantive original text
+            #     -> KEEP THE ORIGINAL. Streaming had a real transcript;
+            #     refusing to re-speak it just because Whisper couldn't
+            #     decode the same audio drops the user.
+            #
+            # ``len(original) >= 2 * min_text_chars`` is the substance
+            # heuristic -- one full short sentence ("turn off the lights"
+            # is 4 chars * "turn" alone, but the whole utterance is well
+            # over the threshold). Anything below that is short enough
+            # we'd rather be safe and drop.
             self.confirmed += 1
+            original_clean = (text or "").strip()
+            keep_original = (
+                reason == "low_conf"
+                and len(original_clean) >= max(
+                    self._min_text_chars * 2, 6,
+                )
+            )
+            if keep_original:
+                logger.info(
+                    "WhisperConfirmer empty-decode on low_conf text -- "
+                    "keeping original to avoid a silent drop: %r [%.1fms]",
+                    original_clean[:60], elapsed_ms,
+                )
+                return ConfirmResult(
+                    original_clean, False, elapsed_ms, reason,
+                )
+            logger.debug(
+                "WhisperConfirmer collapsed suspect (%s) input %r to empty "
+                "[%.1fms]", reason, original_clean[:60], elapsed_ms,
+            )
             return ConfirmResult("", True, elapsed_ms, reason)
 
         self.confirmed += 1
@@ -295,6 +331,31 @@ class WhisperConfirmer:
         return ConfirmResult(decoded, True, elapsed_ms, reason)
 
     # ── model lifecycle ────────────────────────────────────────────
+
+    def unload(self) -> bool:
+        """Drop the faster-whisper model from RAM.
+
+        Sprint Ω.4.C (Apr 26 2026): exposed for the memory governor so a
+        16 GB box can release the second-pass STT model under pressure.
+        The next ``confirm()`` after ``unload()`` will re-load the model
+        on its first invocation (back to cold-load latency, ~250 ms for
+        the tiny model on CPU).
+
+        Returns True iff a model was actually unloaded.
+        """
+        with self._model_lock:
+            if self._model is None:
+                return False
+            self._model = None
+            # Allow the next access to re-attempt even if a previous
+            # cold-load had failed; the user just freed RAM, give it a
+            # second chance.
+            self._model_unavailable = False
+            self._model_load_attempted = False
+        logger.info(
+            "WhisperConfirmer: model unloaded (memory governor)",
+        )
+        return True
 
     def _get_model(self) -> Any:
         """Lazily load faster-whisper. Once a load fails we stay off."""

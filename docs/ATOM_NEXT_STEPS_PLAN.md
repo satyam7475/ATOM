@@ -360,6 +360,41 @@ Read these **in order** before touching code. Skipping ahead has historically ca
 
 ---
 
+## 10.5 Sprint Ω.4 — Status (Apr 26 2026)
+
+This is the layer **on top of** P1–P4. P1–P4 made ATOM correct; Ω.4 makes
+ATOM survive on a 16 GB box.
+
+| Sub-sprint | Item | State | Evidence |
+|---|---|---|---|
+| Ω.4.A | Restore deleted `.cursor/skills` + `.cursor/rules` from `HEAD` | ✅ Shipped | 9 files re-checked-out; `git status` clean for that subtree |
+| Ω.4.B | WhisperKit ANE swap — live activation | ⚠ Blocked | `whisperkit-cli` install requires Homebrew (not present on this host); code path `voice/stt_whisperkit.py` is ready, awaits external install |
+| Ω.4.C.1 | `memory_governor` config block + JSON schema | ✅ Shipped | `config/settings.json`, `core/config_schema.py` |
+| Ω.4.C.2 | `MemoryGovernor` module + `main.py` wiring | ✅ Shipped | `core/memory_governor.py`, registrations in `main.py` boot path |
+| Ω.4.C.3 | Eviction hooks on each evictable role | ✅ Shipped | `brain/mlx_llm.py:unload_draft` + `clear_prompt_caches`; `voice/whisper_confirmer.py:unload`; `core/embedding_engine.py:evict_warm_cache`; `core/perception/vlm_describe.py:unload` |
+| Ω.4.C.4 | Test coverage (eviction order, hysteresis, bus integration) | ✅ Shipped | 22 tests in `tests/test_memory_governor_eviction.py`, all green |
+| Ω.4.D | PR #2 (P1–P4 audit + camera surgery) | ⏳ Awaiting user | `mergeStateStatus=CLEAN`, no failed checks; user-merge gate by design |
+
+### Tier policy (configured)
+
+| Tier | Trigger | Action |
+|---|---|---|
+| 0 | < 80 % unified memory | No action |
+| 1 | 80–86 % | Evict first ⅓ of order (`smolvlm`, `whisper_confirmer`) |
+| 2 | 86–92 % | Evict first ⅔ (`smolvlm` → `embeddings_warm_cache`) |
+| 3 | ≥ 92 % | Evict everything, sacred role included (`persona_kv_cache` released — accepts ~8 s re-prefill on next turn) |
+
+Hysteresis is 6 % below the trigger threshold; this prevents thrashing
+when pressure dances around an edge.
+
+### What Ω.4.C buys you
+
+- On a 16 GB M5 Air, the live boot was hitting tier 2 at 82 % RAM with both LLMs warm + persona cache + speculative decoding all on. The `SiliconGovernor` *warned* but had no per-role lever — first thing to time-out won.
+- Ω.4.C makes that lever explicit: SmolVLM goes first (cheap to reload), persona KV cache goes last (expensive to reload). An idle Air can keep all five roles warm; a busy one bleeds them in declared order.
+- On a 24 GB box you'll never hit tier 1, so this is pure headroom.
+
+---
+
 ## 11. ATOM-vs-JARVIS Scorecard (Projected After P1–P4)
 
 Honest, non-hyperbolic. 1–10 scale. **JARVIS** = fictional MCU baseline (where 10 includes physics-defying capabilities).
@@ -416,6 +451,7 @@ The remaining gap to fictional JARVIS requires Stark Industries.
 | 2026-04-26 | this audit | Initial recreation after the prior write was lost; refreshed against current tree (P2.4 / P2.5 already done; embedding device still hard-coded; whisper still EN-only). |
 | 2026-04-26 | implementation | P1.1–P1.6 (config), P2.1–P2.3, P2.6–P2.8 (code) shipped. P3.3 (WhisperKit / ANE) shipped: new `voice/stt_whisperkit.py`, factory wired, schema extended. P3.6 satisfied via P2.8 instrumentation. Pending: P3.1, P3.2, P3.4, P3.5, P3.7 verify, all of P4. |
 | 2026-04-26 | implementation pt.2 | P3.7 verified (KV persist precedes persona-pin in `_ensure_loaded`). P3.1 reframed: models are already distinct on disk; added optional `brain.mlx_fast_model` for true dual-tier without forcing the 8GB-extra-RAM cost. P3.2 (speculative decoding) + P3.4 (mlx-embeddings) + P3.5 (`mx.compile`) shipped. **All P4 closed except P4.5 (deferred):** P4.1–P4.3 owner profile / style / pronunciations live; P4.4 OpenAI-compatible `/v1/*` shim exposed via `IPhoneBridge` + Enchanted setup documented; P4.6 `/badge` + `tools/atom_status_badge.py` (CLI + `--menubar`) shipped; P4.7 every `if sys.platform=="win32"` / `_IS_WIN` / `self._is_windows` branch swept from the live tree; macOS-native `quartz_window_titles()` replaces the Win32 `EnumWindows` path. |
+| 2026-04-26 | sprint Ω.4 | **Ω.4.A** restored the 9 deleted `.cursor/skills` + `.cursor/rules` files from `HEAD` (atom-systems-engineer SKILL/architecture/playbooks/scripts + GPU/JARVIS/ATOM rules) so the agent identity survives `git restore`. **Ω.4.B (WhisperKit live boot)** blocked: this host has no Homebrew and `whisperkit-cli` install requires interactive root; WhisperKit code path (`voice/stt_whisperkit.py`) is shipped, just not yet activated in `stt.engine`. **Ω.4.C (Memory Governor)** shipped: new `core/memory_governor.py` watches `silicon_stats_update` and walks a tunable per-role eviction order (default `smolvlm → whisper_confirmer → draft_model → embeddings_warm_cache → persona_kv_cache`) across 3 tiers with hysteresis. Eviction hooks landed in `brain/mlx_llm.py` (`unload_draft`, `clear_prompt_caches`), `voice/whisper_confirmer.py` (`unload`), `core/embedding_engine.py` (`evict_warm_cache`), `core/perception/vlm_describe.py` (`unload`). Wired through `main.py` boot, schema-validated in `core/config_schema.py`, configured in `config/settings.json`. 22 new tests in `tests/test_memory_governor_eviction.py`; full suite 1920 passed (was 1900). |
 
 ---
 
