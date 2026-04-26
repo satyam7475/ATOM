@@ -1,0 +1,90 @@
+{
+  "cwd": "/Users/satyamyadav/Desktop/Personal/ATOM",
+  "variant": "off",
+  "system": {
+    "python": "3.11.15",
+    "cpu_count": 10,
+    "ram_total_gb": 16.0,
+    "ram_used_pct_start": 56.8
+  },
+  "config": {
+    "mlx_model": "models/qwen3-4b-instruct-4bit",
+    "n_ctx": 6144,
+    "max_tokens": 64,
+    "single_resident": false,
+    "kv_bits": 8,
+    "mx_compile_enabled": true,
+    "speculative_enabled": false,
+    "speculative_draft": "models/qwen3-0.6b-instruct-4bit",
+    "speculative_num_draft_tokens": 4,
+    "role_timeouts": {
+      "ultra": 5.0,
+      "fast": 18.0,
+      "primary": 28.0
+    },
+    "mlx_ultra_model": "models/qwen3-0.6b-instruct-4bit"
+  },
+  "mlx_cold_load_ms": 4832.1,
+  "mlx_load_ok": true,
+  "rss_after_load_mb": 2822.5,
+  "rss_load_delta_mb": 2747.9,
+  "turn1_ms": 388.3,
+  "turn1_words": 2,
+  "turn1_words_per_sec": 5.15,
+  "turn1_text_head": "16:42 UTC.",
+  "turn2_ms": 390.2,
+  "turn2_words": 1,
+  "turn2_words_per_sec": 2.56,
+  "turn2_text_head": "Ganymede",
+  "turn3_ms": 3303.5,
+  "turn3_words": 65,
+  "turn3_words_per_sec": 19.68,
+  "turn3_text_head": "Unified memory is a single, shared pool of RAM that combines the Mac\u2019s main memory and graphics memory into one seamless system. On M-series Macs, it matters because it enables faster data access for both apps and the GPU, improving performance in demanding tasks like video editing or gaming. This i",
+  "turn4_long_prefill_ms": 210.2,
+  "turn4_text_head": "4.",
+  "rss_final_mb": 2875.9,
+  "system_ram_pct_final": 72.8,
+  "perf_snapshot": {
+    "turns": 4,
+    "tokens": 93,
+    "avg_tok_s": 21.7,
+    "avg_ms": 1072.0,
+    "peak_memory_gb": 2.51,
+    "cache": {
+      "enabled": true,
+      "hits": 4,
+      "misses": 0,
+      "hit_rate": 1.0,
+      "roles_cached": [
+        "primary"
+      ]
+    },
+    "thermal_clamp_ratio": 1.0,
+    "compile": {
+      "compiled_uses": 4,
+      "eager_uses": 0,
+      "total_uses": 4,
+      "compiled_pct": 100.0,
+      "mx_compile_enabled": true
+    },
+    "ultra_enabled": true,
+    "speculative_enabled": false
+  },
+  "dual_tier_info": {
+    "enabled": false,
+    "ultra_enabled": true,
+    "primary_path": "models/qwen3-4b-instruct-4bit",
+    "fast_path": "models/qwen3-4b-instruct-4bit",
+    "ultra_path": "models/qwen3-0.6b-instruct-4bit",
+    "draft_path": "models/qwen3-0.6b-instruct-4bit",
+    "speculative_decoding_enabled": false
+  },
+  "pinned_persona_info": {
+    "path": null,
+    "mtime": 0.0,
+    "role": "fast",
+    "tokens": 0,
+    "total_tokens": 0,
+    "roles": {}
+  }
+}

@@ -941,23 +941,41 @@ class LocalBrainController:
         budget_tier: str,
         requested_tier: str,
     ) -> int | None:
+        """Per-intent ``max_tokens`` ceiling.
+
+        Sprint Ω.10 (Apr 27 2026) — balanced schedule:
+            command : 48   (one-line confirmations: "Done, Boss.")
+            info    : 96   (single-fact answers, < 1 sentence each)
+            simple  : 128  (two-sentence replies)
+            complex : 256  (DETAIL / multi-step explanations)
+            creative: None (REPORT mode, non-voice paths only)
+            default : 160
+
+        The caps reflect Qwen3-4B's empirical behaviour on M-series:
+        above ~110 tokens it starts narrating instead of answering, so
+        SHORT/INFO are kept tight; the controller's per-token budget
+        accounting still honors the SKILL.md cap of 320 tokens on
+        voice turns transitively (REPORT is non-voice only).
+        """
         budget = str(budget_tier or "").strip().lower()
         requested = str(requested_tier or "").strip().lower()
-        # v3.3 brain: caps calibrated for Qwen3-4B-Instruct-2507-4bit.
-        # Empirically Qwen needs room comparable to Phi-3.5-mini for the
-        # same answer quality (live smoke: 60-word reply at max_tokens=64
-        # still coherent), so we keep the Phi-era ceilings. Above SHORT
-        # ~110 tokens the model starts to narrate instead of answer --
-        # caps remain tight on purpose. The SKILL.md invariant
-        # "max_tokens <= 320 for voice turns" is enforced transitively
-        # here: DETAIL=256, REPORT=unbounded (non-voice only).
-        if response_mode is ResponseMode.SHORT or budget in {"command", "info"}:
+        if budget == "command":
+            return 48
+        if response_mode is ResponseMode.SHORT or budget == "info":
             return 96
         if budget == "simple":
             return 128
-        if response_mode is ResponseMode.DETAIL or budget == "complex" or requested == "complex":
+        if (
+            response_mode is ResponseMode.DETAIL
+            or budget == "complex"
+            or requested == "complex"
+        ):
             return 256
-        if response_mode is ResponseMode.REPORT or budget == "creative" or requested == "creative":
+        if (
+            response_mode is ResponseMode.REPORT
+            or budget == "creative"
+            or requested == "creative"
+        ):
             return None
         return 160
 
@@ -1491,7 +1509,10 @@ class LocalBrainController:
         # because the PERCEPTION branch genuinely uses it to bypass the
         # LLM for "describe my screen" / "show me the camera" queries.
         intent = self._intent_classifier.classify(text)
-        logger.info("Cognitive Intent detected: %s (conf: %.2f)", intent.category.name, intent.confidence)
+        logger.debug(
+            "Cognitive Intent detected: %s (conf: %.2f)",
+            intent.category.name, intent.confidence,
+        )
         
         if intent.category.name == "PERCEPTION":
             try:
@@ -1609,9 +1630,16 @@ class LocalBrainController:
         if plan_mode not in {"FAST", "SMART", "DEEP", "SECURE"}:
             plan_mode = ""
         plan_model_role = str(getattr(query_plan, "model_role", "") or "").strip().lower()
-        if plan_model_role not in {"fast", "primary"}:
+        if plan_model_role not in {"fast", "primary", "ultra"}:
             plan_model_role = None
-        self._latency_board_llm = "llm_small" if plan_model_role == "fast" else "llm_large"
+        # Sprint Ω.10: ultra role still books on the small-LLM latency
+        # board (it lives inside the QUICK budget, served by the 0.6B
+        # brain) so existing budget accounting stays accurate.
+        self._latency_board_llm = (
+            "llm_small"
+            if plan_model_role in {"fast", "ultra"}
+            else "llm_large"
+        )
         plan_use_rag = getattr(query_plan, "use_rag", None) if query_plan is not None else None
         plan_use_memory = getattr(query_plan, "use_memory", None) if query_plan is not None else None
         plan_prompt_hint = str(getattr(query_plan, "prompt_hint", "") or "").strip()
@@ -1628,6 +1656,26 @@ class LocalBrainController:
             budget_tier=plan_budget_tier,
             requested_tier=plan_requested_tier,
         )
+        # Sprint Ω.10 — apply the cognitive kernel's memory-tier
+        # max_tokens degrade factor onto the per-intent ceiling. This
+        # is the controller's side of the bus event flow:
+        #   memory_governor -> memory_pressure_tier_changed
+        #   -> CognitiveKernel._on_memory_tier
+        #   -> plan.max_tokens_factor (stamped in _record)
+        #   -> here.
+        # Factor is 1.0 in the steady state, 0.75 at tier 2, 0.5 at
+        # tier 3. We never multiply ``None`` (REPORT mode) because
+        # those are non-voice paths that already manage their own
+        # caps downstream.
+        try:
+            factor = float(getattr(query_plan, "max_tokens_factor", 1.0) or 1.0)
+        except (TypeError, ValueError):
+            factor = 1.0
+        if (
+            max_tokens_override is not None
+            and 0.4 <= factor < 0.999
+        ):
+            max_tokens_override = max(48, int(round(max_tokens_override * factor)))
         repair_tokens_override = self._repair_max_tokens_override(max_tokens_override)
         should_buffer_response = response_mode in {
             ResponseMode.SHORT,

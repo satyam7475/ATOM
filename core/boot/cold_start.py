@@ -69,6 +69,8 @@ class ColdStartOptimizer:
         vlm_captioner: Any = None,
         skills_registry: Any = None,
         snapshot_path: str | Path | None = None,
+        persona_path: str | Path | None = None,
+        mlx_brain: Any = None,
     ) -> None:
         self._config = config or {}
         self._state = state_manager
@@ -89,6 +91,15 @@ class ColdStartOptimizer:
         # — "self check" classify cost ~150 ms) lands on a hot cache.
         self._skills_registry = skills_registry
         self._snapshot_path = Path(snapshot_path or _SNAPSHOT_PATH)
+        # Sprint Ω.10 (Apr 27 2026): persona pin lands inside the
+        # Metal-serial chain so the very first user query already
+        # benefits from the warm KV prefix. Previously the pin happened
+        # AFTER ``warm_up`` returned, which left a 600-1500 ms window
+        # where Boss's first-turn experience was a cold prefill.
+        self._persona_path = (
+            Path(persona_path) if persona_path else None
+        )
+        self._mlx_brain = mlx_brain
         self._boot_time = 0.0
         self._restored_snapshot: dict[str, Any] = {}
         self._restored_context_emitted = False
@@ -140,6 +151,33 @@ class ColdStartOptimizer:
                 fast_ok = bool(await self._preload_fast_model())
             except Exception as exc:
                 logger.debug("Cold start fast-model warmup raised: %s", exc)
+            # Sprint Ω.10 — pin the persona on every loaded role
+            # *inside* the Metal-serial chain. The MLX models just
+            # landed on the GPU queue; pinning here means
+            # embeddings/VLM warmups serialize *after* the persona
+            # prefills, preserving the no-Metal-race invariant while
+            # still delivering a hot KV prefix on turn 1. We pin
+            # ``fast`` (always, governs the bulk of voice replies) and
+            # ``ultra`` (when the multi-tier profile is on, governs
+            # COMMAND/INFO/short-SIMPLE — the queries Boss notices the
+            # most). Each pin is dispatched from the executor since
+            # ``pin_prompt_prefix`` is a blocking MLX call.
+            if fast_ok:
+                try:
+                    await self._pin_persona_in_chain("fast")
+                except Exception:
+                    logger.debug(
+                        "Cold start fast persona-pin raised", exc_info=True,
+                    )
+                try:
+                    if self._mlx_brain is not None and bool(
+                        getattr(self._mlx_brain, "_ultra_tier_enabled", False)
+                    ) and self._is_role_loaded("ultra"):
+                        await self._pin_persona_in_chain("ultra")
+                except Exception:
+                    logger.debug(
+                        "Cold start ultra persona-pin raised", exc_info=True,
+                    )
             emb_ok = False
             try:
                 emb_ok = bool(await self._preload_embeddings())
@@ -304,6 +342,96 @@ class ColdStartOptimizer:
                 return {}
             logger.info("Cold start snapshot found (age %.0fs)", age_s)
         return loaded
+
+    def _is_role_loaded(self, role: str) -> bool:
+        """Return ``True`` when ``role`` is currently resident in MLXBrain.
+
+        Sprint Ω.10 (Apr 27 2026): used by the chain to decide whether
+        the ultra persona pin is meaningful — pinning a non-resident
+        role would force a synchronous load on the persona-pin call,
+        which we want explicit, not implicit. Defensive: any
+        attribute-access failure resolves to ``False``.
+        """
+        brain = self._mlx_brain
+        if brain is None:
+            return False
+        try:
+            loaded = getattr(brain, "_loaded_roles", {}) or {}
+            return bool(loaded.get(role))
+        except Exception:
+            return False
+
+    async def _pin_persona_in_chain(self, role: str) -> bool:
+        """Pin the persona prefix on ``role`` inside the Metal-serial chain.
+
+        Sprint Ω.10 (Apr 27 2026): runs ``MLXBrain.pin_prompt_prefix``
+        synchronously inside the cold-start chain so the very first
+        user-driven query already finds the persona block in the KV
+        trie. Pre-Ω.10 this happened in ``main.py._background_boot_warm``
+        AFTER cold_start returned — leaving a 600-1500 ms window where
+        Boss's first turn paid a cold prefill. Returns ``True`` on a
+        successful pin; logs at DEBUG and silently returns False on
+        every failure mode (no brain wired, no persona file, MLX
+        unavailable, prefill raised) so the boot never aborts on
+        secondary observability.
+        """
+        if self._mlx_brain is None or self._persona_path is None:
+            return False
+        path = self._persona_path
+        if not path.exists():
+            logger.debug(
+                "Cold start persona-pin skipped: %s missing", path,
+            )
+            return False
+        try:
+            text = path.read_text(encoding="utf-8")
+        except Exception:
+            logger.debug(
+                "Cold start persona-pin: read raised for %s",
+                path, exc_info=True,
+            )
+            return False
+        if not text.strip():
+            return False
+        pin_fn = getattr(self._mlx_brain, "pin_prompt_prefix", None)
+        if not callable(pin_fn):
+            return False
+        loop = asyncio.get_running_loop()
+        t0 = time.monotonic()
+        try:
+            result = await loop.run_in_executor(
+                None,
+                lambda: pin_fn(
+                    text, model_role=role, source_path=str(path),
+                ),
+            )
+        except Exception:
+            logger.debug(
+                "Cold start persona-pin dispatch raised role=%s",
+                role, exc_info=True,
+            )
+            return False
+        elapsed_ms = (time.monotonic() - t0) * 1000.0
+        ok = bool(isinstance(result, dict) and result.get("ok"))
+        if ok:
+            logger.info(
+                "Cold start: persona pinned on role=%s tokens=%s "
+                "in %.0fms (chain-serial)",
+                role,
+                (result or {}).get("tokens", "?"),
+                elapsed_ms,
+            )
+        else:
+            reason = (
+                (result or {}).get("reason", "unknown")
+                if isinstance(result, dict)
+                else "no-result"
+            )
+            logger.info(
+                "Cold start: persona pin role=%s failed (%s) in %.0fms",
+                role, reason, elapsed_ms,
+            )
+        return ok
 
     async def _preload_fast_model(self) -> bool:
         if self._local_brain is None:

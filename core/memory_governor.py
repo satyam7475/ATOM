@@ -334,10 +334,49 @@ class MemoryGovernor:
 
     # ── internal: action ────────────────────────────────────────────
 
+    def _emit_tier_changed(
+        self,
+        *,
+        tier: int,
+        prev_tier: int,
+        memory_pct: float,
+        direction: str,
+    ) -> None:
+        """Sprint Ω.10 (Apr 27 2026) — broadcast a pressure-tier change.
+
+        Subscribers (e.g. ``CognitiveKernel._on_memory_tier``) use
+        this to dial back ``max_tokens`` proactively before the next
+        eviction. Idempotent on tier *equality*: callers must check
+        ``prev_tier != tier`` before invoking. Logged at DEBUG so the
+        existing tier escalation/relax INFO lines stay the canonical
+        operator surface.
+        """
+        if self._bus is None:
+            return
+        try:
+            self._bus.emit_fast(
+                "memory_pressure_tier_changed",
+                tier=tier,
+                prev_tier=prev_tier,
+                memory_pct=memory_pct,
+                direction=direction,
+            )
+        except Exception:
+            logger.debug(
+                "MemoryGovernor: failed to emit memory_pressure_tier_changed",
+                exc_info=True,
+            )
+
     def _escalate(self, tier: int, memory_pct: float) -> None:
+        prev_tier = self._current_tier
         target = self._eviction_count_for(tier)
         if target <= 0:
             self._current_tier = tier
+            if prev_tier != tier:
+                self._emit_tier_changed(
+                    tier=tier, prev_tier=prev_tier,
+                    memory_pct=memory_pct, direction="up",
+                )
             return
         logger.warning(
             "MemoryGovernor: pressure %.1f%% -> tier %d, evicting up to %d role(s)",
@@ -369,6 +408,11 @@ class MemoryGovernor:
                     "MemoryGovernor: failed to emit eviction event",
                     exc_info=True,
                 )
+        if prev_tier != tier:
+            self._emit_tier_changed(
+                tier=tier, prev_tier=prev_tier,
+                memory_pct=memory_pct, direction="up",
+            )
 
     def _maybe_relax(self, tier: int, memory_pct: float) -> None:
         # When pressure relaxes, mark roles below the current tier as
@@ -377,6 +421,7 @@ class MemoryGovernor:
         # clears the ``is_evicted`` flag so a future spike can evict
         # them again. If a role registered an explicit ``rewarm`` callback,
         # call it on relax for the inverse symmetry.
+        prev_tier = self._current_tier
         target = self._eviction_count_for(tier)
         rewarmed_now: list[str] = []
         for idx, name in enumerate(self._order):
@@ -405,6 +450,11 @@ class MemoryGovernor:
                 memory_pct, tier, self._current_tier, len(rewarmed_now),
             )
         self._current_tier = tier
+        if prev_tier != tier:
+            self._emit_tier_changed(
+                tier=tier, prev_tier=prev_tier,
+                memory_pct=memory_pct, direction="down",
+            )
 
     def _eviction_count_for(self, tier: int) -> int:
         """Number of leading entries in ``eviction_order`` to evict at ``tier``.

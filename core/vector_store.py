@@ -295,6 +295,94 @@ class VectorStore:
             return self._search_chromadb(collection, query_embedding, k, min_score)
         return self._search_fallback(collection, query_embedding, k, min_score)
 
+    def warm_up(self) -> dict[str, Any]:
+        """Sprint Ω.10 (Apr 27 2026) — pre-warm the vector index so the
+        first user-driven recall query doesn't pay the cold-index tax.
+
+        ChromaDB's HNSW index loads lazily on the first ``query`` call
+        for each collection. With a populated index that cold load is
+        80-300 ms (sub-200ms on the 16 GB M5 Air, longer when the
+        process is paged out). Multiplied across the four collections
+        this is the kind of one-time penalty Boss notices on the very
+        first "what did I ask earlier?" / RAG-augmented turn after a
+        boot.
+
+        We dispatch a tiny zero-vector query (k=1) against every
+        collection that already has rows. Empty collections are
+        skipped — there's nothing to warm. The fallback (in-memory)
+        backend doesn't need warming since it has no on-disk index,
+        but we still touch each shard so the metadata dicts land in
+        the resident set.
+
+        Returns ``{"ok": True, "collections": [...], "elapsed_ms":
+        ...}`` so the cold-start log can render a one-line summary.
+        """
+        t0 = time.time()
+        warmed: list[dict[str, Any]] = []
+        if self._using_chromadb:
+            zero_dim = int(self._embedding_meta.get("_embedding_dim", 384) or 384)
+            zero_vec = [0.0] * zero_dim
+            for name, coll in self._collections.items():
+                if coll is None:
+                    continue
+                t_c = time.time()
+                try:
+                    count = int(coll.count())
+                except Exception:
+                    count = 0
+                if count <= 0:
+                    warmed.append({
+                        "name": name, "count": 0,
+                        "elapsed_ms": 0.0, "ok": True,
+                    })
+                    continue
+                try:
+                    coll.query(
+                        query_embeddings=[zero_vec],
+                        n_results=1,
+                        include=["distances"],
+                    )
+                    warmed.append({
+                        "name": name, "count": count,
+                        "elapsed_ms": (time.time() - t_c) * 1000.0,
+                        "ok": True,
+                    })
+                except Exception as exc:
+                    logger.debug(
+                        "Vector warm-up: %s raised %s", name, exc,
+                        exc_info=True,
+                    )
+                    warmed.append({
+                        "name": name, "count": count,
+                        "elapsed_ms": (time.time() - t_c) * 1000.0,
+                        "ok": False,
+                    })
+        else:
+            for name, entries in self._fallback_data.items():
+                warmed.append({
+                    "name": name,
+                    "count": len(entries),
+                    "elapsed_ms": 0.0,
+                    "ok": True,
+                })
+        elapsed_ms = (time.time() - t0) * 1000.0
+        active = [w for w in warmed if w["count"] > 0]
+        logger.info(
+            "Vector store warmed in %.0fms: %s (backend=%s)",
+            elapsed_ms,
+            ", ".join(
+                f"{w['name']}={w['count']}({int(w['elapsed_ms'])}ms)"
+                for w in active
+            ) or "<all empty>",
+            "chromadb" if self._using_chromadb else "fallback",
+        )
+        return {
+            "ok": True,
+            "elapsed_ms": elapsed_ms,
+            "collections": warmed,
+            "backend": "chromadb" if self._using_chromadb else "fallback",
+        }
+
     def _search_chromadb(
         self, collection: str, query_embedding: list[float],
         k: int, min_score: float,

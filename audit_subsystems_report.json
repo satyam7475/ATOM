@@ -1,0 +1,94 @@
+{
+  "system": {
+    "ram_pct_start": 64.3
+  },
+  "whisperkit_cli": {
+    "ok": true,
+    "ms": 25.6,
+    "rss_delta_mb": 0.0,
+    "installed": true,
+    "path": "/opt/homebrew/bin/whisperkit-cli",
+    "version": "v0.18.0"
+  },
+  "embedding": {
+    "ok": true,
+    "ms": 2474.2,
+    "rss_delta_mb": 471.7,
+    "available": true,
+    "dims": 384,
+    "warm_ok": true,
+    "five_query_ms": 2109.4,
+    "per_query_ms": 421.9
+  },
+  "vlm_caption": {
+    "ok": true,
+    "ms": 2293.6,
+    "rss_delta_mb": 1343.1,
+    "first_call_total_ms": 2282.7,
+    "load_ms": 395.78595900093205,
+    "caption_head": "Background: Blue. Foreground: Empty."
+  },
+  "vector_store": {
+    "ok": true,
+    "ms": 251.5,
+    "rss_delta_mb": 71.8,
+    "backend": "?",
+    "diag": {}
+  },
+  "prompt_builder_voice_cap": {
+    "ok": true,
+    "ms": 21.1,
+    "rss_delta_mb": 3.8,
+    "voice_chars": 4279,
+    "chat_chars": 10947,
+    "voice_approx_tokens": 1069,
+    "chat_approx_tokens": 2736,
+    "voice_under_1800tok": true
+  },
+  "cloud_rotation": {
+    "ok": true,
+    "ms": 43.4,
+    "rss_delta_mb": 6.3,
+    "enabled": true,
+    "provider": "rotating",
+    "slot_count": 4,
+    "slot_names": [
+      "groq",
+      "gemini",
+      "cerebras",
+      "nvidia"
+    ],
+    "tiers": [
+      1,
+      1,
+      2,
+      3
+    ],
+    "ready_slots": [],
+    "diag_keys": [
+      "available",
+      "enabled",
+      "provider",
+      "slots",
+      "tier_cursors"
+    ],
+    "first_slot_keys": [
+      "avg_latency_ms",
+      "base_url",
+      "cooldown_remaining_s",
+      "deep_model",
+      "fast_model",
+      "has_key",
+      "last_error",
+      "name",
+      "provider_kind",
+      "rpm_used",
+      "soft_rpm",
+      "tier",
+      "total_failures",
+      "total_requests",
+      "total_successes",
+      "warm"
+    ]
+  }
+}

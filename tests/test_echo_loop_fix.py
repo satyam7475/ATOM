@@ -56,10 +56,12 @@ def test_tts_is_echo_flags_own_voice() -> None:
 
     class _Stub(MacOSTTSAsync):
         def __init__(self) -> None:  # skip heavy init
-            import collections, time
+            import collections, threading, time
             self._spoken_echo_window = collections.deque(maxlen=6)
             self._last_spoke_t = time.monotonic()
             self._recent_spoken_chunks = collections.deque(maxlen=3)
+            self._last_spoken_was_confirmation = False
+            self._echo_lock = threading.Lock()
 
     tts = _Stub()
     tts._record_spoken("Boss, I'm showing you your active goals.")
@@ -71,7 +73,7 @@ def test_tts_is_echo_flags_own_voice() -> None:
 
 
 def test_tts_is_echo_expires_after_window() -> None:
-    import collections, time as _time
+    import collections, threading, time as _time
     from voice.tts_macos import MacOSTTSAsync
 
     class _Stub(MacOSTTSAsync):
@@ -79,6 +81,8 @@ def test_tts_is_echo_expires_after_window() -> None:
             self._spoken_echo_window = collections.deque(maxlen=6)
             self._last_spoke_t = 0.0  # far in the past
             self._recent_spoken_chunks = collections.deque(maxlen=3)
+            self._last_spoken_was_confirmation = False
+            self._echo_lock = threading.Lock()
 
     tts = _Stub()
     tts._spoken_echo_window.append({"boss", "showing", "active", "goals"})

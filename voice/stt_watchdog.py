@@ -506,8 +506,12 @@ class STTWatchdog:
                 return
 
             try:
+                # Ω.10 step-6: heavy pool for the soft chain restart so a
+                # wedged STT recovery cannot block the default 3-worker
+                # pool that boot warm-up shares.
+                from core.async_event_bus import get_heavy_executor
                 loop = asyncio.get_running_loop()
-                await loop.run_in_executor(None, restart_fn)
+                await loop.run_in_executor(get_heavy_executor(), restart_fn)
                 # Reset BOTH liveness timers — without resetting
                 # ``_last_final_time`` the watchdog's next health
                 # check will still see the previous (now-irrelevant)
@@ -599,8 +603,10 @@ class STTWatchdog:
             restart_fn = getattr(stt, "_restart_recognition_chain", None)
             if callable(restart_fn):
                 try:
+                    # Ω.10 step-6: see soft-restart comment above.
+                    from core.async_event_bus import get_heavy_executor
                     loop = asyncio.get_running_loop()
-                    await loop.run_in_executor(None, restart_fn)
+                    await loop.run_in_executor(get_heavy_executor(), restart_fn)
                     self._last_partial_time = time.monotonic()
                     logger.info("STT Watchdog: recognition chain restarted successfully")
                     self._bus.emit_fast("stt_watchdog_restart", reason=reason, restart_count=self._total_restarts)

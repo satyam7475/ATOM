@@ -876,6 +876,51 @@ CONFIG_SCHEMA: dict[str, Any] = {
                         "single-tier."
                     ),
                 },
+                "mlx_ultra_model": {
+                    "type": "string",
+                    "description": (
+                        "Sprint Ω.10 (Apr 27 2026) -- optional ultra-tier "
+                        "brain. Points at a tiny model "
+                        "(e.g. models/qwen3-0.6b-instruct-4bit) that the "
+                        "cognitive kernel uses for sub-second voice "
+                        "replies on micro-INFO turns. The same directory "
+                        "doubles as the speculative-decoding draft for "
+                        "the 4B target -- when "
+                        "``speculative_decoding.draft_model_path`` matches "
+                        "this path the brain reuses the in-RAM weights "
+                        "instead of loading them twice. Missing paths "
+                        "silently fall back to the fast tier."
+                    ),
+                },
+                "role_timeouts": {
+                    "type": "object",
+                    "description": (
+                        "Sprint Ω.10 (Apr 27 2026) -- per-role MLX "
+                        "inference timeouts (seconds). Overrides the "
+                        "brain-mode profile's ``timeout_seconds`` for "
+                        "specific roles so the ultra path bails fast "
+                        "(~5 s) while the primary path keeps the longer "
+                        "default. Missing keys keep the profile default."
+                    ),
+                    "properties": {
+                        "primary": {
+                            "type": "number",
+                            "minimum": 0.5,
+                            "maximum": 600.0,
+                        },
+                        "fast": {
+                            "type": "number",
+                            "minimum": 0.5,
+                            "maximum": 600.0,
+                        },
+                        "ultra": {
+                            "type": "number",
+                            "minimum": 0.5,
+                            "maximum": 600.0,
+                        },
+                    },
+                    "additionalProperties": False,
+                },
                 "mlx_deep_model": {
                     "type": "string",
                     "description": (
@@ -1015,6 +1060,10 @@ CONFIG_SCHEMA: dict[str, Any] = {
                             "minimum": 1,
                             "maximum": 16,
                             "description": "Number of tokens the draft model proposes per verification step. Higher = more potential speedup but more rejected proposals on uncertain prefixes. 3-5 is a typical sweet spot.",
+                        },
+                        "_disabled_reason": {
+                            "type": "string",
+                            "description": "Sprint Ω.10 (Apr 27 2026): operator note explaining why ``enabled`` was flipped off. Purely documentary — the runtime ignores it. Lets a future maintainer see WHY the flag was disabled (e.g. acceptance-rate audit) without spelunking git history.",
                         },
                     },
                     "additionalProperties": False,
@@ -1680,6 +1729,37 @@ CONFIG_SCHEMA: dict[str, Any] = {
             "properties": {
                 "quick_model": {"type": "string"},
                 "full_model": {"type": "string"},
+                "ultra_model": {
+                    "type": "string",
+                    "description": (
+                        "Sprint Ω.10 (Apr 27 2026): tiny brain (e.g. "
+                        "qwen3-0.6b-instruct-4bit) selected for "
+                        "micro-INFO turns inside the QUICK budget so "
+                        "first-audio latency falls below ~250 ms."
+                    ),
+                },
+                "ultra_max_words": {
+                    "type": "integer",
+                    "minimum": 2,
+                    "maximum": 24,
+                    "description": (
+                        "Sprint Ω.10 — upper word count for routing a "
+                        "query to the ultra brain. Anything longer "
+                        "stays on the fast/full brains."
+                    ),
+                },
+                "ultra_memory_tier_max": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 3,
+                    "description": (
+                        "Sprint Ω.10 — max memory pressure tier the "
+                        "ultra path is allowed at. Above this tier the "
+                        "kernel falls back to the regular QUICK branch "
+                        "so the ultra brain isn't kept resident under "
+                        "high RAM pressure."
+                    ),
+                },
                 "simple_query_max_chars": {"type": "integer", "minimum": 8, "maximum": 200},
                 "deep_query_min_chars": {"type": "integer", "minimum": 40, "maximum": 2000},
                 "battery_degrade": {"type": "boolean"},

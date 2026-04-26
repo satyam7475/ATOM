@@ -187,13 +187,17 @@ def test_pin_prompt_prefix_swallows_prefill_failure(mlx_brain):
 
 
 def test_pinned_persona_info_initial_state(monkeypatch):
+    """Sprint Ω.10 (Apr 27 2026): ``pinned_persona_info`` now reports a
+    per-role view (``roles`` map, ``total_tokens`` aggregate) on top of
+    the legacy single-pin fields. The legacy fields default to the fast
+    role when no pin has fired yet so existing callers keep working."""
     from brain.mlx_llm import MLXBrain
 
     brain = MLXBrain({"brain": {"enabled": True, "mlx_model": "/tmp/m"}})
     info = brain.pinned_persona_info
-    assert info == {
-        "path": None,
-        "mtime": 0.0,
-        "role": "fast",
-        "tokens": 0,
-    }
+    assert info["path"] is None
+    assert info["mtime"] == 0.0
+    assert info["role"] == "fast"
+    assert info["tokens"] == 0
+    assert info["total_tokens"] == 0
+    assert info["roles"] == {}

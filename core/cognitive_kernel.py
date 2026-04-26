@@ -144,6 +144,29 @@ _REALTIME_HINTS = re.compile(
     re.I,
 )
 
+# Sprint Ω.10 — knowledge-probe gate for the ultra (0.6B) router.
+# Any query starting with these stems is sent to the 4B brain instead
+# of ultra because the 0.6B has no reliable world facts and will
+# confidently hallucinate. The pattern is *anchored* at start-of-query
+# (after lowercasing + stripping leading punctuation) so a command
+# that mentions "what" mid-sentence still qualifies for ultra.
+_ULTRA_KNOWLEDGE_PROBE_RE = re.compile(
+    r"^(?:"
+    r"what\s+(?:is|are|was|were|does|do|did|did)\b|"
+    r"who\s+(?:is|are|was|were|wrote|made|invented|founded|owns)\b|"
+    r"where\s+(?:is|are|was|were|did|do)\b|"
+    r"when\s+(?:is|are|was|were|did|do|will|does)\b|"
+    r"why\s+(?:is|are|was|were|did|does|do)\b|"
+    r"which\s+(?:is|are|was|were|one|of)\b|"
+    r"how\s+(?:big|small|tall|long|fast|much|many|old)\b|"
+    r"largest|smallest|biggest|tallest|fastest|oldest|"
+    r"capital|population|distance|temperature|"
+    r"tell\s+me\s+(?:about|why|how|what)|"
+    r"explain|describe|define|name\s+(?:the|a|an)"
+    r")",
+    re.I,
+)
+
 # ── Sprint Ω.9 (Apr 26 2026) — semantic-cache class gate ────────────
 # Short identity/meta queries embed into vectors that fuzzy-match each
 # other at the chat-meta cluster (e.g. "who are you" vs "what time is
@@ -251,6 +274,12 @@ class QueryPlan:
     cloud_augmented: bool = False
     confidence_score: float = -1.0  # -1 = not evaluated yet
 
+    # Sprint Ω.10 (Apr 27 2026) — multiplier the controller applies to
+    # ``max_tokens`` overrides. The cognitive kernel sets it from its
+    # current memory tier (1.0/0.75/0.5) so the controller doesn't
+    # need a back-channel to the governor.
+    max_tokens_factor: float = 1.0
+
 
 # ── Latency budgets per path ─────────────────────────────────────────
 
@@ -355,6 +384,19 @@ class CognitiveKernel:
         ck = self._config.get("cognitive_kernel", {})
         self._quick_model = ck.get("quick_model", "qwen3-4b-instruct-4bit")
         self._full_model = ck.get("full_model", "qwen3-4b-instruct-4bit")
+        # Sprint Ω.10 (Apr 27 2026) — ultra-tier (0.6B) routing inside
+        # the QUICK budget. Used for trivially short INFO/SIMPLE
+        # prompts where the 4B brain's quality is wasted: persona pin
+        # is already warm on the 0.6B weights, so first-audio drops
+        # below ~250 ms. Falls back to QUICK if the model isn't on
+        # disk or memory pressure makes co-residence unsafe.
+        self._ultra_model = ck.get(
+            "ultra_model", "qwen3-0.6b-instruct-4bit",
+        )
+        self._ultra_max_words = int(ck.get("ultra_max_words", 8))
+        self._ultra_memory_tier_max = int(ck.get("ultra_memory_tier_max", 2))
+        self._memory_tier_current: int = 0
+        self._max_tokens_degrade_factor: float = 1.0
         self._deep_query_min_chars = int(ck.get("deep_query_min_chars", 120))
         self._simple_query_max_chars = int(ck.get("simple_query_max_chars", 50))
         self._battery_degrade = bool(ck.get("battery_degrade", True))
@@ -368,6 +410,7 @@ class CognitiveKernel:
             "cache": _CircuitState(),
             "llm_quick": _CircuitState(),
             "llm_full": _CircuitState(),
+            "llm_ultra": _CircuitState(),
             "rag": _CircuitState(),
             "cloud_reason": _CircuitState(),
             "cloud_search": _CircuitState(),
@@ -408,10 +451,22 @@ class CognitiveKernel:
         if self._bus:
             self._bus.on("silicon_thermal_warn", self._on_thermal_warn)
             self._bus.on("silicon_memory_warn", self._on_memory_warn)
+            # Sprint Ω.10 — listen for the granular "tier changed"
+            # event emitted by memory_governor. We use it to (a)
+            # disable ultra-tier routing when the system is under
+            # heavy pressure (tier ≥ ultra_memory_tier_max + 1) and
+            # (b) halve the quick-path ``max_tokens`` once tier 3 is
+            # reached, preserving voice fidelity but freeing RAM.
+            self._bus.on(
+                "memory_pressure_tier_changed", self._on_memory_tier,
+            )
 
         logger.info(
-            "CognitiveKernel: quick=%s, full=%s, deep_min=%d chars, semantic_rag=%s, cloud=%s",
-            self._quick_model, self._full_model, self._deep_query_min_chars,
+            "CognitiveKernel: quick=%s, full=%s, ultra=%s (≤%dw, tier≤%d), "
+            "deep_min=%d chars, semantic_rag=%s, cloud=%s",
+            self._quick_model, self._full_model, self._ultra_model,
+            self._ultra_max_words, self._ultra_memory_tier_max,
+            self._deep_query_min_chars,
             self._semantic_stack_available, self._cloud_enabled,
         )
 
@@ -992,6 +1047,28 @@ class CognitiveKernel:
         elif full_broken:
             reason = "full_circuit_open_fallback"
 
+        # Sprint Ω.10 (Apr 27 2026) — ultra-tier subroute *inside* the
+        # QUICK budget. We re-use the existing QUICK path policy
+        # (memory-only RAG, FAST runtime mode, QUICK budget) but swap
+        # the model+role to the 0.6B brain when the predicate fires.
+        # No new ExecPath is introduced so existing telemetry, latency
+        # controllers, and prompt hints all keep working unchanged.
+        if not degraded and self._ultra_eligible(query, requested_tier):
+            return QueryPlan(
+                path=ExecPath.QUICK,
+                model=self._ultra_model,
+                model_role="ultra",
+                runtime_mode="FAST",
+                use_rag=False,
+                use_memory=False,
+                thinking=False,
+                reason=f"{reason}_ultra",
+                budget_ms=_PATH_BUDGETS[ExecPath.QUICK],
+                prompt_hint=self._prompt_hint_for(
+                    ExecPath.QUICK, degraded=degraded,
+                ),
+            )
+
         return QueryPlan(
             path=ExecPath.QUICK,
             model=self._quick_model,
@@ -1318,11 +1395,137 @@ class CognitiveKernel:
     async def _on_memory_warn(self, **_kw: Any) -> None:
         logger.info("Cognitive Kernel: memory warning received, degrading routing")
 
+    async def _on_memory_tier(self, **kw: Any) -> None:
+        """Sprint Ω.10 — react to memory_governor tier transitions.
+
+        We track the current tier so :py:meth:`_ultra_eligible` can
+        skip the ultra path under heavy pressure (tier exceeds
+        ``ultra_memory_tier_max``). At tier 3 we additionally apply a
+        0.5x ``max_tokens`` degrade factor that the controller honors
+        via :py:meth:`max_tokens_degrade_factor` — voice fidelity is
+        kept (caller still hears full sentences) but the brain emits
+        roughly half the tokens, which buys ~30% RAM headroom on the
+        sustained quick path.
+        """
+        try:
+            # Ω.10 step-1: accept either schema. ``MemoryGovernor`` emits
+            # ``tier=`` (canonical); the ``main.py`` ``_on_silicon_stats_update``
+            # path historically only emitted ``previous=`` / ``current=``,
+            # so without this fallback the kernel silently degrades to
+            # tier 0 on half of the pressure events and the
+            # ``max_tokens_degrade_factor`` stays at 1.0 under sustained
+            # tier-2/3 pressure (the OOM-cascade window).
+            raw_tier = kw.get("tier")
+            if raw_tier is None:
+                raw_tier = kw.get("current", 0)
+            tier = int(raw_tier)
+            mem_pct = float(kw.get("memory_pct", 0.0))
+        except (TypeError, ValueError):
+            return
+        prev_tier = self._memory_tier_current
+        prev_factor = self._max_tokens_degrade_factor
+        self._memory_tier_current = tier
+        if tier >= 3:
+            self._max_tokens_degrade_factor = 0.5
+        elif tier >= 2:
+            self._max_tokens_degrade_factor = 0.75
+        else:
+            self._max_tokens_degrade_factor = 1.0
+        if (
+            tier != prev_tier
+            or abs(self._max_tokens_degrade_factor - prev_factor) > 1e-3
+        ):
+            logger.info(
+                "Cognitive Kernel: memory tier %d->%d (%.0f%%) "
+                "ultra_routing=%s max_tokens_factor=%.2f",
+                prev_tier, tier, mem_pct,
+                "ON" if tier <= self._ultra_memory_tier_max else "OFF",
+                self._max_tokens_degrade_factor,
+            )
+
+    @property
+    def max_tokens_degrade_factor(self) -> float:
+        """Multiplier the controller applies to ``max_tokens`` overrides.
+
+        Sprint Ω.10 — tracked per-instance and updated by
+        :py:meth:`_on_memory_tier` so the cognitive kernel and the
+        local-brain controller stay in sync without a config round-trip.
+        """
+        return float(self._max_tokens_degrade_factor)
+
+    def _ultra_eligible(
+        self,
+        query: str,
+        requested_tier: CognitiveBudgetTier,
+    ) -> bool:
+        """Sprint Ω.10 — predicate for routing onto the 0.6B ultra brain.
+
+        Eligible iff:
+          * ``requested_tier`` ∈ {COMMAND, SIMPLE} — INFO is excluded
+            because most INFO turns are runtime/system probes that
+            ``quick_replies`` already handles BEFORE the LLM router
+            runs (atomCurrentLogs.txt confirms ``time``, ``cpu``,
+            ``battery`` etc. never reach this code path), so dropping
+            INFO from ultra costs us nothing on the happy path while
+            stopping a leaked knowledge-probe ("what is X") from
+            landing on a 0.6B that has no facts.
+          * Query is at most ``ultra_max_words`` words (default 8).
+          * Query is NOT a world-knowledge probe — anything starting
+            with "what is", "who is", "where is", "tell me about"…
+            is rejected. The 0.6B literally does not know world facts
+            and will hallucinate confidently. Audit caught
+            "Largest moon of Jupiter? → Io" (wrong; correct is
+            Ganymede). The 4B brain stays the default for these.
+          * No creative-leaning hints in the query (story/poem/etc).
+            A 0.6B brain confabulates badly on those; the few-token
+            speed win isn't worth the quality drop.
+          * The ``llm_ultra`` circuit is closed.
+          * Memory tier is at or below ``ultra_memory_tier_max``.
+        """
+        if not self._ultra_model:
+            return False
+        if requested_tier not in {
+            CognitiveBudgetTier.COMMAND,
+            CognitiveBudgetTier.SIMPLE,
+        }:
+            return False
+        word_count = len((query or "").split())
+        if word_count == 0 or word_count > self._ultra_max_words:
+            return False
+        low = (query or "").lower().strip(" ?!.,")
+        # Block creative cues even in COMMAND/SIMPLE — anyone asking
+        # for a "story" / "poem" / etc has to go through the 4B brain.
+        for hint in (
+            "story", "poem", "haiku", "song", "lyrics",
+            "joke", "essay", "rap",
+        ):
+            if hint in low:
+                return False
+        # Sprint Ω.10 — world-knowledge probe guard. Anchored at start
+        # of query so a command that *contains* "what" mid-sentence
+        # ("stop what you are doing") still routes to ultra.
+        if _ULTRA_KNOWLEDGE_PROBE_RE.match(low):
+            return False
+        if self._circuits["llm_ultra"].is_open:
+            return False
+        if self._memory_tier_current > self._ultra_memory_tier_max:
+            return False
+        return True
+
     # ── Metrics + recording ──────────────────────────────────────────
 
     def _record(self, plan: QueryPlan, t0: float) -> None:
         elapsed_ms = (time.perf_counter() - t0) * 1000
         self._total_routed += 1
+        # Sprint Ω.10 — stamp the current memory-pressure max_tokens
+        # factor onto every plan as it leaves the kernel. The local
+        # brain controller multiplies its per-intent ``max_tokens``
+        # override by this factor so tier-3 turns naturally emit ~50%
+        # of the tokens (voice still hears full sentences, RAM relief).
+        try:
+            plan.max_tokens_factor = float(self._max_tokens_degrade_factor)
+        except Exception:
+            logger.debug("max_tokens_factor stamp failed", exc_info=True)
         self._routing_counts[plan.path.value] = (
             self._routing_counts.get(plan.path.value, 0) + 1
         )

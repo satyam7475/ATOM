@@ -46,6 +46,7 @@ from __future__ import annotations
 
 import asyncio
 import collections
+import functools
 import json
 import logging
 import os
@@ -56,6 +57,7 @@ import socket
 import subprocess
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable
 
@@ -446,6 +448,17 @@ class WhisperKitSTT:
         self._echo_guard: Callable[[str], bool] | None = None
         self._whisper_confirmer: Any = None
 
+        # Ω.10 step-3: dedicated single-worker pool for the blocking
+        # ``_http_transcribe`` (urllib.request.urlopen). Previously
+        # ``_consume_once`` ran the HTTP call inline on the asyncio
+        # event-loop thread, stalling state transitions, TTS callbacks,
+        # and interrupt detection for 30-150 ms per partial. Pinning
+        # transcribe work to ``atom-stt`` keeps the loop free; partials
+        # still serialize behind one another (good — preserves order).
+        self._stt_io = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="atom-stt",
+        )
+
     def _clear_utterance_buffers(self) -> None:
         self._utterance_frames.clear()
         self._silence_frames = 0
@@ -537,8 +550,15 @@ class WhisperKitSTT:
             return False
 
     async def async_preload(self) -> bool:
+        # Ω.10 step-6: route through ``atom-bus-heavy`` instead of the
+        # default 3-worker pool so a cold-start preload (whisperkit-cli
+        # spawn + /health probe, up to ``startup_timeout_s``) cannot
+        # contend with TTS prewarm or describe-on-wake.
+        from core.async_event_bus import get_heavy_executor
         loop = asyncio.get_running_loop()
-        return bool(await loop.run_in_executor(None, self.preload))
+        return bool(
+            await loop.run_in_executor(get_heavy_executor(), self.preload),
+        )
 
     async def kick_serve_async(self) -> bool:
         """Spawn ``whisperkit-cli serve`` *without* awaiting `/health`.
@@ -584,7 +604,13 @@ class WhisperKitSTT:
                 )
                 return False
 
-        return bool(await loop.run_in_executor(None, _spawn))
+        # Ω.10 step-6: heavy pool for the subprocess spawn + setsid +
+        # /dev/null wiring; the default pool is reserved for cold-start
+        # one-shots and stays out of the per-turn voice path.
+        from core.async_event_bus import get_heavy_executor
+        return bool(
+            await loop.run_in_executor(get_heavy_executor(), _spawn),
+        )
 
     # ── serve lifecycle ─────────────────────────────────────────
 
@@ -923,6 +949,13 @@ class WhisperKitSTT:
         self._stop_serve()
         self._vad = None
         self._available = False
+        # Ω.10 step-3: release the dedicated transcribe worker. ``wait=False``
+        # so a pending HTTP call to a wedged whisperkit-cli serve cannot
+        # block interpreter exit.
+        try:
+            self._stt_io.shutdown(wait=False)
+        except Exception:
+            logger.debug("atom-stt executor shutdown raised", exc_info=True)
         logger.info("WhisperKitSTT shut down")
 
     # ── async-compatible wrappers ───────────────────────────────
@@ -1028,13 +1061,18 @@ class WhisperKitSTT:
         try:
             while self._listening and not self._stop_event.is_set():
                 await asyncio.sleep(_FRAME_MS / 1000.0)
-                self._consume_once()
+                await self._consume_once()
         except asyncio.CancelledError:  # pragma: no cover
             pass
         except Exception:
             logger.exception("WhisperKitSTT consume loop crashed")
 
-    def _consume_once(self) -> None:
+    async def _consume_once(self) -> None:
+        # VAD + ring drain runs inline on the event loop — webrtcvad is a
+        # microsecond-class C call and the ring is already lock-protected.
+        # The expensive bit (HTTP transcribe) is offloaded to ``atom-stt``
+        # below so a slow partial cannot stall TTS callbacks / state
+        # transitions / barge-in detection.
         with self._ring_lock:
             frames = list(self._ring)
             self._ring.clear()
@@ -1070,7 +1108,7 @@ class WhisperKitSTT:
             silence_duration_s >= self._trailing_silence_s
             or utterance_duration_s >= self._max_utterance_s
         ):
-            text = self._flush_utterance(force=True)
+            text = await self._flush_utterance_async(force=True)
             if text:
                 self._emit_final(text)
                 self._last_final = text
@@ -1082,11 +1120,51 @@ class WhisperKitSTT:
             utterance_duration_s >= self._partial_interval_s
             and since_partial >= self._partial_interval_s
         ):
-            text = self._transcribe(self._utterance_frames, partial=True)
+            # Snapshot frames before handing off so a concurrent VAD pass
+            # in the next tick cannot mutate the list under the worker.
+            snapshot = list(self._utterance_frames)
+            text = await self._transcribe_async(snapshot, partial=True)
             if text and text != self._last_partial:
                 self._last_partial = text
                 self._emit_partial(text)
                 self._last_partial_emit_at = now
+
+    async def _transcribe_async(
+        self, frames: list[bytes], *, partial: bool,
+    ) -> str:
+        """Offload the blocking ``_transcribe`` to the ``atom-stt`` pool.
+
+        Keeps the asyncio event loop free during the 30-150 ms HTTP
+        round-trip to ``whisperkit-cli serve``. Errors are swallowed by
+        ``_transcribe`` itself; a failed call returns ``""`` so the
+        consume loop continues normally.
+        """
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            self._stt_io,
+            functools.partial(self._transcribe, frames, partial=partial),
+        )
+
+    async def _flush_utterance_async(self, *, force: bool) -> str:
+        """Async sibling of :meth:`_flush_utterance`.
+
+        Snapshots ``self._utterance_frames`` before awaiting transcribe
+        and resets utterance state afterwards. The sync ``_flush_utterance``
+        is preserved because :meth:`stop_listening` must run from a sync
+        teardown context where awaiting is not available.
+        """
+        if not self._utterance_frames:
+            return ""
+        duration_ms = len(self._utterance_frames) * _FRAME_MS
+        if duration_ms < self._min_utterance_ms:
+            self._reset_utterance_state()
+            return ""
+        snapshot = list(self._utterance_frames)
+        try:
+            text = await self._transcribe_async(snapshot, partial=False)
+        finally:
+            self._reset_utterance_state()
+        return text
 
     def _flush_utterance(self, *, force: bool) -> str:
         if not self._utterance_frames:

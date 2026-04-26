@@ -758,8 +758,14 @@ class AudioIntelligenceEngine:
         if not self._can_switch():
             logger.debug("BT rescan skipped -- switch cooldown active")
             return
+        # Ω.10 step-6: full device rescan is a 200-800 ms CoreAudio +
+        # IORegistry pass; route through ``atom-bus-heavy`` so it never
+        # contends with TTS prewarm or describe-on-wake.
+        from core.async_event_bus import get_heavy_executor
         loop = asyncio.get_running_loop()
-        new_best = await loop.run_in_executor(None, self._full_rescan)
+        new_best = await loop.run_in_executor(
+            get_heavy_executor(), self._full_rescan,
+        )
         if new_best and (not self._selected_input or new_best.index != self._selected_input.index):
             confidence = self._compute_switch_confidence(new_best)
             await self.seamless_switch(new_best, confidence=confidence, reason="bt_connect")
@@ -781,7 +787,10 @@ class AudioIntelligenceEngine:
             non_bt.sort(key=lambda d: d.quality_score, reverse=True)
             return non_bt[0] if non_bt[0].quality_score > 0 else None
 
-        fallback = await loop.run_in_executor(None, _find_non_bt)
+        from core.async_event_bus import get_heavy_executor
+        fallback = await loop.run_in_executor(
+            get_heavy_executor(), _find_non_bt,
+        )
         if fallback:
             await self.seamless_switch(
                 fallback, confidence=0.95, reason="bt_disconnect",
@@ -898,8 +907,11 @@ class AudioIntelligenceEngine:
 
         if sel.rms_db > -60:
             logger.info("STT stuck but audio flowing (RMS=%.1fdB) -- switching device", sel.rms_db)
+            from core.async_event_bus import get_heavy_executor
             loop = asyncio.get_running_loop()
-            new_best = await loop.run_in_executor(None, self._full_rescan)
+            new_best = await loop.run_in_executor(
+                get_heavy_executor(), self._full_rescan,
+            )
             if new_best and new_best.index != sel.index:
                 await self.seamless_switch(new_best, confidence=0.6, reason="stt_stuck_audio_flowing")
         elif sel.rms_db < -85:
@@ -1289,7 +1301,11 @@ class AudioIntelligenceEngine:
                 logger.debug("CoreAudio default switch: waited 0.8s for HAL propagation")
             return best
 
-        best = await loop.run_in_executor(None, _blocking_boot)
+        # Ω.10 step-6: boot-time best-device pick can take 1.5-3 s;
+        # heavy pool keeps it off the default 3-worker pool that
+        # ``init_voice`` and embedding seed share.
+        from core.async_event_bus import get_heavy_executor
+        best = await loop.run_in_executor(get_heavy_executor(), _blocking_boot)
         self._boot_time_ms = (time.monotonic() - t0) * 1000
 
         if self._mic_manager and best:
@@ -1862,7 +1878,10 @@ class AudioWatchdog:
             return self._engine.test_device(selected)
 
         try:
-            result = await loop.run_in_executor(None, _quick_test)
+            from core.async_event_bus import get_heavy_executor
+            result = await loop.run_in_executor(
+                get_heavy_executor(), _quick_test,
+            )
         except Exception:
             logger.debug("Watchdog quick test failed", exc_info=True)
             return
@@ -1912,8 +1931,11 @@ class AudioWatchdog:
                     "Quality trend degrading (rms_slope=%.2f, snr_slope=%.2f) -- pre-warming alternative",
                     rms_slope, snr_slope,
                 )
+                from core.async_event_bus import get_heavy_executor
                 loop = asyncio.get_running_loop()
-                self._pre_warm_candidate = await loop.run_in_executor(None, self._find_alternative)
+                self._pre_warm_candidate = await loop.run_in_executor(
+                    get_heavy_executor(), self._find_alternative,
+                )
 
             min_rms = self._engine._cfg.get("min_rms_threshold_db", -80)
             current_rms = self._rms_history[-1][1] if self._rms_history else -100
@@ -1968,8 +1990,11 @@ class AudioWatchdog:
         if not selected or not _HAS_SD:
             return True
         try:
+            from core.async_event_bus import get_heavy_executor
             loop = asyncio.get_running_loop()
-            devs = await loop.run_in_executor(None, _sd.query_devices)
+            devs = await loop.run_in_executor(
+                get_heavy_executor(), _sd.query_devices,
+            )
             dev_list = list(devs) if not isinstance(devs, list) else devs
             return any(
                 (d.get("name") if isinstance(d, dict) else "") == selected.name
@@ -1991,7 +2016,8 @@ class AudioWatchdog:
             self._engine.score_all_devices()
             return self._engine.select_best_input()
 
-        new_best = await loop.run_in_executor(None, _rescan)
+        from core.async_event_bus import get_heavy_executor
+        new_best = await loop.run_in_executor(get_heavy_executor(), _rescan)
         if new_best is None:
             await self._engine.voice_feedback("no_device")
             return

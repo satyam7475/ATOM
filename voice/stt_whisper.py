@@ -377,8 +377,12 @@ class WhisperSTT:
             return False
 
     async def async_preload(self) -> None:
+        # Ω.10 step-6: heavy pool for whisper.cpp model load (200-1500 ms
+        # I/O + Metal init); keeps default pool quiet for cold-start
+        # one-shots only.
+        from core.async_event_bus import get_heavy_executor
         loop = asyncio.get_running_loop()
-        await loop.run_in_executor(None, self.preload)
+        await loop.run_in_executor(get_heavy_executor(), self.preload)
 
     def start_listening(
         self,

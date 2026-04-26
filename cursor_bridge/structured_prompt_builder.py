@@ -211,16 +211,23 @@ class ContextBudget:
         self._voice_mode = voice_mode
 
         if voice_mode:
-            # Tight per-layer budgets for spoken turns. Total worst case
-            # ≈ 1800 tokens; typical ≈ 700-1000.
-            self.system_budget = 380
+            # Sprint Ω.10 step-5 (Apr 27 2026): tighter caps so the
+            # typical voice prompt stays under 1000 tokens (audit_brain
+            # baseline measured 1227). Each 100 prompt tokens ≈ 50-80 ms
+            # of Qwen3-4B-4bit prefill on M5; trimming the layers below
+            # buys ~120-180 ms of first-token latency every turn while
+            # preserving the load-bearing IDENTITY/DEPTH preamble at the
+            # head of the system layer (only the persona suffix is
+            # trimmed). Total worst case ≈ 1420 tokens; typical
+            # ≈ 600-1000 once history fills.
+            self.system_budget = 320
             self.tools_budget = 140
             self.context_budget = 180
-            self.memory_budget = 280
-            self.documents_budget = 200
-            self.emotion_budget = 60
-            self.query_budget = 200
-            history_floor = 240
+            self.memory_budget = 200
+            self.documents_budget = 140
+            self.emotion_budget = 40
+            self.query_budget = 160
+            history_floor = 200
         else:
             self.system_budget = 900
             self.tools_budget = 600

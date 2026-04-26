@@ -268,12 +268,19 @@
         "kv_group_size": 64,
         "kv_quant_warmup_tokens": 512,
         "mx_compile_enabled": true,
-        "single_resident": true,
+        "single_resident": false,
         "role_switch_min_interval_s": 8.0,
+        "mlx_ultra_model": "models/qwen3-0.6b-instruct-4bit",
+        "role_timeouts": {
+            "ultra": 5.0,
+            "fast": 18.0,
+            "primary": 28.0
+        },
         "speculative_decoding": {
             "enabled": false,
-            "draft_model_path": "models/qwen3-8b-4bit",
-            "num_draft_tokens": 3
+            "draft_model_path": "models/qwen3-0.6b-instruct-4bit",
+            "num_draft_tokens": 4,
+            "_disabled_reason": "Sprint Ω.10 audit (Apr 27 2026): Qwen3-0.6B drafting Qwen3-4B-Instruct sustained 10.3 wps vs 19.7 wps without spec — acceptance rate too low for the 4-token verification window. Re-enable only after a draft model whose distribution actually matches the 4B target is wired."
         }
     },
     "assistant_brain": {
@@ -604,6 +611,9 @@
     "cognitive_kernel": {
         "quick_model": "qwen3-4b-instruct-4bit",
         "full_model": "qwen3-4b-instruct-4bit",
+        "ultra_model": "qwen3-0.6b-instruct-4bit",
+        "ultra_max_words": 8,
+        "ultra_memory_tier_max": 2,
         "simple_query_max_chars": 48,
         "deep_query_min_chars": 140,
         "battery_degrade": true,
@@ -706,7 +716,7 @@
         "enabled": true,
         "prefetch_enabled": true,
         "first_token_budget_ms": 120,
-        "top_k": 3,
+        "top_k": 2,
         "max_snippets": 3,
         "pressure_threshold_pct": 82,
         "pressure_relief_pct": 72,

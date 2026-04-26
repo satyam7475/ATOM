@@ -243,7 +243,13 @@ class VoicePipeline:
                     "describe_on_wake worker raised", exc_info=True,
                 )
 
-        future = loop.run_in_executor(None, _blocking_describe)
+        # Ω.10 step-6: ``engine.look`` is a 200-800 ms VLM/CoreML pass.
+        # Routing through ``atom-bus-heavy`` keeps it off the asyncio
+        # default pool, which after Steps 2 + 3 should go quiet at
+        # steady state. Otherwise a wake-on-presence frame can queue
+        # behind TTS prewarm or stall describe-on-wake forever.
+        from core.async_event_bus import get_heavy_executor
+        future = loop.run_in_executor(get_heavy_executor(), _blocking_describe)
 
         def _clear(_fut: asyncio.Future) -> None:
             self._on_wake_describe_in_flight = False

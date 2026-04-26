@@ -1,0 +1,35 @@
+{
+  "cwd": "/Users/satyamyadav/Desktop/Personal/ATOM",
+  "system": {
+    "python": "3.11.15",
+    "cpu_count": 10,
+    "ram_total_gb": 16.0,
+    "ram_used_pct_start": 57.5
+  },
+  "config": {
+    "mlx_model": "models/qwen3-4b-instruct-4bit",
+    "n_ctx": 6144,
+    "max_tokens": 384,
+    "single_resident": true
+  },
+  "mlx_cold_load_ms": 4780.2,
+  "mlx_load_ok": true,
+  "rss_after_load_mb": 1582.7,
+  "rss_load_delta_mb": 1508.4,
+  "turn1_ms": 803.4,
+  "turn1_words": 1,
+  "turn1_words_per_sec": 1.24,
+  "turn1_text_head": "14:30.",
+  "turn2_ms": 356.2,
+  "turn2_words": 1,
+  "turn2_words_per_sec": 2.81,
+  "turn2_text_head": "Ganymede",
+  "turn3_ms": 2966.5,
+  "turn3_words": 52,
+  "turn3_words_per_sec": 17.53,
+  "turn3_text_head": "Unified memory combines the GPU and CPU memory into a single pool, allowing smoother graphics rendering and multitasking. On M-series Macs, it enables better performance in apps like video editing or gaming by eliminating separate VRAM and RAM bottlenecks. This technology is key to the M1/M2/M3 chip",
+  "turn4_long_prefill_ms": 209.9,
+  "turn4_text_head": "4.",
+  "rss_final_mb": 1637.1,
+  "system_ram_pct_final": 70.1
+}

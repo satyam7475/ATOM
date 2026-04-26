@@ -1,24 +1,43 @@
-"""Sprint Ω.7 (Apr 26 2026): single-resident invariant tests.
+"""Sprint Ω.7 (Apr 26 2026) → Ω.10 (Apr 27 2026): multi-tier eviction tests.
 
-The contract is simple but the bug it prevents is expensive: on a 16 GB
-Apple Silicon laptop, two MLX chat models (e.g. 4B + 8B) co-resident
-will spike unified memory past the thermal headroom and either trigger
-sustained throttling or push other warm caches (embeddings, persona KV)
-out of RAM. ATOM keeps EXACTLY ONE chat-model weight bundle in memory
-at a time when ``brain.single_resident`` is true.
+History:
+  * Ω.7 introduced ``brain.single_resident=true`` as a hard invariant
+    that kept exactly one chat-model bundle in unified memory at a
+    time. That made sense when "primary" and "fast" pointed at the
+    same 4B weights -- aliasing was free, swapping was expensive.
+  * Ω.10 (this sprint) flipped ``single_resident`` to ``false`` after
+    we proved 0.6B (ultra) + 4B (primary/fast) co-resident fits the
+    16 GB / 24 GB M-class budget *and* unlocks ~400 ms wins on the
+    "quick reply" path. The eviction policy itself is unchanged --
+    when an operator opts back into single_resident, the helpers in
+    ``MLXBrain`` still drop divergent siblings before loading the
+    requested role.
 
 These tests deliberately use synthetic stand-in objects in place of
 real MLX tensors -- the goal is to lock the *eviction policy*, not to
-exercise mlx-lm. The invariants:
+exercise mlx-lm. The invariants on the *shipped* config (Ω.10):
 
-1. When the requested role's path differs from a sibling's loaded
-   path, the sibling is unloaded *before* the new load.
-2. When the requested role's path matches the sibling's loaded path
-   (single-model profile), no eviction happens -- tensors are aliased.
-3. Speculative decoding refuses the draft load while single_resident
-   is on, regardless of the speculative_decoding.enabled flag.
-4. ``preload(load_all=True)`` honours the invariant and warms only
-   the requested role.
+1. ``brain.single_resident`` ships as ``false`` -- ultra (0.6B) and
+   primary (4B) live side-by-side so the kernel can route quick
+   replies onto the small brain without a swap penalty.
+2. ``brain.speculative_decoding.enabled`` ships as ``false``. The
+   shipped Qwen3 0.6B/4B pair regressed sustained tok/s in the live
+   audit (10.3 wps vs 17.5 wps baseline), so we keep the feature off
+   until a higher-acceptance draft is found.
+3. ``stt.whisper_confirm.enabled`` stays ``false`` -- WhisperKit is
+   the live STT engine; the second-pass confirmer is redundant CPU.
+
+Plus the eviction policy invariants (still active when an operator
+flips ``single_resident=true`` for a smaller-RAM rig):
+
+4. When the requested role's path differs from a sibling's loaded
+   path, the sibling is unloaded before the new load.
+5. When the requested role's path matches the sibling's loaded path,
+   no eviction happens -- tensors are aliased.
+6. Per-role prompt caches are dropped along with the role's weights
+   (otherwise the LRU would hold dangling references).
+7. The role-switch hysteresis floor stays > 0 so we cannot thrash a
+   swap every turn.
 """
 from __future__ import annotations
 
@@ -39,12 +58,17 @@ def _config_with(brain_overrides: dict | None = None) -> dict:
     return cfg
 
 
-def test_settings_has_single_resident_enabled() -> None:
-    """The shipped config opts in to single-resident on the M5."""
+def test_settings_disables_single_resident_for_multi_tier() -> None:
+    """Sprint Ω.10 (Apr 27 2026): the shipped config now ships with
+    ``single_resident=false`` so the 0.6B "ultra" tier can stay warm
+    next to the 4B primary/fast model. The eviction helpers still
+    work when an operator flips it back to ``true`` (see the policy
+    tests below) — this guards the *shipped* default for the M5 rig.
+    """
     cfg = _config_with()
-    assert cfg["brain"].get("single_resident") is True, (
-        "config/settings.json must ship with brain.single_resident=true "
-        "to keep one chat model in RAM at a time"
+    assert cfg["brain"].get("single_resident") is False, (
+        "config/settings.json must ship with brain.single_resident=false "
+        "(Sprint Ω.10) so ultra (0.6B) + primary/fast (4B) can be co-resident"
     )
 
 
@@ -140,19 +164,23 @@ def test_evict_clears_role_prompt_cache() -> None:
     assert "fast" not in brain._prompt_caches
 
 
-def test_speculative_draft_refused_when_single_resident() -> None:
-    """The draft load is refused as long as single_resident is true,
-    even when speculative_decoding.enabled is also true. This is
-    defense in depth -- the shipped config disables speculative, but
-    a future operator who flips it on must not silently re-introduce
-    a co-resident pair."""
+def test_speculative_draft_refuses_missing_path() -> None:
+    """Sprint Ω.10 (Apr 27 2026): the legacy ``single_resident`` block
+    that structurally refused a draft load was removed (the multi-tier
+    refactor needs ultra + primary/fast co-resident, so co-residency
+    of target+draft is no longer banned by definition). The draft
+    loader must still refuse cleanly when the configured draft path
+    does not exist on disk — that's the layer of safety we keep
+    asserting so a typo in ``draft_model_path`` flips the failure
+    flag instead of silently 500-ing on the first generate.
+    """
     from brain.mlx_llm import MLXBrain
 
     cfg = _config_with({
         "single_resident": True,
         "speculative_decoding": {
             "enabled": True,
-            "draft_model_path": "models/qwen3-8b-4bit",
+            "draft_model_path": "models/this-path-definitely-does-not-exist",
             "num_draft_tokens": 3,
         },
     })

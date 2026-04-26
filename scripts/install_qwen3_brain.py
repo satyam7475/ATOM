@@ -10,6 +10,13 @@ Variants
 * ``--variant 8b`` (Sprint Ω): ``mlx-community/Qwen3-8B-4bit``
   -- the bigger brain. Upstream ships the chat_template embedded so
   no patch is needed; the patch step is skipped automatically.
+* ``--variant 0.6b`` (Sprint Ω.10): ``mlx-community/Qwen3-0.6B-4bit``
+  -- the *ultra* brain (also serves as the speculative-decoding draft
+  for the 4B target). Upstream's quantized tokenizer_config also
+  omits ``chat_template``, so this script patches it from
+  ``Qwen/Qwen3-0.6B``. Critical: the draft tokenizer's vocabulary
+  must match the 4B target — the runtime double-checks this at
+  load time.
 
 Why the patch exists
 --------------------
@@ -65,6 +72,11 @@ _VARIANTS: dict[str, dict[str, object]] = {
         "quant_repo": "mlx-community/Qwen3-8B-4bit",
         "template_repo": None,
         "local_dirname": "qwen3-8b-4bit",
+    },
+    "0.6b": {
+        "quant_repo": "mlx-community/Qwen3-0.6B-4bit",
+        "template_repo": "Qwen/Qwen3-0.6B",
+        "local_dirname": "qwen3-0.6b-instruct-4bit",
     },
 }
 

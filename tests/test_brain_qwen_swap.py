@@ -134,8 +134,15 @@ def test_brain_watchdog_budgets_match_qwen3_class():
 def test_mlx_brain_roles_are_primary_and_fast():
     from brain.mlx_llm import MLXBrain
 
-    assert MLXBrain._ROLES == ("primary", "fast"), (
-        f"v3.2 cleanup: only primary + fast roles remain; got {MLXBrain._ROLES!r}"
+    # Sprint Ω.10 (Apr 27 2026): the role tuple is now a *fallback chain*
+    # (ultra → fast → primary). Older v3.2-era assumption that only
+    # primary+fast existed no longer holds because we route micro-INFO
+    # turns at sub-second latency through the 0.6B "ultra" tier. The
+    # test still locks the *order* + *full set* so a future refactor
+    # that drops a tier or reshuffles the fallback gets caught.
+    assert MLXBrain._ROLES == ("primary", "fast", "ultra"), (
+        f"Sprint Ω.10 baseline: roles must be primary/fast/ultra in that "
+        f"order (fallback chain); got {MLXBrain._ROLES!r}"
     )
 
 
@@ -167,13 +174,14 @@ def test_mlx_brain_single_model_path_attribute():
     )
 
 
-def test_mlx_brain_dicts_only_have_two_role_slots():
-    """Per-role state dicts drop the 'deep' slot after the single-model
-    cleanup."""
+def test_mlx_brain_dicts_have_three_role_slots():
+    """Per-role state dicts cover the full Sprint Ω.10 fallback chain
+    (primary / fast / ultra). The legacy ``deep`` slot stays gone."""
     from brain.mlx_llm import MLXBrain
 
     cfg = _settings()
     brain = MLXBrain(cfg)
+    expected = {"primary", "fast", "ultra"}
     for d in (
         brain._models,
         brain._tokenizers,
@@ -182,7 +190,7 @@ def test_mlx_brain_dicts_only_have_two_role_slots():
         brain._load_failed,
         brain._role_last_used,
     ):
-        assert set(d.keys()) == {"primary", "fast"}, (
+        assert set(d.keys()) == expected, (
             f"Per-role dict keys drifted: {set(d.keys())}"
         )
 
@@ -225,7 +233,10 @@ def test_mlx_brain_falls_back_to_default_when_all_keys_missing():
 # ─────────────────────────────────────────────────────────────────────
 
 
-def test_max_tokens_override_short():
+def test_max_tokens_override_command():
+    """Sprint Ω.10 balanced schedule: command tier wins over SHORT mode
+    so a one-line confirmation ("Done, Boss.") never wastes tokens
+    narrating its own success."""
     from cursor_bridge.local_brain_controller import LocalBrainController
     from core.query_policy import ResponseMode
 
@@ -233,6 +244,20 @@ def test_max_tokens_override_short():
         response_mode=ResponseMode.SHORT,
         budget_tier="command",
         requested_tier="command",
+    )
+    assert cap == 48
+
+
+def test_max_tokens_override_info_via_short_mode():
+    """Sprint Ω.10: SHORT mode without a tighter tier (or info tier in
+    NORMAL mode) caps at 96 — single-fact answers fit in one sentence."""
+    from cursor_bridge.local_brain_controller import LocalBrainController
+    from core.query_policy import ResponseMode
+
+    cap = LocalBrainController._max_tokens_override(
+        response_mode=ResponseMode.SHORT,
+        budget_tier="info",
+        requested_tier="info",
     )
     assert cap == 96
 
@@ -262,6 +287,9 @@ def test_max_tokens_override_detail():
 
 
 def test_max_tokens_override_normal_default():
+    """Sprint Ω.10: the catch-all default dropped from 192 -> 160 to
+    keep voice replies tight on Qwen3-4B which starts narrating past
+    ~150 tokens."""
     from cursor_bridge.local_brain_controller import LocalBrainController
     from core.query_policy import ResponseMode
 

@@ -791,8 +791,17 @@ async def main() -> None:
                 prev_tier, tier, memory_pct,
             )
             try:
+                # Ω.10 step-1: emit ``tier=`` / ``prev_tier=`` so we share
+                # the same payload schema as ``MemoryGovernor._notify_tier``
+                # (core/memory_governor.py). Without ``tier=``,
+                # ``CognitiveKernel._on_memory_tier`` defaults to 0 and the
+                # ``max_tokens_degrade_factor`` never engages on the
+                # main.py emitter path. ``previous=`` / ``current=`` are
+                # kept for any existing subscriber that already reads them.
                 bus.emit_fast(
                     "memory_pressure_tier_changed",
+                    tier=tier,
+                    prev_tier=prev_tier,
                     previous=prev_tier,
                     current=tier,
                     memory_pct=round(memory_pct, 1),
@@ -2185,6 +2194,23 @@ async def main() -> None:
 
     from core.boot.cold_start import ColdStartOptimizer
 
+    # Sprint Ω.10 (Apr 27 2026): the persona pin moved INTO the
+    # cold-start Metal-serial chain so the very first user turn
+    # already lands on a warm KV prefix. We resolve the persona path
+    # and pull the inner MLXBrain reference here so the optimizer can
+    # pin both ``fast`` and ``ultra`` while it still owns the GPU
+    # queue. Falling back to the canonical ``config/atom_persona.md``
+    # mirrors the legacy logic the post-warmup pin block used pre-
+    # Ω.10 (which is now retired below).
+    _persona_cfg_for_pin = (config.get("personality") or {}) if isinstance(config, dict) else {}
+    _persona_path_for_pin = Path(
+        str(
+            _persona_cfg_for_pin.get("persona_file")
+            or "config/atom_persona.md"
+        )
+    ).expanduser()
+    _mlx_brain_for_pin = getattr(local_brain, "_llm", None) if local_brain is not None else None
+
     cold_start = ColdStartOptimizer(
         config=config,
         bus=bus,
@@ -2203,6 +2229,12 @@ async def main() -> None:
         # intent-engine pass after a skill match (atom_log.txt
         # L597-599) lands on a hot cache instead of paying ~150 ms.
         skills_registry=skills_reg,
+        # Sprint Ω.10 — persona pin lives inside the Metal-serial
+        # chain so turn 1 hits a warm KV cache. The optimizer
+        # pins both ``fast`` and ``ultra`` (when enabled) inline
+        # with model preload, while we still own the GPU queue.
+        persona_path=_persona_path_for_pin,
+        mlx_brain=_mlx_brain_for_pin,
     )
 
     # Sprint Ω.2 — TTS init (voice select + prewarm) used to block the
@@ -2253,6 +2285,7 @@ async def main() -> None:
         kick_ok = False
         preflight_ok = False
         seeded = 0
+        cloud_warm_summary = "off"
         try:
             kick = getattr(stt, "kick_serve_async", None)
             if callable(kick):
@@ -2293,12 +2326,81 @@ async def main() -> None:
                     )
             except Exception:
                 logger.debug("Boot warm: TTS preflight raised", exc_info=True)
+            try:
+                # Sprint Ω.10 (Apr 27 2026): warm the ChromaDB HNSW
+                # index so the first RAG-augmented query (e.g. "what
+                # did I ask yesterday") doesn't pay the 80-300 ms
+                # cold-index tax per collection. Skips empty
+                # collections and the fallback backend (no on-disk
+                # index to warm).
+                from core.vector_store import get_shared_vector_store
+
+                t_v = time.monotonic()
+                vstore = get_shared_vector_store(config)
+                loop_v = asyncio.get_running_loop()
+                if vstore is not None and hasattr(vstore, "warm_up"):
+                    await loop_v.run_in_executor(None, vstore.warm_up)
+                    logger.info(
+                        "Boot warm: vector store warm pass (%.0fms)",
+                        (time.monotonic() - t_v) * 1000,
+                    )
+            except Exception:
+                logger.debug(
+                    "Boot warm: vector warm raised", exc_info=True,
+                )
+            try:
+                # Sprint Ω.10 (Apr 27 2026): warm TLS to every
+                # non-Anthropic cloud slot in parallel so the first
+                # user-driven cloud reply doesn't pay the 200-400 ms
+                # one-time handshake. We also kick the circuit
+                # auto-recovery loop here so a slot whose cooldown
+                # expires mid-session gets revalidated within 30 s
+                # instead of being slammed back into use blindly on
+                # the next request.
+                rotating_warmer = None
+                if gemini_client is not None and hasattr(
+                    gemini_client, "warm_tls",
+                ):
+                    rotating_warmer = gemini_client
+                if rotating_warmer is not None:
+                    t_c = time.monotonic()
+                    try:
+                        warm_payload = await rotating_warmer.warm_tls()
+                        warmed = int(warm_payload.get("warmed", 0))
+                        skipped = int(warm_payload.get("skipped", 0))
+                        cloud_warm_summary = (
+                            f"warmed={warmed} skipped={skipped}"
+                        )
+                        logger.info(
+                            "Boot warm: cloud TLS pass (%s, %.0fms)",
+                            cloud_warm_summary,
+                            (time.monotonic() - t_c) * 1000,
+                        )
+                    except Exception:
+                        logger.debug(
+                            "Boot warm: cloud TLS pass raised",
+                            exc_info=True,
+                        )
+                    try:
+                        if hasattr(
+                            rotating_warmer, "start_circuit_auto_recovery",
+                        ):
+                            rotating_warmer.start_circuit_auto_recovery()
+                    except Exception:
+                        logger.debug(
+                            "Boot warm: cloud auto-recovery start raised",
+                            exc_info=True,
+                        )
+            except Exception:
+                logger.debug(
+                    "Boot warm: cloud warm/recovery raised", exc_info=True,
+                )
             elapsed = (time.monotonic() - t0) * 1000
             _bt_mark("boot_warm", elapsed, parallel=True)
             logger.info(
                 "Boot warm pass: %.0fms (stt_kick=%s, embed_seeded=%d, "
-                "tts_preflight=%s)",
-                elapsed, kick_ok, seeded, preflight_ok,
+                "tts_preflight=%s, cloud=%s)",
+                elapsed, kick_ok, seeded, preflight_ok, cloud_warm_summary,
             )
 
     _bg_tasks.append(asyncio.create_task(_background_boot_warm()))
@@ -2457,79 +2559,53 @@ async def main() -> None:
     except Exception:
         logger.debug("OwnerProfile/Style bootstrap failed", exc_info=True)
 
-    # ── Sprint C1 — pin the runtime persona as a stable KV prefix ──
-    # The atomLogs.txt audit (L336/392/509) showed prompt-cache reuse
-    # stuck at 67-75% because the ~600-token persona block was being
-    # prefilled cold most turns. We now run a one-shot prefill right
-    # after the FAST model finishes warming so the trie holds the
-    # persona-prefix KV state. Subsequent turns find it as the longest
-    # matching prefix, which collapses first-token latency on every
-    # FAST reply. The pin auto-refreshes when Boss edits
-    # ``config/atom_persona.md`` (mtime-watched in repin_persona_if_changed).
+    # ── Sprint Ω.10 — persona pin moved into Metal-serial chain ────
+    # Pre-Ω.10 the persona pin happened HERE, *after* the cold-start
+    # warmup returned. That left a 600-1500 ms window (depending on
+    # persona size + model speed) where the very first user query
+    # paid a cold persona prefill: turn 1's first-token latency was
+    # often 1.4 s even though every turn after was hot.
+    #
+    # Sprint Ω.10 wires ``persona_path`` and the inner ``MLXBrain``
+    # ref into ``ColdStartOptimizer`` so the pin runs *inside* the
+    # Metal-serial chain (right after each role finishes loading and
+    # before embeddings/VLM pick up the Metal queue). By the time
+    # ``warm_up`` returns the trie already has both ``fast`` and
+    # ``ultra`` persona blocks resident, so turn 1 lands on a warm
+    # KV prefix. The diagnostic block below just stamps the boot
+    # timer + observability so existing dashboards see a non-zero
+    # ``persona_pin`` mark instead of going dark.
     if (
         brain_enabled
         and local_brain is not None
         and cold_start_report.fast_model_ready
     ):
         try:
-            mlx_brain_for_pin = getattr(local_brain, "_llm", None)
-            persona_cfg = (config.get("personality") or {})
-            persona_path_str = (
-                persona_cfg.get("persona_file")
-                or "config/atom_persona.md"
-            )
-            persona_path = Path(persona_path_str).expanduser()
-            # Sprint Ω.2 — when the per-model KV snapshot was already
-            # restored from disk during MLX warmup, the persona prefix
-            # is already pinned. Skip the 6 s re-prefill and just record
-            # the warm-cache hit so observability still sees the pin.
-            already_pinned = bool(
-                mlx_brain_for_pin is not None
-                and getattr(
-                    mlx_brain_for_pin, "_prompt_cache_persisted_role", {},
-                ).get("fast")
-                and not getattr(
-                    mlx_brain_for_pin, "_pinned_persona_path", None,
-                )
-            )
-            if already_pinned:
+            pin_brain = _mlx_brain_for_pin
+            info: dict[str, Any] = {}
+            if pin_brain is not None:
+                try:
+                    raw = getattr(pin_brain, "pinned_persona_info", {}) or {}
+                    info = dict(raw) if isinstance(raw, dict) else {}
+                except Exception:
+                    info = {}
+            roles = info.get("roles") or {}
+            total_tokens = int(info.get("total_tokens", 0) or 0)
+            pinned_roles = sorted(roles.keys()) if isinstance(roles, dict) else []
+            if pinned_roles:
                 logger.info(
-                    "Persona pin: warm KV cache hit (skipped %d-token re-prefill)",
-                    int(getattr(mlx_brain_for_pin, "_pinned_persona_token_count", 0)),
+                    "Persona pin (chain-serial): roles=%s total_tokens=%d",
+                    ",".join(pinned_roles),
+                    total_tokens,
                 )
                 _bt_mark("persona_pin", 0.0)
-            elif (
-                mlx_brain_for_pin is not None
-                and hasattr(mlx_brain_for_pin, "pin_prompt_prefix")
-                and persona_path.exists()
-            ):
-                persona_text = persona_path.read_text(encoding="utf-8")
-                if persona_text.strip():
-                    pin_result = await asyncio.get_running_loop().run_in_executor(
-                        None,
-                        partial(
-                            mlx_brain_for_pin.pin_prompt_prefix,
-                            persona_text,
-                            model_role="fast",
-                            source_path=str(persona_path),
-                        ),
-                    )
-                    if pin_result and pin_result.get("ok"):
-                        logger.info(
-                            "Persona pinned to KV prefix: %d tokens, %.0fms "
-                            "(source=%s)",
-                            int(pin_result.get("tokens", 0)),
-                            float(pin_result.get("elapsed_ms", 0.0)),
-                            persona_path.name,
-                        )
-                        _bt_mark("persona_pin", float(pin_result.get("elapsed_ms", 0.0)))
-                    else:
-                        logger.info(
-                            "Persona pin skipped: %s",
-                            (pin_result or {}).get("reason", "unknown"),
-                        )
+            else:
+                logger.debug(
+                    "Persona pin diagnostic: no roles pinned by chain "
+                    "(check cold_start logs for the actual pin attempts)",
+                )
         except Exception:
-            logger.debug("persona KV pin failed", exc_info=True)
+            logger.debug("Persona pin post-chain diagnostic failed", exc_info=True)
 
     _obs_v7 = (config.get("v7_intelligence") or {}).get("observability") or {}
     _snap_iv = float(_obs_v7.get("debug_snapshot_interval_s", 120.0))
@@ -2613,9 +2689,25 @@ async def main() -> None:
                             if clamp < 0.999
                             else ""
                         )
+                        compile_info = snap.get("compile", {}) or {}
+                        compiled_pct = float(compile_info.get("compiled_pct", 0.0) or 0.0)
+                        compile_label = (
+                            f" compiled={compiled_pct:.0f}%"
+                            if int(compile_info.get("total_uses", 0) or 0) > 0
+                            else ""
+                        )
+                        tier_flags: list[str] = []
+                        if bool(snap.get("ultra_enabled", False)):
+                            tier_flags.append("ultra")
+                        if bool(snap.get("speculative_enabled", False)):
+                            tier_flags.append("spec")
+                        tier_label = (
+                            f" tiers={'+'.join(tier_flags)}"
+                            if tier_flags else ""
+                        )
                         logger.info(
                             "LLM perf: turns=%d tokens=%d avg=%.1f tok/s "
-                            "avg_ms=%.0f peak=%.2fGB cache=%d/%d (%.0f%%)%s",
+                            "avg_ms=%.0f peak=%.2fGB cache=%d/%d (%.0f%%)%s%s%s",
                             int(snap.get("turns", 0) or 0),
                             int(snap.get("tokens", 0) or 0),
                             float(snap.get("avg_tok_s", 0.0) or 0.0),
@@ -2625,6 +2717,8 @@ async def main() -> None:
                             int(cache.get("hits", 0) or 0) + int(cache.get("misses", 0) or 0),
                             float(cache.get("hit_rate", 0.0) or 0.0) * 100.0,
                             clamp_label,
+                            compile_label,
+                            tier_label,
                         )
                 except Exception:
                     logger.debug("LLM perf snapshot failed", exc_info=True)
@@ -4457,6 +4551,15 @@ async def main() -> None:
             cognitive_handles.stop()
         except Exception:
             logger.debug("cognitive_handles.stop failed", exc_info=True)
+        try:
+            if gemini_client is not None and hasattr(
+                gemini_client, "stop_circuit_auto_recovery",
+            ):
+                gemini_client.stop_circuit_auto_recovery()
+        except Exception:
+            logger.debug(
+                "rotating client auto-recovery stop failed", exc_info=True,
+            )
         try:
             _rt_server = realtime_handles.get("server") if realtime_handles else None
             if _rt_server is not None:

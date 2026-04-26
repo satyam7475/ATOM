@@ -29,6 +29,7 @@ import subprocess
 import sys
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -115,7 +116,83 @@ _RE_INTERNAL_TTS_LINE = re.compile(
 
 _RE_SENTENCE_SPLIT = re.compile(r'(?<=[.!?])\s+')
 # First grammatically complete sentence at buffer start (non-greedy up to first . ! ?)
-_RE_FIRST_SENTENCE = re.compile(r"^(.+?[.!?])\s*", re.DOTALL)
+_RE_FIRST_SENTENCE = re.compile(r"^(.+?[.!?])\s+", re.DOTALL)
+# Sprint Ω.10 — first clause boundary for pre-roll flush. Matches the
+# leading text up to and including a comma / semicolon / colon / em-dash
+# / en-dash / hyphen-with-spaces. We require trailing whitespace so the
+# boundary is unambiguously a phrase break and not part of a token like
+# "10,000" or "1:30". Only used on the very first flush of a stream so
+# subsequent slices keep using the regular sentence/word-batch flush.
+_RE_FIRST_CLAUSE_PREROLL = re.compile(r"^(.+?[,;:\u2014\u2013])\s+", re.DOTALL)
+# Common abbreviations that end in a period but DO NOT end a sentence.
+# All-lowercase, no trailing dot. The guard is matched against the last
+# alpha word right before a period, so "Mr. Smith" / "i.e. this" /
+# "p.m. lunch" / "etc. are all cases" don't trigger an early flush.
+_TTS_ABBREVIATIONS: frozenset[str] = frozenset({
+    "mr", "mrs", "ms", "dr", "prof", "sr", "jr", "st", "ave", "blvd",
+    "vs", "etc", "ie", "eg", "et", "al", "approx", "incl", "info",
+    "am", "pm", "no", "vol", "fig",
+    "us", "uk", "dc", "uae", "eu", "uk", "usa",
+})
+# Numeric/time pattern guard — comma between digits (1,000) or colon
+# between digits (1:30). Used only on the clause pre-roll, never on
+# the existing sentence flush (which doesn't match ``,``/``:`` anyway).
+_RE_NUMERIC_BOUNDARY = re.compile(r"\d[,:]\d")
+
+
+def _is_abbrev_boundary(buf: str, end_pos: int) -> bool:
+    """Sprint Ω.10 — return True when ``buf[end_pos - 1]`` is the end
+    of an abbreviation (e.g. ``Mr.``) rather than a real sentence /
+    clause boundary.
+
+    Only meaningful for periods. Commas/semicolons/colons/dashes are
+    sentence-internal and never abbreviations in English prose, so
+    callers can short-circuit when the boundary char isn't ``.``.
+
+    The check is deliberately permissive: any unknown short word
+    ending in a period is treated as a true boundary so legit
+    sentences like ``"Hi. Are you there?"`` still flush early. We
+    only suppress flushes when the preceding token is a known
+    abbreviation OR a single-letter dotted form (``U.S.``,
+    ``e.g.``).
+    """
+    if end_pos <= 0 or end_pos > len(buf):
+        return False
+    boundary_char = buf[end_pos - 1]
+    if boundary_char != ".":
+        return False
+    head = buf[: end_pos - 1]
+    if not head:
+        return False
+    last_alpha = re.search(r"([A-Za-z]+)\s*$", head)
+    if not last_alpha:
+        return False
+    word = last_alpha.group(1).lower()
+    if word in _TTS_ABBREVIATIONS:
+        return True
+    if len(word) == 1 and head[: last_alpha.start(1)].rstrip().endswith("."):
+        return True
+    return False
+
+
+def _is_numeric_clause_boundary(buf: str, end_pos: int) -> bool:
+    """Sprint Ω.10 — guard the clause pre-roll from numeric punctuation.
+
+    Returns True when the boundary character at ``end_pos - 1`` is
+    sandwiched between digits, e.g. ``"3,000"`` or ``"1:30"`` — both
+    of which are tokens, not phrase breaks. We check a tight 3-char
+    window centred on the boundary so this is O(1) regardless of the
+    overall buffer size.
+    """
+    if end_pos <= 0 or end_pos > len(buf):
+        return False
+    char = buf[end_pos - 1]
+    if char not in (",", ":"):
+        return False
+    if end_pos - 2 < 0 or end_pos >= len(buf):
+        return False
+    window = buf[end_pos - 2 : end_pos + 1]
+    return bool(_RE_NUMERIC_BOUNDARY.search(window))
 
 ACK_PHRASES = [
     "Yes, Boss?", "I'm here.", "Go ahead.", "I'm listening.", "How can I help?",
@@ -819,6 +896,19 @@ class MacOSTTSAsync:
         self._ack_idx = 0
         self._available = sys.platform == "darwin"
 
+        # Ω.10 step-2: dedicated single-worker executor for blocking
+        # NSSpeechSynthesizer / ``say`` subprocess work. Previously we
+        # relied on the asyncio default executor (3 workers, shared with
+        # embedding seed, vector warm-up, RuntimeWatchdog.run_sync, etc.),
+        # which made the ``state→speaking`` first-audio target (250 ms)
+        # load-dependent. Pinning TTS to its own worker keeps voice
+        # responsive even when boot warm or idle maintenance is busy.
+        # ``shutdown(wait=False)`` is called from :py:meth:`shutdown` so
+        # interpreter exit doesn't hang on a wedged synth thread.
+        self._tts_executor = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="atom-tts",
+        )
+
         # ── Deadman timer (Sprint C2) ──────────────────────────────
         # Every speak start records a budget derived from text length;
         # a background task kills the current utterance if the budget
@@ -865,6 +955,33 @@ class MacOSTTSAsync:
         # reply tokens like "yes", "no", "confirm yes" as self-echo while
         # this is set so a legitimate user reply isn't dropped.
         self._last_spoken_was_confirmation: bool = False
+        # Ω.10 step-4: ``_record_spoken`` runs on the ``atom-tts`` worker
+        # thread (Ω.10 step-2); ``is_echo`` is called by STT callbacks
+        # which now hop through the asyncio loop after the ``atom-stt``
+        # offload (Ω.10 step-3) — and historically by the router on the
+        # main loop. Without a lock the deque + ``_last_spoke_t`` +
+        # ``_last_spoken_was_confirmation`` triple can be torn between
+        # threads and invariant I-02 ("every TTS utterance hits the echo
+        # ring before leaving the synthesizer") becomes best-effort.
+        # The lock is held for sub-microsecond windows over a 6-element
+        # deque so contention is structurally negligible.
+        self._echo_lock: threading.Lock = threading.Lock()
+
+        # Sprint Ω.10 (Apr 27 2026): runtime stuck-start watchdog. The
+        # boot ``preflight_speak`` only catches a synth that's wedged at
+        # startup; once we're past boot we currently fall back to ``say``
+        # per-utterance but keep trying the native synth on the *next*
+        # call, so a chronically-broken voice file dies the same death
+        # every reply (200-1500 ms wasted per turn waiting on the
+        # blocked native start). When the per-utterance fallback fires
+        # ``_native_stuck_threshold`` consecutive times, we permanently
+        # flip ``self._backend`` to ``say`` for the rest of the session.
+        # Counter resets the moment a native start succeeds, so a
+        # transient audio-session steal (Zoom focus / AirPods reconnect)
+        # does NOT condemn the rest of the session to the say backend.
+        self._native_stuck_consecutive: int = 0
+        self._native_stuck_threshold: int = 3
+        self._native_permanently_disabled: bool = False
 
         from voice.speech_enhancer import SpeechEnhancer
         self._enhancer = SpeechEnhancer(base_rate=rate)
@@ -899,7 +1016,9 @@ class MacOSTTSAsync:
             # observed in the live boot logs.
             try:
                 loop = asyncio.get_running_loop()
-                await loop.run_in_executor(None, self._native_synth.prewarm)
+                await loop.run_in_executor(
+                    self._tts_executor, self._native_synth.prewarm,
+                )
             except RuntimeError:
                 self._native_synth.prewarm()
 
@@ -957,7 +1076,9 @@ class MacOSTTSAsync:
             # but still allocates the audio session.
             await asyncio.wait_for(
                 loop.run_in_executor(
-                    None, self._native_synth.speak_blocking, " ",
+                    self._tts_executor,
+                    self._native_synth.speak_blocking,
+                    " ",
                 ),
                 timeout=2.0,
             )
@@ -1004,7 +1125,7 @@ class MacOSTTSAsync:
             stuck_before = self._native_synth.stuck_starts
             loop = asyncio.get_running_loop()
             await loop.run_in_executor(
-                None, self._native_synth.speak_blocking, text,
+                self._tts_executor, self._native_synth.speak_blocking, text,
             )
             stuck_after = self._native_synth.stuck_starts
             if stuck_after > stuck_before:
@@ -1014,11 +1135,35 @@ class MacOSTTSAsync:
                 # the user actually hears this utterance instead of
                 # silently losing it. Logged at WARNING so the live
                 # boot logs make it obvious when this fallback fires.
+                self._native_stuck_consecutive += 1
                 logger.warning(
-                    "TTS: native synth stuck (#%d) — falling back to `say` for: '%s'",
-                    stuck_after, text[:60],
+                    "TTS: native synth stuck (#%d, consecutive=%d) — "
+                    "falling back to `say` for: '%s'",
+                    stuck_after, self._native_stuck_consecutive, text[:60],
                 )
+                # Sprint Ω.10 — after ``_native_stuck_threshold`` back-to-
+                # back wedges, give up on the native synth for the rest
+                # of the session. We do *not* tear down ``_native_synth``
+                # so a future hot-recover (e.g. operator releases the
+                # audio session) can opt back in via ``init_voice``.
+                if (
+                    self._native_stuck_consecutive
+                    >= self._native_stuck_threshold
+                    and not self._native_permanently_disabled
+                ):
+                    self._native_permanently_disabled = True
+                    self._backend = "say"
+                    logger.warning(
+                        "TTS: native synth wedged %d turns in a row — "
+                        "permanently flipping to `say` backend for this "
+                        "session (restart ATOM to retry NSSpeechSynth).",
+                        self._native_stuck_consecutive,
+                    )
                 await self._say_subprocess(text)
+            else:
+                # Successful native start — reset the consecutive
+                # counter so transient steals don't accumulate forever.
+                self._native_stuck_consecutive = 0
         else:
             await self._say_subprocess(text)
 
@@ -1130,17 +1275,32 @@ class MacOSTTSAsync:
         return re.sub(r"\s+", " ", lowered).strip()
 
     # ── Self-voice / echo guard ────────────────────────────────────
+    def _ensure_echo_lock(self) -> None:
+        """Sprint Ω.10 (Apr 27 2026) — lazy-init the echo lock.
+
+        Some legacy / test callers construct ``MacOSTTSAsync`` via a
+        stub ``__init__`` that bypasses our setup so the heavy native
+        synth (``NSSpeechSynthesizer``) is never created. Those stubs
+        typically forget to also wire the ``_echo_lock`` introduced in
+        Ω.10 step-4. Rather than scatter the same try/except across
+        every call site, we lazily install the lock the first time
+        ``_record_spoken`` / ``is_echo`` runs without one. Idempotent
+        and only pays a getattr per call after the first init.
+        """
+        if not hasattr(self, "_echo_lock") or self._echo_lock is None:
+            self._echo_lock = threading.Lock()
+        if not hasattr(self, "_last_spoken_was_confirmation"):
+            self._last_spoken_was_confirmation = False
+
     def _record_spoken(self, text: str) -> None:
         """Remember the bag-of-words ATOM just spoke so ``is_echo`` can
         match noisy partials caught by the mic from our own speakers.
         """
+        self._ensure_echo_lock()
         key = self._chunk_key(text)
         if not key:
             return
         words = {w for w in key.split() if len(w) >= 3}
-        # Track whether the most recent TTS chunk was a confirmation
-        # prompt. Used by is_echo() to stop flagging "yes"/"no"/"confirm"
-        # as self-echo when Boss is actually replying to our question.
         try:
             head = (text or "").strip()
             raw_lower = head.lower()
@@ -1155,13 +1315,18 @@ class MacOSTTSAsync:
                 )
             )
             short_prompt = word_count <= 5 and is_question
-            self._last_spoken_was_confirmation = bool(short_prompt or has_confirm_cue)
+            confirmation_flag = bool(short_prompt or has_confirm_cue)
         except Exception:
-            self._last_spoken_was_confirmation = False
-        if not words:
-            return
-        self._spoken_echo_window.append(words)
-        self._last_spoke_t = time.monotonic()
+            confirmation_flag = False
+        # Ω.10 step-4: publish the new state to the echo ring under the
+        # lock so a cross-thread ``is_echo`` reader sees the deque, the
+        # confirmation flag, and the timestamp consistently.
+        now = time.monotonic()
+        with self._echo_lock:
+            self._last_spoken_was_confirmation = confirmation_flag
+            if words:
+                self._spoken_echo_window.append(words)
+                self._last_spoke_t = now
 
     def is_echo(self, partial_text: str, *, window_s: float = 6.0) -> bool:
         """Best-effort echo guard for STT partials.
@@ -1182,9 +1347,19 @@ class MacOSTTSAsync:
         """
         if not partial_text:
             return False
-        if not self._spoken_echo_window:
-            return False
-        elapsed_since_speech = time.monotonic() - self._last_spoke_t
+        self._ensure_echo_lock()
+        # Ω.10 step-4: snapshot the echo ring + flag + timestamp under
+        # one lock so a concurrent ``_record_spoken`` cannot tear our
+        # decision between the deque read and the timestamp read.
+        with self._echo_lock:
+            if not self._spoken_echo_window:
+                return False
+            last_spoke_t = self._last_spoke_t
+            last_was_confirmation = self._last_spoken_was_confirmation
+            recent_corpus: set[str] = set()
+            for slice_words in self._spoken_echo_window:
+                recent_corpus.update(slice_words)
+        elapsed_since_speech = time.monotonic() - last_spoke_t
         try:
             from core.state_manager import AtomState
             currently_speaking = (
@@ -1204,15 +1379,9 @@ class MacOSTTSAsync:
         key = self._chunk_key(partial_text)
         if not key:
             return False
-        # Confirmation-reply exception: if ATOM's most recent speech was a
-        # short yes/no prompt (e.g. "Confirm?", "Proceed?"), Boss is now
-        # answering us — DO NOT flag his reply as an echo. We check this
-        # FIRST so even partials that fuzzy-match pass through.
-        if self._last_spoken_was_confirmation:
+        if last_was_confirmation:
             reply_norm = key.strip()
             reply_tokens = [w for w in reply_norm.split() if w]
-            # Short reply (<= 4 words) containing a yes/no/confirm marker
-            # is trusted as a user answer, not echo.
             if 0 < len(reply_tokens) <= 4:
                 reply_corpus = set(reply_tokens)
                 affirmations = {
@@ -1229,9 +1398,6 @@ class MacOSTTSAsync:
             # because such tokens do not carry user intent and we are
             # confidently talking right now.
             return True
-        recent_corpus: set[str] = set()
-        for slice_words in self._spoken_echo_window:
-            recent_corpus.update(slice_words)
         if not recent_corpus:
             return False
         hits = sum(1 for w in partial_words if w in recent_corpus)
@@ -1269,6 +1435,14 @@ class MacOSTTSAsync:
     # enough to absorb token-at-a-time bursts from a fast LLM stream.
     _STREAM_FIRST_FLUSH_DEBOUNCE_S: float = 0.06
 
+    # Sprint Ω.10 — clause-boundary pre-roll: how many words must
+    # appear *before* the comma/semicolon/dash before we'll cut the
+    # buffer there on the first flush. Below this we keep waiting for
+    # the regular sentence-end / first-3-word path so a 2-word
+    # leading clause ("Right now,") doesn't ship as one utterance and
+    # leave Boss listening to a comma-pause mid-thought.
+    _CLAUSE_PREROLL_MIN_WORDS: int = 4
+
     def _pop_next_stream_segment(self, force: bool, more_pending: bool = False) -> str:
         """Take the next speakable slice from _stream_speak_buffer.
 
@@ -1280,6 +1454,21 @@ class MacOSTTSAsync:
         items. We also apply a short time-based debounce on the very first
         flush so a token-at-a-time burst (e.g. an 8-word reply arriving as
         8 separate chunks) lands as one utterance.
+
+        Sprint Ω.10 (Apr 27 2026): added a clause-boundary pre-roll on
+        the very first flush of a stream. When the LLM emits a long
+        opener like "Right now, the weather in Mumbai is clear and 28
+        degrees", the old code waited for the trailing period to
+        flush — meaning Boss didn't hear the first sample until the
+        whole sentence had decoded. We now look for a comma /
+        semicolon / colon / em-dash boundary after at least four
+        words and flush at that boundary instead, which shaves
+        200-400 ms off first-audio latency. Multiple guards stop us
+        from chopping in the wrong place: the abbreviation guard
+        ignores periods inside ``Mr.``/``i.e.``/``e.g.``, the
+        numeric-token guard ignores commas/colons inside ``3,000``
+        and ``1:30``, and the min-word floor stops single-clause
+        leaders like "Yes, Boss" from firing the pre-roll.
         """
         buf = self._stream_speak_buffer.strip()
         if not buf:
@@ -1289,7 +1478,7 @@ class MacOSTTSAsync:
             return buf
 
         m = _RE_FIRST_SENTENCE.match(buf)
-        if m:
+        if m and not _is_abbrev_boundary(buf, m.end(1)):
             sentence = m.group(1).strip()
             self._stream_speak_buffer = buf[m.end() :].strip()
             return sentence
@@ -1301,8 +1490,10 @@ class MacOSTTSAsync:
         # punctuation, flush immediately so speech aligns with natural
         # pauses instead of arbitrary word-count boundaries.
         if n >= 2 and buf.rstrip()[-1:] in ".!?":
-            self._stream_speak_buffer = ""
-            return buf
+            tail_pos = len(buf.rstrip())
+            if not _is_abbrev_boundary(buf, tail_pos):
+                self._stream_speak_buffer = ""
+                return buf
 
         # First-flush debounce: while the very first chunk is still fresh
         # and nothing has been spoken yet, hold ANY unpunctuated flush so a
@@ -1313,6 +1504,39 @@ class MacOSTTSAsync:
             and (time.perf_counter() - self._stream_start_t)
             < self._STREAM_FIRST_FLUSH_DEBOUNCE_S
         )
+
+        # Sprint Ω.10 — clause-boundary pre-roll. Only on the very
+        # first flush of a stream (``_spoken_word_count == 0``). Cut
+        # at the first comma/semicolon/dash that has at least
+        # ``_CLAUSE_PREROLL_MIN_WORDS`` words ahead of it, isn't a
+        # numeric thousand-separator, and leaves at least one
+        # remaining word in the buffer (so we don't ship "Right
+        # now," with nothing else queued — that would just be a
+        # truncated greeting). The pre-roll bypasses the
+        # ``in_first_flush_window`` debounce only when the producer
+        # has already supplied enough words to honour the floor;
+        # otherwise we fall through to the existing fast first-audio
+        # path below.
+        if (
+            self._spoken_word_count == 0
+            and not in_first_flush_window
+            and n >= self._CLAUSE_PREROLL_MIN_WORDS
+        ):
+            clause = _RE_FIRST_CLAUSE_PREROLL.match(buf)
+            if (
+                clause is not None
+                and not _is_numeric_clause_boundary(buf, clause.end(1))
+                and not _is_abbrev_boundary(buf, clause.end(1))
+            ):
+                head = clause.group(1).strip()
+                head_words = len(head.split())
+                tail = buf[clause.end():].strip()
+                if (
+                    head_words >= self._CLAUSE_PREROLL_MIN_WORDS
+                    and tail
+                ):
+                    self._stream_speak_buffer = tail
+                    return head
 
         # Fast first-audio: flush with as few as 3 words when nothing has
         # been spoken yet so the user hears something immediately — but
@@ -2029,4 +2253,12 @@ class MacOSTTSAsync:
     async def shutdown(self) -> None:
         await self.stop()
         self._native_synth = None
+        # Ω.10 step-2: release the dedicated TTS worker. ``wait=False``
+        # so a wedged synth thread cannot block interpreter shutdown;
+        # the deadman path has already issued ``force_stop`` by the time
+        # we get here.
+        try:
+            self._tts_executor.shutdown(wait=False)
+        except Exception:
+            logger.debug("atom-tts executor shutdown raised", exc_info=True)
         logger.info("macOS TTS shut down (%s)", self._backend)

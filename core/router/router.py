@@ -474,6 +474,52 @@ class Router:
         polished = personality.polish_response(out, source="router")
         self._bus.emit_long("response_ready", text=polished, **kw)
 
+    def _arm_cognitive_silence_watchdog(self, intent: str) -> None:
+        """Speak a fallback ack if no ``response_ready`` lands within 3s.
+
+        Ω.10 step-8 — the cognitive dispatcher in
+        :mod:`core.wiring.cognitive_handlers` runs asynchronously off
+        the ``intent_classified`` event. When that handler raises
+        silently or the goal/brain subsystem returns nothing user-
+        visible, the turn produces zero TTS, which feels like ATOM
+        froze on a recognized command. This watchdog arms a 3 s timer
+        and emits a deterministic acknowledgment only if no
+        ``response_ready`` is observed first.
+        """
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        bus = self._bus
+        state = {"fired": False}
+
+        async def _on_response(**_kw: Any) -> None:
+            state["fired"] = True
+
+        bus.on("response_ready", _on_response)
+
+        async def _silence_watchdog() -> None:
+            try:
+                await asyncio.sleep(3.0)
+                if state["fired"]:
+                    return
+                logger.warning(
+                    "Cognitive intent '%s' produced no response_ready in "
+                    "3s — emitting fallback acknowledgment",
+                    intent,
+                )
+                self._emit_response("Got it, Boss. Working on that.")
+            finally:
+                try:
+                    bus.off("response_ready", _on_response)
+                except Exception:
+                    logger.debug(
+                        "cognitive silence watchdog teardown raised",
+                        exc_info=True,
+                    )
+
+        loop.create_task(_silence_watchdog())
+
     # Short, warm acks for bare wake calls. JARVIS doesn't say "Yes, Boss?"
     # every single time -- he varies between a calm acknowledgement and a
     # quiet "I'm here" so it sounds present without feeling scripted.
@@ -988,6 +1034,19 @@ class Router:
         if result.intent in _COGNITIVE_INTENTS:
             self._local_queries += 1
             self._bus.emit_fast("metrics_event", counter="local_routed_queries")
+            self._bus.emit_fast(
+                "metrics_event", counter="cognitive_routed_queries",
+            )
+            # Ω.10 step-8: cognitive intents are dispatched asynchronously
+            # via the ``intent_classified`` event emitted above (line 952)
+            # — ``core.wiring.cognitive_handlers`` produces the actual
+            # ``response_ready`` payload from the goal/brain/prediction
+            # subsystems. If that handler is unwired, raises silently, or
+            # the subsystem returns nothing user-visible, the turn would
+            # otherwise produce *zero* TTS — which feels like a freeze.
+            # Arm a 3 s silence watchdog that only fires a deterministic
+            # acknowledgment when no ``response_ready`` arrives in time.
+            self._arm_cognitive_silence_watchdog(result.intent)
             return
 
         # ── Entity tracking (conversational continuity) ──────────────

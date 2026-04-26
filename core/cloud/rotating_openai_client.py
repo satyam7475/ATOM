@@ -63,6 +63,8 @@ import functools
 import hashlib
 import json
 import logging
+import socket
+import ssl as _ssl
 import time
 import urllib.error
 import urllib.parse
@@ -959,6 +961,363 @@ class RotatingOpenAIClient:
         if slot.consecutive_failures >= self._hard_failure_threshold:
             slot.circuit_open_until = max(
                 slot.circuit_open_until, now + self._cooldown_hard_s,
+            )
+
+    # ── TLS warmer + circuit auto-recovery (Sprint Ω.10) ─────────
+
+    # Default cooldown (s) applied to a slot when the auto-recovery
+    # ping confirms the endpoint is unreachable. We push the circuit
+    # forward another window so we don't immediately flap back into a
+    # broken slot. Mirrors ``cooldown_5xx_s`` semantics.
+    _RECOVERY_COOLDOWN_S: float = 30.0
+    # How many seconds AFTER ``circuit_open_until`` we'll still treat
+    # as the "freshly-recovered" window. Used to decide whether the
+    # auto-recovery loop should fire a TLS ping on a given slot.
+    _RECOVERY_GRACE_S: float = 30.0
+
+    @staticmethod
+    def _slot_warm_skip(slot: _Slot, skip_kinds: set[str]) -> str:
+        """Return a short reason if ``slot`` should be skipped by the
+        TLS warmer, or empty string if the warmer should hit it.
+
+        Reasons are surfaced in the warmer's diagnostics so an
+        operator reading boot logs can tell why a particular slot
+        wasn't pinged (no key, Anthropic-safe skip, malformed URL).
+        """
+        if slot.provider_kind in skip_kinds:
+            return f"skip_kind={slot.provider_kind}"
+        if not slot.api_key:
+            return "no_key"
+        if not slot.base_url:
+            return "no_base_url"
+        return ""
+
+    @staticmethod
+    def _warm_tls_one(slot: _Slot, *, timeout_s: float) -> dict[str, Any]:
+        """Open a TLS connection to ``slot.base_url``'s host:port.
+
+        Sprint Ω.10 (Apr 27 2026): the goal is to pay the TCP
+        handshake + TLS negotiation cost *now* (during boot or
+        post-cooldown) so the first user-driven request to this slot
+        skips the 200-400 ms one-time penalty. We deliberately
+        DO NOT send any HTTP request — opening the TLS socket alone
+        is enough for OpenSSL to cache the session, and crucially it
+        cannot trip a billable request on any provider.
+
+        Returns a small dict with ``ok``, ``elapsed_ms``, ``reason``
+        so callers can log per-slot results without re-inspecting
+        the slot.
+        """
+        t0 = time.perf_counter()
+        try:
+            parsed = urllib.parse.urlsplit(slot.base_url)
+        except Exception as exc:
+            return {
+                "ok": False,
+                "elapsed_ms": 0.0,
+                "reason": f"parse_error:{exc!s}"[:80],
+            }
+        host = parsed.hostname or ""
+        if not host:
+            return {"ok": False, "elapsed_ms": 0.0, "reason": "no_host"}
+        port = parsed.port or (443 if parsed.scheme in ("https", "") else 80)
+        scheme_is_tls = parsed.scheme in ("", "https")
+        try:
+            sock = socket.create_connection((host, port), timeout=timeout_s)
+        except Exception as exc:
+            return {
+                "ok": False,
+                "elapsed_ms": (time.perf_counter() - t0) * 1000.0,
+                "reason": f"tcp:{type(exc).__name__}",
+            }
+        try:
+            if scheme_is_tls:
+                ctx = _ssl.create_default_context()
+                with ctx.wrap_socket(sock, server_hostname=host) as ssock:
+                    ssock.settimeout(timeout_s)
+                    return {
+                        "ok": True,
+                        "elapsed_ms": (time.perf_counter() - t0) * 1000.0,
+                        "reason": "",
+                        "tls": True,
+                    }
+            return {
+                "ok": True,
+                "elapsed_ms": (time.perf_counter() - t0) * 1000.0,
+                "reason": "",
+                "tls": False,
+            }
+        except Exception as exc:
+            return {
+                "ok": False,
+                "elapsed_ms": (time.perf_counter() - t0) * 1000.0,
+                "reason": f"tls:{type(exc).__name__}",
+            }
+        finally:
+            try:
+                sock.close()
+            except Exception:
+                logger.debug("warm_tls socket close raised", exc_info=True)
+
+    async def warm_tls(
+        self,
+        *,
+        skip_kinds: set[str] | None = None,
+        timeout_s: float = 4.0,
+    ) -> dict[str, Any]:
+        """Pre-warm TLS to every reachable cloud slot in parallel.
+
+        Sprint Ω.10 (Apr 27 2026): the live audit of ATOM's first
+        cloud reply showed a 200-400 ms one-time penalty per
+        provider on cold TLS handshakes that the user perceived as
+        "ATOM thinks for half a second on the first cloud question".
+        Calling this once at boot collapses that penalty for every
+        non-Anthropic slot. Anthropic is skipped by default because
+        Boss explicitly opted out (cost-conscious — Anthropic bills
+        per request even on a 4xx, while every other vendor in the
+        rotation returns the TLS handshake for free).
+
+        Returns a dict with a per-slot result list and aggregate
+        timing so the caller can ``logger.info`` a concise summary.
+        """
+        skip = skip_kinds if skip_kinds is not None else {_KIND_ANTHROPIC}
+        if not self._enabled or not self._slots:
+            return {"ok": True, "warmed": 0, "skipped": 0, "slots": []}
+
+        loop = asyncio.get_running_loop()
+        t_total = time.perf_counter()
+        tasks: list[asyncio.Future[dict[str, Any]]] = []
+        meta: list[tuple[_Slot, str]] = []
+        for slot in self._slots:
+            skip_reason = self._slot_warm_skip(slot, skip)
+            meta.append((slot, skip_reason))
+            if skip_reason:
+                tasks.append(loop.create_future())
+                tasks[-1].set_result({
+                    "ok": False, "elapsed_ms": 0.0, "reason": skip_reason,
+                })
+                continue
+            tasks.append(
+                loop.run_in_executor(
+                    None,
+                    functools.partial(
+                        self._warm_tls_one, slot, timeout_s=timeout_s,
+                    ),
+                ),
+            )
+
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        warmed = 0
+        skipped = 0
+        slot_payload: list[dict[str, Any]] = []
+        for (slot, skip_reason), result in zip(meta, results):
+            if isinstance(result, BaseException):
+                payload = {
+                    "ok": False,
+                    "elapsed_ms": 0.0,
+                    "reason": f"raised:{type(result).__name__}",
+                }
+            else:
+                payload = dict(result)
+            if skip_reason:
+                skipped += 1
+            elif payload.get("ok"):
+                warmed += 1
+            slot_payload.append({
+                "name": slot.name,
+                "kind": slot.provider_kind,
+                "elapsed_ms": float(payload.get("elapsed_ms", 0.0) or 0.0),
+                "ok": bool(payload.get("ok", False)),
+                "reason": str(payload.get("reason", "") or ""),
+            })
+
+        elapsed_total_ms = (time.perf_counter() - t_total) * 1000.0
+        logger.info(
+            "RotatingCloudClient: TLS warm pass — warmed=%d skipped=%d "
+            "in %.0fms (per-slot=%s)",
+            warmed,
+            skipped,
+            elapsed_total_ms,
+            ", ".join(
+                f"{p['name']}:{int(p['elapsed_ms'])}ms{'!' if not p['ok'] and not p.get('reason', '').startswith('skip_kind=') else ''}"
+                for p in slot_payload
+            ) or "<none>",
+        )
+        return {
+            "ok": True,
+            "warmed": warmed,
+            "skipped": skipped,
+            "elapsed_ms": elapsed_total_ms,
+            "slots": slot_payload,
+        }
+
+    def __init_recovery_state(self) -> None:
+        """Lazy attribute init so existing tests that monkeypatch the
+        client don't blow up on missing recovery fields."""
+        if not hasattr(self, "_recovery_task"):
+            self._recovery_task: asyncio.Task | None = None
+        if not hasattr(self, "_recovery_shutdown"):
+            self._recovery_shutdown: asyncio.Event | None = None
+        if not hasattr(self, "_recovery_last_check"):
+            self._recovery_last_check: float = 0.0
+        if not hasattr(self, "_recovery_validated_until"):
+            self._recovery_validated_until: dict[str, float] = {}
+
+    def start_circuit_auto_recovery(
+        self,
+        *,
+        interval_s: float = 30.0,
+    ) -> bool:
+        """Kick off a background loop that re-validates a slot the
+        moment its circuit cooldown expires.
+
+        Sprint Ω.10 (Apr 27 2026): without this, a slot whose
+        circuit just timed out is treated as ``warm`` immediately
+        and the very next user-driven request slams into it. If the
+        underlying issue (rate limit, regional outage, key
+        revocation) is still in effect, the user pays the failure
+        latency and the slot circuit re-opens — sometimes flapping
+        for tens of minutes. The recovery loop fires a TLS ping
+        within ``interval_s`` of cooldown expiry; on failure it
+        bumps the cooldown forward by ``_RECOVERY_COOLDOWN_S`` so
+        Boss never lands on a still-broken slot.
+
+        Idempotent: returns ``True`` on the first call after every
+        stop, ``False`` if a recovery loop is already running. The
+        loop holds NO references back into the running event loop
+        outside the task itself, so its lifecycle is bounded by
+        the caller's ``stop_circuit_auto_recovery``.
+        """
+        self.__init_recovery_state()
+        if self._recovery_task is not None and not self._recovery_task.done():
+            return False
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            logger.debug(
+                "start_circuit_auto_recovery: no running loop, skipping",
+            )
+            return False
+        self._recovery_shutdown = asyncio.Event()
+        self._recovery_task = loop.create_task(
+            self._recovery_loop(interval_s=interval_s),
+        )
+        logger.info(
+            "RotatingCloudClient: circuit auto-recovery started "
+            "(interval=%.0fs)", interval_s,
+        )
+        return True
+
+    def stop_circuit_auto_recovery(self) -> None:
+        self.__init_recovery_state()
+        evt = self._recovery_shutdown
+        if evt is not None:
+            evt.set()
+        task = self._recovery_task
+        if task is not None and not task.done():
+            task.cancel()
+        self._recovery_task = None
+        self._recovery_shutdown = None
+
+    async def _recovery_loop(self, *, interval_s: float) -> None:
+        """Body of ``start_circuit_auto_recovery``.
+
+        Wakes every ``interval_s``. For every slot whose cooldown
+        elapsed within the last ``_RECOVERY_GRACE_S`` AND has an
+        api_key AND isn't an Anthropic slot, fires a TLS ping. If
+        the ping fails, push the circuit forward by
+        ``_RECOVERY_COOLDOWN_S`` so the next user-driven request
+        doesn't slam into a still-broken endpoint.
+        """
+        self.__init_recovery_state()
+        evt = self._recovery_shutdown
+        try:
+            while True:
+                if evt is not None:
+                    try:
+                        await asyncio.wait_for(evt.wait(), timeout=interval_s)
+                        return
+                    except asyncio.TimeoutError:
+                        pass
+                else:
+                    await asyncio.sleep(interval_s)
+
+                now = time.monotonic()
+                self._recovery_last_check = now
+                candidates: list[_Slot] = []
+                for slot in self._slots:
+                    if not slot.api_key:
+                        continue
+                    if slot.provider_kind == _KIND_ANTHROPIC:
+                        continue
+                    if slot.circuit_open_until <= 0:
+                        continue
+                    if slot.circuit_open_until > now:
+                        continue
+                    elapsed = now - slot.circuit_open_until
+                    if elapsed > self._RECOVERY_GRACE_S:
+                        continue
+                    last_validated = self._recovery_validated_until.get(
+                        slot.name, 0.0,
+                    )
+                    if last_validated >= slot.circuit_open_until:
+                        continue
+                    candidates.append(slot)
+
+                if not candidates:
+                    continue
+
+                tasks: list[asyncio.Future[dict[str, Any]]] = []
+                for slot in candidates:
+                    tasks.append(
+                        asyncio.get_running_loop().run_in_executor(
+                            None,
+                            functools.partial(
+                                self._warm_tls_one, slot, timeout_s=4.0,
+                            ),
+                        ),
+                    )
+                results = await asyncio.gather(*tasks, return_exceptions=True)
+                healed = 0
+                punished = 0
+                for slot, raw in zip(candidates, results):
+                    if isinstance(raw, BaseException):
+                        ok = False
+                        reason = f"raised:{type(raw).__name__}"
+                    else:
+                        ok = bool(raw.get("ok"))
+                        reason = str(raw.get("reason", ""))
+                    if ok:
+                        self._recovery_validated_until[slot.name] = (
+                            slot.circuit_open_until or now
+                        )
+                        healed += 1
+                    else:
+                        slot.circuit_open_until = max(
+                            slot.circuit_open_until,
+                            now + self._RECOVERY_COOLDOWN_S,
+                        )
+                        slot.last_error = (
+                            f"auto_recovery:{reason}"
+                        )[:200]
+                        punished += 1
+                if healed or punished:
+                    logger.info(
+                        "RotatingCloudClient: circuit auto-recovery — "
+                        "healed=%d punished=%d (%s)",
+                        healed,
+                        punished,
+                        ", ".join(
+                            f"{s.name}:"
+                            f"{'ok' if self._recovery_validated_until.get(s.name, 0) >= s.circuit_open_until else 'fail'}"
+                            for s in candidates
+                        ),
+                    )
+        except asyncio.CancelledError:
+            return
+        except Exception:
+            logger.exception(
+                "RotatingCloudClient: auto-recovery loop crashed; restart on next start_circuit_auto_recovery()",
             )
 
     # ── diagnostics ──────────────────────────────────────────────

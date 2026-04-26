@@ -8,12 +8,24 @@ Measures (against the *running* code, no full app boot):
   5. Long-context behavior (6144 ctx target with ~1800-token prompt)
   6. Memory footprint delta (rss MB)
 
+Honest harness (Sprint Ω.10): the brain config we hand to ``MLXBrain``
+is a *deep copy* of ``settings.json["brain"]``, not a hand-stitched
+minimal dict — so ``speculative_decoding``, ``kv_bits``,
+``mx_compile_enabled``, ``role_timeouts``, persona_pin, etc. all
+flow through. We only override ``max_tokens`` for fair turn timings.
+
+Use ``--variant on|off|baseline`` to compare speculative-decoding ON
+vs OFF without touching the live ``settings.json``. ``baseline`` is
+"as-configured" (whatever the file currently says).
+
 Writes a JSON report next to itself.
 """
 
 from __future__ import annotations
 
+import argparse
 import asyncio
+import copy
 import gc
 import json
 import os
@@ -40,8 +52,28 @@ def _system_mem_pct() -> float:
 
 
 async def _main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--variant",
+        choices=("baseline", "on", "off"),
+        default="baseline",
+        help=(
+            "Speculative-decoding variant. "
+            "'baseline' = use settings.json as-is. "
+            "'on' = force single_resident=False, speculative_decoding.enabled=True. "
+            "'off' = force speculative_decoding.enabled=False (single_resident untouched)."
+        ),
+    )
+    parser.add_argument(
+        "--report-suffix",
+        default="",
+        help="Optional suffix on the report filename, e.g. '.before' or '.after'.",
+    )
+    args = parser.parse_args()
+
     report: dict = {
         "cwd": os.getcwd(),
+        "variant": args.variant,
         "system": {
             "python": sys.version.split()[0],
             "cpu_count": psutil.cpu_count(),
@@ -54,11 +86,38 @@ async def _main() -> int:
     cfg = json.loads(cfg_path.read_text())
     brain_cfg = cfg["brain"]
     mlx_path = brain_cfg.get("mlx_model")
+
+    # Honest harness: deep-copy the *full* brain config so every knob
+    # (speculative_decoding, kv_bits, mx_compile_enabled, role_timeouts,
+    # persona_pin, …) flows into MLXBrain. Then override only what we
+    # need for the audit run.
+    full_brain = copy.deepcopy(brain_cfg)
+    full_brain["max_tokens"] = 64  # cap default; per-turn overrides apply
+
+    if args.variant == "on":
+        full_brain["single_resident"] = False
+        spec = full_brain.setdefault("speculative_decoding", {})
+        spec["enabled"] = True
+    elif args.variant == "off":
+        spec = full_brain.setdefault("speculative_decoding", {})
+        spec["enabled"] = False
+
+    cfg_audit = copy.deepcopy(cfg)
+    cfg_audit["brain"] = full_brain
+
+    spec_cfg = full_brain.get("speculative_decoding", {}) or {}
     report["config"] = {
         "mlx_model": mlx_path,
-        "n_ctx": brain_cfg.get("n_ctx"),
-        "max_tokens": brain_cfg.get("max_tokens"),
-        "single_resident": brain_cfg.get("single_resident"),
+        "n_ctx": full_brain.get("n_ctx"),
+        "max_tokens": full_brain.get("max_tokens"),
+        "single_resident": full_brain.get("single_resident"),
+        "kv_bits": full_brain.get("kv_bits"),
+        "mx_compile_enabled": full_brain.get("mx_compile_enabled"),
+        "speculative_enabled": bool(spec_cfg.get("enabled")),
+        "speculative_draft": spec_cfg.get("draft_model_path"),
+        "speculative_num_draft_tokens": spec_cfg.get("num_draft_tokens"),
+        "role_timeouts": full_brain.get("role_timeouts"),
+        "mlx_ultra_model": full_brain.get("mlx_ultra_model"),
     }
 
     print("== ATOM brain audit ==")
@@ -66,17 +125,7 @@ async def _main() -> int:
 
     from brain.mlx_llm import MLXBrain
 
-    cfg_min = {
-        "brain": {
-            "mlx_model": mlx_path,
-            "single_resident": True,
-            "max_tokens": 64,
-            "temperature": 0.7,
-            "n_ctx": brain_cfg.get("n_ctx", 6144),
-        }
-    }
-
-    brain = MLXBrain(cfg_min)
+    brain = MLXBrain(cfg_audit)
 
     gc.collect()
     rss_pre = _mem_mb()
@@ -168,7 +217,48 @@ async def _main() -> int:
     report["system_ram_pct_final"] = sys_pct_final
     print(f"  final rss {rss_final:.0f}MB | system RAM {sys_pct_final:.1f}%")
 
-    out_path = ROOT / "audit_brain_report.json"
+    # Sprint Ω.10 — surface the runtime telemetry the brain accumulated
+    # over the four turns above so the audit JSON is the single source
+    # of truth (no more grepping main.py logs to validate a deploy).
+    try:
+        snap = brain.get_perf_snapshot()
+        report["perf_snapshot"] = snap
+        compile_info = snap.get("compile", {}) or {}
+        cache = snap.get("cache", {}) or {}
+        print(
+            "  perf: avg %.1f wps | avg_ms %.0f | peak %.2fGB | "
+            "cache %d/%d (%.0f%%) | compiled %.0f%% (uses %d) | "
+            "ultra=%s spec=%s"
+            % (
+                float(snap.get("avg_tok_s", 0.0) or 0.0),
+                float(snap.get("avg_ms", 0.0) or 0.0),
+                float(snap.get("peak_memory_gb", 0.0) or 0.0),
+                int(cache.get("hits", 0) or 0),
+                int(cache.get("hits", 0) or 0) + int(cache.get("misses", 0) or 0),
+                float(cache.get("hit_rate", 0.0) or 0.0) * 100.0,
+                float(compile_info.get("compiled_pct", 0.0) or 0.0),
+                int(compile_info.get("total_uses", 0) or 0),
+                "ON" if snap.get("ultra_enabled") else "OFF",
+                "ON" if snap.get("speculative_enabled") else "OFF",
+            )
+        )
+    except Exception as exc:
+        report["perf_snapshot_error"] = repr(exc)
+    try:
+        report["dual_tier_info"] = dict(brain.dual_tier_info)
+    except Exception as exc:
+        report["dual_tier_info_error"] = repr(exc)
+    try:
+        info = brain.pinned_persona_info
+        if isinstance(info, dict):
+            report["pinned_persona_info"] = info
+    except Exception as exc:
+        report["pinned_persona_info_error"] = repr(exc)
+
+    suffix = args.report_suffix.strip()
+    if suffix and not suffix.startswith("."):
+        suffix = "." + suffix
+    out_path = ROOT / f"audit_brain_report{suffix}.json"
     out_path.write_text(json.dumps(report, indent=2))
     print(f"\n  report -> {out_path}")
     return 0

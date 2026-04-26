@@ -24,7 +24,7 @@ import inspect
 import logging
 import time
 import weakref
-from collections import defaultdict
+from collections import OrderedDict, defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable, Coroutine
 
@@ -35,6 +35,15 @@ EventHandler = Callable[..., Coroutine[Any, Any, None]]
 HANDLER_TIMEOUT_S = 10.0
 SLOW_HANDLER_WARN_S = 5.0
 LONG_HANDLER_TIMEOUT_S = 60.0
+# Ω.10 step-7: ``emit_fast`` was previously timeout-less so a single
+# slow fast-handler could pin the priority worker indefinitely. 30 s is
+# generous enough that all observed fast-path flows (intent classify,
+# state transitions, partial-response speak) finish comfortably while
+# still bounding the blast radius of a hung subscriber.
+FAST_HANDLER_TIMEOUT_S = 30.0
+# LRU cap for ``_emit_counts``. Defends against unbounded growth in
+# 24h+ sessions if any code path ever emits dynamically-named events.
+_EMIT_COUNTS_MAX = 256
 
 
 # ── Sprint Ω.9 (Apr 26 2026): executor isolation ─────────────────────
@@ -119,7 +128,11 @@ class PriorityEventBus:
         self._handler_snapshot: dict[str, tuple[EventHandler, ...]] = {}
         self._loop: asyncio.AbstractEventLoop | None = None
         self._active_tasks: weakref.WeakSet[asyncio.Task] = weakref.WeakSet()
-        self._emit_counts: dict[str, int] = defaultdict(int)
+        # Ω.10 step-7: bounded LRU counter so unique event names cannot
+        # leak through the bus and grow this map without limit. Most-
+        # recently-emitted events stay; the oldest cold name is evicted
+        # on every dispatch once the cap is reached.
+        self._emit_counts: OrderedDict[str, int] = OrderedDict()
         
         self._queue: asyncio.PriorityQueue | None = None
         self._worker_task: asyncio.Task | None = None
@@ -233,7 +246,13 @@ class AsyncEventBus(PriorityEventBus):
         if not handlers:
             return
 
-        self._emit_counts[event] += 1
+        # Ω.10 step-7: bump-then-evict so the metric stays bounded even
+        # under an emit_storm of dynamically named events.
+        counts = self._emit_counts
+        counts[event] = counts.get(event, 0) + 1
+        counts.move_to_end(event)
+        if len(counts) > _EMIT_COUNTS_MAX:
+            counts.popitem(last=False)
         loop = self._get_loop()
 
         if emit_type == "fast":
@@ -350,7 +369,17 @@ class AsyncEventBus(PriorityEventBus):
         try:
             result = handler(**data)
             if asyncio.iscoroutine(result):
-                await result
+                # Ω.10 step-7: bound fast-handler latency. A wedged fast
+                # subscriber would otherwise sit on the priority worker
+                # forever; 30 s matches the new ``FAST_HANDLER_TIMEOUT_S``
+                # ceiling and is far above any healthy fast handler.
+                await asyncio.wait_for(result, timeout=FAST_HANDLER_TIMEOUT_S)
+        except asyncio.TimeoutError:
+            logger.error(
+                "Fast handler %s TIMED OUT on '%s' (>%.0fs)",
+                handler.__qualname__, event, FAST_HANDLER_TIMEOUT_S,
+            )
+            AsyncEventBus._record_handler_error(event, handler, "timeout")
         except Exception as exc:
             logger.exception("Handler %s failed on event '%s'",
                              handler.__qualname__, event)
@@ -363,7 +392,13 @@ class AsyncEventBus(PriorityEventBus):
         try:
             result = handler(**data)
             if asyncio.iscoroutine(result):
-                await result
+                await asyncio.wait_for(result, timeout=FAST_HANDLER_TIMEOUT_S)
+        except asyncio.TimeoutError:
+            logger.error(
+                "Fast handler %s TIMED OUT on '%s' (>%.0fs)",
+                handler.__qualname__, event, FAST_HANDLER_TIMEOUT_S,
+            )
+            AsyncEventBus._record_handler_error(event, handler, "timeout")
         except Exception as exc:
             logger.exception("Handler %s failed on event '%s'",
                              handler.__qualname__, event)
