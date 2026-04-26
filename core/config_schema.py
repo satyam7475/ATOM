@@ -399,7 +399,15 @@ CONFIG_SCHEMA: dict[str, Any] = {
                     "properties": {
                         "model": {
                             "type": "string",
-                            "description": "WhisperKit model identifier. Default: openai_whisper-large-v3-v20240930. The CLI will download on first use when auto_download=true.",
+                            "description": (
+                                "WhisperKit model identifier suffix (the CLI "
+                                "auto-prepends `openai_`). Default: "
+                                "whisper-large-v3-v20240930_turbo_632MB. The CLI "
+                                "downloads the model on first use and reuses the "
+                                "local cache afterwards "
+                                "(~/Documents/huggingface/models/argmaxinc/"
+                                "whisperkit-coreml/)."
+                            ),
                         },
                         "host": {
                             "type": "string",
@@ -413,7 +421,16 @@ CONFIG_SCHEMA: dict[str, Any] = {
                         },
                         "auto_download": {
                             "type": "boolean",
-                            "description": "If true, pass `--download` to `whisperkit-cli serve` so the model is fetched on first use.",
+                            "description": (
+                                "Legacy flag, no-op since whisperkit-cli 0.18.0 "
+                                "(brew, Apr 26 2026): the CLI dropped the bare "
+                                "`--download` option and now treats `--model NAME` "
+                                "as 'use cache, else download from HuggingFace "
+                                "argmaxinc/whisperkit-coreml'. The launcher in "
+                                "voice/stt_whisperkit.py::_maybe_start_serve "
+                                "ignores this flag in 0.18+. Kept in the schema "
+                                "so older config files validate."
+                            ),
                         },
                         "startup_timeout_s": {
                             "type": "number",

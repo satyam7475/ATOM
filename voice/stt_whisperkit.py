@@ -370,10 +370,19 @@ class WhisperKitSTT:
             "--port", str(self._serve_port),
             "--model", self._model,
         ]
-        if self._auto_download:
-            cmd.append("--download")
+        # Sprint Ω.6.C (Apr 26 2026): whisperkit-cli 0.18.0 dropped the
+        # bare ``--download`` flag (Argmax now treats ``--model NAME`` as
+        # implicit "download if not cached, else use cache"). Passing
+        # ``--download`` makes Swift ArgumentParser exit immediately with
+        # ``Error: Unknown option '--download'`` and the serve subprocess
+        # dies in <100 ms, leaving ATOM to wait the full
+        # ``startup_timeout_s`` before raising. ``self._auto_download``
+        # is now a no-op kept for back-compat with older config files.
         if self._model_dir:
-            cmd.extend(["--model-prefix", self._model_dir])
+            # ``--model-prefix`` only accepts the variant tag
+            # ("openai" | "distil"); a custom directory belongs in
+            # ``--download-model-path`` so the cache is rooted there.
+            cmd.extend(["--download-model-path", self._model_dir])
 
         logger.info("WhisperKit: launching `%s`", " ".join(cmd))
         try:
@@ -396,12 +405,19 @@ class WhisperKitSTT:
         #      stage 1 can fire several seconds before stage 2; hitting
         #      transcribe between the two stages returns 404. The health
         #      check closes that race.
+        # Sprint Ω.6.C (Apr 26 2026): early-death short-circuit. If the
+        # serve subprocess dies before binding (e.g. bad CLI flag, model
+        # download failure, port conflict) we capture its exit + last
+        # bytes of stdout/stderr instead of waiting the full
+        # ``startup_timeout_s``. Cuts the failure-mode latency from 60 s
+        # to <1 s and surfaces the actual error.
         import urllib.request
 
         deadline = time.monotonic() + self._serve_startup_timeout_s
         port_ok = False
         health_url = f"http://{self._serve_host}:{self._serve_port}/health"
         while time.monotonic() < deadline:
+            self._raise_if_serve_died()
             if not port_ok:
                 if _port_is_open(self._serve_host, self._serve_port):
                     port_ok = True
@@ -421,6 +437,34 @@ class WhisperKitSTT:
             f"{self._serve_startup_timeout_s:.1f}s "
             f"(port_bound={port_ok})",
         )
+
+    def _raise_if_serve_died(self) -> None:
+        proc = self._serve_proc
+        if proc is None:
+            return
+        rc = proc.poll()
+        if rc is None:
+            return
+        # Subprocess exited before we observed a healthy port. Drain
+        # whatever it printed before dying so the error is actionable.
+        tail = ""
+        if proc.stdout is not None:
+            try:
+                raw = proc.stdout.read() or b""
+            except Exception:
+                raw = b""
+            tail = raw.decode("utf-8", errors="replace").strip()
+            # Cap so we don't spam the log with megabyte tracebacks.
+            if len(tail) > 800:
+                tail = tail[:400] + " …<truncated>… " + tail[-400:]
+        msg = (
+            f"whisperkit-cli serve exited early "
+            f"(returncode={rc}, host={self._serve_host}:"
+            f"{self._serve_port})"
+        )
+        if tail:
+            msg = f"{msg}: {tail}"
+        raise RuntimeError(msg)
 
     def _stop_serve(self) -> None:
         proc = self._serve_proc
