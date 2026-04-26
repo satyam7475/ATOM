@@ -16,8 +16,6 @@ import json
 import logging
 import os
 import secrets
-import subprocess
-import sys
 import time
 import webbrowser
 from pathlib import Path
@@ -142,25 +140,16 @@ class WebDashboard:
         logger.info("Web dashboard running at %s", url)
 
         if self._auto_open:
+            # Sprint P4.7 (Apr 26 2026): macOS-only product, so the
+            # cross-platform branching collapsed to webbrowser.open
+            # which already calls /usr/bin/open under the hood on
+            # Darwin and falls through to xdg-open on Linux/CI.
             opened = False
-            if sys.platform == "win32":
-                try:
-                    subprocess.Popen(
-                        ["cmd", "/c", "start", "", url],
-                        shell=False,
-                        stdout=subprocess.DEVNULL,
-                        stderr=subprocess.DEVNULL,
-                        stdin=subprocess.DEVNULL,
-                    )
-                    opened = True
-                except OSError as e:
-                    logger.warning("Could not launch default browser via cmd /c start: %s", e)
-            if not opened:
-                try:
-                    webbrowser.open(url)
-                    opened = True
-                except Exception as e:
-                    logger.warning("webbrowser.open failed: %s", e)
+            try:
+                webbrowser.open(url)
+                opened = True
+            except Exception as e:
+                logger.warning("webbrowser.open failed: %s", e)
             if not opened:
                 logger.warning(
                     "Browser did not open automatically. In Cursor: "

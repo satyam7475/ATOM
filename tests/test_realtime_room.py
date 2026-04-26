@@ -14,6 +14,7 @@ import pytest
 
 from core.realtime.atom_room import (
     AtomRoom,
+    AtomRoomServer,
     Frame,
     FrameKind,
     RoomConfig,
@@ -118,6 +119,14 @@ async def test_room_dispatches_data_handlers() -> None:
 
     await room.dispatch_data(p, "chat.message", {"text": "hi"})
     assert seen == [("Boss", "chat.message", {"text": "hi"})]
+
+
+async def test_room_server_requires_token_for_non_loopback_bind() -> None:
+    room = AtomRoom(RoomConfig(name="t", auth_token=None))
+    server = AtomRoomServer(room, host="0.0.0.0", port=0)
+
+    with pytest.raises(RuntimeError, match="auth_token"):
+        await server.start()
 
 
 async def test_room_records_track_on_first_frame() -> None:

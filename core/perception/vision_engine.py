@@ -183,7 +183,11 @@ class VisionEngine:
             return "pyobjc-framework-Vision not importable"
         cams = camera_capture.list_cameras()
         if not cams:
-            return "no cameras visible (try unlocking iPhone for Continuity Camera)"
+            return (
+                "no cameras visible — check System Settings → Privacy & "
+                "Security → Camera and confirm ATOM (or your terminal) is "
+                "allowed to access the built-in MacBook camera"
+            )
         return ""
 
     def attach_captioner(self, captioner: Any) -> None:

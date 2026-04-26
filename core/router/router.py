@@ -1357,7 +1357,7 @@ class Router:
         "whats_on_my_plate",
         # AVCaptureSession + Vision typically takes 0.5-2.5s; running
         # in the executor keeps the event loop responsive while the
-        # camera warms up (esp. Continuity Camera first call).
+        # built-in MacBook camera (FaceTime HD) warms up.
         "vision_look",
         # Adds VLM inference on top of vision_look — first call also
         # pays ~150-400ms VLM first-token latency. Always async.
@@ -1621,10 +1621,10 @@ class Router:
     def _do_vision_look(self, _action: str, args: dict) -> str:
         """On-demand camera glance ("what do you see, ATOM?").
 
-        Captures one frame from the preferred camera (built-in webcam
-        or Continuity Camera = iPhone), runs Apple Vision face/object
-        detection on the Neural Engine, and returns a short, spoken-
-        friendly summary.  No LLM/VLM is loaded by this path.
+        Captures one frame from the built-in MacBook camera (FaceTime
+        HD), runs Apple Vision face/object detection on the Neural
+        Engine, and returns a short, spoken-friendly summary. No
+        LLM/VLM is loaded by this path.
 
         Falls back to a friendly sentence whenever the engine is
         unavailable so the LLM observation stays clean.

@@ -326,12 +326,21 @@ class SceneContextEngine:
                 return chooser()
             except Exception:
                 logger.exception("camera_chooser failed")
+        # Mirror :class:`PresenceSampler._select_camera` -- accept
+        # either ``list_cameras`` (canonical) or ``discover_cameras``
+        # (legacy alias) so a stub harness doesn't silently break the
+        # scene-context capture path.
+        discover = getattr(cap_module, "list_cameras", None)
+        if discover is None:
+            discover = getattr(cap_module, "discover_cameras", None)
+        if discover is None:
+            return None
         try:
-            cams = cap_module.discover_cameras()
+            cams = discover()
         except Exception:
             return None
         try:
-            return cap_module.choose_preferred(cams, preferred="auto")
+            return cap_module.choose_preferred(cams, preferred="builtin")
         except Exception:
             return None
 

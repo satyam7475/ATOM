@@ -35,9 +35,11 @@ class PersistentEmbeddingCache:
         path: str = "data/rag_embedding_cache.sqlite",
         *,
         namespace: str = "default",
+        allow_bucket_fallback: bool = False,
     ) -> None:
         self._path = Path(path)
         self._namespace = namespace or "default"
+        self._allow_bucket_fallback = allow_bucket_fallback
         self._path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.Lock()
         self._conn: sqlite3.Connection | None = None
@@ -89,21 +91,28 @@ class PersistentEmbeddingCache:
         with self._lock:
             try:
                 cur = self._get_conn().execute(
-                    "SELECT vec FROM embeddings WHERE qkey = ? AND namespace = ?",
+                    "SELECT vec, dim FROM embeddings WHERE qkey = ? AND namespace = ?",
                     (k, self._namespace),
                 )
                 row = cur.fetchone()
                 if row:
-                    return json.loads(row[0])
+                    vec = json.loads(row[0])
+                    if row[1] and len(vec) != int(row[1]):
+                        return None
+                    return vec
             except Exception:
                 logger.debug("disk embed get failed", exc_info=True)
-        # Similar bucket fallback
+        if not self._allow_bucket_fallback:
+            return None
+
+        # Similar bucket fallback is opt-in only. It can trade correctness
+        # for speed by reusing a vector from a token-bucket neighbor.
         b = similar_bucket_key(query)
         with self._lock:
             try:
                 cur = self._get_conn().execute(
                     """
-                    SELECT vec FROM embeddings
+                    SELECT vec, dim FROM embeddings
                     WHERE bucket = ? AND namespace = ?
                     ORDER BY updated DESC LIMIT 1
                     """,
@@ -111,7 +120,10 @@ class PersistentEmbeddingCache:
                 )
                 row = cur.fetchone()
                 if row:
-                    return json.loads(row[0])
+                    vec = json.loads(row[0])
+                    if row[1] and len(vec) != int(row[1]):
+                        return None
+                    return vec
             except Exception:
                 logger.debug('Hash digest step failed', exc_info=True)
         return None

@@ -78,6 +78,47 @@ def get_foreground_window_title() -> str:
     return str(get_foreground_window_info().get("window_title") or "")
 
 
+def quartz_window_titles(*, max_count: int = 64) -> list[str]:
+    """Return a list of all on-screen window titles via Quartz.
+
+    Sprint P4.7 (Apr 26 2026): macOS-native replacement for the
+    Win32 ``EnumWindows`` path that used to live in
+    :py:mod:`core.process_manager`. Empty / system / dock titles
+    are filtered out so the output is voice-friendly.
+
+    Returns ``[]`` if Quartz is unavailable (e.g. headless CI box,
+    Linux dev container).
+    """
+    titles: list[str] = []
+    try:
+        import Quartz
+    except Exception:
+        logger.debug("Quartz unavailable for window enumeration", exc_info=True)
+        return titles
+
+    try:
+        opt = (
+            Quartz.kCGWindowListOptionOnScreenOnly
+            | Quartz.kCGWindowListExcludeDesktopElements
+        )
+        windows: Any = Quartz.CGWindowListCopyWindowInfo(opt, Quartz.kCGNullWindowID)
+        seen: set[str] = set()
+        for w in windows:
+            d = dict(w)
+            if int(d.get("kCGWindowLayer", 0)) != 0:
+                continue
+            name = str(d.get("kCGWindowName") or "").strip()
+            if not name or name in seen:
+                continue
+            seen.add(name)
+            titles.append(name[:120])
+            if len(titles) >= max_count:
+                break
+    except Exception:
+        logger.debug("Quartz window enumeration failed", exc_info=True)
+    return titles
+
+
 def classify_activity(
     app_name: str,
     window_title: str,

@@ -1,14 +1,16 @@
-"""
-ATOM -- Media Watcher (Real-Time Media Awareness).
+"""ATOM -- Media Watcher (Real-Time Media Awareness, macOS-native).
 
-macOS native: queries Now Playing info via AppleScript for known apps
-(Music, Spotify) and a generic system-level media query. Zero external
+Queries Now Playing info via AppleScript for known apps (Music,
+Spotify) and a generic system-level media query. Zero external
 dependencies — uses osascript which ships with every Mac.
-
-On Windows: falls back to winsdk (legacy path, unchanged).
 
 This allows ATOM to know what song/video is playing so you can
 ask "Do you like this song?" without specifying the title.
+
+Sprint P4.7 (Apr 26 2026): the legacy Windows ``winsdk`` path was
+removed (ATOM is macOS-only on Apple Silicon). On non-Darwin platforms
+the watcher returns an empty :py:class:`MediaInfo` indefinitely so
+the surrounding voice stack degrades gracefully without crashing.
 
 Owner: Satyam
 """
@@ -191,7 +193,11 @@ def _poll_macos() -> MediaInfo:
 
 
 class MediaWatcher:
-    """Tracks currently playing media. macOS native on darwin, winsdk on Windows."""
+    """Tracks currently playing media. macOS-native via AppleScript.
+
+    On non-macOS platforms the watcher idles silently (returning an
+    empty :py:class:`MediaInfo`) so callers see a consistent shape.
+    """
 
     __slots__ = ("_current_media", "_running", "_task")
 
@@ -203,7 +209,10 @@ class MediaWatcher:
     def start(self) -> None:
         self._running = True
         self._task = asyncio.create_task(self._watch_loop())
-        logger.info("Media Watcher started (%s)", "macOS native" if _IS_MACOS else "winsdk")
+        logger.info(
+            "Media Watcher started (%s)",
+            "macOS native" if _IS_MACOS else "no-op (non-macOS)",
+        )
 
     def stop(self) -> None:
         self._running = False
@@ -219,7 +228,9 @@ class MediaWatcher:
         if _IS_MACOS:
             await self._watch_macos()
         else:
-            await self._watch_windows()
+            # Non-macOS: stay alive so ``stop()`` works, but don't poll.
+            while self._running:
+                await asyncio.sleep(60)
 
     async def _watch_macos(self) -> None:
         """Poll macOS media sources via AppleScript every 3 seconds."""
@@ -233,48 +244,6 @@ class MediaWatcher:
             except Exception as exc:
                 logger.debug("Media watcher error: %s", exc)
             await asyncio.sleep(3)
-
-    async def _watch_windows(self) -> None:
-        """Legacy Windows path via winsdk."""
-        try:
-            from winsdk.windows.media.control import (
-                GlobalSystemMediaTransportControlsSessionManager,
-            )
-        except ImportError:
-            logger.error(
-                "winsdk not installed. Media awareness disabled. "
-                "Run: pip install winsdk"
-            )
-            return
-
-        while self._running:
-            try:
-                manager = await GlobalSystemMediaTransportControlsSessionManager.request_async()
-                if not manager:
-                    await asyncio.sleep(5)
-                    continue
-                session = manager.get_current_session()
-                if session is None:
-                    self._current_media = MediaInfo()
-                    await asyncio.sleep(2)
-                    continue
-                playback_info = session.get_playback_info()
-                is_playing = playback_info and playback_info.playback_status == 4
-                properties = await session.try_get_media_properties_async()
-                if properties:
-                    self._current_media = MediaInfo(
-                        title=properties.title or "",
-                        artist=properties.artist or "",
-                        app_name=session.source_app_user_model_id or "",
-                        is_playing=is_playing,
-                    )
-                else:
-                    self._current_media = MediaInfo(is_playing=is_playing)
-            except asyncio.CancelledError:
-                break
-            except Exception as exc:
-                logger.debug("Media watcher error: %s", exc)
-            await asyncio.sleep(2)
 
 
 media_watcher = MediaWatcher()

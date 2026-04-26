@@ -58,8 +58,11 @@ class SystemControl:
     """
 
     def __init__(self, config: dict | None = None) -> None:
+        # Sprint P4.7 (Apr 26 2026): ATOM is macOS-only on Apple Silicon.
+        # The Windows ``_is_windows`` branch was removed; ``_is_linux``
+        # stays defensive for headless dev/CI boxes that import this
+        # module (e.g. linters in containers) so they don't crash.
         self._config = config or {}
-        self._is_windows = sys.platform.startswith("win")
         self._is_linux = sys.platform.startswith("linux")
         self._is_macos = sys.platform == "darwin"
         self._applescript = AppleScriptEngine() if self._is_macos else None
@@ -72,21 +75,18 @@ class SystemControl:
         try:
             proc = psutil.Process(pid)
             priority_map = {
-                "low": psutil.IDLE_PRIORITY_CLASS if self._is_windows else 19,
-                "below_normal": psutil.BELOW_NORMAL_PRIORITY_CLASS if self._is_windows else 10,
-                "normal": psutil.NORMAL_PRIORITY_CLASS if self._is_windows else 0,
-                "above_normal": psutil.ABOVE_NORMAL_PRIORITY_CLASS if self._is_windows else -5,
-                "high": psutil.HIGH_PRIORITY_CLASS if self._is_windows else -10,
-                "realtime": psutil.REALTIME_PRIORITY_CLASS if self._is_windows else -20,
+                "low": 19,
+                "below_normal": 10,
+                "normal": 0,
+                "above_normal": -5,
+                "high": -10,
+                "realtime": -20,
             }
             nice = priority_map.get(priority)
             if nice is None:
                 return SystemControlResult(False, f"Unknown priority: {priority}")
 
-            if self._is_windows:
-                proc.nice(nice)
-            else:
-                proc.nice(nice)
+            proc.nice(nice)
 
             return SystemControlResult(True, f"Process {proc.name()} (PID {pid}) priority set to {priority}")
         except Exception as e:
@@ -167,12 +167,7 @@ class SystemControl:
     def flush_dns(self) -> SystemControlResult:
         """Flush DNS cache."""
         try:
-            if self._is_windows:
-                result = subprocess.run(
-                    ["ipconfig", "/flushdns"],
-                    capture_output=True, text=True, timeout=10,
-                )
-            elif self._is_linux:
+            if self._is_linux:
                 result = subprocess.run(
                     ["systemd-resolve", "--flush-caches"],
                     capture_output=True, text=True, timeout=10,
@@ -236,32 +231,10 @@ class SystemControl:
     def get_wifi_networks(self) -> SystemControlResult:
         """Scan for available WiFi networks."""
         try:
-            if self._is_windows:
-                result = subprocess.run(
-                    ["netsh", "wlan", "show", "networks", "mode=Bssid"],
-                    capture_output=True, text=True, timeout=15,
-                )
-                networks = []
-                current: dict[str, str] = {}
-                for line in result.stdout.split("\n"):
-                    line = line.strip()
-                    if line.startswith("SSID") and ":" in line:
-                        if current:
-                            networks.append(current)
-                        current = {"ssid": line.split(":", 1)[1].strip()}
-                    elif line.startswith("Signal") and ":" in line:
-                        current["signal"] = line.split(":", 1)[1].strip()
-                    elif line.startswith("Authentication") and ":" in line:
-                        current["auth"] = line.split(":", 1)[1].strip()
-                if current:
-                    networks.append(current)
-                return SystemControlResult(True, f"{len(networks)} WiFi networks found",
-                                            {"networks": networks})
-
-            elif self._is_macos:
+            if self._is_macos:
                 return self._wifi_scan_macos()
 
-            elif self._is_linux:
+            if self._is_linux:
                 result = subprocess.run(
                     ["nmcli", "-t", "-f", "SSID,SIGNAL,SECURITY", "dev", "wifi"],
                     capture_output=True, text=True, timeout=15,
@@ -327,13 +300,7 @@ class SystemControl:
         categories: dict[str, int] = {}
 
         temp_dirs = []
-        if self._is_windows:
-            temp_dirs = [
-                Path(os.environ.get("TEMP", "")),
-                Path(os.environ.get("TMP", "")),
-                Path.home() / "AppData" / "Local" / "Temp",
-            ]
-        elif self._is_macos:
+        if self._is_macos:
             temp_dirs = [
                 Path("/tmp"), Path("/var/tmp"),
                 Path.home() / "Library" / "Caches",
@@ -409,46 +376,7 @@ class SystemControl:
         """List programs that run at startup."""
         programs = []
 
-        if self._is_windows:
-            try:
-                import winreg
-                startup_keys = [
-                    (winreg.HKEY_CURRENT_USER,
-                     r"Software\Microsoft\Windows\CurrentVersion\Run"),
-                    (winreg.HKEY_LOCAL_MACHINE,
-                     r"Software\Microsoft\Windows\CurrentVersion\Run"),
-                ]
-                for hive, path in startup_keys:
-                    try:
-                        key = winreg.OpenKey(hive, path)
-                        i = 0
-                        while True:
-                            try:
-                                name, value, _ = winreg.EnumValue(key, i)
-                                programs.append({
-                                    "name": name,
-                                    "command": value[:200],
-                                    "scope": "user" if hive == winreg.HKEY_CURRENT_USER else "system",
-                                })
-                                i += 1
-                            except OSError:
-                                break
-                        winreg.CloseKey(key)
-                    except FileNotFoundError:
-                        pass
-            except Exception:
-                logger.debug('core system control optional step failed', exc_info=True)
-
-            startup_folder = Path.home() / "AppData" / "Roaming" / "Microsoft" / "Windows" / "Start Menu" / "Programs" / "Startup"
-            if startup_folder.exists():
-                for item in startup_folder.iterdir():
-                    programs.append({
-                        "name": item.stem,
-                        "command": str(item),
-                        "scope": "startup_folder",
-                    })
-
-        elif self._is_macos:
+        if self._is_macos:
             agent_dirs = [
                 (Path.home() / "Library" / "LaunchAgents", "user"),
                 (Path("/Library/LaunchAgents"), "global"),
@@ -513,12 +441,9 @@ class SystemControl:
 
                     if cpu > 40 and mem_mb > 500:
                         try:
-                            if self._is_windows:
-                                proc.nice(psutil.BELOW_NORMAL_PRIORITY_CLASS)
-                            else:
-                                proc.nice(10)
+                            proc.nice(10)
                             optimizations.append(
-                                f"Lowered priority of {name} (CPU: {cpu:.0f}%, RAM: {mem_mb:.0f}MB)"
+                                f"Lowered priority of {name} (CPU: {cpu:.0f}%, RAM: {mem_mb:.0f}MB)",
                             )
                         except (psutil.AccessDenied, psutil.NoSuchProcess):
                             pass
@@ -632,35 +557,13 @@ class SystemControl:
         return SystemControlResult(True, f"{len(safe_env)} environment variables",
                                     {"variables": safe_env})
 
-    # ── Power Plans (Windows) ─────────────────────────────────────
+    # ── Power Plans (macOS via pmset) ─────────────────────────────
 
     def set_power_plan(self, plan: str = "balanced") -> SystemControlResult:
-        """Set power plan. Windows: balanced/high_performance/power_saver. macOS: low_power/auto."""
+        """Set power plan. macOS only: low_power, balanced, auto, high_performance."""
         if self._is_macos:
             return self._set_power_plan_macos(plan)
-
-        if not self._is_windows:
-            return SystemControlResult(False, "Power plans not supported on this platform")
-
-        plan_guids = {
-            "balanced": "381b4222-f694-41f0-9685-ff5bb260df2e",
-            "high_performance": "8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c",
-            "power_saver": "a1841308-3541-4fab-bc81-f71556f20b4a",
-        }
-        guid = plan_guids.get(plan)
-        if not guid:
-            return SystemControlResult(False, f"Unknown power plan: {plan}")
-
-        try:
-            result = subprocess.run(
-                ["powercfg", "/setactive", guid],
-                capture_output=True, text=True, timeout=10,
-            )
-            if result.returncode == 0:
-                return SystemControlResult(True, f"Power plan set to {plan}")
-            return SystemControlResult(False, f"Failed: {result.stderr}")
-        except Exception as e:
-            return SystemControlResult(False, f"Power plan change failed: {e}")
+        return SystemControlResult(False, "Power plans not supported on this platform")
 
     def _set_power_plan_macos(self, plan: str) -> SystemControlResult:
         """macOS power management via pmset. Maps plan names to Low Power Mode toggle."""
@@ -820,7 +723,9 @@ class SystemControl:
 
         if gpu.get("name") and "No dedicated" not in gpu["name"]:
             mem_label = "Unified Memory" if self._is_macos else "VRAM"
-            parts.append(f"GPU: {gpu['name']} with {gpu.get('vram_gb', 0):.0f} gigs {mem_label}.")
+            parts.append(
+                f"GPU: {gpu['name']} with {gpu.get('vram_gb', 0):.0f} gigs {mem_label}.",
+            )
 
         if uptime.success:
             parts.append(f"Uptime: {uptime.data.get('uptime_human', 'unknown')}.")

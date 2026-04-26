@@ -444,3 +444,261 @@ def test_real_settings_json_has_cross_device_block() -> None:
     assert int(cd.get("bridge_port", 0)) >= 1024
     assert cd.get("bridge_port") != cfg.get("ui", {}).get("web_port"), \
         "bridge port must not clash with ui.web_port"
+
+
+# ────────────────────────────────────────────
+# Sprint P4.4 (Apr 26 2026): OpenAI-compat /v1/* shim
+# ────────────────────────────────────────────
+
+async def _fake_chat_stream_factory(text_chunks: list[str]):
+    """Return an async generator that yields the supplied chunks then closes."""
+    async def _gen(messages, **kwargs):
+        for chunk in text_chunks:
+            await __import__("asyncio").sleep(0)
+            yield chunk, False
+        yield "", True
+    return _gen
+
+
+@pytest.mark.asyncio
+async def test_v1_models_requires_auth_and_returns_atom_local(
+    atom_root, fake_emit,
+) -> None:
+    import aiohttp
+    cfg = _bridge_config(atom_root)
+    chat_stream = await _fake_chat_stream_factory(["hi"])
+    b = IPhoneBridge(
+        config=cfg,
+        emit=fake_emit,
+        atom_root=atom_root,
+        chat_stream=chat_stream,
+    )
+    started = await b.start()
+    assert started
+    try:
+        async with aiohttp.ClientSession() as s:
+            async with s.get(f"http://127.0.0.1:{b.actual_port}/v1/models") as r:
+                assert r.status == 401
+            async with s.get(
+                f"http://127.0.0.1:{b.actual_port}/v1/models",
+                headers={"X-ATOM-Token": b.token},
+            ) as r:
+                assert r.status == 200
+                body = await r.json()
+                assert body["object"] == "list"
+                assert any(
+                    m.get("id") == "atom-local" for m in body["data"]
+                ), body
+            async with s.get(
+                f"http://127.0.0.1:{b.actual_port}/v1/models",
+                headers={"Authorization": f"Bearer {b.token}"},
+            ) as r:
+                assert r.status == 200, "Bearer auth must work for Enchanted"
+    finally:
+        await b.stop()
+
+
+@pytest.mark.asyncio
+async def test_v1_chat_completions_non_stream(atom_root, fake_emit) -> None:
+    import aiohttp
+    cfg = _bridge_config(atom_root)
+    chat_stream = await _fake_chat_stream_factory(
+        ["Hi ", "Boss", "."]
+    )
+    b = IPhoneBridge(
+        config=cfg,
+        emit=fake_emit,
+        atom_root=atom_root,
+        chat_stream=chat_stream,
+    )
+    await b.start()
+    try:
+        async with aiohttp.ClientSession() as s:
+            payload = {
+                "model": "atom-local",
+                "messages": [{"role": "user", "content": "hello"}],
+                "stream": False,
+            }
+            async with s.post(
+                f"http://127.0.0.1:{b.actual_port}/v1/chat/completions",
+                headers={"X-ATOM-Token": b.token},
+                json=payload,
+            ) as r:
+                assert r.status == 200
+                body = await r.json()
+                assert body["object"] == "chat.completion"
+                assert body["choices"][0]["message"]["content"] == (
+                    "Hi Boss."
+                )
+                assert body["choices"][0]["finish_reason"] == "stop"
+    finally:
+        await b.stop()
+
+
+@pytest.mark.asyncio
+async def test_v1_chat_completions_stream_terminates_with_done(
+    atom_root, fake_emit,
+) -> None:
+    import aiohttp
+    cfg = _bridge_config(atom_root)
+    chat_stream = await _fake_chat_stream_factory(
+        ["Hello", " ", "Boss"]
+    )
+    b = IPhoneBridge(
+        config=cfg,
+        emit=fake_emit,
+        atom_root=atom_root,
+        chat_stream=chat_stream,
+    )
+    await b.start()
+    try:
+        async with aiohttp.ClientSession() as s:
+            payload = {
+                "model": "atom-local",
+                "messages": [{"role": "user", "content": "hello"}],
+                "stream": True,
+            }
+            async with s.post(
+                f"http://127.0.0.1:{b.actual_port}/v1/chat/completions",
+                headers={"X-ATOM-Token": b.token},
+                json=payload,
+            ) as r:
+                assert r.status == 200
+                assert r.headers.get("Content-Type", "").startswith(
+                    "text/event-stream"
+                )
+                body = await r.text()
+        # SSE frames + a [DONE] terminator.
+        assert "data: [DONE]" in body
+        # We expect at least one delta with content="Hello".
+        assert "Hello" in body
+        # The framing uses "data: " prefix on every JSON chunk.
+        assert "\"object\": \"chat.completion.chunk\"" in body
+    finally:
+        await b.stop()
+
+
+@pytest.mark.asyncio
+async def test_v1_chat_completions_no_handler_returns_503(
+    atom_root, fake_emit,
+) -> None:
+    import aiohttp
+    cfg = _bridge_config(atom_root)
+    # No chat_stream provided -> /v1/chat/completions must NOT register.
+    b = IPhoneBridge(config=cfg, emit=fake_emit, atom_root=atom_root)
+    await b.start()
+    try:
+        async with aiohttp.ClientSession() as s:
+            payload = {"messages": [{"role": "user", "content": "x"}]}
+            async with s.post(
+                f"http://127.0.0.1:{b.actual_port}/v1/chat/completions",
+                headers={"X-ATOM-Token": b.token},
+                json=payload,
+            ) as r:
+                # Without a handler the route is not registered -> 404.
+                assert r.status in (404, 503), (
+                    f"expected 404 or 503 without handler, got {r.status}"
+                )
+    finally:
+        await b.stop()
+
+
+# ────────────────────────────────────────────
+# Sprint P4.6 (Apr 26 2026): /badge unified status surface
+# ────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_badge_no_provider_returns_unknown(atom_root, fake_emit) -> None:
+    """``/badge`` is always registered. Without a status_provider it
+    must return a stable shape (level=unknown), never 404 -- so menubar
+    pollers that start before ATOM finishes wiring don't see a route
+    flip-flop."""
+    import aiohttp
+    cfg = _bridge_config(atom_root)
+    b = IPhoneBridge(config=cfg, emit=fake_emit, atom_root=atom_root)
+    await b.start()
+    try:
+        async with aiohttp.ClientSession() as s:
+            async with s.get(f"http://127.0.0.1:{b.actual_port}/badge") as r:
+                assert r.status == 200
+                body = await r.json()
+                assert "level" in body and "text" in body and "color" in body
+                assert body["level"] == "unknown"
+    finally:
+        await b.stop()
+
+
+@pytest.mark.asyncio
+async def test_badge_uses_provider_after_late_wiring(
+    atom_root, fake_emit,
+) -> None:
+    """Wire a status_provider AFTER ``start()`` -- mirrors how main.py
+    attaches the HealthSnapshotBuilder rollup once subsystems finish
+    coming online -- and confirm /badge picks it up live without
+    needing a restart."""
+    import aiohttp
+    cfg = _bridge_config(atom_root)
+    b = IPhoneBridge(config=cfg, emit=fake_emit, atom_root=atom_root)
+    await b.start()
+
+    state = {
+        "ok": False,
+        "status": "warn",
+        "uptime_s": 12.5,
+        "subsystems": {"stt": {"status": "degraded"}, "bus": {"status": "ok"}},
+        "badge": {
+            "ok": False,
+            "level": "warn",
+            "color": "amber",
+            "text": "ATOM has 1 warning",
+            "headline": "stt: degraded",
+            "warnings": [{"name": "stt", "status": "degraded"}],
+            "criticals": [],
+            "subsystems_total": 2,
+            "uptime_s": 12.5,
+        },
+    }
+
+    def _provider() -> dict:
+        return state
+
+    b._status_provider = _provider
+    try:
+        async with aiohttp.ClientSession() as s:
+            async with s.get(f"http://127.0.0.1:{b.actual_port}/badge") as r:
+                assert r.status == 200
+                body = await r.json()
+                assert body["level"] == "warn"
+                assert body["text"] == "ATOM has 1 warning"
+                assert body["headline"] == "stt: degraded"
+                assert body["subsystems_total"] == 2
+    finally:
+        await b.stop()
+
+
+@pytest.mark.asyncio
+async def test_badge_provider_exception_renders_unknown(
+    atom_root, fake_emit,
+) -> None:
+    """If the wired provider blows up mid-poll, the bridge must still
+    return a 200 with level=unknown so the menubar app degrades
+    gracefully instead of showing a transient 500 every 5 seconds."""
+    import aiohttp
+    cfg = _bridge_config(atom_root)
+    b = IPhoneBridge(config=cfg, emit=fake_emit, atom_root=atom_root)
+    await b.start()
+
+    def _bad_provider() -> dict:
+        raise RuntimeError("snapshot crashed mid-collect")
+
+    b._status_provider = _bad_provider
+    try:
+        async with aiohttp.ClientSession() as s:
+            async with s.get(f"http://127.0.0.1:{b.actual_port}/badge") as r:
+                assert r.status == 200
+                body = await r.json()
+                assert body["level"] == "unknown"
+                assert "ATOM" in body["text"]
+    finally:
+        await b.stop()

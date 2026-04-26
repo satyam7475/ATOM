@@ -53,8 +53,9 @@ import asyncio
 import json
 import logging
 import time
+import uuid
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Optional
+from typing import Any, AsyncIterator, Awaitable, Callable, Optional
 
 from core.cross_device.bridge_auth import (
     AuthAuditLog,
@@ -70,14 +71,29 @@ _DEFAULT_PORT = 8787
 _PORT_FALLBACK_COUNT = 3
 _AUTH_HEADER = "X-ATOM-Token"
 _MAX_BODY_BYTES = 16 * 1024
+_OPENAI_BODY_BYTES = 1024 * 1024  # 1 MiB; chat history can be long
 _PRESENCE_STATES = frozenset({"at_desk", "leaving", "home", "away", "busy"})
 _TRIGGER_NAME_MAX = 64
 _RATE_WINDOW_S = 1.0
+_OPENAI_RATE_WINDOW_S = 0.5  # gentler limit for chat (long-running)
+_OPENAI_DEFAULT_MAX_TOKENS = 512
 
 
 EmitFn = Callable[..., None]
 """Shape of the event-bus emit. We accept any callable so tests can
 inject a capturing fake without pulling the real bus in."""
+
+
+# Sprint P4.4 (Apr 26 2026): OpenAI-compatible chat handler contract.
+# The handler takes a list of OpenAI-style messages and yields text
+# chunks. A final empty string with done=True closes the stream. We
+# keep the contract dependency-free so the bridge module never has to
+# import the brain.
+ChatStreamFn = Callable[
+    [list[dict[str, str]]],
+    AsyncIterator[tuple[str, bool]],
+]
+"""Async iterator yielding ``(token_text, is_done)`` pairs."""
 
 
 class IPhoneBridge:
@@ -102,6 +118,11 @@ class IPhoneBridge:
         "_site",
         "_rate_last_accept",
         "_started",
+        "_chat_stream",
+        "_openai_model_id",
+        "_openai_default_max_tokens",
+        "_openai_enabled",
+        "_status_provider",
     )
 
     def __init__(
@@ -110,6 +131,8 @@ class IPhoneBridge:
         config: dict[str, Any] | None = None,
         emit: Optional[EmitFn] = None,
         atom_root: str | Path | None = None,
+        chat_stream: ChatStreamFn | None = None,
+        status_provider: Callable[[], dict[str, Any]] | None = None,
     ) -> None:
         cfg = dict((config or {}).get("cross_device") or {})
         self._config = cfg
@@ -148,6 +171,30 @@ class IPhoneBridge:
         self._rate_last_accept: dict[tuple[str, str], float] = {}
         self._started = False
 
+        # Sprint P4.4 (Apr 26 2026): OpenAI-compat /v1/* shim. When a
+        # chat-stream callable is provided, GET /v1/models and
+        # POST /v1/chat/completions are exposed so the iPhone Enchanted
+        # app (and any other openai-compatible client over Tailscale)
+        # can talk to ATOM's local brain. Without a handler the routes
+        # are unregistered -- callers see 404, not 500.
+        self._chat_stream = chat_stream
+
+        # Sprint P4.6 (Apr 26 2026): unified status badge surface. When
+        # set, GET /badge returns the same rollup the dashboard menubar
+        # uses. No auth (the badge has no PII; same posture as /health).
+        self._status_provider = status_provider
+        openai_cfg = dict(cfg.get("openai_compat") or {})
+        self._openai_enabled = bool(openai_cfg.get("enabled", True)) and (
+            chat_stream is not None
+        )
+        self._openai_model_id = str(
+            openai_cfg.get("model_id") or "atom-local",
+        )
+        self._openai_default_max_tokens = int(
+            openai_cfg.get("default_max_tokens")
+            or _OPENAI_DEFAULT_MAX_TOKENS,
+        )
+
     @property
     def token(self) -> str:
         return self._token
@@ -179,11 +226,34 @@ class IPhoneBridge:
             logger.critical("aiohttp missing; iPhone bridge cannot start")
             return False
 
-        app = web.Application(client_max_size=_MAX_BODY_BYTES)
+        # Larger client_max_size lets long chat histories arrive intact;
+        # individual handlers still enforce stricter caps. The original
+        # (16 KiB) cap is preserved for /faceid /presence /trigger via
+        # explicit body-size checks in ``_read_json``.
+        app_max_size = (
+            _OPENAI_BODY_BYTES if self._openai_enabled else _MAX_BODY_BYTES
+        )
+        app = web.Application(client_max_size=app_max_size)
         app.router.add_get("/health", self._handle_health)
+        # Sprint P4.6 (Apr 26 2026): /badge is always registered so it
+        # can be wired late at boot via :py:attr:`_status_provider`. The
+        # handler returns a grey "unknown" badge when no provider is
+        # attached -- never 404 -- so a polling menubar app gets a
+        # stable shape from t=0.
+        app.router.add_get("/badge", self._handle_badge)
         app.router.add_post("/faceid", self._handle_faceid)
         app.router.add_post("/presence", self._handle_presence)
         app.router.add_post("/trigger", self._handle_trigger)
+        if self._openai_enabled:
+            app.router.add_get("/v1/models", self._handle_v1_models)
+            app.router.add_post(
+                "/v1/chat/completions", self._handle_v1_chat,
+            )
+            logger.info(
+                "iPhone bridge: OpenAI-compat /v1/* shim enabled "
+                "(model_id=%s)",
+                self._openai_model_id,
+            )
 
         runner = web.AppRunner(app, access_log=None)
         await runner.setup()
@@ -365,6 +435,76 @@ class IPhoneBridge:
         from aiohttp import web
         return web.json_response({"ok": True, "version": 1})
 
+    async def _handle_badge(self, request: Any) -> Any:
+        """Sprint P4.6 (Apr 26 2026): unified status badge.
+
+        Returns the same rollup the dashboard menubar uses, in a
+        no-auth, low-PII shape. Body looks like::
+
+            {
+                "ok": true,
+                "level": "ok" | "warn" | "critical",
+                "color": "green" | "amber" | "red",
+                "text":  "ATOM is OK",
+                "headline": "stt: degraded",
+                "subsystems_total": 10,
+                "uptime_s": 1234.5
+            }
+
+        Designed to be polled by a Mac menubar app at ~5 s, an iPhone
+        widget at ~30 s, and the smoke scripts at boot. Fully tolerant
+        of the provider raising -- on any failure we return a grey
+        ``unknown`` badge with HTTP 200 so the menubar never flashes
+        red just because the provider hiccuped.
+        """
+        from aiohttp import web
+        if self._status_provider is None:
+            return web.json_response(
+                {
+                    "ok": False,
+                    "level": "unknown",
+                    "color": "grey",
+                    "text": "ATOM status unknown",
+                    "headline": "no status provider",
+                    "subsystems_total": 0,
+                },
+                status=200,
+            )
+        try:
+            snapshot = self._status_provider() or {}
+        except Exception as exc:
+            logger.debug("status_provider raised: %s", exc, exc_info=True)
+            return web.json_response(
+                {
+                    "ok": False,
+                    "level": "unknown",
+                    "color": "grey",
+                    "text": "ATOM status unknown",
+                    "headline": f"provider_error:{type(exc).__name__}",
+                    "subsystems_total": 0,
+                },
+                status=200,
+            )
+        badge = (
+            snapshot.get("badge")
+            if isinstance(snapshot, dict) else None
+        ) or {}
+        body = {
+            "ok": bool(snapshot.get("ok")) if isinstance(snapshot, dict) else False,
+            "level": badge.get("level", "unknown"),
+            "color": badge.get("color", "grey"),
+            "text": badge.get("text", "ATOM status unknown"),
+            "headline": badge.get("headline", ""),
+            "warnings": badge.get("warnings", []),
+            "criticals": badge.get("criticals", []),
+            "subsystems_total": badge.get("subsystems_total", 0),
+            "uptime_s": (
+                snapshot.get("uptime_s")
+                if isinstance(snapshot, dict) else None
+            ),
+        }
+        return web.json_response(body)
+
     async def _handle_faceid(self, request: Any) -> Any:
         from aiohttp import web
         err = await self._require_auth(request, "/faceid")
@@ -471,6 +611,356 @@ class IPhoneBridge:
             args=args,
         )
         return web.json_response({"ok": True, "name": name})
+
+    # ── Sprint P4.4 (Apr 26 2026) -- OpenAI-compatible /v1/* shim ────
+    #
+    # Goal: let the Enchanted iPhone app (and any other openai-style
+    # client over Tailscale) talk to ATOM's local brain without us
+    # having to ship a SwiftUI native app. We accept *either* the
+    # native ATOM ``X-ATOM-Token`` header OR an ``Authorization:
+    # Bearer <token>`` header so off-the-shelf clients can paste the
+    # bridge token into the standard "API key" field.
+    #
+    # We deliberately do NOT enforce the trusted-device single-slot
+    # lock here -- a chat session does not provide a stable
+    # ``device_id`` and rejecting Enchanted on first contact would
+    # be hostile. Auth is via the pre-shared bridge token, same as
+    # the rest of the bridge. The audit log still records every
+    # bad-token attempt.
+
+    def _check_openai_auth(self, request: Any) -> str | None:
+        """Return the supplied token if it matches, else None.
+
+        Accepts ``X-ATOM-Token`` (preferred) or ``Authorization: Bearer
+        <token>``. Records a single audit-log entry on rejection.
+        """
+        from aiohttp import web  # noqa: F401  (kept consistent with peers)
+        supplied = request.headers.get(_AUTH_HEADER)
+        if not supplied:
+            authz = request.headers.get("Authorization", "") or ""
+            if authz.lower().startswith("bearer "):
+                supplied = authz[len("Bearer "):].strip() or None
+        if verify_token(self._token, supplied):
+            return supplied or ""
+        reason = "missing_token" if not supplied else "bad_token"
+        try:
+            self._audit.record_failure(
+                source_ip=self._client_ip(request),
+                endpoint=str(request.path),
+                reason=reason,
+            )
+        except Exception:
+            logger.debug("openai_auth audit failed", exc_info=True)
+        return None
+
+    async def _handle_v1_models(self, request: Any) -> Any:
+        from aiohttp import web
+        if self._check_openai_auth(request) is None:
+            return web.json_response(
+                {"error": {"message": "unauthorized", "type": "auth"}},
+                status=401,
+            )
+        now = int(time.time())
+        body = {
+            "object": "list",
+            "data": [
+                {
+                    "id": self._openai_model_id,
+                    "object": "model",
+                    "owned_by": "atom",
+                    "created": now,
+                },
+            ],
+        }
+        return web.json_response(body)
+
+    async def _handle_v1_chat(self, request: Any) -> Any:
+        from aiohttp import web
+        if self._chat_stream is None:
+            return web.json_response(
+                {
+                    "error": {
+                        "message": "chat handler not registered",
+                        "type": "not_configured",
+                    },
+                },
+                status=503,
+            )
+        if self._check_openai_auth(request) is None:
+            return web.json_response(
+                {"error": {"message": "unauthorized", "type": "auth"}},
+                status=401,
+            )
+
+        try:
+            raw = await request.read()
+        except Exception as exc:
+            return web.json_response(
+                {
+                    "error": {
+                        "message": f"read_failed:{type(exc).__name__}",
+                        "type": "bad_request",
+                    },
+                },
+                status=400,
+            )
+        if not raw or len(raw) > _OPENAI_BODY_BYTES:
+            return web.json_response(
+                {"error": {"message": "body_too_large", "type": "bad_request"}},
+                status=413 if raw else 400,
+            )
+        try:
+            payload = json.loads(raw.decode("utf-8", errors="replace"))
+            if not isinstance(payload, dict):
+                raise ValueError("not_an_object")
+        except Exception:
+            return web.json_response(
+                {"error": {"message": "bad_json", "type": "bad_request"}},
+                status=400,
+            )
+
+        messages_raw = payload.get("messages") or []
+        if not isinstance(messages_raw, list) or not messages_raw:
+            return web.json_response(
+                {"error": {"message": "messages required", "type": "bad_request"}},
+                status=400,
+            )
+        messages: list[dict[str, str]] = []
+        for m in messages_raw:
+            if not isinstance(m, dict):
+                continue
+            role = str(m.get("role") or "").strip().lower()
+            content = m.get("content")
+            if isinstance(content, list):
+                content = "".join(
+                    p.get("text", "") if isinstance(p, dict) else str(p)
+                    for p in content
+                )
+            content = str(content or "")
+            if role and content:
+                messages.append({"role": role, "content": content})
+        if not messages:
+            return web.json_response(
+                {
+                    "error": {
+                        "message": "no usable messages",
+                        "type": "bad_request",
+                    },
+                },
+                status=400,
+            )
+
+        max_tokens = payload.get("max_tokens")
+        try:
+            max_tokens_int = int(max_tokens) if max_tokens else None
+        except (TypeError, ValueError):
+            max_tokens_int = None
+
+        stream_requested = bool(payload.get("stream"))
+        completion_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
+        created = int(time.time())
+
+        # Soft rate-limit for chat: per-source-IP, half-second window.
+        source_ip = self._client_ip(request)
+        rate_key = f"openai_chat:{source_ip}"
+        if not self._check_rate(rate_key, "/v1/chat/completions"):
+            return web.json_response(
+                {
+                    "error": {
+                        "message": "rate_limited",
+                        "type": "rate_limit",
+                    },
+                },
+                status=429,
+            )
+
+        try:
+            stream = self._chat_stream(
+                messages,
+                model=self._openai_model_id,
+                max_tokens=max_tokens_int or self._openai_default_max_tokens,
+            )
+        except TypeError:
+            try:
+                stream = self._chat_stream(messages)
+            except Exception:
+                logger.exception("chat_stream invocation failed")
+                return web.json_response(
+                    {
+                        "error": {
+                            "message": "chat_stream_failed",
+                            "type": "server_error",
+                        },
+                    },
+                    status=500,
+                )
+        except Exception:
+            logger.exception("chat_stream invocation failed")
+            return web.json_response(
+                {
+                    "error": {
+                        "message": "chat_stream_failed",
+                        "type": "server_error",
+                    },
+                },
+                status=500,
+            )
+
+        if stream_requested:
+            return await self._stream_v1_chat(
+                request,
+                stream,
+                completion_id=completion_id,
+                created=created,
+            )
+        return await self._collect_v1_chat(
+            stream,
+            completion_id=completion_id,
+            created=created,
+        )
+
+    async def _collect_v1_chat(
+        self,
+        stream: AsyncIterator[tuple[str, bool]],
+        *,
+        completion_id: str,
+        created: int,
+    ) -> Any:
+        from aiohttp import web
+        full = []
+        try:
+            async for token, done in stream:
+                if token:
+                    full.append(token)
+                if done:
+                    break
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("openai_compat: collect stream failed")
+            return web.json_response(
+                {
+                    "error": {
+                        "message": "stream_failed",
+                        "type": "server_error",
+                    },
+                },
+                status=500,
+            )
+        text = "".join(full)
+        body = {
+            "id": completion_id,
+            "object": "chat.completion",
+            "created": created,
+            "model": self._openai_model_id,
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {"role": "assistant", "content": text},
+                    "finish_reason": "stop",
+                },
+            ],
+            "usage": {
+                "prompt_tokens": 0,
+                "completion_tokens": len(text.split()),
+                "total_tokens": len(text.split()),
+            },
+        }
+        return web.json_response(body)
+
+    async def _stream_v1_chat(
+        self,
+        request: Any,
+        stream: AsyncIterator[tuple[str, bool]],
+        *,
+        completion_id: str,
+        created: int,
+    ) -> Any:
+        from aiohttp import web
+        resp = web.StreamResponse(
+            status=200,
+            reason="OK",
+            headers={
+                "Content-Type": "text/event-stream",
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+            },
+        )
+        try:
+            await resp.prepare(request)
+        except Exception:
+            logger.debug("openai_compat: SSE prepare failed", exc_info=True)
+            return resp
+
+        async def _send(frame: dict[str, Any]) -> None:
+            data = "data: " + json.dumps(frame, ensure_ascii=False) + "\n\n"
+            try:
+                await resp.write(data.encode("utf-8"))
+            except (ConnectionResetError, BrokenPipeError):
+                raise
+            except Exception:
+                logger.debug("SSE write failed", exc_info=True)
+                raise
+
+        opener = {
+            "id": completion_id,
+            "object": "chat.completion.chunk",
+            "created": created,
+            "model": self._openai_model_id,
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": {"role": "assistant"},
+                    "finish_reason": None,
+                },
+            ],
+        }
+        try:
+            await _send(opener)
+            async for token, done in stream:
+                if token:
+                    chunk = {
+                        "id": completion_id,
+                        "object": "chat.completion.chunk",
+                        "created": created,
+                        "model": self._openai_model_id,
+                        "choices": [
+                            {
+                                "index": 0,
+                                "delta": {"content": token},
+                                "finish_reason": None,
+                            },
+                        ],
+                    }
+                    await _send(chunk)
+                if done:
+                    break
+            done_frame = {
+                "id": completion_id,
+                "object": "chat.completion.chunk",
+                "created": created,
+                "model": self._openai_model_id,
+                "choices": [
+                    {"index": 0, "delta": {}, "finish_reason": "stop"},
+                ],
+            }
+            await _send(done_frame)
+            try:
+                await resp.write(b"data: [DONE]\n\n")
+            except Exception:
+                logger.debug("SSE [DONE] flush failed", exc_info=True)
+        except (ConnectionResetError, BrokenPipeError):
+            logger.debug("openai_compat: client disconnected mid-stream")
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("openai_compat: stream loop crashed")
+        try:
+            await resp.write_eof()
+        except Exception:
+            logger.debug("openai_compat: write_eof raised", exc_info=True)
+        return resp
 
 
 def _coerce_ts(raw: Any) -> float:

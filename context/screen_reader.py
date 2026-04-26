@@ -191,26 +191,6 @@ class ScreenReader:
         except Exception as exc:
             logger.debug("PIL ImageGrab failed: %s", exc)
 
-        if sys.platform == "win32":
-            try:
-                subprocess.run(
-                    ["powershell", "-Command",
-                     "Add-Type -AssemblyName System.Windows.Forms; "
-                     "[System.Windows.Forms.Screen]::PrimaryScreen | "
-                     "ForEach-Object { $bitmap = New-Object System.Drawing.Bitmap("
-                     "$_.Bounds.Width, $_.Bounds.Height); "
-                     "$graphics = [System.Drawing.Graphics]::FromImage($bitmap); "
-                     "$graphics.CopyFromScreen($_.Bounds.Location, "
-                     "[System.Drawing.Point]::Empty, $_.Bounds.Size); "
-                     "$bitmap.Save('" + str(tmp_path) + "') }"],
-                    capture_output=True, timeout=5,
-                )
-                if tmp_path.exists():
-                    logger.debug("Screenshot captured via PowerShell")
-                    return str(tmp_path)
-            except Exception:
-                logger.debug('Subprocess run failed', exc_info=True)
-
         return None
 
     def _vision_read(self, image_path: str) -> dict[str, Any]:

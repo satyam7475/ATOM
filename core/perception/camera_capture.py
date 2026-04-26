@@ -6,18 +6,26 @@ a single still frame is enough for the boot face check and the
 ``vision_look`` tool, and a one-shot capture is much friendlier than
 a long-lived ``AVCaptureSession`` we'd have to babysit.
 
-Camera coverage
----------------
-The discovery session asks AVFoundation for:
+Camera policy (Apr 26 2026)
+---------------------------
+ATOM is **MacBook-camera only**. Apple's "Continuity Camera" feature
+(iPhone-as-webcam) was removed by owner request — vision frames must
+come from the laptop's built-in FaceTime HD camera, never from a
+paired iPhone. The discovery session therefore asks AVFoundation for:
 
-* ``AVCaptureDeviceTypeBuiltInWideAngleCamera`` — the laptop webcam.
-* ``AVCaptureDeviceTypeContinuityCamera`` — the iPhone-as-webcam, which
-  shows up automatically when the iPhone is unlocked, paired with the
-  same Apple ID, and within Bluetooth range. **No iPhone bridge,
-  Shortcuts, or Xcode is required** for Continuity Camera; macOS does
-  the discovery in the background.
+* ``AVCaptureDeviceTypeBuiltInWideAngleCamera`` — the laptop webcam
+  (i.e. the FaceTime HD on the MacBook Air M5). **Canonical source.**
 * ``AVCaptureDeviceTypeExternal`` / ``…ExternalUnknown`` — USB / DSLR
-  rigs if the user has them attached.
+  rigs if the user has them attached. iPhone-shaped externals
+  (``modelID`` starting with ``iPhone…`` or ``localizedName`` containing
+  ``iPhone``) are filtered out by :func:`list_cameras` so they can
+  never become the active source.
+
+We deliberately do NOT ask AVFoundation for
+``AVCaptureDeviceTypeContinuityCamera`` and we do NOT classify any
+device as the ``continuity`` kind. macOS may still surface a paired
+iPhone under the ``External`` device type — those rows are dropped
+during discovery.
 
 Output choice (live-fix Apr 2026)
 ---------------------------------
@@ -26,20 +34,18 @@ The latter raises ``NSKVONotifying_AVCapturePhotoOutput' not linked``
 + ``AVFoundationErrorDomain Code=-11800`` from pyobjc on macOS 15+
 because the dynamic KVO subclass isn't loaded into the embedded Python
 runtime. ``AVCaptureVideoDataOutput`` doesn't rely on KVO and works
-equally well for built-in webcams *and* Continuity Camera. We grab
-exactly one ``CMSampleBuffer``, JPEG-encode it via ``CIContext``, and
-tear down the session.
+for built-in webcams (and would for Continuity, which we don't use).
+We grab exactly one ``CMSampleBuffer``, JPEG-encode it via
+``CIContext``, and tear down the session.
 
-The "preferred" device is chosen by ``Camera.choose_preferred`` based
-on the ``vision.preferred_camera`` config knob:
+The "preferred" device is chosen by :func:`choose_preferred` based on
+the ``vision.preferred_camera`` config knob:
 
-* ``"continuity"`` — Continuity Camera if available, else the first
-  built-in.
-* ``"builtin"`` — the first built-in, ignoring iPhone.
-* ``"auto"`` (default) — prefers Continuity Camera when present,
-  else the first built-in. This matches the user's stated intent
-  ("ATOM should be able to use either camera, and pick the iPhone if
-  it's nearby").
+* ``"builtin"`` (default) — the first built-in webcam (FaceTime HD).
+* ``"auto"`` — alias of ``"builtin"`` after the iPhone-camera removal.
+* ``"continuity"`` — **deprecated**; treated as an alias of
+  ``"builtin"`` and logged once at startup so old configs don't break.
+* anything else — fall back to ``"builtin"``.
 
 Failure posture
 ---------------
@@ -182,7 +188,10 @@ def _global_dispatch_queue() -> Any:
 # ── Public dataclasses ────────────────────────────────────────────────
 
 
-_CONTINUITY_TYPE = "AVCaptureDeviceTypeContinuityCamera"
+# NOTE: ``AVCaptureDeviceTypeContinuityCamera`` is intentionally NOT
+# listed here. ATOM's policy (Apr 26 2026, owner request) is
+# MacBook-camera only — iPhone Continuity Camera is excluded both at
+# discovery and at the picker layer.
 _BUILTIN_TYPE = "AVCaptureDeviceTypeBuiltInWideAngleCamera"
 _EXTERNAL_TYPES = (
     "AVCaptureDeviceTypeExternal",
@@ -190,31 +199,42 @@ _EXTERNAL_TYPES = (
 )
 
 
-def _classify_kind(device_type: str, *, name: str = "", model_id: str = "") -> str:
-    """Map an AVCaptureDevice to one of our four kinds.
+def _looks_like_iphone(*, name: str = "", model_id: str = "") -> bool:
+    """True when an AVCaptureDevice's metadata reveals a paired iPhone.
 
-    Empirically (macOS 15+ on M5 Air), a Continuity-Camera-paired
-    iPhone reports ``device_type=AVCaptureDeviceTypeExternal`` and
-    ``modelID='iPhone15,4'`` — *not* the dedicated
-    ``AVCaptureDeviceTypeContinuityCamera`` type. So we promote any
-    External device whose model ID or localized name screams "iPhone"
-    up to ``continuity``; the upstream picker then prefers the iPhone
-    over the built-in webcam under ``preferred="auto"``, which is
-    exactly what the owner expects when they ask "use my iPhone
-    camera".
+    Empirically (macOS 15+ on Apple Silicon), a Continuity-Camera-paired
+    iPhone reports ``device_type=AVCaptureDeviceTypeExternal`` with a
+    ``modelID`` like ``"iPhone15,4"`` and a ``localizedName`` containing
+    ``"iPhone"``. We also see the dedicated
+    ``AVCaptureDeviceTypeContinuityCamera`` type on some macOS builds.
+    Either signal is sufficient to ban the device from the active list.
     """
-    if device_type == _CONTINUITY_TYPE:
-        return "continuity"
     name_lower = (name or "").lower()
     model_lower = (model_id or "").lower()
-    looks_like_iphone = (
+    return (
         model_lower.startswith("iphone")
         or "iphone" in name_lower
     )
-    if device_type in _EXTERNAL_TYPES and looks_like_iphone:
-        return "continuity"
+
+
+def _classify_kind(device_type: str, *, name: str = "", model_id: str = "") -> str:
+    """Map an AVCaptureDevice to one of our diagnostic kinds.
+
+    Returns one of:
+
+    * ``"builtin"`` — the laptop's built-in FaceTime HD webcam.
+    * ``"iphone"`` — a paired iPhone (Continuity Camera or
+      iPhone-shaped External). **Diagnostic only** — :func:`list_cameras`
+      filters these out before they reach the picker, so they can
+      never become the active source.
+    * ``"external"`` — a non-iPhone External device (USB webcam, DSLR
+      capture, etc.). Eligible if the user has no built-in available.
+    * ``"unknown"`` — anything else AVFoundation surfaces.
+    """
     if device_type == _BUILTIN_TYPE:
         return "builtin"
+    if _looks_like_iphone(name=name, model_id=model_id):
+        return "iphone"
     if device_type in _EXTERNAL_TYPES:
         return "external"
     return "unknown"
@@ -227,7 +247,7 @@ class CameraInfo:
     name: str
     unique_id: str
     device_type: str
-    kind: str  # "builtin" | "continuity" | "external" | "unknown"
+    kind: str  # "builtin" | "iphone" | "external" | "unknown"
 
     def __str__(self) -> str:
         return f"{self.name} ({self.kind})"
@@ -248,17 +268,24 @@ class CaptureResult:
 
 
 def list_cameras() -> list[CameraInfo]:
-    """Return every camera AVFoundation can see right now.
+    """Return every NON-iPhone camera AVFoundation can see right now.
 
-    Empty list when AVFoundation is unavailable or no cameras are
-    attached / paired. Continuity Camera entries appear/disappear as
-    the iPhone wakes / sleeps; this is just a snapshot.
+    Empty list when AVFoundation is unavailable or no eligible cameras
+    are attached. Per the Apr 26 2026 policy, any device classified
+    as ``"iphone"`` is dropped from the returned list — it is logged
+    once at DEBUG level so a curious operator can confirm the iPhone
+    was *seen* but intentionally ignored.
+
+    The discovery session asks AVFoundation only for the built-in
+    webcam type and the External device types. We do NOT enumerate
+    ``AVCaptureDeviceTypeContinuityCamera`` so macOS won't even pop
+    the Continuity reconnect handshake on ATOM's behalf.
     """
     if not HAS_AVFOUNDATION:
         return []
 
     types: list[Any] = []
-    for name in (_BUILTIN_TYPE, _CONTINUITY_TYPE, *_EXTERNAL_TYPES):
+    for name in (_BUILTIN_TYPE, *_EXTERNAL_TYPES):
         const = getattr(_AVF, name, None)
         if const is not None:
             types.append(const)
@@ -277,6 +304,7 @@ def list_cameras() -> list[CameraInfo]:
         return []
 
     out: list[CameraInfo] = []
+    iphones_filtered: list[str] = []
     for d in devices:
         try:
             name = str(d.localizedName())
@@ -293,20 +321,42 @@ def list_cameras() -> list[CameraInfo]:
             model_id = str(d.modelID() or "")
         except Exception:
             pass
+        kind = _classify_kind(dt, name=name, model_id=model_id)
+        if kind == "iphone":
+            iphones_filtered.append(name or model_id or uid)
+            continue
         out.append(CameraInfo(
-            name=name, unique_id=uid, device_type=dt,
-            kind=_classify_kind(dt, name=name, model_id=model_id),
+            name=name, unique_id=uid, device_type=dt, kind=kind,
         ))
+    if iphones_filtered:
+        logger.debug(
+            "list_cameras: filtered %d iPhone-shaped device(s) "
+            "(MacBook-camera-only policy): %s",
+            len(iphones_filtered),
+            ", ".join(iphones_filtered),
+        )
     return out
+
+
+# Logged once per process so legacy ``preferred_camera="continuity"``
+# config doesn't spam the boot log on every camera selection.
+_continuity_deprecation_logged = False
 
 
 def choose_preferred(
     cameras: Iterable[CameraInfo] | None = None,
     *,
-    preferred: str = "auto",
+    preferred: str = "builtin",
     explicit_uid: str | None = None,
 ) -> CameraInfo | None:
     """Pick the camera matching the configured preference.
+
+    The ATOM policy as of Apr 26 2026 is **MacBook-camera only**, so
+    this function will never return an iPhone-shaped camera regardless
+    of the ``preferred`` argument. iPhone devices are already filtered
+    out by :func:`list_cameras`; the second-line defence here is to
+    rewrite legacy preferences (``"continuity"`` / ``"auto"``) to
+    ``"builtin"``.
 
     Parameters
     ----------
@@ -315,17 +365,29 @@ def choose_preferred(
         discovery — use the explicit form when callers want to log the
         full menu.
     preferred
-        ``"auto"`` (default) prefers Continuity over built-in, then
-        external. ``"continuity"`` requires an iPhone present.
-        ``"builtin"`` ignores iPhone. Anything else falls back to
-        ``"auto"``.
+        ``"builtin"`` (default) — first built-in webcam, falling back
+        to a non-iPhone external rig if no built-in is present.
+        ``"auto"`` — alias of ``"builtin"`` after the iPhone-camera
+        removal.
+        ``"continuity"`` — **deprecated**; aliased to ``"builtin"`` and
+        logged once at startup so old configs keep booting.
+        Anything else also falls back to ``"builtin"``.
     explicit_uid
         If non-empty, look for this exact ``uniqueID`` first. Wins
-        over ``preferred``.
+        over ``preferred``. The UID is still rejected if it points to
+        an iPhone-shaped device (defence in depth — those should
+        already be filtered out upstream).
 
-    Returns ``None`` when no camera is available.
+    Returns ``None`` when no eligible camera is available.
     """
     cams = list(cameras) if cameras is not None else list_cameras()
+    if not cams:
+        return None
+
+    # Defence in depth: even if a caller hands us a pre-built list that
+    # still contains an iPhone (e.g. an older test harness), we drop
+    # those rows here so they cannot win the picker.
+    cams = [c for c in cams if c.kind != "iphone"]
     if not cams:
         return None
 
@@ -334,22 +396,31 @@ def choose_preferred(
             if c.unique_id == explicit_uid:
                 return c
 
-    p = (preferred or "auto").strip().lower()
+    p = (preferred or "builtin").strip().lower()
+    if p == "continuity":
+        global _continuity_deprecation_logged
+        if not _continuity_deprecation_logged:
+            logger.warning(
+                "vision.preferred_camera='continuity' is deprecated as of "
+                "Apr 26 2026 — ATOM is MacBook-camera only and will use "
+                "the built-in webcam instead. Update your config to "
+                "'builtin' to silence this warning.",
+            )
+            _continuity_deprecation_logged = True
+        p = "builtin"
+    elif p == "auto":
+        p = "builtin"
+    elif p != "builtin":
+        # Unknown preference — fail safe to built-in. We don't log
+        # because the schema validator already rejects bad values at
+        # config-load time; this path only fires on programmatic
+        # callers that bypass the schema.
+        p = "builtin"
 
     def _first(kind: str) -> CameraInfo | None:
         return next((c for c in cams if c.kind == kind), None)
 
-    if p == "continuity":
-        return _first("continuity") or _first("builtin") or cams[0]
-    if p == "builtin":
-        return _first("builtin") or _first("external") or cams[0]
-    # auto
-    return (
-        _first("continuity")
-        or _first("builtin")
-        or _first("external")
-        or cams[0]
-    )
+    return _first("builtin") or _first("external") or cams[0]
 
 
 def _resolve_avdevice(camera: CameraInfo) -> Any | None:
@@ -387,9 +458,9 @@ def _build_video_delegate_class() -> Any:
         """Receives ``CMSampleBuffer`` callbacks and JPEG-encodes one frame.
 
         We capture the *second* sample buffer rather than the first:
-        on Continuity Camera the very first frame is sometimes a
-        partially-initialised black frame while the iPhone camera
-        ramps exposure. Skipping one buffer adds <50 ms latency and
+        the very first frame off the FaceTime HD sensor is sometimes a
+        partially-initialised black frame while the camera ramps
+        exposure. Skipping one buffer adds <50 ms latency and
         eliminates a class of "all-black image" bug reports.
         """
 
@@ -528,11 +599,11 @@ def capture_jpeg(
     try:
         session = _AVF.AVCaptureSession.alloc().init()
 
-        # Set the session preset BEFORE adding inputs/outputs.
-        # Continuity Camera in particular refuses to honour outputs
-        # added before the preset is locked in. ``Photo`` works for
-        # both built-in and Continuity; ``High`` is a safe fallback
-        # if the device can't do photo-quality (rare on M5).
+        # Set the session preset BEFORE adding inputs/outputs. Some
+        # devices refuse to honour outputs added before the preset is
+        # locked in, so we set it first as a defensive default.
+        # ``Photo`` works for the built-in FaceTime HD; ``High`` is a
+        # safe fallback if the device can't do photo-quality.
         try:
             preset = getattr(_AVF, "AVCaptureSessionPresetPhoto", None) or \
                 getattr(_AVF, "AVCaptureSessionPresetHigh", None)
@@ -611,8 +682,9 @@ def capture_jpeg(
         # Wait for the delegate to JPEG-encode one frame. We skip the
         # first sample buffer (see _VideoSampleDelegate docstring) so
         # the worst-case wall time is roughly 2 × frame interval (~66 ms
-        # at 30 fps) plus session warmup. Continuity Camera first-call
-        # warmup can take 700-1500 ms, hence the 3.5 s default timeout.
+        # at 30 fps) plus session warmup. Built-in FaceTime HD wakes
+        # in <500 ms typically; the 3.5 s default timeout is generous
+        # for first-call cold starts after lid-open.
         if not delegate._event.wait(timeout_s):
             return CaptureResult(
                 camera=camera,

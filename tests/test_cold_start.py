@@ -160,7 +160,13 @@ def test_cold_start_warm_up_and_restore() -> None:
 
 def test_cold_start_warms_vlm_when_captioner_wired() -> None:
     """ColdStartOptimizer must call ``captioner._load`` in the executor
-    so the first wake-word fire hits the VLM hot path."""
+    so the first wake-word fire hits the VLM hot path.
+
+    Sprint P2.7 (Apr 26 2026): the code default for
+    ``vision.vlm.warm_at_boot`` flipped to ``False`` (matches the shipping
+    settings.json), so this test now opts in explicitly via config so we
+    keep covering the warm path.
+    """
     from core.boot.cold_start import ColdStartOptimizer
     from core.conversation_memory import ConversationMemory
 
@@ -180,7 +186,7 @@ def test_cold_start_warms_vlm_when_captioner_wired() -> None:
     async def _run() -> None:
         cap = FakeCaptioner()
         cold_start = ColdStartOptimizer(
-            config={},
+            config={"vision": {"vlm": {"warm_at_boot": True}}},
             bus=FakeBus(),
             state_manager=FakeState(),
             local_brain=FakeLocalBrain(),
@@ -200,7 +206,14 @@ def test_cold_start_warms_vlm_when_captioner_wired() -> None:
 
 
 def test_cold_start_skips_vlm_when_already_loaded() -> None:
-    """Pre-loaded captioners must short-circuit (no second _load)."""
+    """Pre-loaded captioners must short-circuit (no second _load).
+
+    Sprint P2.7 (Apr 26 2026): explicitly opt into warm_at_boot so we
+    can prove the hot-path skip logic still holds; without the opt-in
+    the cold start would no-op before reaching the ``is_loaded`` short
+    circuit and the assertion would be trivially true for the wrong
+    reason.
+    """
     from core.boot.cold_start import ColdStartOptimizer
     from core.conversation_memory import ConversationMemory
 
@@ -219,7 +232,7 @@ def test_cold_start_skips_vlm_when_already_loaded() -> None:
     async def _run() -> None:
         cap = HotCaptioner()
         cold_start = ColdStartOptimizer(
-            config={},
+            config={"vision": {"vlm": {"warm_at_boot": True}}},
             bus=FakeBus(),
             state_manager=FakeState(),
             local_brain=FakeLocalBrain(),
@@ -456,7 +469,11 @@ def test_cold_start_serializes_metal_warmups_to_avoid_mtl_race() -> None:
 
     async def _run() -> None:
         cold_start = ColdStartOptimizer(
-            config={},
+            # Sprint P2.7 (Apr 26 2026): warm_at_boot now defaults to
+            # False; opt in here so we keep covering the
+            # serialise-Metal-warmups regression that the rest of this
+            # test exists for.
+            config={"vision": {"vlm": {"warm_at_boot": True}}},
             bus=FakeBus(),
             state_manager=FakeState(),
             local_brain=TimedFastBrain(),

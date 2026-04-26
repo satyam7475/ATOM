@@ -74,6 +74,14 @@ def test_kv_group_size_and_warmup_tokens_overridable() -> None:
 
 
 def _make_stub_brain_for_stream(kv_bits: int) -> mlx_llm.MLXBrain:
+    """Hand-rolled stub for :py:class:`mlx_llm.MLXBrain` that bypasses
+    ``__init__`` so we can drive ``_generate_sync_streaming_inner`` in
+    isolation. Sprint P3.2 (Apr 26 2026) added speculative-decoding
+    bookkeeping to that inner loop; the stub now ships the new
+    attributes so the loop exits cleanly through the
+    ``stream_generate`` mock instead of raising ``AttributeError``
+    early and reporting an empty ``captured`` dict.
+    """
     brain = mlx_llm.MLXBrain.__new__(mlx_llm.MLXBrain)
     brain._abort_generation = 0  # type: ignore[attr-defined]
     brain._kv_bits = kv_bits  # type: ignore[attr-defined]
@@ -85,6 +93,12 @@ def _make_stub_brain_for_stream(kv_bits: int) -> mlx_llm.MLXBrain:
     brain._role_last_used = {"fast": 0.0}  # type: ignore[attr-defined]
     brain._perf_lock = threading.Lock()  # type: ignore[attr-defined]
     brain._role_perf = {}  # type: ignore[attr-defined]
+    # P3.2 speculative-decoding bookkeeping: kept defaulted-off so the
+    # KV-quant tests stay focused on KV semantics.
+    brain._speculative_enabled = False  # type: ignore[attr-defined]
+    brain._draft_model = None  # type: ignore[attr-defined]
+    brain._speculative_num_draft_tokens = 4  # type: ignore[attr-defined]
+    brain._ensure_draft_loaded = lambda: False  # type: ignore[attr-defined]
     return brain
 
 

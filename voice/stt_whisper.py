@@ -54,6 +54,33 @@ import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable
 
+# Sprint P2.1 (Apr 26 2026): unify the auto-correction path with
+# STTAsync / STTGoogle so the production whisper.cpp engine also benefits
+# from owner-aware text fixes (wake-word misrecognitions, common typos,
+# Hinglish romanisations) AND the noise-word filter. Without this every
+# whisper final reached the router untouched and we lost every "Hey
+# Adam" → "Hey ATOM" / "play boom" → "play room" save the other engines
+# already had.
+try:
+    from voice.speech_detector import correct_text as _correct_text
+    from voice.speech_detector import is_noise_word as _is_noise_word
+except Exception:  # pragma: no cover -- defensive fallback
+    _correct_text = None  # type: ignore[assignment]
+    _is_noise_word = None  # type: ignore[assignment]
+
+# Sprint P4.1+P4.3 (Apr 26 2026): plug the OwnerProfile in *after* the
+# rule-based corrector so Boss-taught pronunciations + the learned
+# corrections memory rewrite the final transcript before it leaves the
+# STT layer. We lazy-import to avoid a circular dep at module load time
+# and to keep a clean fallback when the personality package can't import
+# (e.g. SQLite locked in a pathological test).
+try:
+    from core.personality import get_owner_profile as _get_owner_profile
+    from core.personality import get_owner_style as _get_owner_style
+except Exception:  # pragma: no cover - defensive
+    _get_owner_profile = None  # type: ignore[assignment]
+    _get_owner_style = None  # type: ignore[assignment]
+
 logger = logging.getLogger("atom.stt_whisper")
 
 if TYPE_CHECKING:
@@ -244,6 +271,14 @@ class WhisperSTT:
         # NativeSTT._echo_guard).
         self._echo_guard: Callable[[str], bool] | None = None
 
+        # Sprint P2.2 (Apr 26 2026): WhisperConfirmer for second-pass STT
+        # on suspect finals. Wired by ``main.py`` via
+        # ``attach_whisper_confirmer`` when ``stt.whisper_confirm.enabled``
+        # is true. The audio-tap path tees PCM into the confirmer ring
+        # buffer so a high-accuracy re-decode is one method-call away on
+        # any low-confidence / noise-token / blank final.
+        self._whisper_confirmer: Any = None
+
     # ── public properties ───────────────────────────────────────
 
     @property
@@ -433,6 +468,94 @@ class WhisperSTT:
         self._available = False
         logger.info("WhisperSTT shut down")
 
+    # ── ATOM event-bus lifecycle hooks ──────────────────────────
+    # These mirror NativeSTT's contract so wire_events can attach
+    # the same set of handlers regardless of the active STT engine.
+    # Without them, ``stt.on_state_changed`` raises AttributeError
+    # at boot, main() exits, and asyncio.run() deadlocks during
+    # teardown waiting for the iPhone-bridge BG task to cancel —
+    # the silent boot-stall that masqueraded as "ATOM hung after
+    # AdaptiveEngine attached".
+
+    async def on_state_changed(self, old: Any, new: Any, **_kw: Any) -> None:
+        """Pause/resume the mic on ATOM state transitions.
+
+        whisper.cpp runs its own decode loop on a background thread;
+        we don't tear it down on every SPEAKING transition (that
+        churns the GGML context and adds restart latency). Instead
+        we drop frames at the audio-callback level via
+        ``_callback_muted_until`` so the VAD/utterance state is
+        cleanly reset on resume but the model stays warm.
+        """
+        try:
+            from core.state_manager import AtomState
+        except Exception:
+            return
+        if self._permanently_disabled:
+            return
+        try:
+            if new in (AtomState.SPEAKING, AtomState.THINKING, AtomState.ERROR_RECOVERY):
+                self._last_partial = ""
+                self._last_speech_time = 0.0
+                with self._ring_lock:
+                    self._ring.clear()
+                    self._utterance_frames.clear()
+            elif new is AtomState.LISTENING and old is AtomState.SPEAKING:
+                self._last_partial = ""
+                self._last_speech_time = time.monotonic()
+        except Exception:
+            logger.debug("WhisperSTT.on_state_changed raised", exc_info=True)
+
+    async def on_tts_complete(self, **_kw: Any) -> None:
+        """Reset the utterance window after TTS finishes speaking.
+
+        Without this hook, fragments of the trailing TTS frame can
+        carry over into the next user turn and produce garbled
+        partials right after ATOM stops talking.
+        """
+        if self._permanently_disabled:
+            return
+        try:
+            self._last_partial = ""
+            self._last_speech_time = time.monotonic()
+            with self._ring_lock:
+                self._ring.clear()
+                self._utterance_frames.clear()
+        except Exception:
+            logger.debug("WhisperSTT.on_tts_complete raised", exc_info=True)
+
+    def on_media_started(self) -> None:
+        """Stop the mic while user-driven media is playing.
+
+        Music/video on the same Mac would otherwise feed audio into
+        whisper.cpp continuously and produce hallucinated finals.
+        """
+        if self._permanently_disabled or not self._listening:
+            return
+        try:
+            self.stop_listening()
+        except Exception:
+            logger.debug("WhisperSTT.on_media_started stop_listening raised", exc_info=True)
+
+    def on_media_stopped(self) -> None:
+        """Resume the mic after media playback ends."""
+        if self._permanently_disabled or self._listening:
+            return
+        loop = self._loop
+        if loop is None:
+            try:
+                loop = asyncio.get_running_loop()
+                self._loop = loop
+            except RuntimeError:
+                loop = None
+        try:
+            if loop is not None:
+                loop.create_task(self.async_start_listening())
+            else:
+                self.start_listening(self._on_partial, self._on_final)
+        except Exception:
+            logger.debug("WhisperSTT.on_media_stopped restart raised", exc_info=True)
+
     # ── async-compatible wrappers ───────────────────────────────
 
     async def async_start_listening(self, **_kw: Any) -> None:
@@ -514,6 +637,28 @@ class WhisperSTT:
                         # use _np.log10 to stay numpy-only
                         _np.log10(max(rms, 1.0) / 32768.0)
                     )
+            # Sprint P2.2 (Apr 26 2026): tee the same int16 PCM into the
+            # WhisperConfirmer ring buffer as float32-LE so a second-pass
+            # re-decode is one method-call away on suspect finals. No-op
+            # when no confirmer is wired or it is disabled. Keeps the
+            # contract identical to NativeSTT (see stt_macos.py:1483).
+            wc = self._whisper_confirmer
+            if (
+                wc is not None
+                and getattr(wc, "is_enabled", lambda: False)()
+                and samples is not None
+                and samples.size
+            ):
+                try:
+                    f32 = (samples.astype(_np.float32) / 32768.0)
+                    wc.feed_audio(f32.tobytes())
+                except Exception:
+                    if not getattr(self, "_logged_wc_feed_fail", False):
+                        logger.debug(
+                            "WhisperSTT: confirmer feed_audio raised",
+                            exc_info=True,
+                        )
+                        self._logged_wc_feed_fail = True
         except Exception:
             logger.debug("WhisperSTT audio_callback raised", exc_info=True)
 
@@ -651,9 +796,15 @@ class WhisperSTT:
                 .astype(_np.float32) / 32768.0
             )
             t0 = time.perf_counter()
+            # Sprint P1.2 (Apr 26 2026): pywhispercpp accepts ``language``
+            # of "auto" → whisper.cpp will run language detection on the
+            # first 30s of audio. Empty string is also accepted on some
+            # builds. We normalise to "auto" so multilingual models pick
+            # Hindi / Hinglish reliably.
+            lang = self._language or "auto"
             segments = self._model.transcribe(
                 audio,
-                language=self._language,
+                language=lang,
                 # Smaller param when partial -> ~30% faster
                 n_processors=1,
             )
@@ -668,6 +819,65 @@ class WhisperSTT:
                 len(text),
                 elapsed_ms,
             )
+
+            # Sprint P2.1 (Apr 26 2026): apply the same correct_text /
+            # noise-word filter used by STTAsync / STTGoogle, but ONLY on
+            # finals. Partials must stream raw so the live caption matches
+            # what the user is saying syllable-by-syllable; running the
+            # corrector mid-utterance produces flicker because the
+            # rewrite rules are word-level.
+            if not partial and text:
+                if _is_noise_word is not None:
+                    try:
+                        if _is_noise_word(text):
+                            logger.info(
+                                "WhisperSTT: rejected noise word: '%s'", text,
+                            )
+                            return ""
+                    except Exception:
+                        logger.debug(
+                            "WhisperSTT noise-word check raised", exc_info=True,
+                        )
+                pre_correct = text
+                if _correct_text is not None:
+                    try:
+                        original = text
+                        text = _correct_text(text)
+                        if text and text != original:
+                            logger.info(
+                                "WhisperSTT correction: '%s' -> '%s'",
+                                original, text,
+                            )
+                    except Exception:
+                        logger.debug(
+                            "WhisperSTT correct_text raised", exc_info=True,
+                        )
+
+                # Sprint P4.1 + P4.3 (Apr 26 2026): owner-aware rewrites.
+                # 1) apply Boss-taught pronunciations (deterministic dict).
+                # 2) replay learned corrections from the OwnerProfile so
+                #    repeat-misrecognitions get fixed even when correct_text
+                #    misses them.
+                # 3) record the (pre_correct -> text) pair when correct_text
+                #    actually changed something so the profile keeps
+                #    learning. We swallow every exception because failure
+                #    to learn is never failure to transcribe.
+                if _get_owner_profile is not None:
+                    try:
+                        profile = _get_owner_profile()
+                        if profile is not None:
+                            text = profile.apply_pronunciations(text)
+                            text = profile.replay_corrections(text)
+                            if pre_correct and text and text != pre_correct:
+                                profile.record_correction(
+                                    pre_correct, text,
+                                    source="whisper_correct_text",
+                                )
+                    except Exception:
+                        logger.debug(
+                            "OwnerProfile post-correct hook raised",
+                            exc_info=True,
+                        )
             return text
         except Exception:
             logger.exception("WhisperSTT transcribe raised")
@@ -709,6 +919,77 @@ class WhisperSTT:
                     return
             except Exception:
                 logger.debug("echo_guard raised", exc_info=True)
+
+        # Sprint P2.2 (Apr 26 2026): WhisperConfirmer second-pass on
+        # suspect finals. Mirrors stt_macos._on_final's contract — if the
+        # confirmer is wired and enabled, run ``confirm()`` on the
+        # streaming transcript. The confirmer holds the rolling float32
+        # ring buffer (fed in ``_audio_callback``) and re-decodes the
+        # last 4 s on noise / blank / low-confidence finals. The pass is
+        # synchronous on the consume-loop thread and bounded by
+        # ``max_confirm_ms``.
+        wc = self._whisper_confirmer
+        confirmer_input = text
+        confirmer_corrected = False
+        if wc is not None and getattr(wc, "is_enabled", lambda: False)():
+            try:
+                result = wc.confirm(
+                    text or "", float(self._last_confidence),
+                )
+                new_text = (result.text or "").strip()
+                if result.used_whisper:
+                    if not new_text:
+                        # Confirmer agreed there was nothing here. Drop
+                        # the streaming noise-token instead of forwarding
+                        # it as a real final.
+                        logger.debug(
+                            "WhisperConfirmer collapsed noise final '%s' to empty",
+                            (text or "")[:60],
+                        )
+                        return
+                    confirmer_corrected = (new_text != confirmer_input)
+                    text = new_text
+            except Exception:
+                logger.debug(
+                    "WhisperConfirmer.confirm raised; using streaming text",
+                    exc_info=True,
+                )
+
+        # Sprint P4.1 + P4.2 + P4.3 (Apr 26 2026):
+        # * record every WhisperConfirmer rewrite as a learned correction
+        # * detect "when I say X I mean Y" voice commands and persist them
+        # * feed the rolling style fingerprint
+        if _get_owner_profile is not None:
+            try:
+                profile = _get_owner_profile()
+                if profile is not None:
+                    if confirmer_corrected and confirmer_input and text:
+                        profile.record_correction(
+                            confirmer_input, text,
+                            source="whisper_confirmer",
+                        )
+                    learn = profile.parse_learn_command(text or "")
+                    if learn is not None:
+                        pattern, replacement = learn
+                        if profile.add_pronunciation(pattern, replacement):
+                            logger.info(
+                                "OwnerProfile: learned pronunciation %r -> %r",
+                                pattern, replacement,
+                            )
+            except Exception:
+                logger.debug(
+                    "OwnerProfile final hook raised", exc_info=True,
+                )
+        if _get_owner_style is not None:
+            try:
+                style = _get_owner_style()
+                if style is not None and text:
+                    style.observe(text)
+            except Exception:
+                logger.debug(
+                    "OwnerStyle observe raised", exc_info=True,
+                )
+
         cb = self._on_final
         if cb is not None:
             try:
@@ -719,6 +1000,44 @@ class WhisperSTT:
             self._bus.emit("speech_final", text=text, language=self._language)
         except Exception:
             logger.debug("emit speech_final raised", exc_info=True)
+
+    # ── public attach surface (parity with NativeSTT) ────────────
+
+    def attach_echo_guard(self, guard: Callable[[str], bool] | None) -> None:
+        """Wire the same echo guard the macOS native STT uses.
+
+        Voice pipeline calls this when TTS starts speaking; the guard
+        rejects partials/finals that look like ATOM's own speech echoing
+        back through the mic. Safe to pass ``None`` to detach.
+        """
+        self._echo_guard = guard
+
+    def attach_whisper_confirmer(self, confirmer: Any) -> None:
+        """Wire a v3 WhisperConfirmer for second-pass re-decode of
+        suspect finals (low confidence, blank, single-noise-token, etc.).
+
+        Sprint P2.2 (Apr 26 2026) parity with ``NativeSTT.attach_whisper_confirmer``
+        (see ``voice/stt_macos.py:1017``). When attached, the audio-tap
+        callback also feeds the confirmer's rolling ring buffer so a
+        high-accuracy decode is always one method call away. Passing
+        ``None`` detaches.
+
+        Also forwards the current capture sample-rate so the confirmer
+        can size its ring buffer correctly (whisper.cpp captures at 16
+        kHz, so the default sample-rate matches anyway, but doing this
+        explicitly mirrors ``stt_macos.py:1422`` and future-proofs the
+        contract if we ever resample upstream).
+        """
+        self._whisper_confirmer = confirmer
+        if confirmer is not None:
+            setter = getattr(confirmer, "set_sample_rate", None)
+            if callable(setter):
+                try:
+                    setter(int(_SAMPLE_RATE))
+                except Exception:
+                    logger.debug(
+                        "WhisperConfirmer.set_sample_rate raised", exc_info=True,
+                    )
 
     # ── diagnostics (mirrors NativeSTT.get_diagnostics shape) ──
 

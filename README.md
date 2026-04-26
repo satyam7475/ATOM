@@ -80,6 +80,7 @@ python main.py
 
 - **Prefer `Run ATOM.command` when the bundle self-test passes** — `ATOM.app`’s `atom_python` is the process that carries **Speech Recognition + Microphone** usage strings for Apple’s on-device STT. Plain `venv` Python often falls back to **Faster-Whisper** (still works; different stack).
 - **Current default voice mode:** `voice.activation_mode` is `always_on`, so ATOM keeps the command path hot instead of waiting for a wake phrase. Set it back to `wake_word` if you want passive gating again.
+- **Production STT preflight:** when `stt.engine` is `whisper_cpp`, boot now refuses to start unless `pywhispercpp`, `sounddevice`, `webrtcvad`, `numpy`, and the configured GGML model are present. Install the model with `python scripts/install_whisper_model.py`.
 - **Permissions:** System Settings → Privacy & Security → **Microphone** and **Speech Recognition** — enable for the app you use to launch ATOM (Terminal, Cursor, or the embedded `atom_python`).
 - **Duplex / interruptibility:** `stt.barge_in_during_speak` is enabled by default, so ATOM can hear you during TTS for real interruption. Headphones are still the cleanest setup to avoid echo.
 - **After startup speech:** the engine waits until state is **LISTENING** (not during TTS) and applies **`stt.post_tts_cooldown_ms`** before reopening the mic so the greeting does not fight the capture path.

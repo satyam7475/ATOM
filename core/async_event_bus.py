@@ -115,19 +115,33 @@ class AsyncEventBus(PriorityEventBus):
 
     async def stop(self) -> None:
         """Stop the worker and flush queues."""
-        if self._worker_task:
-            self._worker_task.cancel()
+        worker = self._worker_task
+        if worker is not None:
+            worker.cancel()
             self._worker_task = None
-        
-        # Cancel all active tasks
-        for task in list(self._active_tasks):
+
+        # Cancel all active tasks and wait briefly so shutdown is deterministic.
+        active = [task for task in list(self._active_tasks) if not task.done()]
+        for task in active:
             if not task.done():
                 task.cancel()
-        
+
+        wait_for: list[asyncio.Task] = []
+        if worker is not None:
+            wait_for.append(worker)
+        wait_for.extend(active)
+        if wait_for:
+            await asyncio.gather(*wait_for, return_exceptions=True)
+
         # Flush queue
         if self._queue:
             while not self._queue.empty():
-                self._queue.get_nowait()
+                try:
+                    self._queue.get_nowait()
+                    self._queue.task_done()
+                except asyncio.QueueEmpty:
+                    break
+        self._queue = None
 
     async def _priority_worker(self) -> None:
         """Process events by priority to prevent inversion."""

@@ -5,11 +5,11 @@ Live log evidence (atom_log.txt L233):
     2026-04-25 00:43:28 | atom.main | INFO | Boot face check: video
     delegate exception: 'CMSampleBufferGetImageBuffer'
 
-The boot face check is an *optional* feature (Continuity Camera or
-local webcam, gated behind ``vision.boot_face_check``). When it fails
-— camera dozed off, video delegate raised, AVCapture never produced
-a frame — the user said it himself: "don't make startup noise about
-an optional feature."
+The boot face check is an *optional* feature (built-in MacBook
+camera, gated behind ``vision.boot_face_check``). When it fails —
+camera busy, video delegate raised, AVCapture never produced a frame
+— the user said it himself: "don't make startup noise about an
+optional feature."
 
 These tests prove that:
 

@@ -59,6 +59,23 @@ def test_rag_embedding_disk_cache_namespaces_vectors(tmp_path) -> None:
     assert cache_b.get("same query") == [0.0, 1.0]
 
 
+def test_rag_embedding_disk_cache_bucket_fallback_is_opt_in(tmp_path) -> None:
+    db_path = str(tmp_path / "emb.sqlite")
+    exact_only = PersistentEmbeddingCache(db_path, namespace="exact")
+    exact_only.put("open chrome", [1.0, 0.0])
+
+    assert exact_only.get("chrome open") is None
+
+    bucket_enabled = PersistentEmbeddingCache(
+        db_path,
+        namespace="bucket",
+        allow_bucket_fallback=True,
+    )
+    bucket_enabled.put("open chrome", [1.0, 0.0])
+
+    assert bucket_enabled.get("chrome open") == [1.0, 0.0]
+
+
 def test_shadow_compare_is_explicit_for_legacy_backend() -> None:
     engine = EmbeddingEngine(
         {

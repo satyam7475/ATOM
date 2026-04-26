@@ -16,6 +16,15 @@
         "name": "Satyam",
         "title": "Boss"
     },
+    "personality": {
+        "persona_file": "config/atom_persona.md",
+        "owner_profile_db": "data/owner_profile.sqlite3",
+        "owner_style": {
+            "enabled": true,
+            "window_size": 200,
+            "min_observations": 12
+        }
+    },
     "cross_device": {
         "enabled": true,
         "bridge_port": 8787,
@@ -25,7 +34,13 @@
         "token_path": "config/bridge_token",
         "audit_log_path": "logs/atom_bridge_audit.jsonl",
         "trusted_device_path": "data/trusted_iphone.json",
-        "port_file_path": "logs/atom_bridge.port"
+        "port_file_path": "logs/atom_bridge.port",
+        "openai_compat": {
+            "enabled": true,
+            "model_id": "atom-local",
+            "default_max_tokens": 256,
+            "rate_window_s": 60.0
+        }
     },
     "realtime": {
         "enabled": true,
@@ -53,7 +68,7 @@
     },
     "vision": {
         "enabled": true,
-        "preferred_camera": "auto",
+        "preferred_camera": "builtin",
         "explicit_camera_uid": null,
         "boot_face_check": true,
         "boot_face_check_announce": true,
@@ -105,12 +120,12 @@
     "stt": {
         "engine": "whisper_cpp",
         "locale": "en-US",
-        "whisper_model_size": "base",
-        "whisper_model_path": "models/ggml-small.en-q5_1.bin",
+        "whisper_model_size": "large-v3-turbo",
+        "whisper_model_path": "models/ggml-large-v3-turbo-q5_0.bin",
         "whisper_n_threads": 4,
-        "whisper_language": "en",
-        "whisper_partial_interval_s": 1.0,
-        "whisper_trailing_silence_s": 0.6,
+        "whisper_language": "auto",
+        "whisper_partial_interval_s": 0.4,
+        "whisper_trailing_silence_s": 0.5,
         "whisper_max_utterance_s": 20.0,
         "whisper_vad_aggressiveness": 2,
         "bilingual": true,
@@ -149,7 +164,7 @@
         "promotion_min_confidence_no_wake": 0.65,
         "passive_revert_delay_s": 30.0,
         "whisper_confirm": {
-            "enabled": false,
+            "enabled": true,
             "model_size": "tiny",
             "ring_seconds": 5.0,
             "decode_seconds": 4.0,
@@ -157,6 +172,14 @@
             "max_confirm_ms": 250.0,
             "language": null,
             "min_text_chars": 3
+        },
+        "whisperkit": {
+            "model": "openai_whisper-large-v3-v20240930",
+            "host": "127.0.0.1",
+            "port": 50060,
+            "auto_download": true,
+            "startup_timeout_s": 30.0,
+            "model_dir": null
         }
     },
     "tts": {
@@ -242,7 +265,13 @@
         "prompt_cache_persist_min_tokens": 256,
         "kv_bits": 8,
         "kv_group_size": 64,
-        "kv_quant_warmup_tokens": 512
+        "kv_quant_warmup_tokens": 512,
+        "mx_compile_enabled": true,
+        "speculative_decoding": {
+            "enabled": true,
+            "draft_model_path": "models/qwen3-4b-instruct-4bit",
+            "num_draft_tokens": 3
+        }
     },
     "assistant_brain": {
         "active_profile": "optimal",
@@ -472,7 +501,7 @@
         "state_path": "data/morning_briefing.json"
     },
     "embedding": {
-        "backend": "sentence_transformers",
+        "backend": "mlx_embeddings",
         "provider_version": "1",
         "shadow_compare": false,
         "shadow_phrases": [
@@ -481,9 +510,9 @@
             "what did we talk about earlier",
             "describe what's on screen"
         ],
-        "model": "all-MiniLM-L6-v2",
+        "model": "mlx-community/all-MiniLM-L6-v2-4bit",
         "dimension": 384,
-        "device": "cpu",
+        "device": "auto",
         "warm_file": {
             "enabled": true,
             "path": "data/embeddings_warm.npz",
@@ -541,8 +570,8 @@
         "poll_interval_s": 30
     },
     "cognitive_kernel": {
-        "quick_model": "qwen3-8b",
-        "full_model": "qwen3-8b",
+        "quick_model": "qwen3-4b-instruct-4bit",
+        "full_model": "qwen3-8b-4bit",
         "simple_query_max_chars": 48,
         "deep_query_min_chars": 140,
         "battery_degrade": true,
@@ -695,7 +724,7 @@
         "simulation_mode": "hybrid"
     },
     "cloud": {
-        "enabled": true,
+        "enabled": false,
         "provider": "gemini",
         "use_secure_credentials": true,
         "buddy_model": "gemini-2.5-flash",
@@ -717,7 +746,7 @@
         "smart_route_local_confidence_floor": 0.5
     },
     "cloud_brain_router": {
-        "enabled": true,
+        "enabled": false,
         "daily_quota": 60,
         "min_query_chars_for_auto_escalate": 80,
         "cooldown_after_failure_s": 30.0,
