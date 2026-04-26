@@ -455,19 +455,23 @@ class StructuredPromptBuilder:
             pass
         return prompt
 
-    def _build_tools_layer(self) -> str:
+    def _build_tools_layer(self, query: str = "") -> str:
         """Layer 2: Available Tools from ToolRegistry."""
-        if self._tools_prompt_cache is not None:
+        if not query and self._tools_prompt_cache is not None:
             return self._tools_prompt_cache
 
         if self._tool_registry is not None:
-            self._tools_prompt_cache = self._tool_registry.generate_prompt_tools_section()
-            return self._tools_prompt_cache
+            text = self._tool_registry.generate_prompt_tools_section(query=query)
+            if not query:
+                self._tools_prompt_cache = text
+            return text
 
         from core.reasoning.tool_registry import get_tool_registry
         registry = get_tool_registry()
-        self._tools_prompt_cache = registry.generate_prompt_tools_section()
-        return self._tools_prompt_cache
+        text = registry.generate_prompt_tools_section(query=query)
+        if not query:
+            self._tools_prompt_cache = text
+        return text
 
     def _build_context_layer(self, context: dict[str, str] | None,
                              query: str, emotion: str = "") -> str:
@@ -788,7 +792,7 @@ class StructuredPromptBuilder:
         query = _compress_text(query)
 
         layer1 = self._build_system_layer()
-        layer2 = self._build_tools_layer()
+        layer2 = self._build_tools_layer(query)
         layer3 = self._build_context_layer(context, query, emotion)
         layer4 = self._build_memory_layer(memory_summaries)
         layer5 = self._build_documents_layer(document_context)

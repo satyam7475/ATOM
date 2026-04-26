@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import logging
+import re
 import time
 from typing import Any
 
@@ -35,6 +36,13 @@ _PARTIAL_BURST_THRESHOLD = 3
 # real barge-in. A real interruption nearly always crosses 2 tokens
 # within 200ms ("hey atom", "stop please", "no no").
 _PARTIAL_MIN_WORDS_FOR_INTERRUPT = 2
+_THINKING_PARTIAL_INTERRUPT_RE = re.compile(
+    r"\b("
+    r"stop|cancel|abort|pause|wait|hold on|never mind|nevermind|"
+    r"leave it|forget it|shut up"
+    r")\b",
+    re.I,
+)
 
 
 class VoiceInterruptHandler:
@@ -86,6 +94,14 @@ class VoiceInterruptHandler:
             return False
         return normalized not in _NON_INTERRUPT_STATUSES
 
+    @staticmethod
+    def partial_indicates_thinking_interrupt(text: str) -> bool:
+        """True when a THINKING partial is an explicit abort command."""
+        normalized = " ".join((text or "").strip().lower().split())
+        if not normalized or normalized in _NON_INTERRUPT_STATUSES:
+            return False
+        return bool(_THINKING_PARTIAL_INTERRUPT_RE.search(normalized))
+
     async def on_speech_partial(self, text: str = "", **_kw: Any) -> None:
         """Early interrupt path from STT partials while TTS is speaking or thinking.
 
@@ -108,6 +124,13 @@ class VoiceInterruptHandler:
         if tts is not None and hasattr(tts, "is_echo") and tts.is_echo(text):
             logger.info(
                 "Echo suppressed (TTS self-feedback): '%s'", (text or "")[:80],
+            )
+            return
+
+        if cur is AtomState.THINKING and not self.partial_indicates_thinking_interrupt(text):
+            logger.debug(
+                "Ignoring non-explicit THINKING partial interrupt: '%s'",
+                (text or "")[:80],
             )
             return
 

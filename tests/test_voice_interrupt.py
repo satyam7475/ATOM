@@ -153,6 +153,50 @@ async def test_transcript_partial_emits_resume() -> None:
     print("  PASS: Transcript partial emits resume_listening")
 
 
+async def test_thinking_partial_politeness_does_not_cancel() -> None:
+    bus = FakeEventBus()
+    state = StateManager(bus, initial=AtomState.THINKING)
+    handler = VoiceInterruptHandler(
+        bus=bus,
+        state=state,
+        tts=FakeTTS(),
+        interrupt_manager=FakeInterruptManager(),
+        local_brain=FakeBrain(),
+        indicator=FakeIndicator(),
+        emit_cooldown_s=0.0,
+    )
+
+    await handler.on_speech_partial("Thank you.")
+
+    assert not any(event == "resume_listening" for event, _ in bus.events)
+    assert state.current is AtomState.THINKING
+    print("  PASS: Politeness partial does not cancel THINKING")
+
+
+async def test_thinking_partial_explicit_stop_cancels() -> None:
+    bus = FakeEventBus()
+    state = StateManager(bus, initial=AtomState.THINKING)
+    handler = VoiceInterruptHandler(
+        bus=bus,
+        state=state,
+        tts=FakeTTS(),
+        interrupt_manager=FakeInterruptManager(),
+        local_brain=FakeBrain(),
+        indicator=FakeIndicator(),
+        emit_cooldown_s=0.0,
+    )
+
+    await handler.on_speech_partial("atom stop please")
+
+    matches = [
+        data for event, data in bus.events
+        if event == "resume_listening" and data.get("source") == "voice_interrupt"
+    ]
+    assert len(matches) == 1
+    assert matches[0].get("reason") == "speech_partial"
+    print("  PASS: Explicit THINKING stop still cancels")
+
+
 async def test_prepare_for_new_speech_from_thinking() -> None:
     bus = FakeEventBus()
     state = StateManager(bus, initial=AtomState.IDLE)
@@ -189,6 +233,8 @@ async def run_all() -> None:
     await test_partial_arming_status_is_ignored()
     await test_processing_status_is_ignored()
     await test_transcript_partial_emits_resume()
+    await test_thinking_partial_politeness_does_not_cancel()
+    await test_thinking_partial_explicit_stop_cancels()
     await test_prepare_for_new_speech_from_thinking()
     print("\n=== ALL TESTS PASSED ===\n")
 

@@ -694,8 +694,8 @@ async def main() -> None:
     )
 
     # Tiered memory-pressure orchestrator (Sprint B1):
-    #  Level 1 (warn)     -> drop KV prefix cache         [cheap, fully recoverable]
-    #  Level 2 (active)   -> + shrink RAG top_k / clear RAG caches
+    #  Level 1 (warn)     -> governor evicts lazy/optional models
+    #  Level 2 (active)   -> drop KV prefix cache + shrink RAG top_k / clear RAG caches
     #  Level 3 (critical) -> + unload sentence-transformer weights (keyword fallback)
     #
     # Each level uses hysteresis (10% below trigger) so we don't flap,
@@ -801,8 +801,10 @@ async def main() -> None:
                 logger.debug("pressure tier emit failed", exc_info=True)
             _last_pressure_tier = tier
 
-        # Level 1+: drop MLX prompt-prefix KV cache. Cheapest action, 100-500MB back.
-        if tier >= 1:
+        # Level 2+: drop MLX prompt-prefix KV cache. Tier 1 is common during
+        # boot on 16 GB Apple Silicon and dropping the warm prefix there makes
+        # the first real answer slower right when Boss is waiting.
+        if tier >= 2:
             if (
                 not _prompt_kv_cache_dropped
                 and local_brain is not None
@@ -2125,8 +2127,27 @@ async def main() -> None:
     async def _background_stt_preload() -> None:
         t0 = time.monotonic()
         logger.info("STT model loading in background...")
+        preload_task: asyncio.Task | None = None
 
         try:
+            async def _run_stt_preload() -> None:
+                if hasattr(stt, "async_preload"):
+                    await stt.async_preload()
+                else:
+                    await stt.preload()
+
+            stt_label = (
+                str(getattr(stt, "backend_name", "") or "")
+                or type(stt).__name__
+            )
+            parallel_model_preload = "WhisperKit" in stt_label
+            if parallel_model_preload:
+                preload_task = asyncio.create_task(_run_stt_preload())
+                logger.info(
+                    "STT model preload overlapping audio intelligence (%s)",
+                    stt_label,
+                )
+
             audio_intel = voice_pipeline.audio_intelligence
             if audio_intel is not None and config.get("audio_intelligence", {}).get("enabled", True):
                 best = await audio_intel.boot()
@@ -2182,14 +2203,22 @@ async def main() -> None:
                             best_legacy.name, best_legacy.device_type, best_legacy.quality_score,
                         )
 
-            if hasattr(stt, "async_preload"):
-                await stt.async_preload()
+            if preload_task is not None:
+                await preload_task
             else:
-                await stt.preload()
+                await _run_stt_preload()
             elapsed = (time.monotonic() - t0) * 1000
             logger.info("STT pipeline ready (%.0fms: devices + model + preprocessor)", elapsed)
             _bt_mark("stt_preload", elapsed, parallel=True)
         except Exception:
+            if preload_task is not None and not preload_task.done():
+                preload_task.cancel()
+                try:
+                    await preload_task
+                except asyncio.CancelledError:
+                    pass
+                except Exception:
+                    logger.debug("STT preload task failed during cleanup", exc_info=True)
             logger.exception("STT preload failed")
         finally:
             stt_preload_done.set()

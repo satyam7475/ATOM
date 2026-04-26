@@ -316,7 +316,6 @@ class ModuleHealthChecker:
         ("voice.stt_macos", "NativeSTT"),
         ("voice.tts_async", "TTSAsync"),
         ("voice.mic_manager", "MicManager"),
-        ("brain.mini_llm", "MiniLLM"),
         ("context.context_engine", "ContextEngine"),
         ("context.privacy_filter", None),
         ("ui.web_dashboard", "WebDashboard"),

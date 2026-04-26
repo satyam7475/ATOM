@@ -7,6 +7,7 @@ rejected the bare ``--download`` flag and ATOM waited the full
 
 from __future__ import annotations
 
+import asyncio
 import subprocess
 from typing import Any
 
@@ -177,3 +178,72 @@ def test_wait_for_serve_ready_succeeds_when_port_and_health_open(
     monkeypatch.setattr(urllib.request, "urlopen", lambda *a, **k: _OkResp())
 
     backend._wait_for_serve_ready()
+
+
+@pytest.mark.asyncio
+async def test_async_start_listening_does_not_duplicate_speech_events(
+    stt: Any, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """WhisperKit callbacks add voice.* metadata; _emit_* owns speech_*."""
+    m, _, state_cls = stt
+
+    class _Bus:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, dict[str, Any]]] = []
+
+        def emit(self, event: str, **kw: Any) -> None:
+            self.calls.append((event, kw))
+
+        def emit_fast(self, event: str, **kw: Any) -> None:
+            self.calls.append((event, kw))
+
+        def emit_long(self, event: str, **kw: Any) -> None:
+            self.calls.append((event, kw))
+
+        def on(self, *a: Any, **k: Any) -> None:
+            return None
+
+    bus = _Bus()
+    backend = m.WhisperKitSTT(
+        bus,
+        state_cls(),
+        config={
+            "stt": {
+                "whisperkit": {
+                    "model": "whisper-large-v3-v20240930_turbo_632MB",
+                    "host": "127.0.0.1",
+                    "port": 50060,
+                    "startup_timeout_s": 5.0,
+                },
+            },
+        },
+    )
+
+    def _fake_start_listening(*, loop, on_final, on_partial) -> bool:
+        backend._on_final = on_final
+        backend._on_partial = on_partial
+        backend._listening = True
+        return True
+
+    monkeypatch.setattr(backend, "start_listening", _fake_start_listening)
+
+    task = asyncio.create_task(backend.async_start_listening())
+    await asyncio.sleep(0)
+
+    backend._emit_partial("hello")
+    backend._emit_final("hello there")
+    await asyncio.sleep(0.05)
+
+    backend._running_async = False
+    backend._listening = False
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+
+    event_names = [event for event, _ in bus.calls]
+    assert event_names.count("speech_partial") == 1
+    assert event_names.count("speech_final") == 1
+    assert event_names.count("voice.partial") == 1
+    assert event_names.count("voice.final") == 1

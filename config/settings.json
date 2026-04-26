@@ -26,7 +26,7 @@
         }
     },
     "cross_device": {
-        "enabled": true,
+        "enabled": false,
         "bridge_port": 8787,
         "bind_host": "127.0.0.1",
         "faceid_freshness_s": 300,
@@ -36,14 +36,14 @@
         "trusted_device_path": "data/trusted_iphone.json",
         "port_file_path": "logs/atom_bridge.port",
         "openai_compat": {
-            "enabled": true,
+            "enabled": false,
             "model_id": "atom-local",
             "default_max_tokens": 256,
             "rate_window_s": 60.0
         }
     },
     "realtime": {
-        "enabled": true,
+        "enabled": false,
         "name": "atom-room",
         "host": "127.0.0.1",
         "port": 8770,
@@ -55,7 +55,7 @@
     },
     "screen_perception_loop": {
         "enabled": true,
-        "interval_s": 12.0,
+        "interval_s": 30.0,
         "pause_during_speech": true,
         "pause_during_listen": true,
         "require_presence": true,
@@ -64,7 +64,7 @@
         "redact_passwords": true,
         "min_text_chars": 24,
         "significance_min_jaccard": 0.55,
-        "burst_when_idle_s": 60.0
+        "burst_when_idle_s": 180.0
     },
     "vision": {
         "enabled": true,
@@ -393,31 +393,31 @@
     "autonomy": {
         "enabled": true,
         "auto_execute_threshold": 0.95,
-        "suggest_threshold": 0.72,
-        "idle_timeout_minutes": 10,
+        "suggest_threshold": 0.82,
+        "idle_timeout_minutes": 15,
         "habit_decay_days": 7,
         "habit_decay_rate": 0.02,
         "max_habits": 50,
-        "check_interval_s": 90,
+        "check_interval_s": 180,
         "log_all_decisions": true
     },
     "cognitive_loop": {
         "enabled": true,
         "reflective": {
             "enabled": true,
-            "cooldown_s": 60.0,
+            "cooldown_s": 180.0,
             "min_user_chars": 5,
-            "max_tokens": 220
+            "max_tokens": 160
         },
         "presence": {
             "enabled": true,
-            "interval_s": 30.0,
-            "min_interval_s": 8.0
+            "interval_s": 60.0,
+            "min_interval_s": 15.0
         },
         "scene": {
             "enabled": true,
-            "cooldown_s": 300.0,
-            "significance_min_seconds": 30.0
+            "cooldown_s": 600.0,
+            "significance_min_seconds": 60.0
         },
         "mood": {
             "enabled": true,
@@ -425,10 +425,10 @@
         },
         "suggester": {
             "enabled": true,
-            "cooldown_s": 720.0,
-            "category_cooldown_s": 2700.0,
-            "daily_cap": 4,
-            "relevance_threshold": 0.7,
+            "cooldown_s": 1800.0,
+            "category_cooldown_s": 5400.0,
+            "daily_cap": 2,
+            "relevance_threshold": 0.82,
             "quiet_hours": [23, 6],
             "suppress_moods": ["frustrated", "focused", "idle"]
         }
@@ -469,21 +469,21 @@
         "dream_prewarm_retrieve_topics": ["work", "ATOM", "project", "schedule", "personal"]
     },
     "proactive_coordination": {
-        "max_insights_per_hour": 20,
+        "max_insights_per_hour": 6,
         "critical_priority_max": 3,
         "audit_log": true,
         "audit_log_path": "logs/proactive_insights.log",
         "window_seconds": 3600
     },
     "proactive_engine": {
-        "check_interval_s": 900,
+        "check_interval_s": 1800,
         "m5_triggers": {
             "enabled": true,
             "battery_low_pct": 20,
-            "memory_high_pct": 82,
+            "memory_high_pct": 78,
             "disk_free_gb_warn": 10,
-            "project_stale_days": 3,
-            "idle_goal_nudge_minutes": 40,
+            "project_stale_days": 5,
+            "idle_goal_nudge_minutes": 90,
             "morning_briefing_hours": [7, 8, 9]
         }
     },

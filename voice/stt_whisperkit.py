@@ -593,9 +593,6 @@ class WhisperKitSTT:
                         engine=self.backend_name,
                         mic=self.mic_name,
                     ),
-                    self._bus.emit(
-                        "speech_final", text=t, language=self._language,
-                    ),
                 ),
             )
 
@@ -611,7 +608,6 @@ class WhisperKitSTT:
                         engine=self.backend_name,
                         mic=self.mic_name,
                     ),
-                    self._bus.emit("speech_partial", text=t),
                 ),
             )
 

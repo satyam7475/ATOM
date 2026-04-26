@@ -1,12 +1,13 @@
 # ATOM Module 10: Brain / LLM System
 
-> Read this before changing: `brain/mini_llm.py`, `cursor_bridge/`, `core/llm_inference_queue.py`, `core/brain_mode_manager.py`
+> Read this before changing: `brain/mlx_llm.py`, `cursor_bridge/`, `core/llm_inference_queue.py`, `core/brain_mode_manager.py`
 
 ## Modules
 
 | Module | File | Purpose |
 |--------|------|---------|
-| **MiniLLM** | `brain/mini_llm.py` | Offline GGUF model wrapper (llama.cpp) |
+| **MLXBrain** | `brain/mlx_llm.py` | Production Apple Silicon local LLM wrapper (Qwen3-8B-4bit, single-resident) |
+| **MiniLLM** | `brain/mini_llm.py` | Legacy GGUF wrapper for benchmarks/tooling only |
 | **LocalBrainController** | `cursor_bridge/local_brain_controller.py` | Event bus interface for LLM |
 | **StructuredPromptBuilder** | `cursor_bridge/structured_prompt_builder.py` | ATOM personality prompt construction |
 | **LLMInferenceQueue** | `core/llm_inference_queue.py` | Serial queue with request coalescing |
@@ -71,15 +72,20 @@ PriorityScheduler (single worker):
 {
   "brain": {
     "enabled": true,
-    "model_path": "models/Llama-3.2-3B-Instruct-Q4_K_M.gguf",
-    "model_path_1b": "models/Llama-3.2-1B-Instruct-Q4_K_M.gguf",
-    "dual_model": true,
-    "n_ctx": 2048,
-    "n_threads": 8,
-    "n_gpu_layers": 0,
-    "max_tokens": 80,
-    "temperature": 0.4,
-    "timeout_seconds": 90
+    "mlx_model": "models/qwen3-8b-4bit",
+    "single_resident": true,
+    "n_ctx": 4096,
+    "n_threads": 4,
+    "n_gpu_layers": -1,
+    "n_batch": 256,
+    "max_tokens": 320,
+    "temperature": 0.6,
+    "timeout_seconds": 28,
+    "speculative_decoding": {
+      "enabled": false,
+      "draft_model_path": "models/qwen3-8b-4bit",
+      "num_draft_tokens": 3
+    }
   }
 }
 ```

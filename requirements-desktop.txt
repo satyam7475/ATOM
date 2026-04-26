@@ -1,57 +1,7 @@
-# =============================================================================
-# ATOM — macOS Desktop Install (canonical dependency set)
-# =============================================================================
+# ATOM desktop install.
 #
-# Use this file on your macOS machine when you are ready to run ATOM fully
-# (voice, local LLM, dashboard, RAG). Mirrors requirements.txt;
-# keep both files aligned when you bump versions.
-#
-# Python: 3.11+ (Apple Silicon recommended)
-#
-# Install (from the ATOM directory, in a virtual environment):
-#   python -m venv .venv
-#   source .venv/bin/activate
-#   python -m pip install --upgrade pip
-#   pip install -r requirements-desktop.txt
-#
-# =============================================================================
+# Keep one canonical dependency graph. This file intentionally delegates to
+# requirements.txt so the desktop install cannot drift from the runtime tested
+# by boot validation, voice/STT, MLX, RAG, MCP, and optional feature gates.
 
-# ─── macOS Native Frameworks (pyobjc) ────────────────────────────────────
-pyobjc-core>=11.0
-pyobjc-framework-Cocoa>=11.0
-pyobjc-framework-AVFoundation>=11.0
-pyobjc-framework-Speech>=11.0
-pyobjc-framework-Vision>=11.0
-pyobjc-framework-Quartz>=11.0
-pyobjc-framework-ApplicationServices>=11.0
-pyobjc-framework-FSEvents>=11.0
-pyobjc-framework-NaturalLanguage>=11.0
-pyobjc-framework-CoreML>=11.0
-pyobjc-framework-WebKit>=11.0
-
-# ─── Core (required for default run) ─────────────────────────────────────
-numpy==2.4.3
-psutil==7.2.2
-jsonschema==4.26.0
-aiohttp==3.13.3
-Pillow==12.1.1
-sounddevice==0.5.1
-
-# ─── Apple Silicon Local Brain (primary path on M-series Macs) ───────────
-mlx==0.29.3
-mlx-lm==0.31.2
-
-# ─── Optional TTS fallbacks (not needed for default macOS-native run) ────
-# edge-tts==7.2.7
-# kokoro-tts==2.3.0
-
-# ─── Optional non-MLX LLM fallback ────────────────────────────────────────
-# llama-cpp-python==0.3.2
-
-# ─── Semantic Memory (embedding + vector store) ───────────────────────────
-sentence-transformers>=3.0.0
-chromadb>=0.5.0
-
-# ─── Document Ingestion (RAG pipeline) ───────────────────────────────────
-PyMuPDF>=1.24.0
-python-docx>=1.1.0
+-r requirements.txt

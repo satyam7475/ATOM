@@ -1,0 +1,312 @@
+Last login: Sun Apr 26 19:39:01 on ttys009
+/Users/satyamyadav/Desktop/Personal/ATOM/Run\ ATOM.command ; exit;                                                      
+satyamyadav@Satyams-MacBook-Air ~ % /Users/satyamyadav/Desktop/Personal/ATOM/Run\ ATOM.command ; exit;
+=== ATOM bundle launcher self-test (optional) ===
+ok /Users/satyamyadav/Desktop/Personal/ATOM/.venv/bin/python
+=== Starting ATOM via bundle launcher — leave this window open ===
+2026-04-26 19:51:33 | atom.config            | INFO  | Configuration validated successfully
+2026-04-26 19:51:33 | atom.main              | INFO  | ATOM owner binding: Satyam — access control via core/owner_gate.py
+2026-04-26 19:51:33 | atom.deployment        | INFO  | Deployment profile: personal
+2026-04-26 19:51:33 | atom.state             | INFO  | StateManager initialised -> idle
+2026-04-26 19:51:33 | atom.registry          | INFO  | Command registry loaded: 28 commands from config/commands.json
+2026-04-26 19:51:33 | atom.main              | INFO  | Command registry: 28 commands loaded
+2026-04-26 19:51:33 | atom.memory            | INFO  | Memory loaded: 5 entries, 43 index terms
+2026-04-26 19:51:33 | atom.memory            | INFO  | Interactions loaded: 26 entries
+2026-04-26 19:51:33 | atom.embedding         | INFO  | Embedding warm-file restored: 84 entries from data/embeddings_warm.npz in 2ms
+2026-04-26 19:51:33 | atom.vector_store      | INFO  | Vector store initialized (ChromaDB, backend=chroma, path=data/vector_db, collections=4)
+2026-04-26 19:51:33 | atom.memory            | INFO  | Memory engine: semantic vectors enabled
+2026-04-26 19:51:33 | atom.memory            | INFO  | Memory engine: embedding batch writer ready (batch_size=4, max_queue=128)
+2026-04-26 19:51:33 | atom.memory.batch_writer | INFO  | Embedding batch writer started (batch=4, max_queue=128, drain_idle=0.75s)
+2026-04-26 19:51:33 | atom.scheduler         | INFO  | Loaded 0 pending tasks
+2026-04-26 19:51:33 | atom.behavior          | INFO  | Loaded 7 behavior entries
+2026-04-26 19:51:33 | atom.timeline          | INFO  | Timeline restored (32 events from disk)
+2026-04-26 19:51:33 | atom.skills            | INFO  | Skills registry: 31 trigger(s), 9 with chains from config/skills.json (regex cached=True)
+2026-04-26 19:51:33 | atom.security          | INFO  | SecurityPolicy init: mode=strict, max_action_tier=3, lock=open, rate_limit=10/5s
+2026-04-26 19:51:33 | atom.tools             | INFO  | Tool registry initialized: 73 tools across 14 categories
+2026-04-26 19:51:33 | atom.router            | INFO  | ActionExecutor initialized with 73 registered tools
+2026-04-26 19:51:33 | atom.fast_path         | INFO  | Intent engine warm-up: 0.3ms
+2026-04-26 19:51:33 | atom.fast_path         | INFO  | Fast-path warm-up complete: 0ms
+2026-04-26 19:51:33 | atom.voice_pipeline    | INFO  | TTS: macOS Native (voice=jarvis)
+2026-04-26 19:51:33 | atom.voice_pipeline    | INFO  | STT engine preference: whisperkit (platform=darwin)
+2026-04-26 19:51:33 | atom.voice_pipeline    | INFO  | STT: WhisperKit (CoreML on Apple Neural Engine)
+2026-04-26 19:51:33 | atom.voice_pipeline    | INFO  | STT backend selected: WhisperKitSTT
+2026-04-26 19:51:33 | atom.voice_pipeline    | INFO  | VOICE_LAUNCH_DIAG: ATOM_LAUNCH_MODE=bundle ATOM_APP_BUNDLE=/Users/satyamyadav/Desktop/Personal/ATOM/ATOM.app label=WhisperKit CoreML/ANE (explicit)
+2026-04-26 19:51:33 | atom.voice_pipeline    | INFO  | Voice pipeline: echo guard wired (TTS.is_echo -> STT finalization)
+2026-04-26 19:51:33 | atom.voice_pipeline    | INFO  | VoicePipeline built: stt=WhisperKit CoreML/ANE (explicit) tts=macOS Native (jarvis)
+2026-04-26 19:51:33 | atom.observability.voice | INFO  | Voice latency probe attached
+2026-04-26 19:51:33 | atom.inference_guard   | INFO  | InferenceGuard: Unified Memory mode (Apple Silicon)
+2026-04-26 19:51:33 | atom.main              | INFO  | ATOM V7: InferenceGuard + RecoveryManager + GPUStallWatchdog (Apple Silicon)
+2026-04-26 19:51:34 | atom.apple_silicon_monitor | INFO  | Apple Silicon: Apple M5 (10 GPU cores)
+2026-04-26 19:51:34 | atom.silicon_governor  | INFO  | Silicon Governor: Apple M5 (10 GPU cores, Unified Memory)
+2026-04-26 19:51:34 | atom.main              | INFO  | Silicon Governor: monitoring active (Apple M5)
+2026-04-26 19:51:34 | atom.memory_governor   | INFO  | MemoryGovernor: registered evictable role 'embeddings_warm_cache' (position 3)
+2026-04-26 19:51:34 | atom.main              | INFO  | Memory Governor: ready (order=['smolvlm', 'whisper_confirmer', 'draft_model', 'embeddings_warm_cache', 'persona_kv_cache'])
+2026-04-26 19:51:34 | atom.cognitive_kernel  | INFO  | CognitiveKernel: quick=qwen3-8b-4bit, full=qwen3-8b-4bit, deep_min=140 chars, semantic_rag=True, cloud=False
+2026-04-26 19:51:34 | atom.router            | INFO  | Cognitive Kernel attached to Router
+2026-04-26 19:51:34 | atom.main              | INFO  | Cognitive Kernel: routing through direct, cache, quick, full, deep, cloud_reason, cloud_search paths
+2026-04-26 19:51:34 | atom.brain.mlx         | INFO  | MLXBrain single-tier: model=qwen3-8b-4bit (set brain.mlx_fast_model to a separate small model dir to enable dual-tier)
+2026-04-26 19:51:34 | atom.local_brain       | INFO  | Action executor connected to brain controller
+2026-04-26 19:51:34 | atom.router            | INFO  | LocalBrainController attached to Router for cloud sanitisation
+2026-04-26 19:51:34 | atom.memory_governor   | INFO  | MemoryGovernor: registered evictable role 'draft_model' (position 2)
+2026-04-26 19:51:34 | atom.memory_governor   | INFO  | MemoryGovernor: registered evictable role 'persona_kv_cache' (position 4)
+2026-04-26 19:51:34 | atom.main              | INFO  | V7 intelligence: RAG + prefetch + MemoryGraph + timeline + feedback + system awareness wired
+2026-04-26 19:51:34 | atom.main              | INFO  | Local brain ENABLED (agentic mode, tool-use, brain.enabled=true)
+2026-04-26 19:51:34 | atom.router            | INFO  | AgentSupervisor attached to Router (parallel=True)
+2026-04-26 19:51:34 | atom.obs.error_rate    | INFO  | Error-rate monitor started (threshold=5/60s, poll=10s)
+2026-04-26 19:51:34 | atom.main              | INFO  | LLM inference queue enabled (single-slot, coalescing)
+2026-04-26 19:51:34 | atom.main              | INFO  | Priority scheduler ON (voice > LLM > background)
+2026-04-26 19:51:34 | atom.main              | INFO  | Performance mode request: auto
+2026-04-26 19:51:34 | atom.brain_mode        | INFO  | Brain profile: optimal -> full_performance
+2026-04-26 19:51:34 | atom.tools             | INFO  | Tool registry confirmation policy merged: 10 extra actions
+2026-04-26 19:51:34 | atom.document          | INFO  | Document ingestion: 2 previously-ingested files restored
+2026-04-26 19:51:34 | atom.main              | INFO  | Reasoning engine initialized: 73 tools, sandbox, workflows, documents
+2026-04-26 19:51:34 | atom.main              | INFO  | ActionExecutor connected: LLM -> security gate -> Router dispatch
+2026-04-26 19:51:34 | atom.voice_pipeline    | INFO  | WakeWordEngine bypassed: voice.activation_mode=always_on
+2026-04-26 19:51:34 | atom.screen            | INFO  | Screen reader: Apple Vision framework (Neural Engine OCR)
+2026-04-26 19:51:34 | atom.main              | INFO  | Screen reader: OCR available (apple_vision)
+2026-04-26 19:51:34 | atom.main              | INFO  | VLM captioner ready (path=models/smolvlm-instruct-4bit, repo=mlx-community/SmolVLM-Instruct-4bit)
+2026-04-26 19:51:34 | atom.memory_governor   | INFO  | MemoryGovernor: registered evictable role 'smolvlm' (position 0)
+2026-04-26 19:51:34 | atom.router            | INFO  | VisionEngine attached to Router (camera ready)
+2026-04-26 19:51:34 | atom.main              | INFO  | Vision engine ready: cameras=['MacBook Air Camera [builtin]'], preferred=builtin (MacBook-camera-only policy)
+2026-04-26 19:51:34 | atom.security_gateway  | INFO  | SecurityGateway: max_outbound=500, max_rpm=10, audit=True
+2026-04-26 19:51:34 | atom.confidence        | INFO  | ConfidenceEngine: threshold=0.45, cloud_abstract_only=True
+2026-04-26 19:51:34 | atom.decision_engine   | INFO  | DecisionEngine: followups=True, recommendations=True, structuring=True
+2026-04-26 19:51:34 | atom.semantic_cache    | INFO  | SemanticCache: max=256, ttl=600s, threshold=0.92, embeddings=True, persistent=True
+2026-04-26 19:51:34 | atom.preference_store  | INFO  | PreferenceStore: db=data/atom_memory.db
+2026-04-26 19:51:34 | atom.user_memory       | INFO  | User profile loaded (10 keys)
+2026-04-26 19:51:34 | atom.main              | INFO  | Cloud/Gemini disabled in config (cloud.enabled=false) — local MLX only for LLM routing
+2026-04-26 19:51:34 | atom.tools.search      | INFO  | SearchTool: max_results=5, timeout=8s
+2026-04-26 19:51:34 | atom.cognitive_kernel  | INFO  | CognitiveKernel cloud wired: confidence=True, search=True, gemini=False, sem_cache=True
+2026-04-26 19:51:34 | atom.router            | INFO  | Router v22 cloud intelligence wired: gemini=False, search=True, confidence=True, decision=True, sem_cache=True, prefs=True, gateway=True
+2026-04-26 19:51:34 | atom.local_brain       | INFO  | Brain v22 cloud intelligence: confidence=True, decision=True, gemini=False, sem_cache=True, prefs=True
+2026-04-26 19:51:34 | atom.local_brain       | INFO  | VLM captioner attached to local brain (vision fallback ready)
+2026-04-26 19:51:34 | atom.main              | INFO  | Cloud brain router ready: providers=none available=False
+2026-04-26 19:51:34 | atom.main              | INFO  | v22 Hybrid Intelligence: SecurityGateway + GeminiClient(disabled) + ConfidenceEngine + DecisionEngine + SearchTool + PreferenceStore + SemanticCache(semantic=True, threshold=0.92)
+2026-04-26 19:51:34 | atom.auth.voice        | INFO  | Voice auth: MFCC fallback mode (13-d features)
+2026-04-26 19:51:34 | atom.security_fortress | INFO  | Session created for Satyam (expires in 86400s)
+2026-04-26 19:51:34 | atom.security_fortress | INFO  | Security Fortress initialized: auth=not_enrolled, vault=keychain, integrity=1471 files, sessions=21, audit=178 entries, voice=available, behavior=learning
+2026-04-26 19:51:34 | atom.self_healing      | INFO  | Exception tracker installed as global hook
+2026-04-26 19:51:34 | atom.self_healing      | INFO  | Startup validation passed (0 warnings)
+2026-04-26 19:51:34 | atom.security          | INFO  | SecurityFortress attached to SecurityPolicy
+2026-04-26 19:51:34 | atom.main              | INFO  | Production systems initialized: SecurityFortress(keychain) + CodeIntrospector(scanning in background) + SelfHealingEngine
+2026-04-26 19:51:34 | atom.platform          | INFO  | Platform adapter initialized: MACOS (macOS-26.4.1-arm64-arm-64bit)
+2026-04-26 19:51:34 | atom.understanding     | INFO  | Owner model loaded (9 total interactions)
+2026-04-26 19:51:34 | atom.sysctl            | INFO  | System control engine initialized (darwin)
+2026-04-26 19:51:34 | atom.system_indexer    | INFO  | System Indexer started
+2026-04-26 19:51:34 | atom.media_watcher     | INFO  | Media Watcher started (macOS native)
+2026-04-26 19:51:34 | atom.fs_watcher        | INFO  | FSWatcher started — watching 3 directories
+2026-04-26 19:51:34 | atom.main              | INFO  | FSWatcher: monitoring ~/Desktop, ~/Downloads, ~/Documents
+2026-04-26 19:51:34 | atom.main              | INFO  | JARVIS intelligence initialized: PlatformAdapter(MACOS) + SystemScanner + SystemIndexer + MediaWatcher + OwnerUnderstanding + FSWatcher
+2026-04-26 19:51:34 | atom.brain             | INFO  | Second brain loaded: 203 facts, 0 prefs, 0 corrections, 0 episodic
+2026-04-26 19:51:34 | atom.goal_engine       | INFO  | Goal engine loaded 2 goals from disk
+2026-04-26 19:51:34 | atom.behavior_model    | INFO  | Behavior profile loaded
+2026-04-26 19:51:34 | atom.optimizer         | INFO  | Optimizer data loaded
+2026-04-26 19:51:34 | atom.main              | INFO  | Cognitive layer initialized (8 modules, incl. dream + curiosity)
+2026-04-26 19:51:34 | atom.jarvis            | INFO  | JARVIS state restored from logs/jarvis_state.json
+2026-04-26 19:51:34 | atom.main              | INFO  | JARVIS Core initialized (proactive anticipation + contextual inference)
+2026-04-26 19:51:34 | atom.real_world        | INFO  | Real-world cache loaded (weather: unknown, headlines: 10)
+2026-04-26 19:51:34 | atom.main              | INFO  | Intelligence layer initialized: ContextFusion + RealWorldIntel + ProactiveEngine + AdaptivePersonality
+2026-04-26 19:51:34 | atom.boot.cold_start   | INFO  | Cold start snapshot found (age 23683s)
+2026-04-26 19:51:34 | atom.system_indexer    | INFO  | System indexed in 65ms (apps: 8, processes: 20)
+2026-04-26 19:51:35 | atom.tts_macos         | INFO  | TTS: using preset voice 'jarvis' -> com.apple.voice.compact.en-GB.Daniel
+2026-04-26 19:51:35 | atom.main              | INFO  | STT model loading in background...
+2026-04-26 19:51:35 | atom.local_brain       | INFO  | Local brain: warming up MLX model (all_roles)...
+2026-04-26 19:51:35 | atom.tts_macos         | INFO  | macOS TTS ready — NSSpeechSynthesizer (compact voice 'Daniel', rate=182)
+2026-04-26 19:51:35 | atom.main              | INFO  | TTS ready (1084ms: voice select + prewarm)
+2026-04-26 19:51:35 | atom.audio_intel       | INFO  | Discovered 3 devices (2 input, 1 output)
+2026-04-26 19:51:37 | atom.code_introspector | INFO  | Code introspection complete: 487 files, 598 classes, 2283 functions in 2136ms
+2026-04-26 19:51:37 | atom.main              | INFO  | CodeIntrospector ready: 487 modules indexed (background scan)
+2026-04-26 19:51:37 | atom.brain.mlx         | INFO  | MLX deferred-import done (mlx=? default_device=Device(gpu, 0) macOS=26.4.1 prompt_cache=yes) in 0 ms
+2026-04-26 19:51:37 | atom.brain.mlx         | INFO  | Loading MLX model role=fast profile=full_performance path=qwen3-8b-4bit
+2026-04-26 19:51:39 | atom.brain.mlx         | INFO  | MLX model role=fast loaded in 2395ms
+2026-04-26 19:51:39 | atom.brain.mlx         | INFO  | MLX prompt-cache restored: role=fast tokens=1435 (warm prefill on next turn)
+2026-04-26 19:51:39 | atom.local_brain       | INFO  | Local brain ready in 4275ms (MLX, role=all_roles, agentic mode)
+Fetching 12 files: 100%|██████████| 12/12 [00:00<00:00, 32451.09it/s]
+2026-04-26 19:51:40 | atom.embedding         | INFO  | Embedding provider loaded: mlx_embeddings model=mlx-community/all-MiniLM-L6-v2-4bit (384-dim, numpy=yes) in 874ms
+2026-04-26 19:51:40 | atom.memory            | INFO  | Memory engine: embeddings warm-up ready in 1463ms
+2026-04-26 19:51:40 | atom.boot.cold_start   | INFO  | Cold start: VLM warm-at-boot disabled by config (vision.vlm.warm_at_boot=false); will load lazily on first describe() call
+2026-04-26 19:51:40 | atom.intent.memory_recall | INFO  | memory_recall_intent: topic='' scope='earlier' hits=0
+2026-04-26 19:51:40 | atom.boot.cold_start   | INFO  | Cold start: primed 17 intent-engine regex paths
+2026-04-26 19:51:40 | atom.boot.cold_start   | INFO  | Cold start: pre-classified 10 skill expansion target(s)
+2026-04-26 19:51:40 | atom.boot.cold_start   | INFO  | Cold start ready in 6022ms (fast=True embeddings=True session=0 cache=19 context=True vlm=False vlm_ms=0)
+2026-04-26 19:51:40 | atom.main              | INFO  | Cold-start bootstrap: 6022ms (fast=True embeddings=True session=0 cache=19)
+2026-04-26 19:51:40 | atom.main              | INFO  | OwnerProfile ready (db=data/owner_profile.sqlite3, owner=satyam, pronunciations=0, recent_corrections=9, style=on).
+2026-04-26 19:51:40 | atom.main              | INFO  | Persona pin: warm KV cache hit (skipped 0-token re-prefill)
+2026-04-26 19:51:40 | atom.router            | INFO  | IdentityEngine attached to Router (Phase 1 tier-3 gate)
+2026-04-26 19:51:40 | atom.bridge.wiring     | INFO  | iphone bridge subscribers wired (faceid, presence, trigger)
+2026-04-26 19:51:40 | atom.router            | INFO  | RuntimeWatchdog attached to Router
+2026-04-26 19:51:40 | atom.proactive.routine_engine | INFO  | Loaded 3 routines: bedtime, deep_work, meeting
+2026-04-26 19:51:40 | atom.router            | INFO  | RoutineEngine attached to Router (routines=3)
+2026-04-26 19:51:40 | atom.router            | INFO  | Router: TTS echo guard wired
+2026-04-26 19:51:40 | atom.router            | INFO  | Context layer attached to Router (state=True session=True user=True)
+2026-04-26 19:51:40 | atom.router            | INFO  | TaskManager attached to Router
+2026-04-26 19:51:40 | atom.adaptive.memory   | INFO  | Behavior profile restored from data/behavior_profile.json (verb=0.79, rate=0.95)
+2026-04-26 19:51:40 | atom.router            | INFO  | AdaptiveEngine attached to Router
+2026-04-26 19:51:40 | atom.boot.cognitive    | INFO  | Cognitive loop: turn_complete emitter attached
+2026-04-26 19:51:40 | atom.cognitive.mood    | INFO  | MoodInferenceEngine attached (min_consecutive=2)
+2026-04-26 19:51:40 | atom.boot.cognitive    | INFO  | Cognitive loop: MoodInferenceEngine attached
+2026-04-26 19:51:40 | atom.cognitive.suggester | INFO  | JarvisSuggester attached (cooldown=720s, cap=4/day, threshold=0.70, quiet=(23, 6))
+2026-04-26 19:51:40 | atom.boot.cognitive    | INFO  | Cognitive loop: JarvisSuggester attached (cooldown=0s, cap=4)
+2026-04-26 19:51:40 | atom.cognitive.reflect | INFO  | ReflectiveLoop attached (cooldown=60.0s, min_chars=5)
+2026-04-26 19:51:40 | atom.boot.cognitive    | INFO  | Cognitive loop: ReflectiveLoop attached
+2026-04-26 19:51:40 | atom.perception.presence | INFO  | PresenceSampler started (interval=30.0s, min=8.0s)
+2026-04-26 19:51:40 | atom.boot.cognitive    | INFO  | Cognitive loop: PresenceSampler started
+2026-04-26 19:51:40 | atom.perception.scene_context | INFO  | SceneContextEngine attached (cooldown=300s, change_min=30s)
+2026-04-26 19:51:40 | atom.boot.cognitive    | INFO  | Cognitive loop: SceneContextEngine attached
+2026-04-26 19:51:40 | atom.cognitive.awareness | INFO  | AwarenessLoop attached (welcome=240s, silent=1800s, dwell=2400s)
+2026-04-26 19:51:40 | atom.boot.cognitive    | INFO  | Cognitive loop: AwarenessLoop attached
+2026-04-26 19:51:40 | atom.boot.cognitive    | INFO  | Cognitive loop wiring complete: {'mood': True, 'suggester': True, 'reflective': True, 'presence': True, 'scene': True, 'awareness': True}
+2026-04-26 19:51:40 | atom.main              | INFO  | Cognitive loop ready: {'mood': True, 'suggester': True, 'reflective': True, 'presence': True, 'scene': True, 'awareness': True}
+2026-04-26 19:51:40 | atom.realtime.agent    | INFO  | RoomAgent attached to room=atom-room
+2026-04-26 19:51:40 | atom.bridge            | INFO  | iPhone bridge: OpenAI-compat /v1/* shim enabled (model_id=atom-local)
+2026-04-26 19:51:40 | atom.realtime.room     | INFO  | AtomRoom listening on http://127.0.0.1:8770 (room=atom-room)
+2026-04-26 19:51:40 | atom.main              | INFO  | Realtime room ready -- open http://127.0.0.1:8770/play/ in any browser, Boss.
+2026-04-26 19:51:40 | atom.perception.screen_loop | INFO  | Screen perception loop attached: interval=12.0s db=data/screen_observations.sqlite max_rows=5000
+2026-04-26 19:51:40 | atom.main              | INFO  | Screen perception loop attached -- ATOM remembers your desktop now, Boss.
+2026-04-26 19:51:40 | atom.llm_queue         | INFO  | LLM inference queue worker started
+2026-04-26 19:51:40 | atom.watchdog          | INFO  | RuntimeWatchdog started (think=90s speak=300s intent=150ms cache=200ms rag=750ms llm=14s tts=15s tool=10s cooldown=8s)
+2026-04-26 19:51:40 | atom.main              | INFO  | Runtime watchdog + priority scheduler started
+2026-04-26 19:51:40 | atom.main              | INFO  | iPhone bridge: /badge wired to HealthSnapshotBuilder.
+2026-04-26 19:51:40 | atom.perception.screen_loop | INFO  | Screen perception loop running
+2026-04-26 19:51:41 | atom.bridge            | INFO  | iPhone bridge listening on 127.0.0.1:8787 (token=yi2nec…)
+2026-04-26 19:51:41 | atom.bridge            | WARNING | iPhone bridge bound to 127.0.0.1:8787 but /v1/* chat is wired -- iPhone clients cannot reach loopback. Set cross_device.bind_host to your Tailscale IP (100.x.y.z) or LAN IP in config/settings.json, or use an SSH local-forward. See module docstring for posture trade-offs.
+2026-04-26 19:51:41 | atom.main              | INFO  | 
+2026-04-26 19:51:41 | atom.main              | INFO  | ┌──────────────────────────────────────────────────────────────────────
+2026-04-26 19:51:41 | atom.main              | INFO  | │  iPhone bridge ONLINE  ->  http://127.0.0.1:8787
+2026-04-26 19:51:41 | atom.main              | INFO  | │  Token file: config/bridge_token
+2026-04-26 19:51:41 | atom.main              | INFO  | │
+2026-04-26 19:51:41 | atom.main              | INFO  | │  Next step on iPhone (one-time):
+2026-04-26 19:51:41 | atom.main              | INFO  | │   1. Open the Shortcuts app on your iPhone 15.
+2026-04-26 19:51:41 | atom.main              | INFO  | │   2. Create a Shortcut that does:
+2026-04-26 19:51:41 | atom.main              | INFO  | │        Get Contents of URL
+2026-04-26 19:51:41 | atom.main              | INFO  | │          URL:    http://<your-mac-ip>:8787/health
+2026-04-26 19:51:41 | atom.main              | INFO  | │          Method: GET
+2026-04-26 19:51:41 | atom.main              | INFO  | │          Headers: X-ATOM-Token = <token from token file>
+2026-04-26 19:51:41 | atom.main              | INFO  | │   3. Run it once -- success registers your iPhone as the
+2026-04-26 19:51:41 | atom.main              | INFO  | │      trusted device. Then add /faceid, /presence, /trigger.
+2026-04-26 19:51:41 | atom.main              | INFO  | │
+2026-04-26 19:51:41 | atom.main              | INFO  | │  See docs (or ask ATOM 'how do I connect my iPhone?')
+2026-04-26 19:51:41 | atom.main              | INFO  | └──────────────────────────────────────────────────────────────────────
+2026-04-26 19:51:41 | atom.main              | INFO  | 
+2026-04-26 19:51:41 | atom.ui                | INFO  | Web dashboard running at http://127.0.0.1:65354/
+2026-04-26 19:51:41 | atom.main              | INFO  | === ATOM (Supernatural Intelligence OS) | Owner: Satyam | Mic: sounddevice (PortAudio/CoreAudio) | Intent Engine + Agentic MLX LLM (qwen3-8b-4bit) | Cognitive Layer ON (dream+curiosity) ===
+2026-04-26 19:51:41 | atom.power             | INFO  | Adaptive Power Governor active (Plugged In: True)
+2026-04-26 19:51:41 | atom.health            | INFO  | Health watchdog started (interval=120s)
+2026-04-26 19:51:41 | atom.watcher           | INFO  | SystemWatcher started (interval=30s)
+2026-04-26 19:51:41 | atom.scheduler         | INFO  | TaskScheduler started
+2026-04-26 19:51:41 | atom.autonomy          | INFO  | Autonomy engine started (interval=90s, auto>=0.95, suggest>=0.72)
+2026-04-26 19:51:41 | atom.goal_engine       | INFO  | Goal engine started (snapshot_interval=300s, timer_safety_net=3600s, 2 goals loaded)
+2026-04-26 19:51:41 | atom.behavior_model    | INFO  | Behavior model disabled via config
+2026-04-26 19:51:41 | atom.prediction        | INFO  | Prediction engine started (interval=300s)
+2026-04-26 19:51:41 | atom.optimizer         | INFO  | Self-optimizer started (interval=7200s)
+2026-04-26 19:51:41 | atom.modes             | INFO  | Personality modes started (mode=work, auto=True)
+2026-04-26 19:51:41 | atom.main              | INFO  | Cognitive layer started (7 engines, incl. dream + curiosity)
+2026-04-26 19:51:42 | atom.system_state      | INFO  | SystemStateEngine started (poll=0.5s, app=Google Chrome)
+2026-04-26 19:51:42 | atom.stt_watchdog      | INFO  | STT Watchdog started (silent=8s stuck=15s)
+2026-04-26 19:51:42 | atom.audio_intel       | INFO  | Audio intelligence context wired
+2026-04-26 19:51:42 | atom.audio_intel       | INFO  | AudioWatchdog started (interval=15s)
+2026-04-26 19:51:42 | atom.state             | INFO  | State: idle -> listening (was idle for 8.7s)
+2026-04-26 19:51:42 | atom.voice_pipeline    | INFO  | Voice loop: Jarvis always-on mode (continuous STT routing, duplex-ready)
+2026-04-26 19:51:42 | atom.voice_pipeline    | INFO  | VOICE_LOOP_READY: 6ms | stt=WhisperKit CoreML/ANE (explicit) | tts=macOS Native (jarvis) | wake_word=disabled
+2026-04-26 19:51:42 | atom.main              | INFO  | HealthMonitor: STT watchdog wired (activity-based stuck check active)
+2026-04-26 19:51:42 | atom.silicon_governor  | INFO  | Silicon Governor monitoring started (interval=30s)
+2026-04-26 19:51:42 | atom.memory_governor   | INFO  | MemoryGovernor: watching silicon_stats_update (thresholds: tier1=80%, tier2=86%, tier3=92%, hysteresis=6%; order=['smolvlm', 'whisper_confirmer', 'draft_model', 'embeddings_warm_cache', 'persona_kv_cache'])
+2026-04-26 19:51:42 | atom.scanner           | INFO  | System scanner started (interval=300s)
+2026-04-26 19:51:42 | atom.understanding     | INFO  | Owner understanding engine started (9 prior interactions)
+2026-04-26 19:51:42 | atom.jarvis            | INFO  | JARVIS Core v21 started (proactive_interval=45s, fusion=wired, behavior=wired, prediction=wired)
+2026-04-26 19:51:42 | atom.real_world        | INFO  | Real-world intelligence started (refresh every 900s)
+2026-04-26 19:51:42 | atom.proactive         | INFO  | Proactive Intelligence Engine started (snapshot_interval=60s, timer_safety_net=900s)
+2026-04-26 19:51:42 | atom.main              | INFO  | Intelligence layer started: SystemScanner + OwnerUnderstanding + JarvisCore + RealWorldIntel + ProactiveEngine
+2026-04-26 19:51:42 | atom.main              | INFO  | Morning briefing service armed (window [6, 11], last=never)
+2026-04-26 19:51:42 | atom.wiring.features   | INFO  | Document + workflow + screen handlers wired
+2026-04-26 19:51:42 | atom.wiring.features   | INFO  | Dream + curiosity + emotion handlers wired
+2026-04-26 19:51:42 | atom.wiring.features   | INFO  | JARVIS + system scan/control + owner understanding handlers wired
+2026-04-26 19:51:42 | atom.wiring.intelligence | INFO  | Self-healing + code introspection + security event handlers wired
+2026-04-26 19:51:42 | atom.wiring.intelligence | INFO  | Auth handlers wired: voice enrollment, verification, behavioral auth
+2026-04-26 19:51:42 | atom.wiring.intelligence | INFO  | Real-world intelligence: context-fusion handler wired (weather/news/clock served by Router._do_* dispatch)
+2026-04-26 19:51:42 | atom.router            | INFO  | RealWorldIntelligence attached to Router
+2026-04-26 19:51:42 | atom.wiring.features   | INFO  | Autonomy + governor + wake word + emotion handlers wired
+2026-04-26 19:51:42 | atom.wiring.cognitive  | INFO  | Cognitive event handlers wired (goals, predictions, brain, optimizer)
+2026-04-26 19:51:42 | atom.boot.cold_start   | INFO  | Cold start restored context: cpu=15.3 ram=48.3 active_app=loginwindow
+2026-04-26 19:51:42 | atom.main              | INFO  | ATOM -- Supernatural Intelligence OS | always listening | requested=auto | active=full_performance | health=120s watcher=30s maint=180s
+2026-04-26 19:51:42 | atom.state             | INFO  | State: listening -> thinking (was listening for 0.0s)
+2026-04-26 19:51:42 | atom.main              | INFO  | M5 mode guard active (requested=auto, CPU thresholds=45/82, memory pressure=82%)
+2026-04-26 19:51:42 | atom.background        | INFO  | BackgroundTaskManager started
+2026-04-26 19:51:42 | atom.main              | INFO  | V22 Convergence Daemon started.
+2026-04-26 19:51:42 | atom.scanner           | INFO  | === ATOM BOOT DIAGNOSTICS ===
+2026-04-26 19:51:42 | atom.ui                | INFO  | Dashboard client connected (1 total)
+2026-04-26 19:51:42 | atom.main              | INFO  | Startup greeting: Here, Boss. 2 active goals. What do you need?
+2026-04-26 19:51:42 | atom.tts_macos         | INFO  | TTS short reply bypassing stream chunker (9 words): 'Here, Boss. 2 active goals. What do you need?'
+2026-04-26 19:51:42 | atom.state             | INFO  | State: thinking -> speaking (was thinking for 0.6s)
+2026-04-26 19:51:42 | atom.tts_macos         | INFO  | TTS [NSSpeechSynthesizer, 3 sentences, rate=170]: 'Here, Boss. 2 active goals. What do you need?'
+2026-04-26 19:51:43 | atom.scanner           | INFO  | ATOM Readiness: 2 SYSTEM(S) NEED ATTENTION (8 passed, 1 warnings, 2 failures)
+2026-04-26 19:51:45 | atom.audio_intel       | INFO  | Selected input: [1] 'MacBook Air Microphone' (builtin, score=1.000)
+2026-04-26 19:51:45 | atom.audio_intel       | INFO  | Using default output: 'MacBook Air Speakers'
+2026-04-26 19:51:45 | atom.audio_intel       | INFO  | 'MacBook Air Microphone' is already the system default input
+2026-04-26 19:51:45 | atom.audio_intel       | INFO  | 
+=== ATOM Audio Intelligence Report ===
+Devices found: 2 input, 1 output
+  [1] MacBook Air Microphone (builtin) -- RMS: -26.2dB, SNR: 9.6dB, VAD: True(0.97), Score: 1.000, HistSR: 356% [SELECTED]
+  [0] iPhone Microphone (unknown) -- RMS: -46.0dB, SNR: 40.0dB, VAD: False(0.05), Score: 0.497
+System default input: MacBook Air Microphone
+Selected input: MacBook Air Microphone
+Selected output: MacBook Air Speakers
+CoreAudio bridge: active
+WebRTC VAD: active
+Boot time: 10630ms
+Voice presence: ambient
+Context: activity=idle, app=loginwindow, night=False
+Device memory: 1 records
+==========================================
+2026-04-26 19:51:45 | atom.main              | INFO  | Audio Intelligence: 'MacBook Air Microphone' (builtin, score=1.000)
+2026-04-26 19:51:46 | atom.scanner           | INFO  | System scan #1 complete: Darwin 25.4.0 | Apple M5 | 16GB RAM | GPU: Apple M5 (10-core GPU) | Health: 79/100
+2026-04-26 19:51:46 | atom.scanner           | INFO  | === BOOT DIAGNOSTICS COMPLETE ===
+2026-04-26 19:51:46 | atom.stt_whisperkit    | INFO  | WhisperKit: launching `/opt/homebrew/bin/whisperkit-cli serve --host 127.0.0.1 --port 50060 --model whisper-large-v3-v20240930_turbo_632MB`
+2026-04-26 19:51:49 | atom.state             | INFO  | State: speaking -> listening (was speaking for 7.1s)
+2026-04-26 19:51:57 | atom.stt_whisperkit    | INFO  | WhisperKitSTT preloaded (model=whisper-large-v3-v20240930_turbo_632MB, serve=127.0.0.1:50060, vad=2) in 11263 ms
+2026-04-26 19:51:57 | atom.main              | INFO  | STT pipeline ready (22708ms: devices + model + preprocessor)
+2026-04-26 19:51:57 | atom.main              | INFO  | STT ready -- ATOM fully operational
+2026-04-26 19:51:57 | atom.boot.timeline     | INFO  | Boot timeline: total=24762ms | ∥tts_init=1084ms cold_start=6022ms persona_pin=0ms ∥stt_preload=22708ms
+||PaMacCore (AUHAL)|| Error on line 2523: err='-50', msg=Unknown Error
+2026-04-26 19:51:58 | atom.stt_whisperkit    | INFO  | WhisperKitSTT listening (16000 Hz, 30-ms VAD, partial @0.4s, trail 0.50s)
+2026-04-26 19:52:04 | atom.audio_intel       | INFO  | Voice presence: ambient -> conversation (density=5.0/min)
+2026-04-26 19:52:12 | atom.silicon_governor  | WARNING | Memory pressure warning: 82% (13398/16384MB)
+2026-04-26 19:52:13 | atom.main              | WARNING | Memory pressure tier 0 -> 1 (memory_pct=81.8%)
+2026-04-26 19:52:13 | atom.brain.mlx         | INFO  | MLX prompt-cache dropped (memory_pressure_tier1)
+2026-04-26 19:52:13 | atom.memory_governor   | WARNING | MemoryGovernor: pressure 81.8% -> tier 1, evicting up to 2 role(s)
+2026-04-26 19:52:13 | atom.memory_governor   | INFO  | MemoryGovernor: evicted role='smolvlm' in 0 ms
+2026-04-26 19:52:13 | atom.cognitive_kernel  | INFO  | Cognitive Kernel: memory warning received, degrading routing
+2026-04-26 19:52:19 | atom.stt_whisperkit    | INFO  | WhisperKitSTT correction: 'Adam, can you listen me? TAKDA MA CHANDY BOOT DIAGNOSTIC COMPLETE TAKDA MA CHANDY' -> 'atom, can you listen me? takda ma chandy boot diagnostic complete takda ma chandy'
+2026-04-26 19:52:19 | atom.perception        | INFO  | Perception: emotion=neutral(0.1) urgency=low(0.00) rate=0.92x pause=1.5x concise=False | 'atom, can you listen me? takda ma chandy boot diagnostic com'
+2026-04-26 19:52:19 | atom.perception        | INFO  | Perception: emotion=neutral(0.1) urgency=low(0.00) rate=0.92x pause=1.5x concise=False | 'atom, can you listen me? takda ma chandy boot diagnostic com'
+2026-04-26 19:52:20 | atom.state             | INFO  | State: listening -> thinking (was listening for 30.9s)
+2026-04-26 19:52:20 | atom.timeline          | INFO  | v7_timeline type=user_query keys=['text', 'source']
+2026-04-26 19:52:20 | atom.intent            | INFO  | Intent: 'atom, can you listen me? takda ma chandy boot diagnostic com' -> fallback/LLM (0.6ms)
+2026-04-26 19:52:20 | atom.router            | INFO  | Router: 'atom, can you listen me? takda ma chandy boot diagnostic com' -> fallback (0.7ms)
+2026-04-26 19:52:20 | atom.intent            | INFO  | Intent: 'atom, can you listen me? takda ma chandy boot diagnostic com' -> fallback/LLM (0.4ms)
+2026-04-26 19:52:20 | atom.cognitive_kernel  | INFO  | CK route: tier=simple requested=info path=quick model=qwen3-8b-4bit role=fast mode=FAST rag=False think=False base=1500ms budget=1500ms rag_budget=0ms reason=simple_query latency=simple+quick (18.5ms)
+2026-04-26 19:52:20 | atom.voice_interrupt   | INFO  | Voice interrupt partial detected: 'Thank you.'
+2026-04-26 19:52:20 | atom.tts_macos         | INFO  | TTS ack [NSSpeechSynthesizer]: 'Go ahead.'
+2026-04-26 19:52:20 | atom.voice_interrupt   | INFO  | Echo suppressed (TTS self-feedback): 'Thank you.'
+2026-04-26 19:52:21 | atom.command_loop      | INFO  | CommandLoop: task cancelled for 'atom, can you listen me? takda ma chandy boot diagnostic complete takda ma chandy'
+2026-04-26 19:52:21 | atom.state             | INFO  | State: thinking -> listening (was thinking for 0.7s)
+2026-04-26 19:52:21 | atom.voice_interrupt   | INFO  | Voice interrupt -> LISTENING (trigger=voice_interrupt reason=speech_partial)
+2026-04-26 19:52:21 | atom.command_loop      | INFO  | [ef8c3c3cd457] Command cancelled: 'atom, can you listen me? takda ma chandy boot diagnostic com'
+2026-04-26 19:52:41 | atom.stt_whisperkit    | INFO  | WhisperKitSTT correction: 'Hey, Adam, are you there? Go ahead. Go ahead.' -> 'hey, atom, are you there? go ahead. go ahead.'
+2026-04-26 19:52:41 | atom.perception        | INFO  | Perception: emotion=neutral(0.1) urgency=low(0.00) rate=0.92x pause=1.5x concise=False | 'hey, atom, are you there? go ahead. go ahead.'
+2026-04-26 19:52:41 | atom.perception        | INFO  | Perception: emotion=neutral(0.1) urgency=low(0.00) rate=0.92x pause=1.5x concise=False | 'hey, atom, are you there? go ahead. go ahead.'
+2026-04-26 19:52:53 | atom.ui                | INFO  | Dashboard client disconnected (0 remaining)
+2026-04-26 19:52:53 | atom.ui                | INFO  | Dashboard client connected (1 total)
+2026-04-26 19:53:00 | atom.stt_whisperkit    | INFO  | WhisperKitSTT correction: 'Hey Atom, are you there? Atom Hey Atom Atom, are you there?' -> 'hey atom, are you there? atom hey atom atom, are you there?'
+2026-04-26 19:53:00 | atom.perception        | INFO  | Perception: emotion=neutral(0.1) urgency=low(0.00) rate=0.92x pause=1.5x concise=False | 'hey atom, are you there? atom hey atom atom, are you there?'
+2026-04-26 19:53:00 | atom.perception        | INFO  | Perception: emotion=neutral(0.1) urgency=low(0.00) rate=0.92x pause=1.5x concise=False | 'hey atom, are you there? atom hey atom atom, are you there?'
+2026-04-26 19:53:21 | atom.stt_whisperkit    | INFO  | WhisperKitSTT correction: 'There is too much latency, I can see. And Atom is still not responding.' -> 'there is too much latency, i can see. and atom is still not responding.'
+2026-04-26 19:53:21 | atom.perception        | INFO  | Perception: emotion=frustrated(0.4) urgency=low(0.00) rate=1.10x pause=0.6x concise=False | 'there is too much latency, i can see. and atom is still not '
+2026-04-26 19:53:21 | atom.perception        | INFO  | Perception: emotion=frustrated(0.4) urgency=low(0.00) rate=1.10x pause=0.6x concise=False | 'there is too much latency, i can see. and atom is still not '
+2026-04-26 19:53:41 | atom.observability.snapshot | INFO  | v7_debug_snapshot {'ts': 1777213421.039092, 'runtime_mode': 'SMART', 'mode_info': {}, 'system_state': {'cpu_percent': 9.5, 'memory_percent': 78.3}, 'prediction_accuracy': 0.0, 'prefetch_hit_rate': 0.0, 'prefetch_miss_rate': 1.0, 'graph_vs_rag_ratio': 0.0, 'last_retrieval_source': '', 'preemption': {'score': None, 'threshold': None}, 'timeline_event_count': 33, 'timeline_recent': [{'type': 'user_query', 'ts': 1777068110.9592462}, {'type': 'user_query', 'ts': 1777068170.611748}, {'type': 'user_query', 'ts': 1777075700.261903}, {'type': 'user_query', 'ts': 1777104587.2360268}, {'type': 'user_query', 'ts': 1777189941.9611552}, {'type': 'user_query', 'ts': 1777213340.5382578}], 'active_project': None}
+2026-04-26 19:53:42 | atom.stt_whisperkit    | INFO  | WhisperKitSTT: rejected noise word: 'you'
+2026-04-26 19:54:03 | atom.stt_whisperkit    | INFO  | WhisperKitSTT: rejected noise word: 'so'
+2026-04-26 19:54:23 | atom.stt_whisperkit    | INFO  | WhisperKitSTT correction: 'Thank you.' -> 'thank you.'
+2026-04-26 19:54:23 | atom.perception        | INFO  | Perception: emotion=frustrated(0.4) urgency=low(0.10) rate=1.10x pause=0.6x concise=False | 'thank you.'
+2026-04-26 19:54:23 | atom.perception        | INFO  | Perception: emotion=frustrated(0.3) urgency=low(0.10) rate=1.10x pause=0.6x concise=False | 'thank you.'
+

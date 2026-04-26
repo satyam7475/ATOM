@@ -1504,6 +1504,9 @@ class MacOSTTSAsync:
                 phrase[:80],
             )
             return
+        # Pre-register before the speak lock so racing STT partials see the
+        # acknowledgement as ATOM audio, even if another utterance is winding down.
+        self._record_spoken(phrase)
         logger.info("TTS ack [%s]: '%s'", self._backend, phrase)
         async with self._speak_lock:
             if self._cancel_requested:

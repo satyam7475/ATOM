@@ -24,6 +24,45 @@ from typing import Any, Callable
 
 logger = logging.getLogger("atom.tools")
 
+_ALWAYS_PROMPT_CATEGORIES = frozenset({
+    "goals",
+    "info",
+    "memory",
+    "productivity",
+    "utility",
+})
+
+_PROMPT_CATEGORY_KEYWORDS: dict[str, tuple[str, ...]] = {
+    "apps": (
+        "app", "application", "open", "launch", "close", "quit",
+        "chrome", "safari", "spotify", "cursor",
+    ),
+    "desktop": (
+        "click", "type", "keyboard", "mouse", "scroll", "window",
+        "space", "desktop", "macro", "hotkey",
+    ),
+    "files": (
+        "file", "folder", "download", "document", "spotlight",
+        "copy", "move", "large file",
+    ),
+    "media": (
+        "music", "song", "spotify", "youtube", "volume", "mute",
+        "play", "pause", "next track",
+    ),
+    "network": ("wifi", "network", "port", "ip address", "dns"),
+    "perception": (
+        "see", "camera", "vision", "look", "screen", "display",
+        "describe", "scan", "qr", "barcode",
+    ),
+    "system": (
+        "system", "process", "cpu", "memory", "ram", "disk",
+        "shutdown", "restart", "sleep", "lock", "brightness", "focus",
+        "terminal", "command",
+    ),
+    "vision": ("focused", "ui", "element", "screen", "text"),
+    "web": ("search", "web", "url", "browser", "research", "google"),
+}
+
 
 @dataclass
 class ToolParameter:
@@ -173,17 +212,42 @@ class ToolRegistry:
         except Exception:
             return False
 
-    def generate_prompt_tools_section(self) -> str:
-        """Generate the tools section for the LLM prompt."""
-        lines = ["AVAILABLE TOOLS (you can call these to perform actions):\n"]
-        for cat in sorted(self._categories.keys()):
+    def _prompt_categories_for_query(self, query: str | None) -> list[str]:
+        if not query:
+            return sorted(self._categories.keys())
+
+        q = f" {query.lower()} "
+        selected = {
+            cat for cat in _ALWAYS_PROMPT_CATEGORIES
+            if cat in self._categories
+        }
+        for cat, keywords in _PROMPT_CATEGORY_KEYWORDS.items():
+            if cat not in self._categories:
+                continue
+            if any(keyword in q for keyword in keywords):
+                selected.add(cat)
+
+        return sorted(selected or self._categories.keys())
+
+    def _tool_signature(self, tool: Tool) -> str:
+        if not tool.parameters:
+            return tool.name
+        params = []
+        for param in tool.parameters:
+            suffix = "*" if param.required else ""
+            params.append(f"{param.name}{suffix}")
+        return f"{tool.name}({','.join(params)})"
+
+    def generate_prompt_tools_section(self, query: str | None = None) -> str:
+        """Generate a compact, query-scoped tools section for the LLM prompt."""
+        categories = self._prompt_categories_for_query(query)
+        lines = ["AVAILABLE TOOLS (compact; exact names only):"]
+        for cat in categories:
             tools = self.get_by_category(cat)
             if not tools:
                 continue
-            lines.append(f"  [{cat.upper()}]")
-            for tool in tools:
-                lines.append(tool.to_prompt_description())
-            lines.append("")
+            signatures = ", ".join(self._tool_signature(tool) for tool in tools)
+            lines.append(f"  [{cat.upper()}] {signatures}")
 
         lines.append("TOOL CALL FORMAT:")
         lines.append('  To call a tool: <tool_call>{"name": "tool_name", "arguments": {"param": "value"}}</tool_call>')
