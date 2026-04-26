@@ -6,6 +6,7 @@ from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import List, Tuple, Dict, Any, Optional
 
+from core.embedding_engine import get_embedding_engine
 from core.profiler import profile
 
 logger = logging.getLogger("atom.brain.memory_graph")
@@ -62,11 +63,26 @@ def _distance_to_similarity(distance: float) -> float:
 class VectorMemory:
     """Vector layer with episodic / semantic / task routing (single collection + metadata)."""
 
-    def __init__(self, persist_directory: str = "atom_vector_db"):
+    def __init__(
+        self,
+        persist_directory: str = "data/vector_db",
+        config: Optional[Dict[str, Any]] = None,
+    ):
         self.enabled = CHROMA_AVAILABLE
+        self._embedding_engine: Any = None
+        self._embedding_meta: Dict[str, Any] = {}
         if not self.enabled:
             self.collection = None  # type: ignore[assignment]
             return
+
+        try:
+            self._embedding_engine = get_embedding_engine(config or {})
+            meta_fn = getattr(self._embedding_engine, "provider_metadata", None)
+            if callable(meta_fn):
+                self._embedding_meta = dict(meta_fn())
+        except Exception:
+            self._embedding_engine = None
+            logger.debug("MemoryGraph vector embedding facade unavailable", exc_info=True)
 
         self.client = chromadb.PersistentClient(path=persist_directory)
         self.collection = self.client.get_or_create_collection(
@@ -87,11 +103,21 @@ class VectorMemory:
             idx = memory_index or _memory_index_for_node_type(str(metadata.get("type", "semantic")))
             meta = dict(metadata)
             meta["memory_index"] = idx
-            self.collection.upsert(
-                documents=[text],
-                metadatas=[meta],
-                ids=[node_id],
-            )
+            meta.update({
+                f"_embedding_{key}": value
+                for key, value in self._embedding_meta.items()
+                if key in {"provider", "model_name", "provider_version", "signature"}
+            })
+            kwargs = {
+                "documents": [text],
+                "metadatas": [meta],
+                "ids": [node_id],
+            }
+            if self._embedding_engine is not None:
+                vec = self._embedding_engine.embed_sync(text)
+                if vec:
+                    kwargs["embeddings"] = [vec]
+            self.collection.upsert(**kwargs)
         except Exception as e:
             logger.error(f"Failed to add to vector memory: {e}")
 
@@ -120,10 +146,15 @@ class VectorMemory:
             routed = memory_index or _route_query_type_to_index(query_type)
             where = {"memory_index": routed} if routed else None
             n_fetch = max(limit * overfetch, limit, 1)
-            kwargs = {
-                "query_texts": [query],
-                "n_results": n_fetch,
-            }
+            kwargs = {"n_results": n_fetch}
+            if self._embedding_engine is not None:
+                vec = self._embedding_engine.embed_sync(query)
+                if vec:
+                    kwargs["query_embeddings"] = [vec]
+                else:
+                    kwargs["query_texts"] = [query]
+            else:
+                kwargs["query_texts"] = [query]
             if where is not None:
                 kwargs["where"] = where
 
@@ -135,7 +166,9 @@ class VectorMemory:
                 and results.get("ids")
                 and len(results["ids"][0]) == 0
             ):
-                results = self.collection.query(query_texts=[query], n_results=n_fetch)
+                retry_kwargs = dict(kwargs)
+                retry_kwargs.pop("where", None)
+                results = self.collection.query(**retry_kwargs)
 
             matches: List[Dict[str, Any]] = []
             if results and results.get("ids") and len(results["ids"]) > 0:
@@ -162,8 +195,14 @@ class VectorMemory:
 class MemoryGraph:
     def __init__(self, db_path: str = "atom_memory.db", config: Optional[Dict[str, Any]] = None):
         mem_cfg = (config or {}).get("memory", {}) if isinstance(config, dict) else {}
+        vector_cfg = (config or {}).get("vector_store", {}) if isinstance(config, dict) else {}
         self.db_path = db_path
-        self.vector_db = VectorMemory()
+        vector_path = str(
+            mem_cfg.get("vector_path")
+            or vector_cfg.get("path")
+            or "data/vector_db",
+        )
+        self.vector_db = VectorMemory(vector_path, config=config)
         self._query_cache: "OrderedDict[str, List[MemoryNode]]" = OrderedDict()
         self._query_cache_max = 500
         self._max_vector_results = max(1, int(mem_cfg.get("max_vector_results", 5)))

@@ -1,7 +1,12 @@
-"""
-ATOM -- Network and web action handlers (cross-platform).
+"""ATOM -- Network and web action handlers (macOS-only).
 
-Handles: open_url, weather, search, wifi status
+Handles: open_url, weather, search, wifi status.
+
+Sprint P4.7 (Apr 26 2026): Windows ``netsh`` / ``cmd start`` branches
+removed. The Linux ``xdg-open`` fallback is retained because it's
+trivial and lets headless CI / dev boxes open weather URLs in
+default browsers without crashing. See
+``docs/ATOM_NEXT_STEPS_PLAN.md`` § P4.7.
 """
 
 from __future__ import annotations
@@ -13,16 +18,13 @@ import sys
 logger = logging.getLogger("atom.router.network")
 
 _IS_MAC = sys.platform == "darwin"
-_IS_WIN = sys.platform == "win32"
 
 
 def _open_url_platform(url: str) -> None:
-    """Open a URL in the default browser, platform-aware."""
+    """Open a URL in the default browser. macOS uses ``open``; the
+    Linux ``xdg-open`` fallback keeps headless CI / dev boxes happy."""
     if _IS_MAC:
         subprocess.Popen(["open", url],
-                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    elif _IS_WIN:
-        subprocess.Popen(["cmd", "/c", "start", url],
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     else:
         subprocess.Popen(["xdg-open", url],
@@ -54,11 +56,9 @@ def open_weather_fallback() -> None:
 
 
 def get_wifi_status() -> str:
-    """Get WiFi connection info. macOS uses networksetup, Windows uses netsh."""
+    """Get WiFi connection info via ``networksetup`` (macOS-native)."""
     if _IS_MAC:
         return _get_wifi_macos()
-    elif _IS_WIN:
-        return _get_wifi_windows()
     return "WiFi status not supported on this platform."
 
 
@@ -75,32 +75,5 @@ def _get_wifi_macos() -> str:
             ssid = line.split(":", 1)[-1].strip()
             return f"Connected to {ssid}."
         return line or "Couldn't determine WiFi status."
-    except Exception:
-        return "Couldn't check WiFi status."
-
-
-def _get_wifi_windows() -> str:
-    try:
-        proc = subprocess.run(
-            ["netsh", "wlan", "show", "interfaces"],
-            capture_output=True, text=True, timeout=3,
-        )
-        output = proc.stdout
-        ssid = ""
-        signal = ""
-        state = ""
-        for raw_line in output.splitlines():
-            line = raw_line.strip()
-            if line.startswith("SSID") and "BSSID" not in line:
-                ssid = line.split(":", 1)[-1].strip()
-            elif line.startswith("Signal"):
-                signal = line.split(":", 1)[-1].strip()
-            elif line.startswith("State"):
-                state = line.split(":", 1)[-1].strip()
-        if ssid:
-            return f"Connected to {ssid}, signal strength {signal}."
-        if state:
-            return f"WiFi state: {state}."
-        return "No WiFi connection detected."
     except Exception:
         return "Couldn't check WiFi status."

@@ -1,8 +1,11 @@
-"""
-ATOM -- Utility action handlers.
+"""ATOM -- Utility action handlers (macOS-only).
 
 Handles: minimize_window, maximize_window, switch_window,
-         next_window_in_app, switch_space, read_clipboard, timer
+         next_window_in_app, switch_space, read_clipboard, timer.
+
+Sprint P4.7 (Apr 26 2026): Windows ``win32`` ctypes branches removed.
+ATOM ships only on Apple Silicon, so the Windows code paths were
+unreachable. See ``docs/ATOM_NEXT_STEPS_PLAN.md`` § P4.7.
 """
 
 from __future__ import annotations
@@ -27,12 +30,6 @@ def minimize_active_window() -> None:
             stderr=subprocess.DEVNULL,
             check=False,
         )
-    elif sys.platform == "win32":
-        import ctypes
-
-        SW_MINIMIZE = 6
-        hwnd = ctypes.windll.user32.GetForegroundWindow()
-        ctypes.windll.user32.ShowWindow(hwnd, SW_MINIMIZE)
 
 
 def maximize_active_window() -> None:
@@ -56,16 +53,10 @@ def maximize_active_window() -> None:
             stderr=subprocess.DEVNULL,
             check=False,
         )
-    elif sys.platform == "win32":
-        import ctypes
-
-        SW_MAXIMIZE = 3
-        hwnd = ctypes.windll.user32.GetForegroundWindow()
-        ctypes.windll.user32.ShowWindow(hwnd, SW_MAXIMIZE)
 
 
 def switch_active_window() -> None:
-    """Switch to the next *application* (macOS: Cmd+Tab, Windows: Alt+Tab)."""
+    """Switch to the next *application* (macOS: Cmd+Tab)."""
     if sys.platform == "darwin":
         subprocess.run(
             [
@@ -77,22 +68,12 @@ def switch_active_window() -> None:
             stderr=subprocess.DEVNULL,
             check=False,
         )
-    elif sys.platform == "win32":
-        import ctypes
-
-        VK_MENU = 0x12
-        VK_TAB = 0x09
-        ctypes.windll.user32.keybd_event(VK_MENU, 0, 0, 0)
-        ctypes.windll.user32.keybd_event(VK_TAB, 0, 0, 0)
-        ctypes.windll.user32.keybd_event(VK_TAB, 0, 2, 0)
-        ctypes.windll.user32.keybd_event(VK_MENU, 0, 2, 0)
 
 
 def next_window_in_app() -> None:
     """Cycle to the next window of the *current* app.
 
-    macOS: Cmd+\` (the standard "Move focus to next window" shortcut).
-    Windows: Alt+Esc (cycles open windows in z-order).
+    macOS: Cmd+\\` (the standard "Move focus to next window" shortcut).
 
     This complements ``switch_active_window`` which switches between
     applications. Voice commands like "next window" should reach
@@ -110,15 +91,6 @@ def next_window_in_app() -> None:
             stderr=subprocess.DEVNULL,
             check=False,
         )
-    elif sys.platform == "win32":
-        import ctypes
-
-        VK_MENU = 0x12
-        VK_ESCAPE = 0x1B
-        ctypes.windll.user32.keybd_event(VK_MENU, 0, 0, 0)
-        ctypes.windll.user32.keybd_event(VK_ESCAPE, 0, 0, 0)
-        ctypes.windll.user32.keybd_event(VK_ESCAPE, 0, 2, 0)
-        ctypes.windll.user32.keybd_event(VK_MENU, 0, 2, 0)
 
 
 def switch_space(direction: str = "right") -> None:
@@ -146,60 +118,18 @@ def switch_space(direction: str = "right") -> None:
             check=False,
         )
         logger.info("Switch space %s (%s)", direction, arrow)
-    elif sys.platform == "win32":
-        import ctypes
-
-        # Win+Ctrl+→/← cycles virtual desktops on Windows 10+.
-        VK_LWIN = 0x5B
-        VK_CONTROL = 0x11
-        VK_RIGHT = 0x27
-        VK_LEFT = 0x25
-        key = VK_RIGHT if direction.lower() == "right" else VK_LEFT
-        u32 = ctypes.windll.user32
-        u32.keybd_event(VK_LWIN, 0, 0, 0)
-        u32.keybd_event(VK_CONTROL, 0, 0, 0)
-        u32.keybd_event(key, 0, 0, 0)
-        u32.keybd_event(key, 0, 2, 0)
-        u32.keybd_event(VK_CONTROL, 0, 2, 0)
-        u32.keybd_event(VK_LWIN, 0, 2, 0)
 
 
 def read_clipboard_text() -> str:
     if sys.platform == "darwin":
         try:
             result = subprocess.run(
-                ["pbpaste"], capture_output=True, text=True, check=False
+                ["pbpaste"], capture_output=True, text=True, check=False,
             )
             if result.returncode != 0:
                 return ""
             text = result.stdout or ""
             return text[:300] if text else ""
-        except Exception:
-            return ""
-    if sys.platform == "win32":
-        import ctypes
-
-        try:
-            CF_UNICODETEXT = 13
-            user32 = ctypes.windll.user32
-            kernel32 = ctypes.windll.kernel32
-            if not user32.OpenClipboard(0):
-                return ""
-            try:
-                handle = user32.GetClipboardData(CF_UNICODETEXT)
-                if not handle:
-                    return ""
-                kernel32.GlobalLock.restype = ctypes.c_void_p
-                ptr = kernel32.GlobalLock(handle)
-                if not ptr:
-                    return ""
-                try:
-                    text = ctypes.wstring_at(ptr)
-                    return text[:300] if text else ""
-                finally:
-                    kernel32.GlobalUnlock(handle)
-            finally:
-                user32.CloseClipboard()
         except Exception:
             return ""
     return ""

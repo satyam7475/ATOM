@@ -371,7 +371,12 @@ class ColdStartOptimizer:
             (self._config.get("vision") or {}).get("vlm") or {}
             if isinstance(self._config, dict) else {}
         )
-        warm_at_boot = bool(vlm_cfg.get("warm_at_boot", True))
+        # Sprint P2.7 (Apr 26 2026): align the code default with the
+        # shipping config (settings.json:76 = false). VLM warm-at-boot
+        # buys ~1.5s on the *first* describe() at the cost of ~1.6 GB
+        # RAM at idle on a 16 GB machine. Default off; users on bigger
+        # boxes can opt in via vision.vlm.warm_at_boot=true.
+        warm_at_boot = bool(vlm_cfg.get("warm_at_boot", False))
         if not warm_at_boot:
             logger.info(
                 "Cold start: VLM warm-at-boot disabled by config "

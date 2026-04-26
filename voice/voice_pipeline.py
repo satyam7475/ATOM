@@ -398,6 +398,37 @@ class VoicePipeline:
             intent_engine=self._intent_engine,
         ), ""
 
+    def _build_whisperkit_stt(self) -> tuple[Any | None, str]:
+        """Construct the WhisperKit (CoreML / ANE) backend (Sprint P3.3).
+
+        Returns ``(stt, "")`` on success and ``(None, reason)`` if any
+        dependency is missing. The factory falls back to whisper.cpp
+        when ``whisperkit-cli`` is not on $PATH.
+        """
+        try:
+            from voice.stt_whisperkit import (
+                WhisperKitSTT,
+                is_whisperkit_available,
+            )
+        except Exception as exc:
+            return None, (
+                f"WhisperKit module import failed: {exc}; "
+                "did you `pip install sounddevice webrtcvad`?"
+            )
+        if not is_whisperkit_available(self._config):
+            return None, (
+                "WhisperKit unavailable: install with "
+                "`brew install whisperkit-cli`. Falling back to whisper.cpp."
+            )
+        stt = WhisperKitSTT(
+            self._bus,
+            self._state,
+            self._config,
+            mic_manager=self._mic_manager,
+            intent_engine=self._intent_engine,
+        )
+        return stt, ""
+
     def _build_whisper_cpp_stt(self) -> tuple[Any | None, str]:
         """Construct the whisper.cpp Metal backend (Sprint B3).
 
@@ -486,6 +517,10 @@ class VoicePipeline:
             return ""
 
     _WHISPER_CPP_ALIASES = ("whisper_cpp", "whispercpp", "whisper", "whisper.cpp")
+    # Sprint P3.3 (Apr 26 2026): WhisperKit (CoreML / ANE) is the highest-
+    # ROI engine on Apple Silicon. We accept several spellings so config
+    # files and docs can be casual.
+    _WHISPERKIT_ALIASES = ("whisperkit", "whisper_kit", "whisper-kit", "wk")
 
     def _build_stt(self) -> None:
         stt_cfg = self._config.get("stt", {})
@@ -496,6 +531,8 @@ class VoicePipeline:
         # all map to the canonical whisper_cpp branch.
         if engine_pref in self._WHISPER_CPP_ALIASES:
             engine_pref = "whisper_cpp"
+        if engine_pref in self._WHISPERKIT_ALIASES:
+            engine_pref = "whisperkit"
         logger.info(
             "STT engine preference: %s (platform=%s)",
             engine_pref, sys.platform,
@@ -523,7 +560,42 @@ class VoicePipeline:
             return
 
         if sys.platform == "darwin":
-            if engine_pref == "whisper_cpp":
+            if engine_pref == "whisperkit":
+                # Sprint P3.3 (Apr 26 2026): explicit WhisperKit. If the
+                # CLI is missing we still gracefully fall back to
+                # whisper.cpp -- ANE > Metal > nothing.
+                wk_stt, wk_reason = self._build_whisperkit_stt()
+                if wk_stt is not None:
+                    self.stt = wk_stt
+                    self.stt_runtime_label = (
+                        "WhisperKit CoreML/ANE (explicit)"
+                    )
+                    logger.info(
+                        "STT: WhisperKit (CoreML on Apple Neural Engine)",
+                    )
+                else:
+                    self.stt_runtime_fallbacks.append(
+                        f"whisperkit unavailable: {wk_reason}",
+                    )
+                    logger.warning(
+                        "STT whisperkit: %s -- falling back to whisper.cpp",
+                        wk_reason,
+                    )
+                    whisper_stt, whisper_reason = (
+                        self._build_whisper_cpp_stt()
+                    )
+                    if whisper_stt is not None:
+                        self.stt = whisper_stt
+                        self.stt_runtime_label = (
+                            "whisper.cpp Metal (whisperkit fallback)"
+                        )
+                    else:
+                        self.stt_runtime_error = whisper_reason or ""
+                        self.stt = self._build_disabled_stt(
+                            f"whisperkit + whisper.cpp both unavailable",
+                        )
+                        self.stt_runtime_label = "Disabled"
+            elif engine_pref == "whisper_cpp":
                 whisper_stt, whisper_reason = self._build_whisper_cpp_stt()
                 if whisper_stt is not None:
                     self.stt = whisper_stt
@@ -547,32 +619,48 @@ class VoicePipeline:
                     )
                     self.stt_runtime_label = "Disabled (whisper.cpp required)"
             elif engine_pref == "auto":
-                # Sprint B3: prefer whisper.cpp when it's installed,
-                # because SFSpeechRecognizer suffers from the
-                # idle-timeout cliff documented in atomLogs.txt L310/437.
-                whisper_stt, whisper_reason = self._build_whisper_cpp_stt()
-                if whisper_stt is not None:
-                    self.stt = whisper_stt
-                    self.stt_runtime_label = (
-                        "whisper.cpp Metal (auto)"
-                    )
+                # Sprint P3.3 (Apr 26 2026): prefer WhisperKit if the CLI
+                # is present (ANE > Metal). Else fall back to whisper.cpp,
+                # which is still better than SFSpeechRecognizer for long
+                # sessions (atomLogs.txt L310/437).
+                wk_stt, wk_reason = self._build_whisperkit_stt()
+                if wk_stt is not None:
+                    self.stt = wk_stt
+                    self.stt_runtime_label = "WhisperKit CoreML/ANE (auto)"
                     logger.info(
-                        "STT auto: whisper.cpp selected -- model present",
+                        "STT auto: WhisperKit selected -- ANE on hot path",
                     )
                 else:
                     self.stt_runtime_fallbacks.append(
-                        f"whisper.cpp unavailable: {whisper_reason}",
+                        f"whisperkit unavailable: {wk_reason}",
                     )
-                    self.stt_runtime_error = whisper_reason or ""
-                    logger.error(
-                        "STT auto: whisper.cpp unavailable (%s) -- "
-                        "not falling back to SFSpeechRecognizer after Sprint K",
-                        whisper_reason,
+                    whisper_stt, whisper_reason = (
+                        self._build_whisper_cpp_stt()
                     )
-                    self.stt = self._build_disabled_stt(
-                        f"whisper.cpp unavailable ({whisper_reason})",
-                    )
-                    self.stt_runtime_label = "Disabled (whisper.cpp required)"
+                    if whisper_stt is not None:
+                        self.stt = whisper_stt
+                        self.stt_runtime_label = "whisper.cpp Metal (auto)"
+                        logger.info(
+                            "STT auto: whisper.cpp selected -- "
+                            "model present (whisperkit unavailable)",
+                        )
+                    else:
+                        self.stt_runtime_fallbacks.append(
+                            f"whisper.cpp unavailable: {whisper_reason}",
+                        )
+                        self.stt_runtime_error = whisper_reason or ""
+                        logger.error(
+                            "STT auto: whisper.cpp unavailable (%s) -- "
+                            "not falling back to SFSpeechRecognizer "
+                            "after Sprint K",
+                            whisper_reason,
+                        )
+                        self.stt = self._build_disabled_stt(
+                            f"whisper.cpp unavailable ({whisper_reason})",
+                        )
+                        self.stt_runtime_label = (
+                            "Disabled (whisper.cpp required)"
+                        )
             elif engine_pref == "macos_native":
                 native_stt, native_reason = self._build_native_stt()
                 if native_stt is not None:

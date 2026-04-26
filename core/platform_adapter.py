@@ -1,14 +1,12 @@
-"""
-ATOM -- Cross-Platform Adapter (JARVIS-Level Portability).
+"""ATOM -- Cross-Platform Adapter (JARVIS-Level portability for macOS).
 
-Abstracts ALL operating system interactions behind a unified API so ATOM
-can run on Windows, Linux, and macOS without any code changes in consuming
-modules. Every module that needs OS interaction imports from here instead
-of calling ctypes/subprocess directly.
-
-Auto-detects the current platform at import time and selects the right
-backend. Falls back gracefully when platform-specific features are
-unavailable.
+Abstracts OS interactions behind a unified API. macOS is the primary
+target; Linux paths are kept for headless dev / CI boxes that import
+this module (e.g. linters in containers). Sprint P4.7 (Apr 26 2026)
+removed the Windows branches — see ``docs/ATOM_NEXT_STEPS_PLAN.md``
+§ P4.7 for rationale. ``OSType.WINDOWS`` is intentionally retained in
+the enum so older code that imports it doesn't crash on import; the
+adapter will simply no-op gracefully on Windows.
 
 Capabilities:
     - Window management (foreground window, title, process)
@@ -40,7 +38,6 @@ from enum import Enum, auto
 from pathlib import Path
 from typing import Any
 import psutil
-import ctypes
 
 from core.macos import AppleScriptEngine
 
@@ -204,16 +201,7 @@ class PlatformAdapter:
     def _get_cpu_name(self) -> str:
         """Get human-readable CPU name across platforms."""
         try:
-            if self.os_type == OSType.WINDOWS:
-                import winreg
-                key = winreg.OpenKey(
-                    winreg.HKEY_LOCAL_MACHINE,
-                    r"HARDWARE\DESCRIPTION\System\CentralProcessor\0",
-                )
-                name, _ = winreg.QueryValueEx(key, "ProcessorNameString")
-                winreg.CloseKey(key)
-                return name.strip()
-            elif self.os_type == OSType.LINUX:
+            if self.os_type == OSType.LINUX:
                 with open("/proc/cpuinfo", "r") as f:
                     for line in f:
                         if "model name" in line:
@@ -251,24 +239,6 @@ class PlatformAdapter:
         except Exception:
             logger.debug('CPU brand string query failed', exc_info=True)
 
-        if self.os_type == OSType.WINDOWS:
-            try:
-                result = subprocess.run(
-                    ["wmic", "path", "win32_VideoController", "get",
-                     "Name,AdapterRAM", "/format:csv"],
-                    capture_output=True, text=True, timeout=10,
-                )
-                for line in result.stdout.strip().split("\n"):
-                    parts = line.strip().split(",")
-                    if len(parts) >= 3 and parts[1].strip():
-                        vram = 0.0
-                        try:
-                            vram = round(int(parts[2]) / (1024 ** 3), 2)
-                        except (ValueError, IndexError):
-                            pass
-                        return parts[1].strip(), vram
-            except Exception:
-                logger.debug('Subprocess run failed', exc_info=True)
         return "", 0.0
 
     def _get_gpu_info_macos(self) -> tuple[str, float]:
@@ -305,18 +275,9 @@ class PlatformAdapter:
 
     def _get_display_info(self) -> tuple[int, str]:
         """Get display count and primary resolution."""
-        if self.os_type == OSType.WINDOWS:
-            try:
-                user32 = ctypes.windll.user32
-                w = user32.GetSystemMetrics(0)
-                h = user32.GetSystemMetrics(1)
-                count = user32.GetSystemMetrics(80)
-                return max(1, count), f"{w}x{h}"
-            except Exception:
-                logger.debug('Subprocess run failed', exc_info=True)
-        elif self.os_type == OSType.MACOS:
+        if self.os_type == OSType.MACOS:
             return self._get_display_info_macos()
-        elif self.os_type == OSType.LINUX:
+        if self.os_type == OSType.LINUX:
             try:
                 result = subprocess.run(
                     ["xrandr", "--current"],
@@ -368,46 +329,11 @@ class PlatformAdapter:
 
     def get_foreground_window(self) -> dict[str, str]:
         """Get foreground window info: title, app_name, process_name, pid."""
-        if self.os_type == OSType.WINDOWS:
-            return self._fg_window_windows()
-        elif self.os_type == OSType.LINUX:
+        if self.os_type == OSType.LINUX:
             return self._fg_window_linux()
-        elif self.os_type == OSType.MACOS:
+        if self.os_type == OSType.MACOS:
             return self._fg_window_macos()
         return {"title": "", "app_name": "", "process_name": "", "pid": ""}
-
-    def _fg_window_windows(self) -> dict[str, str]:
-        try:
-            from ctypes import wintypes
-
-            user32 = ctypes.windll.user32
-            hwnd = user32.GetForegroundWindow()
-            length = user32.GetWindowTextLengthW(hwnd)
-            title = ""
-            if length > 0:
-                buf = ctypes.create_unicode_buffer(length + 1)
-                user32.GetWindowTextW(hwnd, buf, length + 1)
-                title = buf.value
-
-            pid = wintypes.DWORD()
-            user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
-
-            process_name = ""
-            try:
-                proc = psutil.Process(pid.value)
-                process_name = proc.name()
-            except Exception:
-                logger.debug('Process lookup failed', exc_info=True)
-
-            app_name = title.rsplit(" - ", 1)[-1].strip() if " - " in title else title
-            return {
-                "title": title,
-                "app_name": app_name,
-                "process_name": process_name,
-                "pid": str(pid.value),
-            }
-        except Exception:
-            return {"title": "", "app_name": "", "process_name": "", "pid": ""}
 
     def _fg_window_linux(self) -> dict[str, str]:
         try:
@@ -442,8 +368,6 @@ class PlatformAdapter:
 
     def get_clipboard(self, max_chars: int = 500) -> str:
         """Read clipboard text, cross-platform."""
-        if self.os_type == OSType.WINDOWS:
-            return self._clipboard_windows(max_chars)
         try:
             result = subprocess.run(
                 ["xclip", "-selection", "clipboard", "-o"]
@@ -452,29 +376,6 @@ class PlatformAdapter:
                 capture_output=True, text=True, timeout=3,
             )
             return result.stdout[:max_chars]
-        except Exception:
-            return ""
-
-    def _clipboard_windows(self, max_chars: int) -> str:
-        try:
-            user32 = ctypes.windll.user32
-            kernel32 = ctypes.windll.kernel32
-            if not user32.OpenClipboard(0):
-                return ""
-            try:
-                handle = user32.GetClipboardData(13)
-                if not handle:
-                    return ""
-                kernel32.GlobalLock.restype = ctypes.c_void_p
-                ptr = kernel32.GlobalLock(handle)
-                if not ptr:
-                    return ""
-                try:
-                    return ctypes.wstring_at(ptr)[:max_chars]
-                finally:
-                    kernel32.GlobalUnlock(handle)
-            finally:
-                user32.CloseClipboard()
         except Exception:
             return ""
 
@@ -577,69 +478,11 @@ class PlatformAdapter:
 
     def get_installed_apps(self) -> list[InstalledApp]:
         """List installed applications (platform-specific)."""
-        if self.os_type == OSType.WINDOWS:
-            return self._installed_apps_windows()
-        elif self.os_type == OSType.LINUX:
+        if self.os_type == OSType.LINUX:
             return self._installed_apps_linux()
-        elif self.os_type == OSType.MACOS:
+        if self.os_type == OSType.MACOS:
             return self._installed_apps_macos()
         return []
-
-    def _installed_apps_windows(self) -> list[InstalledApp]:
-        apps: list[InstalledApp] = []
-        try:
-            import winreg
-            paths = [
-                r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall",
-                r"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall",
-            ]
-            for reg_path in paths:
-                try:
-                    key = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, reg_path)
-                    for i in range(winreg.QueryInfoKey(key)[0]):
-                        try:
-                            subkey_name = winreg.EnumKey(key, i)
-                            subkey = winreg.OpenKey(key, subkey_name)
-                            name = ""
-                            try:
-                                name = winreg.QueryValueEx(subkey, "DisplayName")[0]
-                            except FileNotFoundError:
-                                continue
-                            if not name:
-                                continue
-                            version = ""
-                            publisher = ""
-                            install_path = ""
-                            install_date = ""
-                            try:
-                                version = winreg.QueryValueEx(subkey, "DisplayVersion")[0]
-                            except FileNotFoundError:
-                                pass
-                            try:
-                                publisher = winreg.QueryValueEx(subkey, "Publisher")[0]
-                            except FileNotFoundError:
-                                pass
-                            try:
-                                install_path = winreg.QueryValueEx(subkey, "InstallLocation")[0]
-                            except FileNotFoundError:
-                                pass
-                            try:
-                                install_date = winreg.QueryValueEx(subkey, "InstallDate")[0]
-                            except FileNotFoundError:
-                                pass
-                            apps.append(InstalledApp(
-                                name=name, version=version, publisher=publisher,
-                                install_path=install_path, install_date=install_date,
-                            ))
-                            winreg.CloseKey(subkey)
-                        except Exception:
-                            logger.debug('core platform adapter optional step failed', exc_info=True)
-                    winreg.CloseKey(key)
-                except FileNotFoundError:
-                    pass
-        except Exception:
-            logger.debug("Windows app listing failed", exc_info=True)
-        return apps
 
     def _installed_apps_linux(self) -> list[InstalledApp]:
         apps: list[InstalledApp] = []
@@ -677,9 +520,7 @@ class PlatformAdapter:
 
     def lock_screen(self) -> bool:
         try:
-            if self.os_type == OSType.WINDOWS:
-                ctypes.windll.user32.LockWorkStation()
-            elif self.os_type == OSType.LINUX:
+            if self.os_type == OSType.LINUX:
                 subprocess.Popen(["xdg-screensaver", "lock"])
             elif self.os_type == OSType.MACOS:
                 subprocess.Popen([
@@ -693,9 +534,7 @@ class PlatformAdapter:
 
     def shutdown(self, delay_seconds: int = 0) -> bool:
         try:
-            if self.os_type == OSType.WINDOWS:
-                os.system(f"shutdown /s /t {delay_seconds}")
-            elif self.os_type == OSType.LINUX:
+            if self.os_type == OSType.LINUX:
                 os.system(f"shutdown -h +{delay_seconds // 60 or 0}")
             elif self.os_type == OSType.MACOS:
                 subprocess.run(["osascript", "-e",
@@ -706,9 +545,7 @@ class PlatformAdapter:
 
     def restart(self, delay_seconds: int = 0) -> bool:
         try:
-            if self.os_type == OSType.WINDOWS:
-                os.system(f"shutdown /r /t {delay_seconds}")
-            elif self.os_type == OSType.LINUX:
+            if self.os_type == OSType.LINUX:
                 os.system(f"shutdown -r +{delay_seconds // 60 or 0}")
             elif self.os_type == OSType.MACOS:
                 subprocess.run(["osascript", "-e",
@@ -719,9 +556,7 @@ class PlatformAdapter:
 
     def sleep_system(self) -> bool:
         try:
-            if self.os_type == OSType.WINDOWS:
-                os.system("rundll32.exe powrprof.dll,SetSuspendState 0,1,0")
-            elif self.os_type == OSType.LINUX:
+            if self.os_type == OSType.LINUX:
                 os.system("systemctl suspend")
             elif self.os_type == OSType.MACOS:
                 os.system("pmset sleepnow")
@@ -735,18 +570,7 @@ class PlatformAdapter:
         """Set display brightness (0-100)."""
         level = max(0, min(100, level))
         try:
-            if self.os_type == OSType.WINDOWS:
-                try:
-                    result = subprocess.run(
-                        ["powershell", "-Command",
-                         f"(Get-WmiObject -Namespace root/WMI -Class WmiMonitorBrightnessMethods)"
-                         f".WmiSetBrightness(1,{level})"],
-                        capture_output=True, timeout=10,
-                    )
-                    return result.returncode == 0
-                except Exception:
-                    return False
-            elif self.os_type == OSType.LINUX:
+            if self.os_type == OSType.LINUX:
                 brightness_file = Path("/sys/class/backlight")
                 if brightness_file.exists():
                     for ctrl in brightness_file.iterdir():
@@ -767,32 +591,10 @@ class PlatformAdapter:
     def send_notification(self, title: str, message: str) -> bool:
         """Send a native OS notification."""
         try:
-            if self.os_type == OSType.WINDOWS:
-                try:
-                    from win10toast import ToastNotifier
-                    ToastNotifier().show_toast(title, message, duration=5, threaded=True)
-                    return True
-                except ImportError:
-                    subprocess.run([
-                        "powershell", "-Command",
-                        f'[Windows.UI.Notifications.ToastNotificationManager, '
-                        f'Windows.UI.Notifications, ContentType = WindowsRuntime] > $null; '
-                        f'$template = [Windows.UI.Notifications.ToastNotificationManager]'
-                        f'::GetTemplateContent([Windows.UI.Notifications.ToastTemplateType]'
-                        f'::ToastText02); '
-                        f'$textNodes = $template.GetElementsByTagName("text"); '
-                        f'$textNodes.Item(0).AppendChild($template.CreateTextNode("{title}")); '
-                        f'$textNodes.Item(1).AppendChild($template.CreateTextNode("{message}")); '
-                        f'$notifier = [Windows.UI.Notifications.ToastNotificationManager]'
-                        f'::CreateToastNotifier("ATOM"); '
-                        f'$notifier.Show([Windows.UI.Notifications.ToastNotification]'
-                        f'::new($template))',
-                    ], timeout=10)
-                    return True
-            elif self.os_type == OSType.LINUX:
+            if self.os_type == OSType.LINUX:
                 subprocess.run(["notify-send", title, message], timeout=5)
                 return True
-            elif self.os_type == OSType.MACOS:
+            if self.os_type == OSType.MACOS:
                 if self._applescript is not None:
                     return self._applescript.send_notification(title, message)
         except Exception:
@@ -805,21 +607,7 @@ class PlatformAdapter:
         """List system services."""
         services: list[dict[str, str]] = []
         try:
-            if self.os_type == OSType.WINDOWS:
-                for svc in psutil.win_service_iter():
-                    try:
-                        info = svc.as_dict()
-                        if filter_running and info.get("status") != "running":
-                            continue
-                        services.append({
-                            "name": info.get("name", ""),
-                            "display_name": info.get("display_name", ""),
-                            "status": info.get("status", ""),
-                            "start_type": info.get("start_type", ""),
-                        })
-                    except Exception:
-                        logger.debug('Subprocess run failed', exc_info=True)
-            elif self.os_type == OSType.MACOS:
+            if self.os_type == OSType.MACOS:
                 result = subprocess.run(
                     ["launchctl", "list"],
                     capture_output=True, text=True, timeout=10,
@@ -884,15 +672,13 @@ class PlatformAdapter:
 
     def recommended_tts_engine(self) -> str:
         """Recommend the best TTS engine for the current platform."""
-        if self.os_type == OSType.WINDOWS:
-            return "sapi"
-        elif self.os_type == OSType.LINUX:
+        if self.os_type == OSType.LINUX:
             if shutil.which("piper"):
                 return "piper"
             if shutil.which("espeak"):
                 return "espeak"
             return "edge"
-        elif self.os_type == OSType.MACOS:
+        if self.os_type == OSType.MACOS:
             return "nsss"
         return "edge"
 

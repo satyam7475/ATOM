@@ -589,6 +589,47 @@ class StructuredPromptBuilder:
             except Exception:
                 logger.debug("Owner preferences block inject failed", exc_info=True)
 
+        # Sprint P4.2 (Apr 26 2026): owner-style fingerprint. The
+        # OwnerStyleAdapter holds a rolling window of Boss's last N
+        # turns and emits a compact one-liner ("Boss is terse; reply
+        # in 1 short sentence", "Boss frequently mixes Hindi/Hinglish")
+        # once it has enough samples. We feed it through the dynamic
+        # context layer (NOT the persona prefix) so a style change
+        # never invalidates the persona KV pin -- the cost of the
+        # extra ~80 chars per prompt is in the noise.
+        try:
+            from core.personality import get_owner_style as _owner_style_fn
+            style = _owner_style_fn()
+        except Exception:
+            style = None
+        if style is not None:
+            try:
+                block = style.style_block_for_prompt()
+                if block:
+                    parts.append(block)
+            except Exception:
+                logger.debug(
+                    "OwnerStyle block inject failed", exc_info=True,
+                )
+
+        # Sprint P4.1 + P4.3 (Apr 26 2026): owner-taught corrections +
+        # pronunciation summary. Surfaces only after Boss has actually
+        # taught ATOM something; otherwise an empty string.
+        try:
+            from core.personality import get_owner_profile as _owner_profile_fn
+            profile = _owner_profile_fn()
+        except Exception:
+            profile = None
+        if profile is not None:
+            try:
+                summary = profile.summary()
+                if summary:
+                    parts.append(f"OWNER LEARNED: {summary}")
+            except Exception:
+                logger.debug(
+                    "OwnerProfile summary inject failed", exc_info=True,
+                )
+
         # Real-world block only when query needs weather/place/news/world awareness (prevents parroting Delhi/season)
         needs_real_world = any(
             w in q_lower

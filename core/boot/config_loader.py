@@ -12,6 +12,8 @@ from typing import Any
 
 # Global overrides for runtime modifications (e.g., via CLI)
 _CONFIG_OVERRIDES: dict[str, Any] = {}
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+_CONFIG_PATH = _REPO_ROOT / "config" / "settings.json"
 
 
 def set_config_overrides(overrides: dict[str, Any]) -> None:
@@ -22,24 +24,23 @@ def set_config_overrides(overrides: dict[str, Any]) -> None:
 
 def load_config() -> dict[str, Any]:
     """Parse config/settings.json and apply any runtime overrides."""
-    cfg_path = Path("config/settings.json")
     base: dict[str, Any] = {}
-    
-    if cfg_path.exists():
+
+    if _CONFIG_PATH.exists():
         try:
-            with open(cfg_path, "r", encoding="utf-8") as f:
+            with open(_CONFIG_PATH, "r", encoding="utf-8") as f:
                 base = json.load(f)
         except Exception as e:
             import logging
             logging.getLogger("atom.boot").error(
-                "Failed to parse config/settings.json: %s", e
+                "Failed to parse %s: %s", _CONFIG_PATH, e
             )
-            
+
     if _CONFIG_OVERRIDES:
         for key, val in _CONFIG_OVERRIDES.items():
             if isinstance(val, dict) and isinstance(base.get(key), dict):
                 base[key].update(val)
             else:
                 base[key] = val
-                
+
     return base

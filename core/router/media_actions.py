@@ -1,7 +1,12 @@
-"""
-ATOM -- Media and volume action handlers (cross-platform).
+"""ATOM -- Media and volume action handlers (macOS-only).
 
-Handles: set_volume, mute/unmute, play/pause, play_youtube
+Handles: set_volume, mute/unmute, play/pause, play_youtube.
+
+Sprint P4.7 (Apr 26 2026): Windows ``win32`` ctypes branches removed.
+A Linux ``xdg-open`` fallback is retained for ``_open_url`` because
+it's a single line and survives without imports -- useful in CI/dev
+boxes that aren't Apple Silicon. See
+``docs/ATOM_NEXT_STEPS_PLAN.md`` § P4.7.
 """
 
 from __future__ import annotations
@@ -14,16 +19,13 @@ import urllib.parse
 logger = logging.getLogger("atom.router.media")
 
 _IS_MAC = sys.platform == "darwin"
-_IS_WIN = sys.platform == "win32"
 
 
 def _open_url(url: str) -> None:
-    """Open a URL in the default browser, platform-aware."""
+    """Open a URL in the default browser. macOS uses ``open``; the
+    Linux ``xdg-open`` fallback keeps headless CI / dev boxes happy."""
     if _IS_MAC:
         subprocess.Popen(["open", url],
-                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    elif _IS_WIN:
-        subprocess.Popen(["cmd", "/c", "start", url],
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     else:
         subprocess.Popen(["xdg-open", url],
@@ -46,13 +48,8 @@ def _osascript(script: str) -> str:
 def send_media_play_pause() -> None:
     if _IS_MAC:
         _osascript(
-            'tell application "System Events" to key code 16 using {command down}'
+            'tell application "System Events" to key code 16 using {command down}',
         )
-    elif _IS_WIN:
-        import ctypes
-        VK_MEDIA_PLAY_PAUSE = 0xB3
-        ctypes.windll.user32.keybd_event(VK_MEDIA_PLAY_PAUSE, 0, 0, 0)
-        ctypes.windll.user32.keybd_event(VK_MEDIA_PLAY_PAUSE, 0, 2, 0)
 
 
 def set_system_volume_percent(percent: int) -> None:
@@ -60,16 +57,6 @@ def set_system_volume_percent(percent: int) -> None:
     if _IS_MAC:
         _osascript(f"set volume output volume {vol}")
         logger.info("macOS volume set to %d%%", vol)
-    elif _IS_WIN:
-        import ctypes
-        vk_down, vk_up = 0xAE, 0xAF
-        target_steps = round(vol / 2)
-        for _ in range(60):
-            ctypes.windll.user32.keybd_event(vk_down, 0, 0, 0)
-            ctypes.windll.user32.keybd_event(vk_down, 0, 2, 0)
-        for _ in range(target_steps):
-            ctypes.windll.user32.keybd_event(vk_up, 0, 0, 0)
-            ctypes.windll.user32.keybd_event(vk_up, 0, 2, 0)
 
 
 def send_mute_toggle() -> None:
@@ -78,11 +65,6 @@ def send_mute_toggle() -> None:
         new_state = "false" if current == "true" else "true"
         _osascript(f"set volume output muted {new_state}")
         logger.info("macOS mute toggled to %s", new_state)
-    elif _IS_WIN:
-        import ctypes
-        VK_VOLUME_MUTE = 0xAD
-        ctypes.windll.user32.keybd_event(VK_VOLUME_MUTE, 0, 0, 0)
-        ctypes.windll.user32.keybd_event(VK_VOLUME_MUTE, 0, 2, 0)
 
 
 def play_youtube(query: str, auto_play: bool = True) -> str:

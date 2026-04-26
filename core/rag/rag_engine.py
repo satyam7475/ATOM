@@ -164,6 +164,9 @@ class RagEngine:
                 self._disk_cache = PersistentEmbeddingCache(
                     path=self._rag_cfg.get("embed_cache_path", "data/rag_embedding_cache.sqlite"),
                     namespace=embed_signature,
+                    allow_bucket_fallback=bool(
+                        self._rag_cfg.get("embed_cache_bucket_fallback", False),
+                    ),
                 )
             except Exception:
                 self._disk_cache = None

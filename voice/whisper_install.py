@@ -30,6 +30,39 @@ BASE_URL = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main"
 DEFAULT_MODEL = "small.en-q5_1"
 
 KNOWN_MODELS: dict[str, dict[str, object]] = {
+    # ── Multilingual variants (Hindi + Hinglish + everything else) ─────
+    # Apr 26 2026 (P1.1): added so config can flip
+    # `stt.whisper_model_path` to a multilingual model without us having
+    # to download bytes outside the standard install path.
+    "large-v3-turbo-q5_0": {
+        "filename": "ggml-large-v3-turbo-q5_0.bin",
+        "approx_mb": 547,
+    },
+    "large-v3-turbo": {
+        "filename": "ggml-large-v3-turbo.bin",
+        "approx_mb": 1624,
+    },
+    "medium-q5_0": {
+        "filename": "ggml-medium-q5_0.bin",
+        "approx_mb": 514,
+    },
+    "medium-q8_0": {
+        "filename": "ggml-medium-q8_0.bin",
+        "approx_mb": 813,
+    },
+    "small-q5_1": {
+        "filename": "ggml-small-q5_1.bin",
+        "approx_mb": 181,
+    },
+    "base-q5_1": {
+        "filename": "ggml-base-q5_1.bin",
+        "approx_mb": 57,
+    },
+    "tiny-q5_1": {
+        "filename": "ggml-tiny-q5_1.bin",
+        "approx_mb": 32,
+    },
+    # ── English-only variants (faster on EN, no Hindi/Hinglish) ────────
     "small.en-q5_1": {
         "filename": "ggml-small.en-q5_1.bin",
         "approx_mb": 181,

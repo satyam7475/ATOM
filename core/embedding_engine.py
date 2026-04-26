@@ -192,7 +192,9 @@ class EmbeddingEngine:
             if self._loaded:
                 return True
             try:
-                if self._backend in {"fastembed", "onnx"}:
+                if self._backend in {
+                    "fastembed", "onnx", "mlx", "mlx_embeddings",
+                }:
                     return self._ensure_provider_loaded()
 
                 # Sprint Ω.1: silence the two cosmetic boot-log
@@ -280,6 +282,15 @@ class EmbeddingEngine:
                 from core.embeddings import FastEmbedProvider
 
                 self._provider = FastEmbedProvider(**provider_cfg)
+            elif self._backend in {"mlx", "mlx_embeddings"}:
+                # Sprint P3.4 (Apr 26 2026): MLX-native embeddings on the
+                # Apple Neural Engine. Falls back to sentence_transformers
+                # automatically if the package is missing -- the
+                # ProviderLoadError below is caught and re-routes through
+                # the legacy path.
+                from core.embeddings import MLXEmbeddingsProvider
+
+                self._provider = MLXEmbeddingsProvider(**provider_cfg)
             else:
                 logger.warning(
                     "Unknown embedding backend %r; falling back to hash embeddings",
@@ -289,7 +300,25 @@ class EmbeddingEngine:
                 return False
 
             t0 = time.monotonic()
-            self._provider.load()
+            try:
+                self._provider.load()
+            except Exception as exc:
+                # Sprint P3.4 (Apr 26 2026): if the user asked for the MLX
+                # provider but `mlx-embeddings` isn't installed (or any
+                # other one-shot recoverable failure), gracefully fall
+                # back to sentence_transformers so retrieval keeps
+                # working. This costs the SentenceTransformer boot once,
+                # and the warm-file masks it on subsequent boots.
+                if self._backend in {"mlx", "mlx_embeddings"}:
+                    logger.warning(
+                        "MLX embeddings provider failed (%s); "
+                        "falling back to sentence_transformers",
+                        exc,
+                    )
+                    self._provider = None
+                    self._backend = "sentence_transformers"
+                    return self._ensure_loaded()
+                raise
             self._dimension = int(getattr(self._provider, "dimension", self._dimension))
             self._provider_version = str(
                 getattr(self._provider, "version", self._provider_version),

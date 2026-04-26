@@ -115,11 +115,22 @@ def test_restore_validates_model_path_match(tmp_path: Path) -> None:
 def test_restore_idempotent_per_role(tmp_path: Path) -> None:
     """Restore must run at most once per role per boot — repeated
     calls during model reloads must NOT keep re-injecting the same
-    cache and bloating the LRU."""
+    cache and bloating the LRU.
+
+    Sprint P2.6 (Apr 26 2026): the MLX symbols are now lazy-loaded, so
+    ``_prompt_cache_persist_enabled`` checks BOTH ``_save_prompt_cache``
+    and ``_load_prompt_cache`` for non-None. Pre-P2.6 only the load
+    symbol mattered; we now patch both with a sentinel so the property
+    returns ``True`` and the function reaches its body.
+    """
     brain = _brain(tmp_path)
 
     load_mock = MagicMock(return_value=(None, {}))
-    with patch("brain.mlx_llm._load_prompt_cache", load_mock):
+    save_mock = MagicMock()
+    with (
+        patch("brain.mlx_llm._load_prompt_cache", load_mock),
+        patch("brain.mlx_llm._save_prompt_cache", save_mock),
+    ):
         brain._restore_persisted_prompt_cache("primary")
         brain._restore_persisted_prompt_cache("primary")
         brain._restore_persisted_prompt_cache("primary")

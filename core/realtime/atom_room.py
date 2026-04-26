@@ -34,6 +34,7 @@ Design goals
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import logging
 import secrets
 import time
@@ -44,6 +45,16 @@ from typing import Any, Awaitable, Callable
 from core import json_fast
 
 logger = logging.getLogger("atom.realtime.room")
+
+
+def _is_loopback_host(host: str) -> bool:
+    h = (host or "").strip().lower()
+    if h in {"localhost", "127.0.0.1", "::1", "[::1]"}:
+        return True
+    try:
+        return ipaddress.ip_address(h.strip("[]")).is_loopback
+    except ValueError:
+        return False
 
 
 # ── Frame protocol ──────────────────────────────────────────────────
@@ -401,6 +412,10 @@ class AtomRoomServer:
         self._app: Any = None
 
     async def start(self) -> None:
+        if not self.room.config.auth_token and not _is_loopback_host(self.host):
+            raise RuntimeError(
+                "realtime.auth_token is required when realtime.host is not loopback",
+            )
         WSMsgType, web = _lazy_aiohttp()
         app = web.Application()
         app.router.add_get("/healthz", self._handle_healthz)
@@ -458,8 +473,9 @@ class AtomRoomServer:
 
     async def _handle_ws(self, request: Any) -> Any:
         WSMsgType, web = _lazy_aiohttp()
-        # Auth: token via query string, header, or sub-protocol. LAN
-        # dev mode allows anonymous when ``auth_token`` is None.
+        # Auth: token via query string, header, or sub-protocol. Anonymous
+        # access is allowed only for loopback dev mode; start() rejects
+        # routable binds without a configured token.
         configured_token = self.room.config.auth_token
         if configured_token:
             supplied = (

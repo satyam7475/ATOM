@@ -99,6 +99,10 @@ password_backup*
 config/bridge_token
 data/trusted_iphone.json
 
+# Biometric enrollment artifacts
+config/owner_face*.npy
+config/face_*.npy
+
 # macOS app bundle codesigning churn (rebuilt by `scripts/build_atom_app_launcher.sh`)
 ATOM.app/Contents/_CodeSignature/
 ATOM.app/Contents/MacOS/atom_python

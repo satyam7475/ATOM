@@ -284,3 +284,213 @@ reason. Tail it while debugging.
 - [core/identity_engine.py](../core/identity_engine.py) -- `is_owner_verified()` and Face ID freshness.
 - [core/identity/device_binding.py](../core/identity/device_binding.py) -- `is_trusted_iphone()`.
 - [docs/shortcuts/README.md](shortcuts/README.md) -- pre-canned action recipes you can import.
+
+---
+
+## 10. Tailscale + Enchanted (Sprint P4.4, Apr 26 2026)
+
+The Phase 1 setup above gives you triggers from the iPhone Shortcuts
+app. Phase 2 (P4.4 in [docs/ATOM_NEXT_STEPS_PLAN.md](ATOM_NEXT_STEPS_PLAN.md)) wires
+ATOM's local brain into a real **conversational** iPhone client over
+[Tailscale](https://tailscale.com/) — no public ports, no Apple
+developer account, no pay-walled cloud.
+
+The bridge now ships an **OpenAI-compatible `/v1/*` shim** so any
+mainstream iOS LLM client (Enchanted, ChatX, GPTMobile-fork, etc.)
+will work. We use [Enchanted](https://github.com/AugustDev/enchanted)
+as the reference client because it's free, open source, and explicitly
+supports an "Ollama" / OpenAI-style backend URL.
+
+End-to-end stack:
+
+```
+iPhone 15
+  └─ Enchanted (App Store, free)
+       │  HTTPS-over-WireGuard (Tailscale tunnel; encrypted, no NAT punching)
+       ▼
+MacBook Air M5 (server)
+  └─ ATOM bridge on 100.x.x.x:8787 (cross_device.bridge_port)
+       │  Tailscale exposes the port to your tailnet only (private subnet)
+       ▼
+ATOM's MLX brain (Qwen3-8B-4bit, local, ANE-accelerated)
+```
+
+What you get:
+
+- A real chat with ATOM's local brain from anywhere — coffee shop,
+  commute, kitchen — over an encrypted WireGuard tunnel without
+  exposing a single port to the open internet.
+- Same auth model as the Shortcuts bridge (one shared token in iCloud
+  Keychain). Enchanted lets you paste it as the API key.
+- Streamed replies (SSE) so first-token latency on iPhone matches the
+  Mac dashboard.
+
+### 10.1 Prerequisites
+
+1. A free Tailscale account on the same email/Apple ID for both Mac
+   and iPhone.
+2. Enchanted installed on iPhone:
+   [App Store link](https://apps.apple.com/app/enchanted-llm/id6474268307).
+3. ATOM running on the Mac with `cross_device.enabled: true` and
+   the bridge port reachable on **localhost** (already covered in §0).
+
+### 10.2 Install Tailscale on the Mac
+
+```bash
+# Homebrew is the cleanest path on macOS 26.x:
+brew install --cask tailscale
+
+# Or grab the pkg from https://tailscale.com/download/macos
+```
+
+Open Tailscale, sign in. The menubar icon shows a green dot when
+the tunnel is up. Note your Mac's tailnet IP — it looks like
+`100.64.0.5` and is **stable** (Tailscale assigns it once).
+
+```bash
+# From the Mac, confirm:
+tailscale ip -4
+# 100.64.0.5
+```
+
+### 10.3 Install Tailscale on the iPhone
+
+1. App Store → search **Tailscale** → install.
+2. Open it, sign in with the same account.
+3. Toggle **Connect**. The iPhone gets its own `100.x.x.x` IP.
+
+### 10.4 Make the bridge listen on the tailnet (NOT 0.0.0.0)
+
+Edit `config/settings.json`:
+
+```json
+"cross_device": {
+    "enabled": true,
+    "bridge_port": 8787,
+    "bind_host": "0.0.0.0",
+    "allow_origins": ["100.64.0.0/10", "127.0.0.1"],
+    "faceid_freshness_s": 300,
+    ...
+}
+```
+
+> **Why `0.0.0.0` is safe here:** Tailscale's WireGuard tunnel
+> means the only IPs that can reach the Mac on this port are
+> machines you've explicitly added to your tailnet. The
+> `allow_origins` list is a *belt-and-suspenders* CIDR check ATOM
+> applies on top.
+>
+> If you have **any** doubt about the network you're on (public
+> Wi-Fi, hotel, conference) keep `bind_host: "127.0.0.1"` and only
+> flip to `0.0.0.0` when you're back on a trusted Tailscale-only
+> path. Tailscale's `--shields-up` mode is also worth enabling on
+> the Mac if it's ever shared.
+
+After editing, restart ATOM. The boot banner now shows the bridge
+URL on the tailnet IP:
+
+```
+│  iPhone bridge ONLINE  ->  http://100.64.0.5:8787
+│  Token file: config/bridge_token
+```
+
+### 10.5 Smoke-test from the iPhone before involving Enchanted
+
+In Safari on the iPhone:
+
+```
+http://100.64.0.5:8787/health
+```
+
+You should see `{"ok": true, "version": 1}`. If you get
+`Could not connect`, your tailnet isn't routing — re-check both
+sides have Tailscale toggled on.
+
+### 10.6 Configure Enchanted
+
+In Enchanted on iPhone:
+
+1. Tap the gear icon → **Servers**.
+2. Add a server:
+   - **Type:** `OpenAI-compatible`
+   - **URL:** `http://100.64.0.5:8787/v1`  *(use **your** tailnet IP)*
+   - **API Key:** paste the contents of `config/bridge_token`
+     from the Mac. iCloud Keychain syncs it from §1 if you stored
+     it there earlier — you can long-press the API Key field and
+     paste from the keychain entry named `atom-bridge`.
+3. Tap **Save** then **Models** — Enchanted should fetch `atom-local`
+   from `/v1/models`. If you see an error, the most common cause
+   is a wrong token (compare `cat config/bridge_token` to what you
+   pasted).
+4. Start a new chat. Type "hello, who are you?" — you should see
+   ATOM's reply stream in token-by-token, identical to the Mac
+   dashboard.
+
+### 10.7 What ATOM exposes via `/v1/*`
+
+The shim is intentionally minimal and **does not** invoke ATOM's
+voice state machine, persona-pin, or full prompt-builder. It is a
+pure "ask the local brain over Tailscale" surface. That means:
+
+- **No tool execution.** iPhone-initiated chats cannot run shell
+  commands, open apps, or trigger actions. Use the
+  `/trigger` endpoint (Shortcut 3 in §4) for action commands.
+- **No context from the Mac session.** The shim only sees the
+  messages in the request body. Conversation history is whatever
+  Enchanted sends — independent of what's on the Mac dashboard.
+- **No persona file applied.** The shim sends raw ChatML through
+  the model's tokenizer template; if you want ATOM-style replies
+  on iPhone, paste a one-line system prompt into Enchanted's
+  per-server "system message" field.
+
+| Endpoint | Method | Auth | Behaviour |
+|---|---|---|---|
+| `/v1/models` | GET | `X-ATOM-Token` or `Authorization: Bearer <token>` | Lists `atom-local` |
+| `/v1/chat/completions` | POST `stream=false` | same | Returns full reply once generated |
+| `/v1/chat/completions` | POST `stream=true` | same | SSE: opener delta → content deltas → `data: [DONE]` |
+
+### 10.8 Verify the whole loop with the smoke test
+
+From the Mac (with ATOM running):
+
+```bash
+python scripts/iphone_bridge_smoke.py \
+    --base-url http://127.0.0.1:8787 \
+    --token "$(cat config/bridge_token)"
+```
+
+Expected: all three checks pass (models / non-stream / stream) and
+total roundtrip < 5s warm. From an iPhone running Enchanted, the
+same `python scripts/iphone_bridge_smoke.py` against the tailnet IP
+proves the tunnel itself isn't the bottleneck.
+
+### 10.9 ACL hardening (read this twice)
+
+- **Don't add `0.0.0.0` to `allow_origins`** — that's a different
+  setting (CIDR allowlist) and adding `0.0.0.0` would bypass the
+  belt-and-suspenders check. Use `100.64.0.0/10` (Tailscale's
+  CGNAT range) or your specific iPhone tailnet IP.
+- **Keep `cross_device.faceid_freshness_s = 300`** so iPhone-driven
+  tier-3 actions still need a fresh Face ID confirmation every 5
+  minutes.
+- **Audit the bridge log weekly:**
+
+   ```bash
+   tail -100 logs/atom_bridge_audit.jsonl | jq .
+   ```
+
+   Lines only appear on auth failures (bad/missing token, device
+   conflict). If you see lines from an IP that isn't in your
+   tailnet, **rotate the token immediately** by deleting
+   `config/bridge_token` and restarting ATOM.
+
+### 10.10 Troubleshooting (Tailscale-specific)
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| `Could not connect` from Safari at `:8787` | Tailscale not connected on either side | Toggle Tailscale on both Mac and iPhone; check menubar/iOS toggle |
+| `Could not connect` only from iPhone (Safari OK on Mac) | `bind_host: 127.0.0.1` blocks tailnet IP | Set `bind_host: 0.0.0.0` and restart |
+| Enchanted says "Failed to fetch models" | Token mismatch | Re-paste `config/bridge_token` into Enchanted; some keyboards mangle `_` and `-` |
+| Replies cut off mid-sentence | Default `max_tokens=512` ran out | Tap the model in Enchanted → Advanced → bump `max_tokens` |
+| First token takes >5s | Cold MLX brain (model not loaded yet) | Run one chat from the Mac first to warm; subsequent iPhone calls are warm |
+| `429 rate_limited` | Two rapid requests from same IP | Wait 0.5s and retry; this is the per-source-IP soft limit |

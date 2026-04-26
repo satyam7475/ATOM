@@ -401,14 +401,27 @@ def wire_events(
             source="indicator.on_state_changed",
         ),
     )
-    bus.on(
-        "state_changed",
-        _guard_handler(
+    # Defensive: STT engines without ``on_state_changed`` (older
+    # backends or future drop-ins) must not break boot. Before this
+    # guard, an AttributeError here propagated out of wire_events,
+    # main() exited mid-init, and asyncio.run() deadlocked during
+    # teardown waiting for the iPhone-bridge BG task to cancel —
+    # the silent post-AdaptiveEngine stall.
+    stt_on_state_changed = getattr(stt, "on_state_changed", None)
+    if callable(stt_on_state_changed):
+        bus.on(
             "state_changed",
-            stt.on_state_changed,
-            source="stt.on_state_changed",
-        ),
-    )
+            _guard_handler(
+                "state_changed",
+                stt_on_state_changed,
+                source="stt.on_state_changed",
+            ),
+        )
+    else:
+        logger.debug(
+            "STT backend %s has no on_state_changed; skipping state-bridge wire",
+            type(stt).__name__,
+        )
     stt_on_tts_complete = getattr(stt, "on_tts_complete", None)
     if callable(stt_on_tts_complete):
         bus.on(

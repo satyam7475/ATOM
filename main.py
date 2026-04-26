@@ -39,11 +39,26 @@ Owner: Satyam
 from __future__ import annotations
 
 import asyncio
+import faulthandler
 import json
 import logging
 import os
+import signal
 import sys
+import threading
 import time
+
+if os.environ.get("ATOM_BOOT_FAULTHANDLER"):
+    _atom_fh_path = os.environ.get("ATOM_BOOT_FAULTHANDLER_FILE", "/tmp/atom_boot_traceback.log")
+    _atom_fh_secs = float(os.environ.get("ATOM_BOOT_FAULTHANDLER_SECS", "30"))
+    try:
+        _atom_fh_fp = open(_atom_fh_path, "w", buffering=1)
+        faulthandler.enable(file=_atom_fh_fp)
+        faulthandler.dump_traceback_later(
+            _atom_fh_secs, repeat=True, file=_atom_fh_fp,
+        )
+    except Exception:
+        pass
 from datetime import datetime
 import psutil
 from concurrent.futures import ThreadPoolExecutor
@@ -76,18 +91,175 @@ shutdown_event: asyncio.Event | None = None
 _restart_requested = False
 
 
+def _install_shutdown_signal_handlers(stop_event: asyncio.Event):
+    """Route process-manager stop signals through ATOM's normal teardown."""
+    loop = asyncio.get_running_loop()
+    installed: list[signal.Signals] = []
+
+    def _request_shutdown(signame: str) -> None:
+        if stop_event.is_set():
+            return
+        logger.info("%s received -- requesting graceful shutdown", signame)
+        stop_event.set()
+
+    for signame in ("SIGTERM", "SIGINT"):
+        sig = getattr(signal, signame, None)
+        if sig is None:
+            continue
+        try:
+            loop.add_signal_handler(sig, _request_shutdown, signame)
+            installed.append(sig)
+        except (NotImplementedError, RuntimeError, ValueError):
+            logger.debug("Signal handler install skipped for %s", signame, exc_info=True)
+
+    def _cleanup() -> None:
+        for sig in installed:
+            try:
+                loop.remove_signal_handler(sig)
+            except Exception:
+                logger.debug("Signal handler cleanup skipped for %s", sig, exc_info=True)
+
+    return _cleanup
+
+
+def _shutdown_executor_bounded(
+    executor: ThreadPoolExecutor,
+    *,
+    timeout_s: float = 3.0,
+) -> None:
+    """Drain the default executor briefly without hanging shutdown forever."""
+    done = threading.Event()
+
+    def _close() -> None:
+        try:
+            executor.shutdown(wait=True, cancel_futures=True)
+        finally:
+            done.set()
+
+    closer = threading.Thread(
+        target=_close,
+        name="atom-executor-shutdown",
+        daemon=True,
+    )
+    closer.start()
+    closer.join(timeout_s)
+    if not done.is_set():
+        logger.warning(
+            "Executor shutdown exceeded %.1fs; continuing process teardown",
+            timeout_s,
+        )
+
+
 from core.boot.wiring import wire_events
 from core.boot.cognitive_loop_wiring import wire_cognitive_loop
+
+
+def _build_iphone_chat_stream(local_brain: Any) -> Any:
+    """Sprint P4.4 (Apr 26 2026): build the OpenAI-compat chat-stream
+    callable consumed by ``IPhoneBridge``.
+
+    Returns ``None`` if no compatible local brain is available, in
+    which case the bridge silently disables /v1/* (404 instead of 500).
+
+    The returned callable's contract::
+
+        async for token, done in chat_stream(messages, model=..., max_tokens=...):
+            ...
+
+    where ``messages`` is OpenAI ChatML and ``token`` is the next text
+    chunk. ``done=True`` closes the stream. The callable accepts and
+    ignores any keyword arguments it doesn't recognise (forwards-compat
+    with future Enchanted features).
+    """
+    if local_brain is None:
+        return None
+    llm = getattr(local_brain, "_llm", None)
+    if llm is None or not hasattr(llm, "chat_streaming"):
+        return None
+
+    async def _chat_stream(
+        messages: list[dict[str, str]],
+        **kwargs: Any,
+    ):
+        loop = asyncio.get_running_loop()
+        queue: asyncio.Queue[tuple[str, bool]] = asyncio.Queue()
+
+        def _on_token(token_text: str, is_done: bool) -> None:
+            try:
+                loop.call_soon_threadsafe(
+                    queue.put_nowait, (token_text, is_done),
+                )
+            except RuntimeError:
+                pass
+
+        max_tokens = kwargs.get("max_tokens")
+        try:
+            max_tokens_int = (
+                int(max_tokens) if max_tokens is not None else None
+            )
+        except (TypeError, ValueError):
+            max_tokens_int = None
+
+        gen_task = asyncio.create_task(
+            llm.chat_streaming(
+                list(messages),
+                on_token=_on_token,
+                model_role="primary",
+                max_tokens_override=max_tokens_int,
+            )
+        )
+
+        try:
+            while True:
+                done_set, _ = await asyncio.wait(
+                    [asyncio.create_task(queue.get()), gen_task],
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                token_received = False
+                for task in done_set:
+                    if task is gen_task:
+                        continue
+                    try:
+                        token_text, is_done = task.result()
+                    except Exception:
+                        token_text, is_done = "", True
+                    token_received = True
+                    if token_text:
+                        yield token_text, False
+                    if is_done:
+                        yield "", True
+                        return
+                if gen_task.done() and not token_received:
+                    while not queue.empty():
+                        token_text, is_done = queue.get_nowait()
+                        if token_text:
+                            yield token_text, False
+                        if is_done:
+                            yield "", True
+                            return
+                    yield "", True
+                    return
+        finally:
+            if not gen_task.done():
+                gen_task.cancel()
+                try:
+                    await gen_task
+                except (asyncio.CancelledError, Exception):
+                    pass
+
+    return _chat_stream
 
 
 async def main() -> None:
     global shutdown_event
     shutdown_event = asyncio.Event()
+    signal_cleanup = None
 
     _bt_start()  # Sprint Ω.2 — anchor for the boot-timeline summary line
 
     from core.logging_setup import setup_logging
     setup_logging()
+    signal_cleanup = _install_shutdown_signal_handlers(shutdown_event)
 
     llm_queue = None
     runtime_watchdog = None
@@ -359,6 +531,7 @@ async def main() -> None:
             from brain.memory_graph import MemoryGraph
             from core.rag.prefetch_engine import RagPrefetchEngine
             from core.rag.rag_engine import RagEngine
+            from core.vector_store import get_shared_vector_store
 
             _mg_path = (config.get("memory") or {}).get(
                 "graph_db_path", "data/atom_memory.db",
@@ -368,11 +541,12 @@ async def main() -> None:
             _rag_cfg = config.get("rag") or {}
             semantic_rag_ready = bool(getattr(cognitive_kernel, "_semantic_stack_available", False))
             if _rag_cfg.get("enabled", True) and semantic_rag_ready:
-                rag_engine = RagEngine(config, vector_store=None)
+                shared_vector_store = get_shared_vector_store(config)
+                rag_engine = RagEngine(config, vector_store=shared_vector_store)
                 rag_engine.set_memory_graph(shared_memory_graph)
                 rag_engine.set_feedback_engine(feedback_engine)
                 prefetch_eng = RagPrefetchEngine(rag_engine, config)
-                local_brain.attach_rag(rag_engine, None)
+                local_brain.attach_rag(rag_engine, shared_vector_store)
                 local_brain.attach_prefetch_engine(prefetch_eng)
                 logger.info(
                     "V7 intelligence: RAG + prefetch + MemoryGraph + timeline + "
@@ -1951,6 +2125,34 @@ async def main() -> None:
     )
     _bt_mark("cold_start", cold_start_report.elapsed_ms)
 
+    # ── Sprint P4.1 + P4.2 + P4.3 (Apr 26 2026) ────────────────────
+    # Warm-init the OwnerProfile + OwnerStyleAdapter singletons so the
+    # configured owner.name + personality.owner_profile_db are bound
+    # before the first speech_final fires. Both inits are cheap
+    # (sqlite open + a couple of CREATE-IF-NOT-EXISTS); we log a single
+    # diagnostic line for each so the boot trace shows we're learning.
+    try:
+        from core.personality import get_owner_profile, get_owner_style
+        _owner_profile = get_owner_profile(config)
+        _owner_style = get_owner_style(config)
+        try:
+            pron_n = len(_owner_profile.list_pronunciations(limit=1024))
+        except Exception:
+            pron_n = -1
+        try:
+            corr_n = len(_owner_profile.recent_corrections(limit=1024))
+        except Exception:
+            corr_n = -1
+        logger.info(
+            "OwnerProfile ready (db=%s, owner=%s, pronunciations=%d, "
+            "recent_corrections=%d, style=%s).",
+            _owner_profile._db_path, _owner_profile._owner,
+            pron_n, corr_n,
+            "on" if _owner_style.enabled else "off",
+        )
+    except Exception:
+        logger.debug("OwnerProfile/Style bootstrap failed", exc_info=True)
+
     # ── Sprint C1 — pin the runtime persona as a stable KV prefix ──
     # The atomLogs.txt audit (L336/392/509) showed prompt-cache reuse
     # stuck at 67-75% because the ~600-token persona block was being
@@ -2146,10 +2348,21 @@ async def main() -> None:
             # ``IPhoneBridge.__init__`` auto-generates a ~32-char hex
             # token at ``config/bridge_token`` if one doesn't exist
             # yet, so we never need a manual setup script.
+            #
+            # Sprint P4.4 (Apr 26 2026): we also pass a chat-stream
+            # callable so the bridge can expose an OpenAI-compatible
+            # ``/v1/chat/completions`` shim. This is what the iPhone
+            # Enchanted app talks to over Tailscale. The callable is a
+            # *thin* delegate to ``MLXBrain.chat_streaming`` -- no extra
+            # cognitive_kernel routing -- so iPhone-initiated chats are
+            # plain "ask the local brain" and never trip ATOM's voice
+            # state machine, prompt-builder, or persona-pin path.
+            chat_stream_fn = _build_iphone_chat_stream(local_brain)
             iphone_bridge = IPhoneBridge(
                 config=config,
                 emit=getattr(bus, "emit_fast", None) or getattr(bus, "emit", None),
                 atom_root=Path(__file__).resolve().parent,
+                chat_stream=chat_stream_fn,
             )
 
             async def _speak_iphone_hint(hint: str) -> None:
@@ -2177,17 +2390,18 @@ async def main() -> None:
                     )
                     return
                 port = iphone_bridge.actual_port or _cross_cfg.get("bridge_port", 8787)
-                tok = iphone_bridge.token
                 # Loud, single-shot setup banner. The token must be
                 # entered into the iPhone Shortcuts (X-ATOM-Token
-                # header) on first run; we surface it here so the user
-                # never has to grep config/bridge_token by hand.
+                # header) on first run. Never print the bearer token
+                # itself; atomlogs.txt is routinely shared for triage.
                 _here = Path(__file__).resolve().parent
+                token_path = _cross_cfg.get("token_path") or str(
+                    _here / "config" / "bridge_token",
+                )
                 logger.info("")
                 logger.info("┌──────────────────────────────────────────────────────────────────────")
                 logger.info("│  iPhone bridge ONLINE  ->  http://127.0.0.1:%d", port)
-                logger.info("│  Token: %s", tok)
-                logger.info("│  (also stored at %s/config/bridge_token)", _here)
+                logger.info("│  Token file: %s", token_path)
                 logger.info("│")
                 logger.info("│  Next step on iPhone (one-time):")
                 logger.info("│   1. Open the Shortcuts app on your iPhone 15.")
@@ -2195,7 +2409,7 @@ async def main() -> None:
                 logger.info("│        Get Contents of URL")
                 logger.info("│          URL:    http://<your-mac-ip>:%d/health", port)
                 logger.info("│          Method: GET")
-                logger.info("│          Headers: X-ATOM-Token = <paste token above>")
+                logger.info("│          Headers: X-ATOM-Token = <token from token file>")
                 logger.info("│   3. Run it once -- success registers your iPhone as the")
                 logger.info("│      trusted device. Then add /faceid, /presence, /trigger.")
                 logger.info("│")
@@ -2977,6 +3191,20 @@ async def main() -> None:
                 mic_manager=mic_manager,
             )
             web_dashboard.set_health_provider(health_builder.build)
+            # Sprint P4.6 (Apr 26 2026): the iPhone bridge re-uses the
+            # same builder so /badge stays in lock-step with the
+            # dashboard /health rollup -- one source of truth, no drift.
+            if iphone_bridge is not None:
+                try:
+                    iphone_bridge._status_provider = health_builder.build
+                    logger.info(
+                        "iPhone bridge: /badge wired to HealthSnapshotBuilder.",
+                    )
+                except Exception:
+                    logger.debug(
+                        "iPhone bridge /badge wiring skipped",
+                        exc_info=True,
+                    )
         except Exception:
             logger.info("Health snapshot wiring failed", exc_info=True)
 
@@ -3824,13 +4052,15 @@ async def main() -> None:
         if fs_watcher is not None:
             fs_watcher.shutdown()
         logger.info("JARVIS intelligence modules stopped and persisted")
+        _tasks_to_cancel: list[asyncio.Task] = []
         maintenance_task.cancel()
+        _tasks_to_cancel.append(maintenance_task)
         for _t in _bg_tasks:
             if not _t.done():
                 _t.cancel()
-        _all_cancelled = [maintenance_task] + [t for t in _bg_tasks if t.cancelled()]
-        if _all_cancelled:
-            await asyncio.gather(*_all_cancelled, return_exceptions=True)
+                _tasks_to_cancel.append(_t)
+        if _tasks_to_cancel:
+            await asyncio.gather(*_tasks_to_cancel, return_exceptions=True)
         behavior.persist()
         evolution.persist()
 
@@ -3860,6 +4090,10 @@ async def main() -> None:
                 await screen_loop.stop()
         except Exception:
             logger.debug("screen perception loop stop failed", exc_info=True)
+        try:
+            await bus.stop()
+        except Exception:
+            logger.debug("event bus stop failed", exc_info=True)
         bus.clear()
         stt.shutdown()
         await tts.shutdown()
@@ -3890,7 +4124,9 @@ async def main() -> None:
                 _adaptive.flush()
         except Exception:
             logger.info("Adaptive engine flush failed", exc_info=True)
-        executor.shutdown(wait=False)
+        if signal_cleanup is not None:
+            signal_cleanup()
+        _shutdown_executor_bounded(executor)
         logger.info("ATOM stopped.")
 
 
@@ -4007,6 +4243,55 @@ def _preflight_brain_model() -> list[str]:
     return errors
 
 
+def _preflight_voice_runtime() -> list[str]:
+    """Verify production STT artifacts before the voice pipeline is built."""
+    preflight_log = logging.getLogger("atom.boot.preflight")
+    errors: list[str] = []
+    try:
+        from core.boot.config_loader import load_config
+        cfg = load_config()
+    except Exception as exc:
+        errors.append(f"settings.json unreadable for STT preflight: {exc}")
+        return errors
+
+    stt_cfg = cfg.get("stt") or {}
+    engine = str(stt_cfg.get("engine") or "").strip().lower()
+    if engine not in ("whisper_cpp", "whispercpp", "whisper", "whisper.cpp"):
+        return []
+
+    try:
+        import importlib
+        for module_name in (
+            "pywhispercpp.model",
+            "sounddevice",
+            "webrtcvad",
+            "numpy",
+        ):
+            try:
+                importlib.import_module(module_name)
+            except Exception as exc:
+                errors.append(
+                    f"whisper.cpp STT dependency missing: {module_name} ({exc})",
+                )
+
+        from voice.stt_whisper import _resolve_model_path
+        model_path = _resolve_model_path(stt_cfg.get("whisper_model_path"))
+        if not model_path.is_file():
+            errors.append(
+                f"whisper.cpp model missing: {model_path} "
+                "(run scripts/install_whisper_model.py)",
+            )
+        elif model_path.stat().st_size <= 0:
+            errors.append(f"whisper.cpp model is empty: {model_path}")
+    except Exception as exc:
+        errors.append(f"whisper.cpp STT preflight failed: {exc}")
+
+    if errors:
+        for line in errors:
+            preflight_log.critical("Voice preflight: %s", line)
+    return errors
+
+
 def run_atom(config_overrides: dict | None = None) -> None:
     """Launch ATOM programmatically with optional config overrides.
 
@@ -4024,10 +4309,14 @@ def run_atom(config_overrides: dict | None = None) -> None:
     global _restart_requested
     set_config_overrides(config_overrides or {})
 
-    if _preflight_hard_deps() or _preflight_brain_model():
+    preflight_errors: list[str] = []
+    preflight_errors.extend(_preflight_hard_deps())
+    preflight_errors.extend(_preflight_brain_model())
+    preflight_errors.extend(_preflight_voice_runtime())
+    if preflight_errors:
         logging.getLogger("atom.crash_guard").critical(
             "Preflight failed -- not starting main(). "
-            "Install missing deps / restore the MLX model directory and retry."
+            "Install missing deps / restore required model artifacts and retry."
         )
         set_config_overrides({})
         sys.exit(2)

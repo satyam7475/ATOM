@@ -82,6 +82,13 @@ class HealthSnapshotBuilder:
             "uptime_s": max(0.0, time.time() - float(self.started_at)),
             "generated_at": time.time(),
             "subsystems": subsystems,
+            # Sprint P4.6 (Apr 26 2026): unified status badge. Distilled
+            # from the same per-subsystem probes into a single
+            # "ATOM is OK" / "ATOM has N warnings" / "ATOM is critical"
+            # line + colour so the dashboard menubar / iPhone widget /
+            # smoke scripts can render the same state without
+            # reimplementing the rollup logic.
+            "badge": summarize_health(subsystems, overall=overall),
         }
 
     # ── Probes ────────────────────────────────────────────────────
@@ -275,4 +282,109 @@ class HealthSnapshotBuilder:
             return {"status": _STATUS_DEGRADED, "detail": repr(exc)}
 
 
-__all__ = ["HealthSnapshotBuilder"]
+def summarize_health(
+    subsystems: dict[str, Any],
+    *,
+    overall: str | None = None,
+) -> dict[str, Any]:
+    """Distil per-subsystem probes into one menubar-ready badge.
+
+    Sprint P4.6 (Apr 26 2026). Returns a stable, JSON-serializable
+    dict shaped::
+
+        {
+            "level": "ok" | "warn" | "critical" | "unknown",
+            "color": "green" | "amber" | "red" | "grey",
+            "text":  "ATOM is OK"             # or
+                     "ATOM has 2 warnings"     # or
+                     "ATOM is critical",
+            "headline":   "stt: degraded · brain: down",
+            "warnings":   [{"name": "stt", "status": "degraded", ...}, ...],
+            "criticals":  [{"name": "brain", "status": "down", ...}, ...],
+            "subsystems_total": 10,
+        }
+
+    The function is pure (no I/O, no logging) so the dashboard, the
+    iPhone bridge, and the menubar poller can all call it on the same
+    snapshot and get identical output.
+
+    ``subsystems`` is the dict produced by
+    :py:meth:`HealthSnapshotBuilder.build`. ``overall`` may be supplied
+    (cheap path) or recomputed from ``subsystems`` if ``None`` (used by
+    callers that hold the raw subsystems dict but not the rollup).
+    """
+    warnings: list[dict[str, Any]] = []
+    criticals: list[dict[str, Any]] = []
+    unknown: list[dict[str, Any]] = []
+
+    if overall is None:
+        rollup = _STATUS_OK
+        for sub in subsystems.values():
+            if not isinstance(sub, dict):
+                continue
+            status = str(sub.get("status", _STATUS_UNKNOWN))
+            if status == _STATUS_DOWN:
+                rollup = _STATUS_DOWN
+                break
+            if status == _STATUS_DEGRADED and rollup == _STATUS_OK:
+                rollup = _STATUS_DEGRADED
+        overall = rollup
+
+    for name, sub in (subsystems or {}).items():
+        if not isinstance(sub, dict):
+            continue
+        status = str(sub.get("status", _STATUS_UNKNOWN))
+        entry = {"name": name, "status": status}
+        detail = sub.get("detail")
+        if detail:
+            entry["detail"] = str(detail)[:160]
+        if status == _STATUS_DOWN:
+            criticals.append(entry)
+        elif status == _STATUS_DEGRADED:
+            warnings.append(entry)
+        elif status == _STATUS_UNKNOWN:
+            unknown.append(entry)
+
+    if overall == _STATUS_DOWN:
+        level, color = "critical", "red"
+        n = len(criticals) or 1
+        text = (
+            "ATOM is critical"
+            if n == 1
+            else f"ATOM is critical ({n} subsystems down)"
+        )
+    elif overall == _STATUS_DEGRADED:
+        level, color = "warn", "amber"
+        n = len(warnings) or 1
+        text = (
+            "ATOM has 1 warning"
+            if n == 1
+            else f"ATOM has {n} warnings"
+        )
+    elif overall == _STATUS_OK:
+        level, color = "ok", "green"
+        text = "ATOM is OK"
+    else:
+        level, color = "unknown", "grey"
+        text = "ATOM status unknown"
+
+    headline_parts: list[str] = []
+    for e in criticals[:3]:
+        headline_parts.append(f"{e['name']}: down")
+    for e in warnings[:3]:
+        headline_parts.append(f"{e['name']}: degraded")
+    headline = " · ".join(headline_parts)
+
+    return {
+        "level": level,
+        "color": color,
+        "text": text,
+        "headline": headline,
+        "warnings": warnings,
+        "criticals": criticals,
+        "unknown": unknown,
+        "subsystems_total": len(subsystems or {}),
+    }
+
+
+__all__ = ["HealthSnapshotBuilder", "summarize_health"]

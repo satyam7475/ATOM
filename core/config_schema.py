@@ -151,11 +151,15 @@ CONFIG_SCHEMA: dict[str, Any] = {
                         "whispercpp",
                         "whisper",
                         "whisper.cpp",
+                        "whisperkit",
+                        "whisper_kit",
+                        "whisper-kit",
+                        "wk",
                         "faster_whisper",
                         "google_online",
                         "google",
                     ],
-                    "description": "STT: whisper_cpp uses the Metal-accelerated whisper.cpp backend (Sprint B). On macOS, auto prefers whisper.cpp when its GGML model is present, then falls back to macos_native (SFSpeechRecognizer). faster_whisper/google_* are for non-macOS / legacy configs.",
+                    "description": "STT: whisperkit uses Argmax's CoreML-on-ANE WhisperKit (Sprint P3.3, highest-ROI on Apple Silicon). whisper_cpp uses the Metal-accelerated whisper.cpp backend (Sprint B). On macOS, auto prefers WhisperKit when its CLI is present, then whisper.cpp, then macos_native (SFSpeechRecognizer). faster_whisper/google_* are for non-macOS / legacy configs.",
                 },
                 "whisper_model_path": {
                     "type": "string",
@@ -197,8 +201,19 @@ CONFIG_SCHEMA: dict[str, Any] = {
                 },
                 "whisper_model_size": {
                     "type": "string",
-                    "enum": ["tiny", "base", "small", "medium", "large-v3"],
-                    "description": "Whisper model size (recommended: small for bilingual)",
+                    "enum": [
+                        "tiny",
+                        "base",
+                        "small",
+                        "medium",
+                        "large-v3",
+                        "large-v3-turbo",
+                    ],
+                    "description": (
+                        "Whisper model size. P1.1 (Apr 26 2026) added "
+                        "'large-v3-turbo' for the q5_0 multilingual GGML "
+                        "weights checked into models/ggml-large-v3-turbo-q5_0.bin."
+                    ),
                 },
                 "bilingual": {
                     "type": "boolean",
@@ -358,6 +373,41 @@ CONFIG_SCHEMA: dict[str, Any] = {
                         "max_confirm_ms": {"type": "number", "minimum": 50.0, "maximum": 2000.0},
                         "language": {"type": ["string", "null"]},
                         "min_text_chars": {"type": "integer", "minimum": 0, "maximum": 20},
+                    },
+                    "additionalProperties": False,
+                },
+                "whisperkit": {
+                    "type": "object",
+                    "description": "Sprint P3.3 (Apr 26 2026). Argmax WhisperKit (CoreML on Apple Neural Engine). Spawns `whisperkit-cli serve` as a long-running subprocess and POSTs PCM utterances over HTTP. Replaces whisper.cpp Metal as the highest-throughput STT path on Apple Silicon when the CLI is installed (`brew install whisperkit-cli`).",
+                    "properties": {
+                        "model": {
+                            "type": "string",
+                            "description": "WhisperKit model identifier. Default: openai_whisper-large-v3-v20240930. The CLI will download on first use when auto_download=true.",
+                        },
+                        "host": {
+                            "type": "string",
+                            "description": "Bind host for the local serve subprocess. Use 127.0.0.1 unless you know what you're doing.",
+                        },
+                        "port": {
+                            "type": "integer",
+                            "minimum": 1024,
+                            "maximum": 65535,
+                            "description": "Bind port for the serve subprocess. Default 50060.",
+                        },
+                        "auto_download": {
+                            "type": "boolean",
+                            "description": "If true, pass `--download` to `whisperkit-cli serve` so the model is fetched on first use.",
+                        },
+                        "startup_timeout_s": {
+                            "type": "number",
+                            "minimum": 1.0,
+                            "maximum": 300.0,
+                            "description": "Seconds to wait for whisperkit-cli serve to bind its port before declaring failure.",
+                        },
+                        "model_dir": {
+                            "type": ["string", "null"],
+                            "description": "Optional override for the directory the CLI uses to store downloaded models. None = inherit $WHISPERKIT_HOME.",
+                        },
                     },
                     "additionalProperties": False,
                 },
@@ -603,7 +653,15 @@ CONFIG_SCHEMA: dict[str, Any] = {
             "properties": {
                 "backend": {
                     "type": "string",
-                    "enum": ["sentence_transformers", "legacy", "fastembed", "onnx"],
+                    "enum": [
+                        "sentence_transformers",
+                        "legacy",
+                        "fastembed",
+                        "onnx",
+                        "mlx",
+                        "mlx_embeddings",
+                    ],
+                    "description": "Sprint P3.4 (Apr 26 2026): mlx / mlx_embeddings runs Apple's mlx-embeddings package on the Apple Neural Engine -- materially faster than torch-MPS on Apple Silicon. Falls back to sentence_transformers automatically if the package is missing.",
                 },
                 "provider_version": {"type": "string"},
                 "shadow_compare": {"type": "boolean"},
@@ -637,6 +695,10 @@ CONFIG_SCHEMA: dict[str, Any] = {
                 "graph_db_path": {
                     "type": "string",
                     "description": "SQLite path for MemoryGraph (V7 timeline + RAG graph hints).",
+                },
+                "vector_path": {
+                    "type": "string",
+                    "description": "Chroma persistence path for MemoryGraph vectors; defaults to vector_store.path.",
                 },
                 "max_entries": {
                     "type": "integer",
@@ -762,7 +824,17 @@ CONFIG_SCHEMA: dict[str, Any] = {
                 },
                 "mlx_fast_model": {
                     "type": "string",
-                    "description": "DEPRECATED: legacy alias for mlx_model.",
+                    "description": (
+                        "Sprint P3.1 (Apr 26 2026) -- optional dual-tier "
+                        "brain. When set to a *separate, smaller* model "
+                        "directory (e.g. models/qwen3-4b-instruct-4bit) "
+                        "the brain loads it for the 'fast' role while "
+                        "'primary' keeps using ``mlx_model``. Roughly "
+                        "doubles RAM, so leave unset on 16 GB Macs unless "
+                        "you have profiled and want the headroom trade. "
+                        "Missing directories silently fall back to "
+                        "single-tier."
+                    ),
                 },
                 "mlx_deep_model": {
                     "type": "string",
@@ -881,6 +953,31 @@ CONFIG_SCHEMA: dict[str, Any] = {
                 "mlx_model_fallback": {
                     "type": "string",
                     "description": "Sprint Ω1c -- secondary MLX model directory used when ``mlx_model`` cannot be loaded (e.g. half-downloaded weights, OOM under thermal pressure). Lets ATOM degrade from Qwen3-8B-4bit to Qwen3-4B-Instruct-4bit instead of going silent.",
+                },
+                "mx_compile_enabled": {
+                    "type": "boolean",
+                    "description": "Sprint P3.5 (Apr 26 2026): wrap the per-token sampler in ``mx.compile`` to fuse temp/top_p ops into one kernel. 10-25% steady-state speedup on M-series with macOS 26.2+. Falls back to eager sampler if compile fails.",
+                },
+                "speculative_decoding": {
+                    "type": "object",
+                    "description": "Sprint P3.2 (Apr 26 2026): MLX speculative decoding. Use a small draft model (e.g. Qwen3-4B-Instruct-4bit) to predict candidate tokens that the target model verifies in parallel. 1.5-2x tokens/s on warm runs per Apple's MLX-LM examples. Off by default; enable after profiling.",
+                    "properties": {
+                        "enabled": {
+                            "type": "boolean",
+                            "description": "Master switch.",
+                        },
+                        "draft_model_path": {
+                            "type": "string",
+                            "description": "Directory containing the smaller draft model. MUST share a tokenizer with the target model.",
+                        },
+                        "num_draft_tokens": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "maximum": 16,
+                            "description": "Number of tokens the draft model proposes per verification step. Higher = more potential speedup but more rejected proposals on uncertain prefixes. 3-5 is a typical sweet spot.",
+                        },
+                    },
+                    "additionalProperties": False,
                 },
             },
             "additionalProperties": False,
@@ -1010,6 +1107,55 @@ CONFIG_SCHEMA: dict[str, Any] = {
                 "port_file_path": {
                     "type": "string",
                     "description": "Path written with the actual bound port so Shortcuts can pick it up after fallback.",
+                },
+                "openai_compat": {
+                    "type": "object",
+                    "description": (
+                        "Sprint P4.4 (Apr 26 2026): OpenAI-compatible "
+                        "/v1/models + /v1/chat/completions shim, used by "
+                        "Enchanted on iOS over Tailscale. The shim only "
+                        "registers when the bridge is wired with a "
+                        "``chat_stream`` callable, so flipping ``enabled`` "
+                        "off in config is a hard, audit-friendly disarm."
+                    ),
+                    "properties": {
+                        "enabled": {
+                            "type": "boolean",
+                            "description": (
+                                "Master switch. Default true; flip false "
+                                "to fully disarm /v1/* even if the bridge "
+                                "is wired."
+                            ),
+                        },
+                        "model_id": {
+                            "type": "string",
+                            "description": (
+                                "Public model id returned by /v1/models. "
+                                "'atom-local' by default; rename if you "
+                                "want clients to recognise a custom name."
+                            ),
+                        },
+                        "default_max_tokens": {
+                            "type": "integer",
+                            "minimum": 16,
+                            "maximum": 8192,
+                            "description": (
+                                "Per-request token cap if the client "
+                                "doesn't supply max_tokens. 256 is a sane "
+                                "default for chat-style replies."
+                            ),
+                        },
+                        "rate_window_s": {
+                            "type": "number",
+                            "minimum": 1.0,
+                            "description": (
+                                "Sliding rate-limit window for /v1/* "
+                                "requests in seconds. Inherits the bridge "
+                                "auth contract on top of this."
+                            ),
+                        },
+                    },
+                    "additionalProperties": True,
                 },
             },
             "additionalProperties": True,
@@ -2136,6 +2282,7 @@ CONFIG_SCHEMA: dict[str, Any] = {
                 },
                 "persistent_embed_cache": {"type": "boolean"},
                 "embed_cache_path": {"type": "string"},
+                "embed_cache_bucket_fallback": {"type": "boolean"},
                 "prefetch_enabled": {"type": "boolean"},
                 "late_restart_confidence": {
                     "type": "number",
@@ -2195,6 +2342,43 @@ CONFIG_SCHEMA: dict[str, Any] = {
             },
             "additionalProperties": False,
         },
+        # Sprint P4 (Apr 26 2026): owner personality + style learning.
+        # Fully optional; ATOM works without this block. Used by
+        # core/personality/* and the structured prompt builder.
+        "personality": {
+            "type": "object",
+            "properties": {
+                "persona_file": {
+                    "type": "string",
+                    "description": (
+                        "Path to the Boss-authored persona markdown file "
+                        "pinned into the LLM's KV prefix."
+                    ),
+                },
+                "owner_profile_db": {
+                    "type": "string",
+                    "description": (
+                        "SQLite path for OwnerProfile (corrections + "
+                        "pronunciation dictionary). Defaults to "
+                        "data/owner_profile.sqlite3."
+                    ),
+                },
+                "owner_style": {
+                    "type": "object",
+                    "properties": {
+                        "enabled": {"type": "boolean"},
+                        "window_size": {
+                            "type": "integer", "minimum": 8, "maximum": 2048,
+                        },
+                        "min_observations": {
+                            "type": "integer", "minimum": 1, "maximum": 256,
+                        },
+                    },
+                    "additionalProperties": False,
+                },
+            },
+            "additionalProperties": True,
+        },
     },
     "additionalProperties": True,
 }
@@ -2216,6 +2400,10 @@ def validate_config(config: dict) -> list[str]:
     Falls back to basic type checks if jsonschema is not installed.
     """
     errors: list[str] = []
+    if not isinstance(config, dict):
+        return ["(root): config must be an object"]
+    if not config:
+        return ["(root): config is empty; config/settings.json was not loaded"]
 
     try:
         import jsonschema
@@ -2326,5 +2514,5 @@ def validate_and_log(config: dict) -> bool:
     logger.warning("Configuration validation errors:")
     for err in errors:
         logger.warning("    %s", err)
-    logger.warning("Continuing despite validation warnings (non-fatal).")
-    return True
+    logger.error("Configuration validation failed; refusing to boot.")
+    return False

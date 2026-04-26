@@ -27,18 +27,24 @@ logger = logging.getLogger("atom.brain.mlx")
 if TYPE_CHECKING:
     from core.brain_mode_manager import BrainModeManager
 
-_HAS_MLX = True
-try:
-    import mlx.core as mx
-    from mlx_lm import load, stream_generate
-    from mlx_lm.sample_utils import make_logits_processors, make_sampler
-except ImportError:
-    _HAS_MLX = False
-    mx = None  # type: ignore[assignment]
-    load = None  # type: ignore[assignment]
-    stream_generate = None  # type: ignore[assignment]
-    make_sampler = None  # type: ignore[assignment]
-    make_logits_processors = None  # type: ignore[assignment]
+# Sprint P2.6 (Apr 26 2026): defer the MLX import until the first
+# ``_ensure_loaded`` call. The eager ``import mlx.core`` paid ~600 ms on
+# every Python startup -- including subagents and unit tests that never
+# touch the brain. We replace it with a cheap ``find_spec`` probe so
+# ``is_available()`` stays honest, and only the actual load path pays
+# the real import cost. Once paid, subsequent inference calls hit the
+# fast path because the imports populate module-level globals.
+import importlib.util as _importlib_util  # cheap stdlib probe
+
+_HAS_MLX: bool = bool(
+    _importlib_util.find_spec("mlx") is not None
+    and _importlib_util.find_spec("mlx_lm") is not None,
+)
+mx: Any = None
+load: Any = None
+stream_generate: Any = None
+make_sampler: Any = None
+make_logits_processors: Any = None
 
 # Prompt-prefix KV cache. The LRU cache stores full (prompt+response) KV
 # states keyed by the token list; on the next turn it finds the longest
@@ -46,34 +52,102 @@ except ImportError:
 # MLX only runs forward on the delta. For ATOM this lets us skip
 # reprocessing the ~500-token system identity block on every single turn,
 # which accounts for ~30-40% of first-token latency.
-_HAS_PROMPT_CACHE = False
+_HAS_PROMPT_CACHE: bool = False
 _LRUPromptCache: Any = None
 _make_prompt_cache: Any = None
 _trim_prompt_cache: Any = None
 _can_trim_prompt_cache: Any = None
 _save_prompt_cache: Any = None
 _load_prompt_cache: Any = None
-if _HAS_MLX:
-    try:
-        from mlx_lm.models.cache import (  # type: ignore[import-not-found]
-            LRUPromptCache as _LRUPromptCache,
-            can_trim_prompt_cache as _can_trim_prompt_cache,
-            make_prompt_cache as _make_prompt_cache,
-            trim_prompt_cache as _trim_prompt_cache,
-        )
-        _HAS_PROMPT_CACHE = True
-    except Exception:  # pragma: no cover -- optional feature
-        _HAS_PROMPT_CACHE = False
-    # Disk persistence: best-effort -- works on mlx_lm versions that
-    # ship save/load_prompt_cache. If absent, persistence stays off.
-    try:
-        from mlx_lm.models.cache import (  # type: ignore[import-not-found]
-            save_prompt_cache as _save_prompt_cache,
-            load_prompt_cache as _load_prompt_cache,
-        )
-    except Exception:  # pragma: no cover -- optional feature
-        _save_prompt_cache = None
-        _load_prompt_cache = None
+
+# Set once the heavy imports actually run. Idempotent so concurrent
+# `_ensure_loaded` calls converge.
+_MLX_IMPORTED: bool = False
+_MLX_IMPORT_LOCK = threading.Lock()
+
+
+def _lazy_import_mlx() -> bool:
+    """Heavy MLX imports, deferred to first model-load.
+
+    Populates the module-level globals (``mx``, ``load``,
+    ``stream_generate``, ``make_sampler``, ``make_logits_processors``,
+    plus the prompt-cache symbols) so the rest of the file can keep
+    referencing them as before. Returns ``False`` if MLX is unavailable
+    or the import fails -- callers must respect that and fall back.
+    """
+    global _MLX_IMPORTED, _HAS_MLX, mx, load, stream_generate
+    global make_sampler, make_logits_processors
+    global _LRUPromptCache, _make_prompt_cache, _trim_prompt_cache
+    global _can_trim_prompt_cache, _save_prompt_cache, _load_prompt_cache
+    global _HAS_PROMPT_CACHE
+    if _MLX_IMPORTED:
+        return _HAS_MLX
+    if not _HAS_MLX:
+        _MLX_IMPORTED = True
+        return False
+    with _MLX_IMPORT_LOCK:
+        if _MLX_IMPORTED:
+            return _HAS_MLX
+        try:
+            t0 = time.perf_counter()
+            import mlx.core as _mx
+            from mlx_lm import load as _load, stream_generate as _sg
+            from mlx_lm.sample_utils import (
+                make_logits_processors as _mlp,
+                make_sampler as _ms,
+            )
+            mx = _mx
+            load = _load
+            stream_generate = _sg
+            make_sampler = _ms
+            make_logits_processors = _mlp
+            try:
+                from mlx_lm.models.cache import (  # type: ignore[import-not-found]
+                    LRUPromptCache as _LRU,
+                    can_trim_prompt_cache as _can_trim,
+                    make_prompt_cache as _mpc,
+                    trim_prompt_cache as _tpc,
+                )
+                _LRUPromptCache = _LRU
+                _make_prompt_cache = _mpc
+                _trim_prompt_cache = _tpc
+                _can_trim_prompt_cache = _can_trim
+                _HAS_PROMPT_CACHE = True
+            except Exception:
+                _HAS_PROMPT_CACHE = False
+            try:
+                from mlx_lm.models.cache import (  # type: ignore[import-not-found]
+                    save_prompt_cache as _spc,
+                    load_prompt_cache as _lpc,
+                )
+                _save_prompt_cache = _spc
+                _load_prompt_cache = _lpc
+            except Exception:
+                _save_prompt_cache = None
+                _load_prompt_cache = None
+            elapsed_ms = (time.perf_counter() - t0) * 1000.0
+            try:
+                import platform
+                logger.info(
+                    "MLX deferred-import done (mlx=%s default_device=%s "
+                    "macOS=%s prompt_cache=%s) in %.0f ms",
+                    getattr(__import__("mlx"), "__version__", "?"),
+                    getattr(mx, "default_device", lambda: "?")(),
+                    platform.mac_ver()[0] or "n/a",
+                    "yes" if _HAS_PROMPT_CACHE else "no",
+                    elapsed_ms,
+                )
+            except Exception:
+                logger.debug(
+                    "MLX deferred-import boot log raised", exc_info=True,
+                )
+            _HAS_MLX = True
+        except Exception:
+            logger.exception("MLX deferred-import failed")
+            _HAS_MLX = False
+        finally:
+            _MLX_IMPORTED = True
+    return _HAS_MLX
 
 
 # Sprint C4: extra stop sequences applied ONLY when the caller is the
@@ -326,12 +400,16 @@ class MLXBrain:
 
     @classmethod
     def _resolve_model_path(cls, brain_cfg: dict) -> str:
-        """Resolve the MLX model path with back-compat for pre-v3.2 keys.
+        """Resolve the *primary* MLX model path with back-compat for pre-v3.2 keys.
 
         Preferred key: ``brain.mlx_model``. For older settings.json
         files we also accept ``mlx_primary_model`` / ``mlx_fast_model`` /
         ``model_path`` (in that order) so an upgrade doesn't crash on a
         stale config.
+
+        The "fast" role resolves separately via :py:meth:`_resolve_fast_model_path`
+        so dual-tier (small fast + large primary) is configurable; see
+        Sprint P3.1 (Apr 26 2026).
         """
         for key in ("mlx_model", "mlx_primary_model", "mlx_fast_model", "model_path"):
             val = brain_cfg.get(key)
@@ -339,17 +417,90 @@ class MLXBrain:
                 return str(Path(str(val)).expanduser())
         return cls._DEFAULT_MODEL_PATH
 
+    @classmethod
+    def _resolve_fast_model_path(
+        cls, brain_cfg: dict, primary_path: str,
+    ) -> str:
+        """Resolve the optional "fast" role's model path (Sprint P3.1).
+
+        If ``brain.mlx_fast_model`` is set AND that directory exists on
+        disk, dual-tier mode is unblocked: the "fast" role loads the
+        smaller model while "primary" loads the full one. Otherwise we
+        fall back to the primary path so a single-model profile keeps
+        working unchanged.
+
+        We deliberately do **not** auto-pick ``mlx_model_fallback`` for
+        "fast"; that key is a *cold-boot fallback* (used when the
+        primary model directory is missing), not a dual-tier hint. Mixing
+        the two would silently double RAM on the operator the moment
+        they install the smaller model. Dual-tier must be opt-in.
+        """
+        val = brain_cfg.get("mlx_fast_model")
+        if not val:
+            return primary_path
+        path = Path(str(val)).expanduser()
+        if not path.is_dir():
+            logger.info(
+                "MLX dual-tier: fast model path %s not on disk; "
+                "falling back to primary for role=fast.",
+                path,
+            )
+            return primary_path
+        return str(path)
+
     def __init__(self, config: dict) -> None:
         self._config = config
         brain_cfg = config.get("brain", {})
 
         self._model_path = self._resolve_model_path(brain_cfg)
+        # Sprint P3.1 (Apr 26 2026): role-aware model paths. The "fast"
+        # role can be pointed at a separate, smaller model directory via
+        # ``brain.mlx_fast_model`` so the kernel actually runs dual-tier
+        # (e.g. Qwen3-4B for fast intent, Qwen3-8B for full reasoning)
+        # instead of aliasing both roles to the same weights. When the
+        # fast model directory is missing or unset, we fall back to the
+        # primary path -- callers see no behavior change.
+        fast_model_path = self._resolve_fast_model_path(
+            brain_cfg, self._model_path,
+        )
+        self._role_model_paths: dict[str, str] = {
+            "primary": self._model_path,
+            "fast": fast_model_path,
+        }
+        self._dual_tier_enabled: bool = (fast_model_path != self._model_path)
         self._active_role = "primary"
 
         self._max_tokens = int(brain_cfg.get("max_tokens", 512))
         self._temperature = float(brain_cfg.get("temperature", 0.7))
         self._top_p = float(brain_cfg.get("top_p", 0.9))
         self._timeout = float(brain_cfg.get("timeout_seconds", 30))
+
+        # Sprint P3.2 (Apr 26 2026): Speculative decoding (4B drafts 8B).
+        # mlx-lm's stream_generate accepts `draft_model=...` and the kwarg
+        # `num_draft_tokens` for the verification window. With Qwen3-4B
+        # drafting Qwen3-8B we expect 1.5-2x tokens/s on warm runs. Off
+        # by default; enable with `brain.speculative_decoding.enabled=true`.
+        spec_cfg = brain_cfg.get("speculative_decoding", {}) or {}
+        self._speculative_enabled: bool = bool(spec_cfg.get("enabled", False))
+        self._speculative_draft_path: str | None = spec_cfg.get("draft_model_path")
+        self._speculative_num_draft_tokens: int = int(
+            spec_cfg.get("num_draft_tokens", 3),
+        )
+        self._draft_model: Any = None
+        self._draft_tokenizer: Any = None
+        self._draft_loaded: bool = False
+        self._draft_load_failed: bool = False
+
+        # Sprint P3.5 (Apr 26 2026): mx.compile on the hot sampler path.
+        # The token sampler runs once per generated token, so a compiled
+        # version saves ~10-25% steady-state time on M-series with
+        # macOS 26.2+. Off if the user is on older macOS or wants to
+        # compare. Compiled samplers are cached per (temp, top_p) pair.
+        self._mx_compile_enabled: bool = bool(
+            brain_cfg.get("mx_compile_enabled", True),
+        )
+        self._compiled_sampler_cache: dict[tuple[float, float], Any] = {}
+        self._compiled_sampler_lock = threading.Lock()
 
         # Sprint C5: KV cache quantisation. mlx-lm 0.22+ accepts
         # ``kv_bits`` on ``stream_generate`` -- 8 halves KV memory and
@@ -384,9 +535,15 @@ class MLXBrain:
         self._streaming_depth = 0
 
         # Prompt-prefix KV cache (opt-in via config). Keyed per role.
-        self._prompt_cache_enabled: bool = bool(
+        # Sprint P2.6 (Apr 26 2026): the runtime availability check
+        # (_HAS_PROMPT_CACHE / _save_prompt_cache) is deferred until the
+        # MLX import has actually run. We persist the user's *intent*
+        # here and gate the runtime *capability* via helpers below so
+        # config doesn't get silently False'd at __init__ time before
+        # the lazy import has populated the symbols.
+        self._prompt_cache_user_pref: bool = bool(
             brain_cfg.get("prompt_cache_enabled", True),
-        ) and _HAS_PROMPT_CACHE
+        )
         self._prompt_cache_max_size: int = int(
             brain_cfg.get("prompt_cache_max_size", 4),
         )
@@ -404,9 +561,9 @@ class MLXBrain:
         # first-token latency drops from ~7s (cold prefill) to <1s
         # (warm cache reuse). Keyed by role + model_path md5 so a model
         # swap or prompt rewrite invalidates safely.
-        self._prompt_cache_persist_enabled: bool = bool(
-            brain_cfg.get("prompt_cache_persist", True)
-        ) and _save_prompt_cache is not None and _load_prompt_cache is not None
+        self._prompt_cache_persist_user_pref: bool = bool(
+            brain_cfg.get("prompt_cache_persist", True),
+        )
         persist_path = brain_cfg.get(
             "prompt_cache_persist_path", "data/prompt_cache_v33.safetensors",
         )
@@ -420,8 +577,10 @@ class MLXBrain:
         self._prompt_cache_restore_attempted: dict[str, bool] = {
             role: False for role in self._ROLES
         }
-        if self._prompt_cache_persist_enabled:
-            self._gc_stale_prompt_caches()
+        # Lazy GC: when the persistence symbols load post __init__, the
+        # first ``_ensure_loaded`` call will run ``_gc_stale_prompt_caches``
+        # via ``_maybe_init_prompt_cache_runtime``. Doing it here would
+        # require the heavy MLX import, which P2.6 explicitly defers.
 
         # Lifetime perf counters used by the periodic perf snapshot (logged
         # every ~60s by the main loop). We track totals rather than a
@@ -459,6 +618,28 @@ class MLXBrain:
         self._pinned_persona_token_count: int = 0
         self._pinned_persona_lock = threading.Lock()
 
+        # Sprint P3.1 (Apr 26 2026): one-line summary of the model wiring
+        # so a fresh boot trace shows whether dual-tier actually took
+        # effect. Operators previously had to grep for fingerprints across
+        # multiple log lines to answer "is fast=4B or 8B right now?"
+        if self._dual_tier_enabled:
+            logger.info(
+                "MLXBrain dual-tier wired: primary=%s fast=%s%s",
+                Path(self._role_model_paths["primary"]).name,
+                Path(self._role_model_paths["fast"]).name,
+                (
+                    f" speculative=on(draft={Path(self._speculative_draft_path).name})"
+                    if self._speculative_enabled and self._speculative_draft_path
+                    else ""
+                ),
+            )
+        else:
+            logger.info(
+                "MLXBrain single-tier: model=%s (set brain.mlx_fast_model "
+                "to a separate small model dir to enable dual-tier)",
+                Path(self._model_path).name,
+            )
+
     def set_brain_mode_manager(self, mgr: "BrainModeManager | None") -> None:
         self._brain_mode_mgr = mgr
 
@@ -481,6 +662,50 @@ class MLXBrain:
             return False
         return Path(self._model_path).is_dir()
 
+    @property
+    def _prompt_cache_enabled(self) -> bool:
+        """User-config preference AND runtime symbol availability.
+
+        Sprint P2.6 (Apr 26 2026): the runtime side of this flips True
+        only after ``_lazy_import_mlx()`` has populated
+        ``_LRUPromptCache``. Before that, _make_prompt_cache may be
+        None and ``_get_prompt_lru`` would crash; this gate keeps the
+        rest of the code unchanged.
+        """
+        return bool(
+            self._prompt_cache_user_pref
+            and _HAS_PROMPT_CACHE
+            and _LRUPromptCache is not None,
+        )
+
+    @property
+    def _prompt_cache_persist_enabled(self) -> bool:
+        """User-config preference AND runtime save/load availability."""
+        return bool(
+            self._prompt_cache_persist_user_pref
+            and _save_prompt_cache is not None
+            and _load_prompt_cache is not None,
+        )
+
+    def _maybe_init_prompt_cache_runtime(self) -> None:
+        """Run the one-time prompt-cache GC after the MLX import lands.
+
+        Was previously done eagerly in ``__init__`` -- moved out as part
+        of P2.6 so the heavy MLX symbol import doesn't run until first
+        model-load. Idempotent.
+        """
+        if getattr(self, "_prompt_cache_runtime_inited", False):
+            return
+        if not self._prompt_cache_persist_enabled:
+            return
+        try:
+            self._gc_stale_prompt_caches()
+        except Exception:
+            logger.debug(
+                "MLX prompt-cache GC raised post-lazy-import", exc_info=True,
+            )
+        self._prompt_cache_runtime_inited = True
+
     def _normalize_role(self, role: str | None) -> str:
         """Coerce any role label to one of the two tracked tags.
 
@@ -493,8 +718,19 @@ class MLXBrain:
         return "primary"
 
     def _path_for_role(self, role: str) -> str:
-        # Single model: every role resolves to the same weights.
-        self._normalize_role(role)
+        """Resolve the model path for ``role``.
+
+        Sprint P3.1 (Apr 26 2026): when ``brain.mlx_fast_model`` is set
+        and the fast model directory exists, "fast" and "primary" can
+        resolve to *different* on-disk weights -- this is the dual-tier
+        path. Otherwise the role tag is just observability metadata and
+        every role aliases the same primary weights (the prior single-
+        model behavior, preserved verbatim for low-RAM setups).
+        """
+        norm = self._normalize_role(role)
+        path = self._role_model_paths.get(norm)
+        if path:
+            return path
         return self._model_path
 
     def _effective_inference(self, model_role: str | None = None) -> dict[str, Any]:
@@ -568,8 +804,11 @@ class MLXBrain:
             logger.debug("MLX cache clear failed", exc_info=True)
 
     def _ensure_loaded(self, model_role: str | None = None) -> bool:
-        if not _HAS_MLX or load is None:
+        # Sprint P2.6 (Apr 26 2026): pay the heavy MLX import cost only on
+        # first model-load; subsequent calls hit the populated globals.
+        if not _lazy_import_mlx() or load is None:
             return False
+        self._maybe_init_prompt_cache_runtime()
 
         eff = self._effective_inference(model_role)
         role = eff["model_role"]
@@ -645,6 +884,76 @@ class MLXBrain:
                 ok = self._ensure_loaded(role) and ok
             return ok
         return self._ensure_loaded(model_role)
+
+    def _ensure_draft_loaded(self) -> bool:
+        """Lazy-load the speculative draft model (Sprint P3.2).
+
+        Returns True only when speculative decoding is enabled, the draft
+        model path is configured AND on disk, and load() succeeded. Any
+        failure flips ``_draft_load_failed`` so we don't retry every
+        call. mlx-lm's speculative path requires the draft and target
+        models to share a tokenizer; we log a warning if vocabs disagree
+        and disable speculation for safety.
+        """
+        if not self._speculative_enabled:
+            return False
+        if self._draft_loaded:
+            return True
+        if self._draft_load_failed:
+            return False
+        if not _lazy_import_mlx() or load is None:
+            return False
+        path_str = self._speculative_draft_path
+        if not path_str:
+            logger.warning(
+                "MLX speculative decoding enabled but "
+                "brain.speculative_decoding.draft_model_path is empty",
+            )
+            self._draft_load_failed = True
+            return False
+        path = Path(str(path_str)).expanduser()
+        if not path.is_dir():
+            logger.warning(
+                "MLX draft model path missing: %s -- "
+                "disabling speculative decoding",
+                path,
+            )
+            self._draft_load_failed = True
+            return False
+        # If the user pointed the draft at the same dir as the target the
+        # speculation is a no-op (draft == target). Skip and warn.
+        if str(path) == str(Path(self._model_path).expanduser()):
+            logger.warning(
+                "MLX speculative decoding draft path == target path (%s); "
+                "skipping (would not yield speedup)",
+                path,
+            )
+            self._draft_load_failed = True
+            return False
+
+        try:
+            t0 = time.monotonic()
+            draft_model, draft_tokenizer = load(str(path))
+            self._draft_model = draft_model
+            self._draft_tokenizer = draft_tokenizer
+            self._draft_loaded = True
+            elapsed_ms = (time.monotonic() - t0) * 1000.0
+            logger.info(
+                "MLX draft model loaded for speculative decoding: %s "
+                "(num_draft_tokens=%d) in %.0f ms",
+                path.name,
+                self._speculative_num_draft_tokens,
+                elapsed_ms,
+            )
+            return True
+        except Exception:
+            logger.exception(
+                "MLX draft model load failed for %s; "
+                "disabling speculative decoding",
+                path,
+            )
+            self._draft_load_failed = True
+            return False
 
     def request_abort_preempt(self) -> None:
         """Invalidate the current streaming generation."""
@@ -1034,7 +1343,37 @@ class MLXBrain:
         nucleus = max(0.0, min(1.0, float(top_p)))
         if make_sampler is None:
             return None
-        return make_sampler(temp=temp, top_p=nucleus)
+        # Sprint P3.5 (Apr 26 2026): wrap the sampler in mx.compile so the
+        # per-token graph is JIT-fused once and reused for every later
+        # token. Cache by (temp, top_p) so multiple profiles each get a
+        # warm compiled function. If compile fails (older mlx, weird
+        # backend) we fall back transparently to the eager sampler.
+        base = make_sampler(temp=temp, top_p=nucleus)
+        if not self._mx_compile_enabled or mx is None:
+            return base
+        compile_fn = getattr(mx, "compile", None)
+        if compile_fn is None:
+            return base
+        key = (round(temp, 6), round(nucleus, 6))
+        with self._compiled_sampler_lock:
+            cached = self._compiled_sampler_cache.get(key)
+            if cached is not None:
+                return cached
+            try:
+                compiled = compile_fn(base)
+            except Exception:
+                logger.debug(
+                    "mx.compile failed for sampler "
+                    "(temp=%.3f top_p=%.3f); using eager",
+                    temp, nucleus, exc_info=True,
+                )
+                return base
+            self._compiled_sampler_cache[key] = compiled
+            logger.info(
+                "MLX sampler compiled via mx.compile (temp=%.2f top_p=%.2f)",
+                temp, nucleus,
+            )
+            return compiled
 
     def _make_logits_processors(self, repeat_penalty: float):
         penalty = float(repeat_penalty or 1.0)
@@ -1270,6 +1609,61 @@ class MLXBrain:
             stream_kwargs["kv_group_size"] = int(self._kv_group_size)
             stream_kwargs["quantized_kv_start"] = int(self._kv_quant_warmup)
 
+        # Sprint P3.2 (Apr 26 2026): plumb the draft model + draft window
+        # into stream_generate when speculative decoding is enabled. The
+        # mlx-lm path drops `max_kv_size` and `prompt_progress_callback`
+        # automatically when `draft_model is not None`, so we just pass
+        # what we know. Speculation is silently disabled if the draft
+        # model never loaded.
+        speculative_active = False
+        # Tracks where the main-model portion of `prompt_cache_obj` ends
+        # when we have to extend the list with a fresh draft segment for
+        # `mlx_lm.speculative_generate_step`. Sliced back off after
+        # generation so `_commit_prompt_cache` only stores the main cache
+        # in the LRU. ``None`` means no extension was performed.
+        main_cache_len: int | None = None
+        if self._speculative_enabled and self._ensure_draft_loaded():
+            stream_kwargs["draft_model"] = self._draft_model
+            stream_kwargs["num_draft_tokens"] = int(
+                self._speculative_num_draft_tokens,
+            )
+            speculative_active = True
+            # mlx_lm's speculative_generate_step expects ``prompt_cache``
+            # to be sized for BOTH models concatenated:
+            #     prompt_cache = [main_layer_0..N, draft_layer_0..M]
+            # When ATOM passes only the main-model cache (which it does
+            # on every prompt-cache hit), the draft segment slices to []
+            # and the very first ``model(y, cache=[])`` raises
+            # ``IndexError: list index out of range`` from inside
+            # ``create_attention_mask(h, cache[0])``. We extend the cache
+            # list in-place with a fresh draft prompt cache so the shape
+            # is correct. The draft starts with no cached prefix — its
+            # speculation may be lower quality on the first turn but it
+            # is correct AND won't crash; the main model still benefits
+            # from its cached prefix unchanged.
+            if (
+                prompt_cache_obj is not None
+                and isinstance(prompt_cache_obj, list)
+                and _make_prompt_cache is not None
+                and self._draft_model is not None
+            ):
+                try:
+                    main_cache_len = len(prompt_cache_obj)
+                    draft_cache_segment = _make_prompt_cache(
+                        self._draft_model,
+                    )
+                    prompt_cache_obj.extend(draft_cache_segment)
+                except Exception:
+                    logger.debug(
+                        "MLX speculative: failed to build draft cache "
+                        "segment; disabling speculation for this turn",
+                        exc_info=True,
+                    )
+                    stream_kwargs.pop("draft_model", None)
+                    stream_kwargs.pop("num_draft_tokens", None)
+                    speculative_active = False
+                    main_cache_len = None
+
         try:
             for resp in stream_generate(
                 model,
@@ -1318,6 +1712,18 @@ class MLXBrain:
             if on_token:
                 on_token("", True)
 
+            # Strip the draft-cache segment we appended for speculative
+            # decoding (if any) so ``_commit_prompt_cache`` stores ONLY
+            # the main-model cache in the LRU. The LRU is shape-keyed by
+            # the main model and any draft-cache leakage would corrupt
+            # subsequent ``fetch_nearest_cache`` slicing.
+            if (
+                main_cache_len is not None
+                and isinstance(prompt_cache_obj, list)
+                and len(prompt_cache_obj) > main_cache_len
+            ):
+                del prompt_cache_obj[main_cache_len:]
+
             # Commit the post-generation cache back into the LRU trie.
             # This keys the cache under (prompt + response) tokens so the
             # next turn's ``fetch_nearest_cache`` can trim down to the
@@ -1353,7 +1759,8 @@ class MLXBrain:
                 if peak_memory > self._perf_peak_memory_gb:
                     self._perf_peak_memory_gb = peak_memory
             logger.info(
-                "MLX [%s/%s]: %.0fms, %d tokens, ~%d words, %.1f tok/s, peak %.2fGB",
+                "MLX [%s/%s]: %.0fms, %d tokens, ~%d words, %.1f tok/s, "
+                "peak %.2fGB%s",
                 eff["profile"],
                 role,
                 elapsed_ms,
@@ -1361,6 +1768,7 @@ class MLXBrain:
                 len(text.split()),
                 generation_tps,
                 peak_memory,
+                " spec=on" if speculative_active else "",
             )
             if stop_reason:
                 logger.info("MLX [%s/%s]: stopped early on %s", eff["profile"], role, stop_reason)
@@ -1373,6 +1781,18 @@ class MLXBrain:
                 except Exception:
                     logger.debug('Stream end callback failed', exc_info=True)
             return "", False
+        finally:
+            # Defensive: even if generation crashed mid-stream, ensure
+            # ``prompt_cache_obj`` is restored to main-model shape. This
+            # makes the function side-effect-safe — the LRU never sees a
+            # combined main+draft cache list, and the next turn can
+            # reuse the (partial) main prefix without surprises.
+            if (
+                main_cache_len is not None
+                and isinstance(prompt_cache_obj, list)
+                and len(prompt_cache_obj) > main_cache_len
+            ):
+                del prompt_cache_obj[main_cache_len:]
 
     def _generate_sync(
         self,
@@ -1421,6 +1841,83 @@ class MLXBrain:
         except Exception:
             logger.exception("MLX generate error")
             return "", False
+
+    def render_chat_prompt(
+        self,
+        messages: list[dict[str, str]],
+        *,
+        model_role: str | None = None,
+    ) -> str:
+        """Render OpenAI-style chat messages to a prompt string.
+
+        Sprint P4.4 (Apr 26 2026): consumed by the OpenAI-compat bridge
+        shim so iPhone clients (Enchanted, etc.) can hit ``/v1/chat/
+        completions`` and have the messages converted using the model's
+        actual chat_template instead of a hand-rolled string concat.
+
+        Falls back to a plain ``role: content`` join if the tokenizer
+        can't apply its template (e.g. on a backend without one).
+        """
+        norm_role = self._normalize_role(model_role)
+        try:
+            self._ensure_loaded(norm_role)
+        except Exception:
+            logger.debug(
+                "render_chat_prompt: ensure_loaded raised", exc_info=True,
+            )
+        tokenizer = self._tokenizers.get(norm_role)
+        cleaned: list[dict[str, str]] = []
+        for m in messages or []:
+            role = str(m.get("role") or "").strip().lower()
+            content = m.get("content")
+            if isinstance(content, list):
+                content = "".join(
+                    p.get("text", "") if isinstance(p, dict) else str(p)
+                    for p in content
+                )
+            content = str(content or "")
+            if role and content:
+                cleaned.append({"role": role, "content": content})
+        if not cleaned:
+            return ""
+        if tokenizer is not None:
+            try:
+                rendered = tokenizer.apply_chat_template(
+                    cleaned,
+                    tokenize=False,
+                    add_generation_prompt=True,
+                )
+                if isinstance(rendered, str) and rendered.strip():
+                    return rendered
+            except Exception:
+                logger.debug(
+                    "apply_chat_template fell back to plain join",
+                    exc_info=True,
+                )
+        return "\n".join(
+            f"{m['role'].upper()}: {m['content']}" for m in cleaned
+        )
+
+    async def chat_streaming(
+        self,
+        messages: list[dict[str, str]],
+        on_token: Callable[[str, bool], None] | None = None,
+        *,
+        model_role: str | None = None,
+        max_tokens_override: int | None = None,
+    ) -> tuple[str, bool]:
+        """OpenAI-compatible chat shim. Renders messages then delegates
+        to :py:meth:`generate_streaming`. Sprint P4.4 (Apr 26 2026).
+        """
+        prompt = self.render_chat_prompt(messages, model_role=model_role)
+        if not prompt:
+            return "", False
+        return await self.generate_streaming(
+            prompt,
+            on_token=on_token,
+            model_role=model_role,
+            max_tokens_override=max_tokens_override,
+        )
 
     async def generate_streaming(
         self,
@@ -1597,6 +2094,23 @@ class MLXBrain:
                 "role": self._pinned_persona_role,
                 "tokens": self._pinned_persona_token_count,
             }
+
+    @property
+    def dual_tier_info(self) -> dict[str, Any]:
+        """Diagnostics surface for Sprint P3.1 dual-tier brain.
+
+        Returns the per-role model paths and whether dual-tier is
+        actually live. Surfaced by the unified status badge so an
+        operator can tell at a glance whether ``mlx_fast_model``
+        actually took effect.
+        """
+        return {
+            "enabled": bool(self._dual_tier_enabled),
+            "primary_path": self._role_model_paths.get("primary"),
+            "fast_path": self._role_model_paths.get("fast"),
+            "draft_path": self._speculative_draft_path,
+            "speculative_decoding_enabled": bool(self._speculative_enabled),
+        }
 
     def shutdown(self) -> None:
         with self._load_lock:

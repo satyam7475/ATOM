@@ -1,5 +1,4 @@
-"""
-ATOM -- Process Manager (AI OS Kernel Service).
+"""ATOM -- Process Manager (AI OS Kernel Service).
 
 Provides OS-level process management capabilities:
   - List top processes by CPU/memory
@@ -9,6 +8,13 @@ Provides OS-level process management capabilities:
   - Foreground app history tracking
 
 Uses psutil (already a dependency).
+
+Sprint P4.7 (Apr 26 2026): the Win32 ``EnumWindows`` path in
+``get_open_windows`` was removed; on macOS we delegate to AppKit /
+NSWorkspace via :py:mod:`context.context_darwin` for window listing
+when needed. ``get_open_windows`` returns ``[]`` here and the
+JARVIS-level "what's open" surface lives in
+:py:mod:`core.platform_adapter` and :py:mod:`context.screen_reader`.
 """
 
 from __future__ import annotations
@@ -18,7 +24,6 @@ import time
 from collections import deque
 from datetime import datetime
 import psutil
-import ctypes
 
 logger = logging.getLogger("atom.process_mgr")
 
@@ -185,31 +190,20 @@ class ProcessManager:
         return " ".join(parts)
 
     def get_open_windows(self) -> list[str]:
-        """List all visible windows using Win32 EnumWindows."""
+        """Return open window titles. macOS implementation uses
+        :py:mod:`context.context_darwin` (Quartz / NSWorkspace) when
+        available; on platforms where it isn't, we return ``[]``
+        rather than fail loudly so callers can compose voice output.
+
+        Sprint P4.7 (Apr 26 2026): replaces the dead Win32 EnumWindows
+        branch.
+        """
         try:
-            from ctypes import wintypes
-
-            user32 = ctypes.windll.user32
-            windows: list[str] = []
-
-            def _callback(hwnd, _lp):
-                if user32.IsWindowVisible(hwnd):
-                    length = user32.GetWindowTextLengthW(hwnd)
-                    if length > 0:
-                        buf = ctypes.create_unicode_buffer(length + 1)
-                        user32.GetWindowTextW(hwnd, buf, length + 1)
-                        title = buf.value.strip()
-                        if title and title not in ("Program Manager",):
-                            windows.append(title)
-                return True
-
-            WNDENUMPROC = ctypes.WINFUNCTYPE(
-                wintypes.BOOL, wintypes.HWND, wintypes.LPARAM,
-            )
-            user32.EnumWindows(WNDENUMPROC(_callback), 0)
-            return windows
+            from context.context_darwin import quartz_window_titles
+            return list(quartz_window_titles() or [])
         except Exception:
-            logger.debug("EnumWindows failed", exc_info=True)
+            logger.debug("Window enumeration unavailable on this platform",
+                         exc_info=True)
             return []
 
     def format_open_windows(self) -> str:

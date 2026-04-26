@@ -327,8 +327,15 @@ def test_stt_macos_exposes_attach_whisper_confirmer() -> None:
 
 
 def test_settings_json_includes_whisper_confirm_block() -> None:
-    """settings.json should ship with the whisper_confirm block (default
-    disabled) so opting in only requires flipping `enabled: true`."""
+    """settings.json must ship with a fully-formed whisper_confirm block.
+
+    Sprint P1.6 (Apr 26 2026): the default flipped from ``false`` to
+    ``true`` because the second-pass confirm path is now wired into
+    ``WhisperSTT`` (P2.2). Older versions of this test asserted the
+    default was opt-out; we now assert the block exists and has the
+    expected shape, and that ``enabled`` is a bool either way so a
+    user can flip it back without hitting a schema error.
+    """
     import json
     from pathlib import Path
 
@@ -338,7 +345,7 @@ def test_settings_json_includes_whisper_confirm_block() -> None:
     stt = cfg.get("stt") or {}
     wc = stt.get("whisper_confirm") or {}
     assert "enabled" in wc
-    assert wc.get("enabled") is False, "default must be opt-in (disabled)"
+    assert isinstance(wc.get("enabled"), bool), "enabled must be a bool"
     assert wc.get("model_size") in {"tiny", "tiny.en", "base", "base.en"}
     assert isinstance(wc.get("decode_seconds"), (int, float))
     assert isinstance(wc.get("max_confirm_ms"), (int, float))
