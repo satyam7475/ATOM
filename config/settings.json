@@ -569,6 +569,20 @@
         "memory_threshold_pct": 78,
         "poll_interval_s": 30
     },
+    "memory_governor": {
+        "enabled": true,
+        "tier1_threshold_pct": 80,
+        "tier2_threshold_pct": 86,
+        "tier3_threshold_pct": 92,
+        "rewarm_hysteresis_pct": 6,
+        "eviction_order": [
+            "smolvlm",
+            "whisper_confirmer",
+            "draft_model",
+            "embeddings_warm_cache",
+            "persona_kv_cache"
+        ]
+    },
     "cognitive_kernel": {
         "quick_model": "qwen3-4b-instruct-4bit",
         "full_model": "qwen3-8b-4bit",

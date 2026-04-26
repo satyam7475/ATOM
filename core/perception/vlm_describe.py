@@ -383,6 +383,28 @@ class VLMCaptioner:
             )
         return caption
 
+    def unload(self) -> bool:
+        """Release the SmolVLM weights from RAM.
+
+        Sprint Ω.4.C (Apr 26 2026): exposed for the memory governor so
+        the ~1.4 GB SmolVLM bundle doesn't sit warm during high-pressure
+        windows. The next ``describe()`` after ``unload()`` will
+        re-trigger the lazy ``_load()`` path.
+
+        Returns True iff a model was actually unloaded.
+        """
+        if self._model is None and self._processor is None:
+            return False
+        self._model = None
+        self._processor = None
+        self._config = None
+        # Allow a future load to retry even if a previous attempt failed,
+        # since the eviction signal is independent of the prior failure.
+        self._load_failed = False
+        self._load_error = ""
+        logger.info("VLMCaptioner: weights unloaded (memory governor)")
+        return True
+
     def metrics(self) -> dict[str, Any]:
         """Snapshot of captioner runtime state.
 
