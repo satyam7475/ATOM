@@ -374,7 +374,7 @@ Read these **in order** before touching code. Skipping ahead has historically ca
 
 1. `docs/ATOM_NEXT_STEPS_PLAN.md` ← _this file_
 2. `docs/ATOM_M5_EVOLUTION_PLAN.md` (history of how we got here)
-3. `docs/atom_v3_vs_jarvis.md` (last shipped scorecard)
+3. `docs/ATOM_VS_JARVIS_SCORECARD.md` (current module-rating scorecard)
 4. `config/settings.json` (the actual current config — most "what does ATOM do?" questions resolve here)
 5. `main.py` §"# ── Security Fortress + Self-Healing + Code Introspection ──" (boot graph)
 6. `core/boot/cold_start.py` (the Metal-serial warmup explanation in the docstring is critical context)
