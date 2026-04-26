@@ -14,9 +14,10 @@ Architecture::
         v
     Rolling 30-s ring buffer
         v
-    HTTP POST {pcm bytes} -> http://127.0.0.1:50060/transcribe
+    HTTP POST multipart/form-data ->
+       http://127.0.0.1:50060/v1/audio/transcriptions
         |
-        +-- whisperkit-cli serve (CoreML / ANE)
+        +-- whisperkit-cli serve (CoreML / ANE), OpenAI-compatible API
         v
     AsyncEventBus -- speech_partial / speech_final / voice.partial /
                      voice.final  (same shape as WhisperSTT/NativeSTT)
@@ -30,7 +31,12 @@ Setup
 
     # one-time, on Apple Silicon Macs
     brew install whisperkit-cli
-    whisperkit-cli download --model openai_whisper-large-v3-v20240930
+    # Model auto-downloads from HuggingFace argmaxinc/whisperkit-coreml on
+    # first ``serve`` call. The CLI prepends ``openai_`` to the model name
+    # via ``--model-prefix openai`` (default), so pass model names WITHOUT
+    # that prefix -- e.g. ``whisper-large-v3-v20240930_turbo_632MB``
+    # resolves to ``openai_whisper-large-v3-v20240930_turbo_632MB`` in the
+    # repo.
 
 The factory in ``voice/voice_pipeline.py`` falls back to whisper.cpp
 when ``whisperkit-cli`` is not on $PATH.
@@ -102,8 +108,12 @@ _TRAILING_SILENCE_S = 0.5
 _MAX_UTTERANCE_S = 20.0
 _MIN_UTTERANCE_MS = 250
 
-# Default WhisperKit model directory layout matches `whisperkit-cli download`.
-_DEFAULT_WHISPERKIT_MODEL = "openai_whisper-large-v3-v20240930"
+# Default WhisperKit model -- multilingual large-v3-turbo, quantized to
+# ~632 MB for ANE. The CLI auto-prepends ``openai_`` (see module
+# docstring), so this string is the suffix only. Resolves to
+# ``openai_whisper-large-v3-v20240930_turbo_632MB`` in
+# ``argmaxinc/whisperkit-coreml`` on HuggingFace.
+_DEFAULT_WHISPERKIT_MODEL = "whisper-large-v3-v20240930_turbo_632MB"
 _DEFAULT_SERVE_PORT = 50060
 _DEFAULT_SERVE_HOST = "127.0.0.1"
 
@@ -132,8 +142,9 @@ def is_whisperkit_available(_config: dict | None = None) -> bool:
     - ``whisperkit-cli`` is on $PATH.
     - ``sounddevice`` + ``webrtcvad`` + ``numpy`` are importable.
 
-    The model itself is NOT required at probe time -- the first
-    ``preload`` call will trigger ``whisperkit-cli download`` if missing.
+    The model itself is NOT required at probe time -- the first ``preload``
+    call will trigger ``whisperkit-cli serve`` which lazy-downloads from
+    HuggingFace ``argmaxinc/whisperkit-coreml`` on first run.
     """
     if _whisperkit_cli_path() is None:
         return False
@@ -193,9 +204,9 @@ class WhisperKitSTT:
         )
         self._serve_host: str = str(wk_cfg.get("host", _DEFAULT_SERVE_HOST))
         self._serve_port: int = int(wk_cfg.get("port", _DEFAULT_SERVE_PORT))
-        # Where `whisperkit-cli download` stores model bundles. The CLI
-        # respects $WHISPERKIT_HOME, so we just inherit the env default
-        # unless the user has overridden it.
+        # Where ``whisperkit-cli serve`` lazy-downloads model bundles.
+        # The CLI respects $WHISPERKIT_HOME, so we just inherit the env
+        # default unless the user has overridden it via ``model_dir``.
         self._model_dir: str | None = wk_cfg.get("model_dir")
         # Boot-time download is async-friendly: the first `preload` call
         # will block on the download. We let the user gate this.
@@ -378,15 +389,37 @@ class WhisperKitSTT:
             ) from exc
 
     def _wait_for_serve_ready(self) -> None:
+        # Sprint Ω.6.A (Apr 26 2026): two-stage readiness check.
+        #   1. Port-bound  -> Vapor accepted the listen()
+        #   2. /health 200 -> the model is loaded AND the route table is
+        #      registered. With large turbo + first-load ANE compile,
+        #      stage 1 can fire several seconds before stage 2; hitting
+        #      transcribe between the two stages returns 404. The health
+        #      check closes that race.
+        import urllib.request
+
         deadline = time.monotonic() + self._serve_startup_timeout_s
+        port_ok = False
+        health_url = f"http://{self._serve_host}:{self._serve_port}/health"
         while time.monotonic() < deadline:
-            if _port_is_open(self._serve_host, self._serve_port):
-                return
+            if not port_ok:
+                if _port_is_open(self._serve_host, self._serve_port):
+                    port_ok = True
+                else:
+                    time.sleep(0.25)
+                    continue
+            try:
+                with urllib.request.urlopen(health_url, timeout=1.0) as resp:
+                    if resp.status == 200:
+                        return
+            except Exception:
+                pass
             time.sleep(0.25)
         raise TimeoutError(
-            f"whisperkit-cli serve did not bind to "
-            f"{self._serve_host}:{self._serve_port} within "
-            f"{self._serve_startup_timeout_s:.1f}s",
+            f"whisperkit-cli serve did not become healthy at "
+            f"{self._serve_host}:{self._serve_port}/health within "
+            f"{self._serve_startup_timeout_s:.1f}s "
+            f"(port_bound={port_ok})",
         )
 
     def _stop_serve(self) -> None:
@@ -779,6 +812,18 @@ class WhisperKitSTT:
             )
             return ""
 
+        # Sprint Ω.6.A (Apr 26 2026): whisperkit-cli 0.18.0 serves an
+        # OpenAI-compatible API at /v1/audio/transcriptions, NOT the older
+        # /transcribe path the original driver was written against.
+        # Multipart fields:
+        #   - file:    audio bytes (we send 16 kHz mono WAV)
+        #   - model:   model name (whisperkit ignores the value but
+        #              Vapor's OpenAI parser requires the field)
+        #   - language: BCP-47 / Whisper short code or "auto"
+        # WhisperKit's "language" auto-detect uses an empty string, not the
+        # literal "auto" token (the OpenAI spec doesn't define "auto").
+        # If the configured language is "auto" or empty we omit the field
+        # entirely so WhisperKit picks the language from the audio.
         boundary = "----ATOMWhisperKitBoundary"
         body = io.BytesIO()
         body.write(f"--{boundary}\r\n".encode())
@@ -789,11 +834,21 @@ class WhisperKitSTT:
         body.write(b"Content-Type: audio/wav\r\n\r\n")
         body.write(buf.getvalue())
         body.write(f"\r\n--{boundary}\r\n".encode())
-        body.write(b'Content-Disposition: form-data; name="language"\r\n\r\n')
-        body.write((self._language or "auto").encode())
+        body.write(b'Content-Disposition: form-data; name="model"\r\n\r\n')
+        body.write(b"whisper-1")
+        lang = (self._language or "").strip().lower()
+        if lang and lang != "auto":
+            body.write(f"\r\n--{boundary}\r\n".encode())
+            body.write(
+                b'Content-Disposition: form-data; name="language"\r\n\r\n',
+            )
+            body.write(lang.encode())
         body.write(f"\r\n--{boundary}--\r\n".encode())
 
-        url = f"http://{self._serve_host}:{self._serve_port}/transcribe"
+        url = (
+            f"http://{self._serve_host}:{self._serve_port}"
+            "/v1/audio/transcriptions"
+        )
         req = urllib.request.Request(
             url,
             data=body.getvalue(),

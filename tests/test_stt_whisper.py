@@ -288,6 +288,25 @@ def _stub_disabled_native(monkeypatch):
     monkeypatch.setattr(vp.VoicePipeline, "_build_native_stt", _fake_native)
 
 
+def _stub_disabled_whisperkit(monkeypatch):
+    """Force WhisperKit 'unsupported' so engine=auto tests can exercise
+    the whisper.cpp branch without depending on whether
+    ``whisperkit-cli`` happens to be installed on the test host.
+
+    Sprint Ω.6.A (Apr 26 2026): once whisperkit-cli is installed, the
+    factory's auto-mode rightfully prefers WhisperKit (ANE > Metal).
+    Tests that target the whisper.cpp branch must stub WhisperKit out.
+    """
+    from voice import voice_pipeline as vp
+
+    def _fake_whisperkit(self):
+        return None, "whisperkit disabled in test"
+
+    monkeypatch.setattr(
+        vp.VoicePipeline, "_build_whisperkit_stt", _fake_whisperkit,
+    )
+
+
 def _stub_whisper_factory(monkeypatch, *, ok: bool, reason: str = ""):
     from voice import voice_pipeline as vp
 
@@ -352,6 +371,7 @@ def test_pipeline_auto_prefers_whisper_when_available(monkeypatch):
     from core.async_event_bus import AsyncEventBus
     from voice.voice_pipeline import VoicePipeline
 
+    _stub_disabled_whisperkit(monkeypatch)
     sentinel = _stub_whisper_factory(monkeypatch, ok=True)
     _stub_disabled_native(monkeypatch)
 
@@ -362,7 +382,7 @@ def test_pipeline_auto_prefers_whisper_when_available(monkeypatch):
     pipeline._build_stt()
 
     assert pipeline.stt is sentinel, \
-        "engine=auto should pick WhisperSTT before NativeSTT"
+        "engine=auto should pick WhisperSTT before NativeSTT (WhisperKit stubbed off)"
 
 
 @pytest.mark.skipif(sys.platform != "darwin",
@@ -370,11 +390,17 @@ def test_pipeline_auto_prefers_whisper_when_available(monkeypatch):
 def test_pipeline_auto_disables_stt_when_whisper_missing(monkeypatch):
     """Sprint K hardening: engine=auto must NOT silently fall back to
     SFSpeechRecognizer when whisper.cpp is missing -- it must surface a
-    disabled STT so Boss is told to install whisper.cpp."""
+    disabled STT so Boss is told to install whisper.cpp.
+
+    Sprint Ω.6.A: WhisperKit is stubbed unavailable so the auto-chain
+    falls through to the whisper.cpp branch this test was written to
+    cover.
+    """
     from core.async_event_bus import AsyncEventBus
     from voice import voice_pipeline as vp
     from voice.voice_pipeline import VoicePipeline, _DisabledSTT
 
+    _stub_disabled_whisperkit(monkeypatch)
     _stub_whisper_factory(monkeypatch, ok=False, reason="model missing")
 
     native_stub = MagicMock(name="NativeSTT")

@@ -54,7 +54,11 @@ def test_config_settings_required_keys() -> None:
     stt = settings.get("stt", {})
     assert "engine" in stt, "STT missing engine"
     assert stt["engine"] in (
-        "macos_native", "whisper", "whisper_cpp", "custom",
+        "macos_native", "whisper", "whisper_cpp",
+        # Sprint Ω.6.A (Apr 26 2026): WhisperKit (CoreML/ANE) + aliases.
+        # voice/voice_pipeline.py:_WHISPERKIT_ALIASES.
+        "whisperkit", "whisper_kit", "whisper-kit", "wk",
+        "auto", "custom",
     ), f"Invalid STT engine: {stt['engine']}"
     
     # TTS config
