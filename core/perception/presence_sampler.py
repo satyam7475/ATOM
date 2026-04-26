@@ -322,12 +322,22 @@ class PresenceSampler:
                 return chooser()
             except Exception:
                 logger.exception("camera_chooser failed")
+        # Resolve the camera-discovery callable defensively. The
+        # ``camera_capture`` module exposes :func:`list_cameras`; older
+        # injection points expected ``discover_cameras``. Accept either
+        # so a stub harness or future rename can't silently break the
+        # presence sampler.
+        discover = getattr(cap_module, "list_cameras", None)
+        if discover is None:
+            discover = getattr(cap_module, "discover_cameras", None)
+        if discover is None:
+            return None
         try:
-            cams = cap_module.discover_cameras()
+            cams = discover()
         except Exception:
             return None
         try:
-            return cap_module.choose_preferred(cams, preferred="auto")
+            return cap_module.choose_preferred(cams, preferred="builtin")
         except Exception:
             return None
 

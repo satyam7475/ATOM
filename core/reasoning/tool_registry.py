@@ -254,12 +254,12 @@ class ToolRegistry:
             Tool(
                 "vision_look",
                 (
-                    "Open the camera (built-in webcam or iPhone Continuity "
-                    "Camera) and report what you see in front of the user. "
-                    "Detects faces and (optionally) barcodes via the Apple "
-                    "Neural Engine. Use when the user asks 'what do you see', "
-                    "'can you see me', 'who is in the room', or to scan a QR/"
-                    "barcode."
+                    "Open the built-in MacBook camera (FaceTime HD) and "
+                    "report what you see in front of the user. Detects "
+                    "faces and (optionally) barcodes via the Apple Neural "
+                    "Engine. Use when the user asks 'what do you see', "
+                    "'can you see me', 'who is in the room', or to scan a "
+                    "QR/barcode."
                 ),
                 "perception",
                 "moderate",
@@ -282,10 +282,10 @@ class ToolRegistry:
             Tool(
                 "vision_describe",
                 (
-                    "Open the camera (built-in webcam or iPhone Continuity "
-                    "Camera) and generate a rich one-sentence description "
-                    "of the scene using the on-device VLM (SmolVLM-Instruct-"
-                    "4bit, mlx-vlm). "
+                    "Open the built-in MacBook camera (FaceTime HD) and "
+                    "generate a rich one-sentence description of the scene "
+                    "using the on-device VLM (SmolVLM-Instruct-4bit, "
+                    "mlx-vlm). "
                     "Use when the user wants actual understanding of what's "
                     "in front of them, not just a face count: 'describe what "
                     "you see', 'tell me about the room', 'what am I holding', "

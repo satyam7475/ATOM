@@ -1143,8 +1143,10 @@ async def main() -> None:
     # Built around AVFoundation single-frame capture + Apple Vision
     # face/object detection on the Neural Engine. No LLM/VLM is loaded
     # by this subsystem -- it stays inside the user's "one 7B model"
-    # constraint while still giving ATOM eyes (built-in webcam +
-    # Continuity Camera = iPhone-as-webcam).
+    # constraint while still giving ATOM eyes. As of Apr 26 2026 the
+    # camera source is **MacBook built-in (FaceTime HD) only**;
+    # iPhone Continuity Camera is intentionally excluded by
+    # ``core/perception/camera_capture.py`` discovery + picker.
     vision_engine = None
     # Hoisted so cold_start.warm_up can pick it up even when the vision
     # block below short-circuits (vision.enabled=false). cold_start
@@ -1197,7 +1199,7 @@ async def main() -> None:
 
             vision_engine = VisionEngine(
                 enabled=True,
-                preferred_camera=str(_vision_cfg.get("preferred_camera") or "auto"),
+                preferred_camera=str(_vision_cfg.get("preferred_camera") or "builtin"),
                 explicit_uid=_vision_cfg.get("explicit_camera_uid"),
                 audit_log_path=_vision_cfg.get("audit_log_path"),
                 emit=getattr(bus, "emit_fast", None) or getattr(bus, "emit", None),
@@ -1236,9 +1238,10 @@ async def main() -> None:
                 )
             else:
                 logger.info(
-                    "Vision engine ready: cameras=%s, preferred=%s",
+                    "Vision engine ready: cameras=%s, preferred=%s "
+                    "(MacBook-camera-only policy)",
                     _vision_cams or ["<none>"],
-                    _vision_cfg.get("preferred_camera", "auto"),
+                    _vision_cfg.get("preferred_camera", "builtin"),
                 )
         except Exception:
             logger.warning("VisionEngine init failed; camera tools disabled", exc_info=True)
@@ -3640,8 +3643,8 @@ async def main() -> None:
                             face_result.camera.name if face_result.camera else "?",
                         )
                     else:
-                        # Optional feature failed (Continuity Camera dozed
-                        # off, video delegate raised, AVCapture session
+                        # Optional feature failed (built-in camera was
+                        # busy, video delegate raised, AVCapture session
                         # never produced a frame). The user said it
                         # explicitly: "don't make startup noise about an
                         # optional feature." Demote to DEBUG so it shows

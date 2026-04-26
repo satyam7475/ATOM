@@ -68,7 +68,7 @@
     },
     "vision": {
         "enabled": true,
-        "preferred_camera": "auto",
+        "preferred_camera": "builtin",
         "explicit_camera_uid": null,
         "boot_face_check": true,
         "boot_face_check_announce": true,

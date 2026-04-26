@@ -34,86 +34,135 @@ def _mk(name: str, kind: str, uid: str = "") -> CameraInfo:
     )
 
 
-def test_classify_kind_continuity_type_string():
-    assert (
-        camera_capture._classify_kind("AVCaptureDeviceTypeContinuityCamera") == "continuity"
-    )
-
-
 def test_classify_kind_builtin_type_string():
     assert (
         camera_capture._classify_kind("AVCaptureDeviceTypeBuiltInWideAngleCamera") == "builtin"
     )
 
 
-def test_classify_kind_iphone_via_external_type_promoted_to_continuity():
+def test_classify_kind_continuity_type_classifies_as_iphone():
+    # Apr 26 2026: Continuity Camera devices are flagged ``iphone``
+    # (banned kind) so ``list_cameras`` filters them out before the
+    # picker can ever pick them. The dedicated continuity device-type
+    # constant is recognised purely so the diagnostic log line knows
+    # "we saw the iPhone, we ignored it."
+    kind = camera_capture._classify_kind(
+        "AVCaptureDeviceTypeContinuityCamera",
+        name="Satyam's iPhone",
+        model_id="iPhone15,4",
+    )
+    assert kind == "iphone"
+
+
+def test_classify_kind_iphone_via_external_type_classifies_as_iphone():
     # Real macOS 15+ behaviour: a Continuity-Camera-paired iPhone
     # reports as ``AVCaptureDeviceTypeExternal`` with a modelID of
-    # ``"iPhone15,4"`` (or similar). We must classify it as
-    # ``continuity`` so the auto preference picks the iPhone over the
-    # built-in MacBook camera.
+    # ``"iPhone15,4"`` (or similar). The new policy classifies it as
+    # ``"iphone"`` (banned), not ``"continuity"`` (no longer a kind),
+    # so the picker can never select it.
     kind = camera_capture._classify_kind(
         "AVCaptureDeviceTypeExternal",
         name="iPhone Camera",
         model_id="iPhone15,4",
     )
-    assert kind == "continuity"
+    assert kind == "iphone"
 
 
-def test_classify_kind_external_only_via_modelid_promotes_to_continuity():
+def test_classify_kind_external_only_via_modelid_classifies_as_iphone():
     # Some pyobjc builds return an empty localizedName but a valid
-    # modelID — modelID alone must be enough for the promotion.
+    # modelID -- modelID alone is sufficient to ban the device.
     kind = camera_capture._classify_kind(
         "AVCaptureDeviceTypeExternal", name="", model_id="iPhone16,2",
     )
-    assert kind == "continuity"
+    assert kind == "iphone"
 
 
 def test_classify_kind_real_external_usb_stays_external():
-    # A USB DSLR rig with no iPhone signal must stay external so the
-    # iPhone preference doesn't accidentally pick a wired webcam.
+    # A USB DSLR / external webcam with no iPhone signal must stay
+    # ``external`` so the picker can fall back to it when no built-in
+    # camera is available.
     kind = camera_capture._classify_kind(
         "AVCaptureDeviceTypeExternal", name="Logitech BRIO", model_id="C925e",
     )
     assert kind == "external"
 
 
-def test_choose_preferred_auto_prefers_continuity_over_builtin():
-    cams = [_mk("MacBook Air Camera", "builtin"), _mk("Satyam's iPhone", "continuity")]
+def test_choose_preferred_auto_aliases_to_builtin():
+    # Pre-Apr-26-2026 the auto policy preferred the iPhone. After the
+    # MacBook-camera-only policy, ``auto`` is a strict alias for
+    # ``builtin``: the iPhone row in the input list is filtered out by
+    # the picker and the built-in is returned.
+    cams = [_mk("MacBook Air Camera", "builtin"), _mk("Satyam's iPhone", "iphone")]
     chosen = camera_capture.choose_preferred(cams, preferred="auto")
     assert chosen is not None
-    assert chosen.kind == "continuity"
+    assert chosen.kind == "builtin"
 
 
 def test_choose_preferred_builtin_ignores_iphone_even_when_present():
-    cams = [_mk("MacBook Air Camera", "builtin"), _mk("Satyam's iPhone", "continuity")]
+    cams = [_mk("MacBook Air Camera", "builtin"), _mk("Satyam's iPhone", "iphone")]
     chosen = camera_capture.choose_preferred(cams, preferred="builtin")
     assert chosen is not None
     assert chosen.kind == "builtin"
 
 
-def test_choose_preferred_continuity_falls_back_to_builtin_when_iphone_absent():
-    cams = [_mk("MacBook Air Camera", "builtin")]
+def test_choose_preferred_continuity_legacy_aliases_to_builtin():
+    # Legacy configs with ``preferred_camera="continuity"`` must keep
+    # booting after the iPhone-camera removal: the picker logs a
+    # one-line deprecation warning and falls through to the built-in.
+    cams = [_mk("MacBook Air Camera", "builtin"), _mk("Satyam's iPhone", "iphone")]
     chosen = camera_capture.choose_preferred(cams, preferred="continuity")
-    # Falls back rather than returning None so a "prefer iPhone" config
-    # still yields *some* camera when the iPhone is asleep.
     assert chosen is not None
     assert chosen.kind == "builtin"
 
 
-def test_choose_preferred_explicit_uid_wins():
+def test_choose_preferred_filters_iphone_even_when_only_camera_listed():
+    # Pure-defence-in-depth: if the only camera handed to the picker
+    # is an iPhone, we return None rather than fall back to it. This
+    # makes "no MacBook camera available" a failure mode the runtime
+    # can surface ("camera offline") instead of silently using the
+    # banned device.
+    cams = [_mk("Satyam's iPhone", "iphone")]
+    chosen = camera_capture.choose_preferred(cams, preferred="builtin")
+    assert chosen is None
+
+
+def test_choose_preferred_falls_back_to_external_when_no_builtin():
+    cams = [_mk("Logitech BRIO", "external")]
+    chosen = camera_capture.choose_preferred(cams, preferred="builtin")
+    assert chosen is not None
+    assert chosen.kind == "external"
+
+
+def test_choose_preferred_explicit_uid_wins_for_non_iphone_devices():
     cams = [
         _mk("MacBook Air Camera", "builtin", uid="UID-A"),
-        _mk("Satyam's iPhone", "continuity", uid="UID-B"),
         _mk("USB Webcam", "external", uid="UID-C"),
     ]
-    chosen = camera_capture.choose_preferred(cams, preferred="auto", explicit_uid="UID-C")
+    chosen = camera_capture.choose_preferred(
+        cams, preferred="builtin", explicit_uid="UID-C",
+    )
     assert chosen is not None
     assert chosen.unique_id == "UID-C"
 
 
+def test_choose_preferred_explicit_uid_pointing_at_iphone_is_rejected():
+    # Even an explicit ``vision.explicit_camera_uid`` cannot summon an
+    # iPhone — the iPhone row is filtered before the UID lookup runs.
+    cams = [
+        _mk("MacBook Air Camera", "builtin", uid="UID-A"),
+        _mk("Satyam's iPhone", "iphone", uid="UID-IPHONE"),
+    ]
+    chosen = camera_capture.choose_preferred(
+        cams, preferred="builtin", explicit_uid="UID-IPHONE",
+    )
+    assert chosen is not None
+    # Falls back to the built-in instead of returning None — we still
+    # have a valid camera on disk.
+    assert chosen.kind == "builtin"
+
+
 def test_choose_preferred_no_cameras_returns_none():
-    assert camera_capture.choose_preferred([], preferred="auto") is None
+    assert camera_capture.choose_preferred([], preferred="builtin") is None
 
 
 # ── CGColorSpaceCreateDeviceRGB resolution (live-fix Apr 2026) ───────
@@ -266,7 +315,7 @@ def patched_engine(monkeypatch, tmp_path):
 
     engine = VisionEngine(
         enabled=True,
-        preferred_camera="auto",
+        preferred_camera="builtin",
         audit_log_path=tmp_path / "audit.jsonl",
         min_gap_s=0.0,  # disable throttle for these tests
         capture_timeout_s=1.0,

@@ -1163,10 +1163,12 @@ CONFIG_SCHEMA: dict[str, Any] = {
         "vision": {
             "type": "object",
             "description": (
-                "Camera + Apple Vision (Neural Engine) settings. Covers both "
-                "the built-in MacBook webcam and Continuity Camera (iPhone-as-"
-                "webcam). Detection runs on-device via VNDetectFaceRectangles "
-                "— no LLM/VLM is loaded by this subsystem."
+                "Camera + Apple Vision (Neural Engine) settings. ATOM is "
+                "MacBook-camera only as of Apr 26 2026 (built-in FaceTime HD "
+                "webcam on the laptop) — iPhone Continuity Camera is "
+                "intentionally not used as a vision source. Detection runs "
+                "on-device via VNDetectFaceRectangles; no LLM/VLM is loaded "
+                "by this subsystem."
             ),
             "properties": {
                 "enabled": {
@@ -1178,18 +1180,21 @@ CONFIG_SCHEMA: dict[str, Any] = {
                 },
                 "preferred_camera": {
                     "type": "string",
-                    "enum": ["auto", "continuity", "builtin"],
+                    "enum": ["builtin", "auto", "continuity"],
                     "description": (
-                        "auto = prefer iPhone (Continuity) when present, else "
-                        "built-in. continuity = require iPhone. builtin = "
-                        "ignore iPhone even if available."
+                        "builtin (default) = the laptop's built-in FaceTime "
+                        "HD webcam. auto = alias of builtin after the "
+                        "iPhone-camera removal. continuity = deprecated "
+                        "(legacy configs only); aliased to builtin and "
+                        "logged once at startup."
                     ),
                 },
                 "explicit_camera_uid": {
                     "type": ["string", "null"],
                     "description": (
                         "AVCaptureDevice uniqueID; if set, wins over "
-                        "preferred_camera. Use to pin a specific external rig."
+                        "preferred_camera. Use to pin a specific external "
+                        "(non-iPhone) USB rig."
                     ),
                 },
                 "boot_face_check": {
@@ -1214,8 +1219,9 @@ CONFIG_SCHEMA: dict[str, Any] = {
                     "maximum": 10.0,
                     "description": (
                         "Max wall time to wait for a single frame from the "
-                        "AVCaptureSession. Continuity Camera needs the higher "
-                        "end of this range on first warm-up."
+                        "AVCaptureSession. The built-in FaceTime HD typically "
+                        "wakes in <500 ms; the higher end of this range "
+                        "accommodates first-call cold start after lid-open."
                     ),
                 },
                 "min_gap_s": {

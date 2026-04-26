@@ -22,6 +22,7 @@ column reflects the gate, not capability.
 | **Reasoning (local)** | MLX local model, routing, latency | **4–5** | **5** | Qwen3-8B-4bit primary + Qwen3-4B-Instruct-4bit fast/draft on MLX with KV-quant warm-up, `mx.compile`'d sampler, persona prompt cache pinned at boot. Speculative decoding (4B drafts 8B) wired and **enabled** Apr 26 2026 — expect 1.5–2× tokens/s on warm runs. |
 | **Cloud / Gemini** | Optional escalation, quotas, safety | **3** (gated, off by default) | **5** | `cloud.enabled = false` and `cloud_brain_router.enabled = false` ship by default — ATOM is **100 % offline-first**. Flip both true + set `GEMINI_API_KEY` (and `pip install google-generativeai`) to escalate hard queries. Daily quota + cooldown wiring is real. |
 | **Memory / RAG** | Graph + vectors, recall quality | **4** | **5** | Memory engine + vector store (Chroma) + graph-first retrieval with project boost; `mlx-embeddings` backend (Apr 26 2026) on the Apple Neural Engine, ~3× faster than torch-MPS for the 384-dim MiniLM-L6 model. Owner-priority + recency half-life smart-scoring is live. |
+| **Vision (camera + VLM)** | Eyes that work without a second device | **4** | **5** | **MacBook-camera only** as of Apr 26 2026: built-in FaceTime HD via `AVCaptureVideoDataOutput`, single-frame capture, software-encoded JPEG (no GPU contention with MLX), Apple Vision face/object on the Neural Engine, optional SmolVLM-Instruct-4bit captioner. iPhone Continuity Camera is intentionally excluded — discovery filters iPhone-shaped externals and the picker rewrites legacy `preferred_camera="continuity"` to `"builtin"`. |
 | **Tools / OS control** | Security-gated actions, confirmations | **4** | **5** | 40+ tools, ReAct loop, code sandbox, security gateway with system-path block, `pending_tool_confirmation` flow, autonomy thresholds (auto-execute 0.95 / suggest 0.72), runtime watchdog. Real safety constraints vs plot armour. |
 | **UI / dashboard** | Health at a glance, WebSocket state | **4** | **5** | AtomRuntimeStateBridge → realtime room (`http://127.0.0.1:8770/play/`) with voice health strip + orb. Unified `/badge` endpoint + standalone menubar polling daemon (`tools/atom_status_badge.py`) — see *How to enable the menubar status badge* below. |
 | **Proactivity** | Reminders, hints, habits | **4** | **5** | Phase G cognitive loop is **all on**: ReflectiveLoop, PresenceSampler, SceneContext, MoodInference, JarvisSuggester, AwarenessLoop. Quiet-hours + per-category cooldowns + `suppress_moods` keep nudges respectful. |
@@ -83,3 +84,14 @@ by default) so it works against a running ATOM with zero extra wiring.
   `WhisperSTT.on_state_changed` parity fix landed (boot was silently exiting
   mid-init via an unhandled `AttributeError` and `asyncio.run()` was
   deadlocking on an un-cancellable iPhone-bridge BG task during teardown).
+- **2026-04-26 (camera source pinned to MacBook):** Removed iPhone
+  Continuity Camera as a vision source per owner request.
+  `core/perception/camera_capture.py` no longer enumerates
+  `AVCaptureDeviceTypeContinuityCamera`, classifies any iPhone-shaped
+  External as kind `"iphone"` and filters it from `list_cameras`,
+  and `choose_preferred` rewrites legacy `"continuity"` /
+  `"auto"` preferences to `"builtin"` with a one-shot deprecation
+  warning. `config/settings.json` now ships `vision.preferred_camera =
+  "builtin"`. The vision pipeline (PresenceSampler, SceneContext,
+  VisionEngine, vision_look / vision_describe tools) all run from the
+  built-in FaceTime HD only.
