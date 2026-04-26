@@ -383,6 +383,63 @@ class VectorStore:
             "backend": "chromadb" if self._using_chromadb else "fallback",
         }
 
+    @property
+    def backend(self) -> str:
+        """Sprint Ω.10 (Apr 27 2026) — public read-only view of which
+        backend is actually live (``"chromadb"`` or ``"fallback"``).
+
+        Observability callers used to reach into the private
+        ``_backend`` slot (which only stores the *configured* backend
+        from settings) or guess from ``_using_chromadb``. ``backend``
+        reports what is actually *running*; the configured backend is
+        still available via ``diagnostics()["configured_backend"]``.
+
+        Note: when ``settings.json::vector_store.backend`` is set to
+        ``"torch_gpu"`` we still use Chroma for ANN today (the GPU
+        path is wired through embeddings only); this property reflects
+        that runtime reality so a monitor doesn't think the GPU path
+        is live when it isn't.
+        """
+        return "chromadb" if self._using_chromadb else "fallback"
+
+    def diagnostics(self) -> dict[str, Any]:
+        """Sprint Ω.10 (Apr 27 2026) — single source of truth for the
+        observability surfaces that ask the vector store about itself
+        (audit scripts, status badge, future health snapshots).
+
+        Cheap to call: ``get_stats()`` is already 30-second-cached so
+        per-turn invocations don't hit Chroma. Returns:
+
+          ``backend``: live backend, see :pyattr:`backend`.
+          ``configured_backend``: the requested backend from
+            ``settings.json``. Diverges from ``backend`` whenever
+            ChromaDB import / init failed and we silently fell back
+            to in-memory — the divergence is itself the alert signal.
+          ``store_dir``: on-disk path. Absent on the in-memory
+            fallback because there is no path.
+          ``collections``: per-collection row counts (≤30 s old).
+          ``total_rows``: convenience sum so callers don't need to
+            ``sum(diag['collections'].values())`` themselves.
+          ``embedding_signature``: the embedding-provider signature
+            stamped on every row's metadata. Lets a monitor detect
+            drift between the running provider and what the index
+            was actually built with — usually the first symptom of a
+            silent embedding-model swap.
+        """
+        stats = self.get_stats()
+        out: dict[str, Any] = {
+            "backend": self.backend,
+            "configured_backend": self._backend,
+            "collections": dict(stats),
+            "total_rows": sum(stats.values()),
+            "embedding_signature": str(
+                self._embedding_meta.get("_embedding_signature", ""),
+            ),
+        }
+        if self._using_chromadb:
+            out["store_dir"] = str(self._store_dir)
+        return out
+
     def _search_chromadb(
         self, collection: str, query_embedding: list[float],
         k: int, min_score: float,

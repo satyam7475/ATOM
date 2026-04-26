@@ -1,6 +1,6 @@
 {
   "sprint": "omega.9",
-  "ts": 1777232943.3731651,
+  "ts": 1777233717.1835089,
   "config": {
     "cross_device.enabled": true,
     "cognitive_kernel.quick_model": "qwen3-4b-instruct-4bit",
@@ -15,21 +15,21 @@
       "expected": "filler-fires",
       "fired": true,
       "ok": true,
-      "head": "Ready, Boss."
+      "head": "I'm here, Boss."
     },
     {
       "query": "how are you",
       "expected": "filler-fires",
       "fired": true,
       "ok": true,
-      "head": "All good here, Boss."
+      "head": "I'm good, Boss. Ready for you."
     },
     {
       "query": "tell me about yourself",
       "expected": "domain-fires",
       "fired": true,
       "ok": true,
-      "head": "I'm ATOM, your operating intelligence, Boss."
+      "head": "I'm ATOM, Boss. Your personal AI buddy."
     },
     {
       "query": "how does unified memory work in detail",
@@ -156,6 +156,7 @@
     "enabled": true,
     "provider": "rotating",
     "available": true,
+    "vault_unlocked_in_audit_env": true,
     "slot_count": 4,
     "slot_names": [
       "groq",
@@ -169,7 +170,12 @@
       2,
       3
     ],
-    "ready_slots": [],
+    "ready_slots": [
+      "groq",
+      "gemini",
+      "cerebras",
+      "nvidia"
+    ],
     "deep_models": {
       "groq": "llama-3.3-70b-versatile",
       "gemini": "gemini-2.5-flash",

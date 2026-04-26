@@ -128,9 +128,11 @@ def main() -> int:
         from core.vector_store import VectorStore
         cfg = json.loads((ROOT / "config/settings.json").read_text())
         store = VectorStore(cfg)
-        diag = store.diagnostics() if hasattr(store, "diagnostics") else {}
-        info = {"backend": getattr(store, "backend", "?"), "diag": diag}
-        return info
+        # Sprint Ω.10 (Apr 27 2026): ``backend`` is now a public
+        # property and ``diagnostics()`` is a real method (not just an
+        # ``hasattr`` probe). The defensive fallback to ``"?"`` is
+        # gone because the public surface is guaranteed.
+        return {"backend": store.backend, **store.diagnostics()}
 
     _maybe(chroma_ping, "vector_store", report)
 
@@ -177,10 +179,19 @@ def main() -> int:
         client = RotatingOpenAIClient(cfg)
         diag = client.diagnostics()
         slots = diag.get("slots", []) or []
-        ready = [s for s in slots if s.get("api_key_present")]
+        # Sprint Ω.10 (Apr 27 2026): the diagnostics dict emits the slot
+        # key as ``has_key`` (see RotatingOpenAIClient.diagnostics ~L1340),
+        # not ``api_key_present``. The previous probe always returned []
+        # so we couldn't tell the difference between "vault unlocked but
+        # no keys configured" and "vault sealed because the audit env
+        # is missing ATOM_MASTER_PASSWORD". The vault_unlocked flag below
+        # makes the distinction explicit in the report JSON.
+        ready = [s for s in slots if s.get("has_key")]
+        vault_unlocked = bool(os.environ.get("ATOM_MASTER_PASSWORD"))
         return {
             "enabled": diag.get("enabled"),
             "provider": diag.get("provider"),
+            "vault_unlocked_in_audit_env": vault_unlocked,
             "slot_count": len(slots),
             "slot_names": [s.get("name") for s in slots],
             "tiers": [s.get("tier") for s in slots],

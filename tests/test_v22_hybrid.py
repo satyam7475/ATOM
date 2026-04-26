@@ -38,8 +38,17 @@ def _record_test(name, func):
         print(f"  {FAIL} {name}: {e}")
 
 
-# Back-compat alias for the pre-rename callers below. Underscore prefix
-# keeps it out of pytest's auto-collection net.
+# Sprint Ω.10 (Apr 27 2026): the per-step dispatchers below are now
+# named ``_check_*`` so pytest's auto-collection heuristic skips them
+# entirely. The file is meant to be run as a standalone smoke runner
+# (``python tests/test_v22_hybrid.py``) — its dispatchers return
+# truthy/falsy values which pytest used to flag with
+# ``PytestReturnNotNoneWarning``. Underscored names eliminate the
+# warnings without changing the runner's behaviour.
+#
+# ``_test`` is kept as a back-compat alias for any external caller that
+# still passes ``func=test_*`` by reference, even though no in-repo
+# call site relies on it after the rename.
 _test = _record_test
 
 
@@ -51,12 +60,12 @@ print("=" * 60)
 print("\n🔐 Phase 1: Security Gateway")
 
 
-def test_gateway_import():
+def _check_gateway_import():
     from core.security_gateway import SecurityGateway
     return SecurityGateway is not None
 
 
-def test_gateway_sanitize():
+def _check_gateway_sanitize():
     from core.security_gateway import SecurityGateway
     gw = SecurityGateway()
 
@@ -79,7 +88,7 @@ def test_gateway_sanitize():
     return True
 
 
-def test_gateway_block():
+def _check_gateway_block():
     from core.security_gateway import SecurityGateway
     gw = SecurityGateway()
 
@@ -98,7 +107,7 @@ def test_gateway_block():
     return True
 
 
-def test_gateway_rate_limit():
+def _check_gateway_rate_limit():
     from core.security_gateway import SecurityGateway
     gw = SecurityGateway({"security_gateway": {"max_requests_per_minute": 2}})
 
@@ -113,28 +122,28 @@ def test_gateway_rate_limit():
     return True
 
 
-_record_test("Import SecurityGateway", test_gateway_import)
-_record_test("Sanitize sensitive data", test_gateway_sanitize)
-_record_test("Block system commands", test_gateway_block)
-_record_test("Rate limiting", test_gateway_rate_limit)
+_record_test("Import SecurityGateway", _check_gateway_import)
+_record_test("Sanitize sensitive data", _check_gateway_sanitize)
+_record_test("Block system commands", _check_gateway_block)
+_record_test("Rate limiting", _check_gateway_rate_limit)
 
 # ── Phase 2: Gemini Client ───────────────────────────────────────
 print("\n☁️  Phase 2: Gemini Client")
 
 
-def test_gemini_import():
+def _check_gemini_import():
     from core.cloud.gemini_client import GeminiClient
     return GeminiClient is not None
 
 
-def test_gemini_unavailable_without_key():
+def _check_gemini_unavailable_without_key():
     from core.cloud.gemini_client import GeminiClient
     client = GeminiClient()
     assert not client.is_available, "Should be unavailable without key"
     return True
 
 
-def test_gemini_circuit_breaker():
+def _check_gemini_circuit_breaker():
     from core.cloud.gemini_client import GeminiClient
     client = GeminiClient()
     # Simulate failures
@@ -144,15 +153,15 @@ def test_gemini_circuit_breaker():
     return True
 
 
-_record_test("Import GeminiClient", test_gemini_import)
-_record_test("Unavailable without API key", test_gemini_unavailable_without_key)
-_record_test("Circuit breaker opens after failures", test_gemini_circuit_breaker)
+_record_test("Import GeminiClient", _check_gemini_import)
+_record_test("Unavailable without API key", _check_gemini_unavailable_without_key)
+_record_test("Circuit breaker opens after failures", _check_gemini_circuit_breaker)
 
 # ── Phase 3: Cognitive Kernel ────────────────────────────────────
 print("\n🧠 Phase 3: Cognitive Kernel Upgrade")
 
 
-def test_kernel_cloud_paths():
+def _check_kernel_cloud_paths():
     from core.cognitive_kernel import ExecPath
     assert hasattr(ExecPath, "CLOUD_REASON"), "Missing CLOUD_REASON path"
     assert hasattr(ExecPath, "CLOUD_SEARCH"), "Missing CLOUD_SEARCH path"
@@ -161,7 +170,7 @@ def test_kernel_cloud_paths():
     return True
 
 
-def test_kernel_queryplan_fields():
+def _check_kernel_queryplan_fields():
     from core.cognitive_kernel import QueryPlan, ExecPath
     plan = QueryPlan(path=ExecPath.DIRECT)
     assert hasattr(plan, "cloud_augmented"), "Missing cloud_augmented field"
@@ -171,19 +180,19 @@ def test_kernel_queryplan_fields():
     return True
 
 
-_record_test("CLOUD_REASON + CLOUD_SEARCH paths", test_kernel_cloud_paths)
-_record_test("QueryPlan cloud fields", test_kernel_queryplan_fields)
+_record_test("CLOUD_REASON + CLOUD_SEARCH paths", _check_kernel_cloud_paths)
+_record_test("QueryPlan cloud fields", _check_kernel_queryplan_fields)
 
 # ── Phase 4: Confidence Engine ───────────────────────────────────
 print("\n📊 Phase 4: Confidence Engine")
 
 
-def test_confidence_import():
+def _check_confidence_import():
     from core.confidence_engine import ConfidenceEngine
     return ConfidenceEngine is not None
 
 
-def test_confidence_scoring():
+def _check_confidence_scoring():
     from core.confidence_engine import ConfidenceEngine
     engine = ConfidenceEngine()
 
@@ -221,7 +230,7 @@ def test_confidence_scoring():
     return True
 
 
-def test_confidence_pre_heuristic():
+def _check_confidence_pre_heuristic():
     from core.confidence_engine import ConfidenceEngine
     engine = ConfidenceEngine()
 
@@ -236,7 +245,7 @@ def test_confidence_pre_heuristic():
     return True
 
 
-def test_confidence_escalation():
+def _check_confidence_escalation():
     from core.confidence_engine import ConfidenceEngine
     engine = ConfidenceEngine({"confidence": {"escalation_threshold": 0.5}})
 
@@ -245,21 +254,21 @@ def test_confidence_escalation():
     return True
 
 
-_record_test("Import ConfidenceEngine", test_confidence_import)
-_record_test("Response quality scoring", test_confidence_scoring)
-_record_test("Pre-confidence heuristic", test_confidence_pre_heuristic)
-_record_test("Escalation decision", test_confidence_escalation)
+_record_test("Import ConfidenceEngine", _check_confidence_import)
+_record_test("Response quality scoring", _check_confidence_scoring)
+_record_test("Pre-confidence heuristic", _check_confidence_pre_heuristic)
+_record_test("Escalation decision", _check_confidence_escalation)
 
 # ── Phase 5: Decision Engine ────────────────────────────────────
 print("\n🎯 Phase 5: Decision Engine")
 
 
-def test_decision_import():
+def _check_decision_import():
     from core.decision_engine import DecisionEngine
     return DecisionEngine is not None
 
 
-def test_decision_enrichment():
+def _check_decision_enrichment():
     from core.decision_engine import DecisionEngine
     engine = DecisionEngine()
 
@@ -272,7 +281,7 @@ def test_decision_enrichment():
     return True
 
 
-def test_decision_style():
+def _check_decision_style():
     from core.decision_engine import DecisionEngine, ResponseStyle
     engine = DecisionEngine()
 
@@ -282,20 +291,20 @@ def test_decision_style():
     return True
 
 
-_record_test("Import DecisionEngine", test_decision_import)
-_record_test("Query enrichment", test_decision_enrichment)
-_record_test("Response style control", test_decision_style)
+_record_test("Import DecisionEngine", _check_decision_import)
+_record_test("Query enrichment", _check_decision_enrichment)
+_record_test("Response style control", _check_decision_style)
 
 # ── Phase 6: Search Tool ────────────────────────────────────────
 print("\n🔍 Phase 6: Search Tool")
 
 
-def test_search_import():
+def _check_search_import():
     from core.tools.search_tool import SearchTool
     return SearchTool is not None
 
 
-def test_search_realtime_detection():
+def _check_search_realtime_detection():
     from core.tools.search_tool import SearchTool
     assert SearchTool.needs_realtime_info("What is the latest news?")
     assert SearchTool.needs_realtime_info("Current Bitcoin price")
@@ -305,19 +314,19 @@ def test_search_realtime_detection():
     return True
 
 
-_record_test("Import SearchTool", test_search_import)
-_record_test("Real-time info detection", test_search_realtime_detection)
+_record_test("Import SearchTool", _check_search_import)
+_record_test("Real-time info detection", _check_search_realtime_detection)
 
 # ── Phase 7: Preference Store ───────────────────────────────────
 print("\n💾 Phase 7: Preference Store")
 
 
-def test_preference_import():
+def _check_preference_import():
     from core.memory.preference_store import PreferenceStore
     return PreferenceStore is not None
 
 
-def test_preference_crud():
+def _check_preference_crud():
     from core.memory.preference_store import PreferenceStore
     import tempfile
     store = PreferenceStore({
@@ -352,19 +361,19 @@ def test_preference_crud():
     return True
 
 
-_record_test("Import PreferenceStore", test_preference_import)
-_record_test("Preference CRUD + context block", test_preference_crud)
+_record_test("Import PreferenceStore", _check_preference_import)
+_record_test("Preference CRUD + context block", _check_preference_crud)
 
 # ── Phase 8: Semantic Cache ─────────────────────────────────────
 print("\n⚡ Phase 8: Semantic Cache")
 
 
-def test_semantic_cache_import():
+def _check_semantic_cache_import():
     from core.semantic_cache import SemanticCache
     return SemanticCache is not None
 
 
-def test_semantic_cache_exact_match():
+def _check_semantic_cache_exact_match():
     import tempfile
     from pathlib import Path
 
@@ -394,8 +403,8 @@ def test_semantic_cache_exact_match():
     return True
 
 
-_record_test("Import SemanticCache", test_semantic_cache_import)
-_record_test("Exact match cache", test_semantic_cache_exact_match)
+_record_test("Import SemanticCache", _check_semantic_cache_import)
+_record_test("Exact match cache", _check_semantic_cache_exact_match)
 
 # ── Summary ─────────────────────────────────────────────────────
 print("\n" + "=" * 60)

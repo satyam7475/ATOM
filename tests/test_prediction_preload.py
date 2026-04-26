@@ -62,7 +62,18 @@ class FakePrefetchEngine:
         self.calls.append((list(queries), prediction_accuracy))
 
 
-class TestPredictionEngine(PredictionEngine):
+class _PredictionEngineForTests(PredictionEngine):
+    """Sprint Ω.10 (Apr 27 2026): underscore-prefixed so pytest's
+    ``Test*`` auto-discovery heuristic skips it. The previous name
+    (``TestPredictionEngine``) tripped ``PytestCollectionWarning``
+    because the class has an ``__init__`` constructor and pytest
+    cannot instantiate it as a test class. This is a real testable
+    subclass of ``PredictionEngine`` — it overrides
+    ``_warm_app_target`` to record warm-up calls — not a stub like
+    the surrounding ``Fake*`` classes, hence the more descriptive
+    name.
+    """
+
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self.warmed_apps: list[str] = []
@@ -91,7 +102,7 @@ def test_prediction_preload_warms_multiple_resources() -> None:
     bus = FakeBus()
     prompt_builder = FakePromptBuilder()
     prefetch = FakePrefetchEngine()
-    engine = TestPredictionEngine(bus, FakeBehavior(), FakeMemory(), object(), _config())
+    engine = _PredictionEngineForTests(bus, FakeBehavior(), FakeMemory(), object(), _config())
     engine.attach_prompt_builder(prompt_builder)
     engine.attach_prefetch_engine(prefetch)
     engine.attach_cognitive_kernel(
@@ -140,7 +151,7 @@ def test_prediction_preload_respects_cooldown_and_degradation() -> None:
     bus = FakeBus()
     prompt_builder = FakePromptBuilder()
     prefetch = FakePrefetchEngine()
-    engine = TestPredictionEngine(bus, FakeBehavior(), FakeMemory(), object(), _config())
+    engine = _PredictionEngineForTests(bus, FakeBehavior(), FakeMemory(), object(), _config())
     engine.attach_prompt_builder(prompt_builder)
     engine.attach_prefetch_engine(prefetch)
     engine.attach_cognitive_kernel(
@@ -177,7 +188,7 @@ def test_prediction_preload_respects_cooldown_and_degradation() -> None:
 
 
 def test_llm_query_predictions_learn_live_queries() -> None:
-    engine = TestPredictionEngine(FakeBus(), FakeBehavior(), FakeMemory(), object(), _config())
+    engine = _PredictionEngineForTests(FakeBus(), FakeBehavior(), FakeMemory(), object(), _config())
 
     async def _run() -> None:
         await engine._on_cursor_query("summarize repo architecture")

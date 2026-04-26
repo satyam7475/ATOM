@@ -159,15 +159,23 @@ def main() -> int:
         client = RotatingOpenAIClient(cfg)
         diag = client.diagnostics()
         slots = diag.get("slots", []) or []
+        # Sprint Ω.10 (Apr 27 2026): the per-slot key in the diagnostics
+        # payload is ``has_key`` (RotatingOpenAIClient.diagnostics), not
+        # ``api_key_present``. The audit also surfaces whether the
+        # encrypted vault was unlocked in the audit env so a "no ready
+        # slots" reading can be distinguished from "vault sealed".
         report["cloud_rotation"] = {
             "enabled": diag.get("enabled"),
             "provider": diag.get("provider"),
             "available": diag.get("available"),
+            "vault_unlocked_in_audit_env": bool(
+                os.environ.get("ATOM_MASTER_PASSWORD"),
+            ),
             "slot_count": len(slots),
             "slot_names": [s.get("name") for s in slots],
             "tiers": [s.get("tier") for s in slots],
             "ready_slots": [
-                s["name"] for s in slots if s.get("api_key_present")
+                s["name"] for s in slots if s.get("has_key")
             ],
             "deep_models": {s.get("name"): s.get("deep_model") for s in slots},
         }

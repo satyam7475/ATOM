@@ -23,11 +23,27 @@ def test_fast_path_stop_sequences_do_not_include_open_paren() -> None:
 
 
 def test_vision_intent_tolerates_trailing_stt_fragment() -> None:
+    """STT routinely cuts off the tail of a question (atomLogs.txt L419
+    captured "Can you see me at" instead of "Can you see me at all"). The
+    pattern in ``vision_intents._SEE_ME`` lists ``at`` among the optional
+    trailing tokens so the intent still fires.
+
+    Sprint C2 (post-recovery) consolidated the camera-facing fast path
+    onto the ``vision_look`` action -- the heavier ``vision_describe``
+    route is reserved for VLM-captioning offers synthesised by the
+    kernel (see ``core.cognitive.offer_synthesizer``), not for naked
+    "can you see me" questions. This test was originally written
+    against an earlier draft that asserted ``vision_describe``; we keep
+    the STT-fragment-tolerance contract but pin the action to the
+    canonical name from ``test_intent_vision.py`` so the two suites
+    no longer disagree.
+    """
     from core.intent_engine import vision_intents
 
     result = vision_intents.check("Can you see me at")
     assert result is not None
-    assert result.action == "vision_describe"
+    assert result.action == "vision_look"
+    assert result.intent == "vision_look"
 
 
 def test_music_actions_not_fire_and_forget() -> None:
