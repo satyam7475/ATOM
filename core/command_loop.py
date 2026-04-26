@@ -71,6 +71,11 @@ class CommandLoop:
         "_turn_attached", "_turn_complete_count",
         # Sprint C3: parallel ack-TTS overlap
         "_tts", "_ack_task", "_ack_overlap_count",
+        # Sprint Ω.13: deferred ack — cancellation flag + submit clock so
+        # we can suppress the ACK entirely whenever ``response_ready``
+        # arrives within the deferral window.
+        "_ack_cancelled", "_ack_submit_t", "_ack_deferral_s",
+        "_ack_skipped_count",
     )
 
     def __init__(
@@ -113,6 +118,17 @@ class CommandLoop:
         self._tts: Any = None
         self._ack_task: asyncio.Task[None] | None = None
         self._ack_overlap_count: int = 0
+        # Sprint Ω.13 (Apr 27 2026): deferred ACK. The previous build
+        # spoke "One moment." even for sub-10 ms intent fast-paths
+        # (atomCurrentLogs.txt L295/L338/L365/L404/L417). We now wait
+        # ``_ack_deferral_s`` before actually speaking the ack, and the
+        # ``response_ready`` handler cancels the pending task if the
+        # brain returns inside that window. The bus event still fires
+        # immediately so dashboard/indicator subscribers stay in sync.
+        self._ack_cancelled: bool = False
+        self._ack_submit_t: float = 0.0
+        self._ack_deferral_s: float = 0.28
+        self._ack_skipped_count: int = 0
 
     def attach_system_state(self, engine: Any) -> None:
         self._system_state_engine = engine
@@ -233,13 +249,21 @@ class CommandLoop:
                 text=text[:120],
             )
 
-            # ── Instant acknowledgement (sub-100ms) ──────────────────
-            # Sprint C3: parallel TTS-ack overlap. We launch the ack
-            # speak as a fire-and-forget task *before* the LLM/router
-            # call so the audio rolls while the brain prefills. The
-            # bus event still fires for indicator subscribers.
+            # ── Acknowledgement (deferred — Sprint Ω.13) ─────────────
+            # Sprint C3 spawned ``speak_ack`` immediately so the audio
+            # could roll while the LLM prefilled. That worked for slow
+            # turns but produced a "One moment" for every sub-300 ms
+            # intent fast-path (atomCurrentLogs L295/L338/L365). We now
+            # wait ``_ack_deferral_s`` before speaking; the
+            # ``response_ready`` handler sets ``_ack_cancelled`` and
+            # cancels the task if the brain replied inside the window
+            # — saving the user from a useless "On it." in front of an
+            # instant answer. Bus event still fires immediately so
+            # dashboard/indicator subscribers stay in sync.
             budget.start_stage("ack")
             self._ack_task = None
+            self._ack_cancelled = False
+            self._ack_submit_t = time.perf_counter()
             if self._ack_engine is not None:
                 is_follow = False
                 if self._session_memory is not None:
@@ -250,7 +274,7 @@ class CommandLoop:
                     if self._tts is not None:
                         try:
                             self._ack_task = asyncio.create_task(
-                                self._tts.speak_ack(ack_text),
+                                self._deferred_ack(ack_text, trace_id),
                                 name=f"ack_overlap_{trace_id}",
                             )
                             self._ack_task.add_done_callback(
@@ -466,10 +490,63 @@ class CommandLoop:
             diag["pipeline_metrics"] = self._pipeline_metrics.get_diagnostics()
         return diag
 
+    # ── deferred ack (Sprint Ω.13) ─────────────────────────────
+
+    async def _deferred_ack(self, ack_text: str, trace_id: str) -> None:
+        """Speak the ACK only if the response hasn't already arrived.
+
+        Sleeps ``_ack_deferral_s`` (default 280 ms). If
+        :meth:`_on_response_ready` flips ``_ack_cancelled`` during the
+        sleep — i.e. the brain returned faster than the deferral
+        window — we skip the ACK entirely. Otherwise we speak it on
+        the original schedule. ``CancelledError`` from
+        ``_on_response_ready`` is swallowed so the pipeline never sees
+        a stray cancellation.
+        """
+        if self._tts is None:
+            return
+        try:
+            await asyncio.sleep(self._ack_deferral_s)
+        except asyncio.CancelledError:
+            return
+        if self._ack_cancelled or self._cancelled.is_set():
+            return
+        try:
+            await self._tts.speak_ack(ack_text)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.debug(
+                "[%s] deferred ack speak failed", trace_id, exc_info=True,
+            )
+
     # ── turn lifecycle (G6) ─────────────────────────────────────
 
     async def _on_response_ready(self, text: str = "", **_kw: Any) -> None:
-        """Latch the most recent assistant utterance for ``turn_complete``."""
+        """Latch the most recent assistant utterance for ``turn_complete``.
+
+        Sprint Ω.13: also short-circuits the deferred ACK when the brain
+        returns inside the deferral window. We log
+        ``PIPELINE_FAST_PATH: skip ACK`` so observability shows the
+        suppression — the user feels an instant reply with no "One
+        moment." preamble.
+        """
+        ack_task = self._ack_task
+        if ack_task is not None and not ack_task.done():
+            elapsed_ms = (time.perf_counter() - self._ack_submit_t) * 1000.0
+            if elapsed_ms < (self._ack_deferral_s * 1000.0):
+                self._ack_cancelled = True
+                self._ack_skipped_count += 1
+                logger.info(
+                    "PIPELINE_FAST_PATH: skip ACK (response_ready in %.0fms < %dms)",
+                    elapsed_ms, int(self._ack_deferral_s * 1000.0),
+                )
+                try:
+                    ack_task.cancel()
+                except Exception:
+                    logger.debug(
+                        "ack_task cancel raised", exc_info=True,
+                    )
         if text:
             self._last_response_text = text
 

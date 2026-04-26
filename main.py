@@ -2299,21 +2299,19 @@ async def main() -> None:
                 except Exception:
                     logger.debug("Boot warm: STT kick raised", exc_info=True)
         finally:
-            try:
-                from core.embedding_engine import get_embedding_engine
-
-                t_e = time.monotonic()
-                emb = get_embedding_engine(config)
-                loop = asyncio.get_running_loop()
-                seeded = int(
-                    await loop.run_in_executor(None, emb.seed_warm_cache)
-                )
-                logger.info(
-                    "Boot warm: embedding seed (new=%d, %.0fms)",
-                    seeded, (time.monotonic() - t_e) * 1000,
-                )
-            except Exception:
-                logger.debug("Boot warm: embedding seed raised", exc_info=True)
+            # Sprint Ω.12 (Apr 27 2026) — embedding seed moved out of
+            # this background task. Loading the MLX embedding model
+            # here in parallel with ``cold_start._metal_serial_warmup``
+            # raced the brain's persona-pin sampler compile on the
+            # same Metal device queue and tripped
+            # ``-[_MTLCommandBuffer addCompletedHandler:]:1011`` →
+            # SIGABRT (exit 134) on every cold boot. The cold_start
+            # chain already calls ``memory.warm_up_embeddings`` which
+            # itself calls ``embedding_engine.seed_warm_cache`` AFTER
+            # the model is loaded — fully serialised behind the
+            # Metal-serial chain. Doing it again here was redundant
+            # AND fatal. Keeping ``seeded = 0`` so the rollup line
+            # below stays format-stable.
             try:
                 gate = await _await_tts_ready(timeout=10.0)
                 if gate and hasattr(tts, "preflight_speak"):
@@ -2398,9 +2396,9 @@ async def main() -> None:
             elapsed = (time.monotonic() - t0) * 1000
             _bt_mark("boot_warm", elapsed, parallel=True)
             logger.info(
-                "Boot warm pass: %.0fms (stt_kick=%s, embed_seeded=%d, "
+                "Boot warm pass: %.0fms (stt_kick=%s, "
                 "tts_preflight=%s, cloud=%s)",
-                elapsed, kick_ok, seeded, preflight_ok, cloud_warm_summary,
+                elapsed, kick_ok, preflight_ok, cloud_warm_summary,
             )
 
     _bg_tasks.append(asyncio.create_task(_background_boot_warm()))

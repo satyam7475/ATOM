@@ -279,6 +279,84 @@ def test_tts_jarvis_preset_prefers_best_daniel_voice(monkeypatch) -> None:
     )
 
 
+def test_tts_friday_preset_prefers_best_irish_then_american_voice(monkeypatch) -> None:
+    """The ``friday`` preset (the new ATOM default — Class: Friday) must
+    pick the best Moira (en-IE, matches Kerry Condon in the MCU) it can
+    find, then fall through Ava → Allison → Samantha → Karen. Compact
+    Moira ships on every Mac, so the worst-case path is still feminine
+    and Irish — never the male British Daniel.
+    """
+    import voice.tts_macos as tts_macos
+
+    class _FakeAppKitFactory:
+        @staticmethod
+        def with_voices(voice_ids: list[str]):
+            class _FakeSynth:
+                @staticmethod
+                def availableVoices():
+                    return list(voice_ids)
+
+                @staticmethod
+                def defaultVoice():
+                    return None
+
+            class _FakeAppKit:
+                NSSpeechSynthesizer = _FakeSynth
+
+            return _FakeAppKit
+
+    monkeypatch.setattr(tts_macos, "_HAS_NATIVE", True)
+    monkeypatch.setattr(
+        tts_macos,
+        "_spoken_content_voice_from_prefs",
+        lambda _available: "",
+    )
+
+    monkeypatch.setattr(
+        tts_macos,
+        "_AppKit",
+        _FakeAppKitFactory.with_voices([
+            "com.apple.voice.compact.en-IE.Moira",
+            "com.apple.voice.compact.en-US.Samantha",
+            "com.apple.voice.compact.en-GB.Daniel",
+            "com.apple.voice.premium.en-IE.Moira",
+            "com.apple.voice.enhanced.en-US.Ava",
+        ]),
+    )
+    assert (
+        tts_macos._pick_best_voice("friday")
+        == "com.apple.voice.premium.en-IE.Moira"
+    ), "friday preset must prefer premium Moira over Ava / Samantha when available"
+
+    monkeypatch.setattr(
+        tts_macos,
+        "_AppKit",
+        _FakeAppKitFactory.with_voices([
+            "com.apple.voice.compact.en-IE.Moira",
+            "com.apple.voice.compact.en-US.Samantha",
+            "com.apple.voice.compact.en-GB.Daniel",
+        ]),
+    )
+    assert (
+        tts_macos._pick_best_voice("friday")
+        == "com.apple.voice.compact.en-IE.Moira"
+    ), "friday preset must fall through to compact Moira on stock macOS"
+
+    monkeypatch.setattr(
+        tts_macos,
+        "_AppKit",
+        _FakeAppKitFactory.with_voices([
+            "com.apple.voice.compact.en-US.Samantha",
+            "com.apple.voice.compact.en-GB.Daniel",
+            "com.apple.voice.compact.en-AU.Karen",
+        ]),
+    )
+    assert (
+        tts_macos._pick_best_voice("friday")
+        == "com.apple.voice.compact.en-US.Samantha"
+    ), "with no Moira on this host, friday must take Samantha before Karen"
+
+
 def test_tts_pitch_shift_keeps_daniel_neutral() -> None:
     """British Daniel should not get the generic brightness boost."""
     import voice.tts_macos as tts_macos

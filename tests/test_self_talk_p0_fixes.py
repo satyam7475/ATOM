@@ -208,6 +208,71 @@ def test_cold_start_has_intent_priming() -> None:
     )
 
 
+# ── Sprint Ω.13: SELF_AUDIO_FILTER log + mixed-sentence stripping ───
+
+
+def test_self_audio_filter_drops_self_speech_prefix(caplog) -> None:
+    """When ATOM's mic captures its own greeting tail prefixed onto a
+    real wake utterance ('What do you need? Hey Atom, are you there?'
+    — atomCurrentLogs L287), the self-speech sentence must be dropped,
+    the wake half preserved, and ``SELF_AUDIO_FILTER:`` logged at INFO
+    so the suppression is visible to triage."""
+    import logging
+    from voice.stt_whisperkit import _normalize_atom_final_text
+
+    caplog.set_level(logging.INFO, logger="atom.stt_whisperkit")
+    out = _normalize_atom_final_text(
+        "What do you need? Hey Atom, are you there?",
+    )
+
+    assert out, f"expected non-empty result after strip, got {out!r}"
+    assert out.lower().startswith("hey atom"), repr(out)
+    assert "what do you need" not in out.lower(), (
+        f"self-speech prefix must be removed, got {out!r}"
+    )
+    self_filter = [
+        r for r in caplog.records
+        if "SELF_AUDIO_FILTER" in r.getMessage()
+    ]
+    assert self_filter, (
+        "missing SELF_AUDIO_FILTER log line; "
+        f"got {[r.getMessage() for r in caplog.records]!r}"
+    )
+    assert any(
+        "matched ATOM_SELF_SPEECH" in r.getMessage() for r in self_filter
+    ), "log line must surface which pattern was matched"
+
+
+def test_self_audio_filter_drops_full_self_utterance(caplog) -> None:
+    """Pure self-speech (no real wake) returns empty string but still
+    emits the SELF_AUDIO_FILTER INFO log."""
+    import logging
+    from voice.stt_whisperkit import _normalize_atom_final_text
+
+    caplog.set_level(logging.INFO, logger="atom.stt_whisperkit")
+    out = _normalize_atom_final_text("What do you need?")
+
+    assert out == "", f"expected empty result, got {out!r}"
+    assert any(
+        "SELF_AUDIO_FILTER" in r.getMessage() for r in caplog.records
+    ), "missing SELF_AUDIO_FILTER log on full self-utterance"
+
+
+def test_real_user_speech_passes_through_untouched(caplog) -> None:
+    """A normal user utterance must NOT trigger the filter — false
+    positives would silently drop legitimate commands."""
+    import logging
+    from voice.stt_whisperkit import _normalize_atom_final_text
+
+    caplog.set_level(logging.INFO, logger="atom.stt_whisperkit")
+    out = _normalize_atom_final_text("what is the weather today")
+
+    assert out.lower() == "what is the weather today"
+    assert not any(
+        "SELF_AUDIO_FILTER" in r.getMessage() for r in caplog.records
+    ), "filter must not fire on legitimate user speech"
+
+
 if __name__ == "__main__":
     import traceback
     failures: list[str] = []

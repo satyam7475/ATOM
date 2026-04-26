@@ -6,11 +6,11 @@ multiplies into the final TTS rate / pause params. This module is the
 ``mood_changed`` bus event.
 
 Each mood maps to a steady prosody profile. The numbers are
-intentionally subtle (within ±20%) -- big swings break the JARVIS
+intentionally subtle (within ±20%) -- big swings break the FRIDAY
 voice continuity. The intent is "Boss can hear ATOM lean in or step
 back" without the voice ever sounding like a different model.
 
-We also expose a *voice preset hint* (e.g. ``"jarvis"`` / ``"focused"``
+We also expose a *voice preset hint* (e.g. ``"friday"`` / ``"focused"``
 / ``"calm"``) that the existing voice picker in ``voice/tts_macos.py``
 can honour when it next reseeds.
 
@@ -29,7 +29,7 @@ class MoodProsody:
     mood: str
     rate_multiplier: float = 1.0
     pause_multiplier: float = 1.0
-    voice_preset: str = "jarvis"
+    voice_preset: str = "friday"
     intent: str = ""
 
     def to_speech_params(self) -> dict[str, float]:
@@ -44,15 +44,15 @@ class MoodProsody:
 # pause ≥ 0.3 / ≤ 2.0).
 _PROFILES: dict[str, MoodProsody] = {
     "neutral": MoodProsody(
-        "neutral", 1.00, 1.00, "jarvis",
-        "Default Friday voice for unstated mood.",
+        "neutral", 1.00, 1.00, "friday",
+        "Default FRIDAY voice for unstated mood.",
     ),
     "focused": MoodProsody(
-        "focused", 1.05, 0.85, "jarvis",
+        "focused", 1.05, 0.85, "friday",
         "Slightly faster, tighter pauses -- match Boss's flow state.",
     ),
     "engaged": MoodProsody(
-        "engaged", 1.03, 0.95, "jarvis",
+        "engaged", 1.03, 0.95, "friday",
         "Lean-in voice when Boss is actively in dialogue.",
     ),
     "calm": MoodProsody(
@@ -80,11 +80,11 @@ _PROFILES: dict[str, MoodProsody] = {
         "Tight, clipped delivery for critical / time-pressed tasks.",
     ),
     "happy": MoodProsody(
-        "happy", 1.05, 0.95, "jarvis",
+        "happy", 1.05, 0.95, "friday",
         "Slight lift -- Boss is in a good mood, lean into it.",
     ),
     "distracted": MoodProsody(
-        "distracted", 0.98, 1.05, "jarvis",
+        "distracted", 0.98, 1.05, "friday",
         "Extra clarity -- Boss is splitting attention.",
     ),
     "idle": MoodProsody(
@@ -92,7 +92,7 @@ _PROFILES: dict[str, MoodProsody] = {
         "Boss isn't engaged; lower energy proactive voice.",
     ),
     "absent": MoodProsody(
-        "absent", 1.00, 1.00, "jarvis",
+        "absent", 1.00, 1.00, "friday",
         "Boss is away -- prosody stays neutral until they return.",
     ),
 }

@@ -1,6 +1,7 @@
-"""ATOM -- regression suite for parallel ack-TTS overlap (Sprint C3).
+"""ATOM -- regression suite for parallel ack-TTS overlap (Sprint C3 +
+Sprint Ω.13 deferred-ACK).
 
-Pins three behaviours:
+Pins five behaviours:
 
 1. ``CommandLoop.submit()`` spawns ``tts.speak_ack`` as a fire-and-
    forget task BEFORE awaiting the router, so the ack audio rolls
@@ -11,6 +12,12 @@ Pins three behaviours:
    does NOT double-speak the same ack.
 3. When no TTS is wired the loop falls back gracefully to the legacy
    bus-only flow (no crash, no double-speak, no missing ack).
+4. (Sprint Ω.13) When ``response_ready`` arrives within the deferral
+   window (default 280 ms) the spoken ACK is suppressed entirely —
+   ``speak_ack`` is NOT awaited and ``PIPELINE_FAST_PATH: skip ACK``
+   is logged.
+5. (Sprint Ω.13) When ``response_ready`` arrives AFTER the deferral
+   window the ACK is spoken on schedule, exactly once.
 """
 
 from __future__ import annotations
@@ -107,6 +114,17 @@ class _TTSRecorder:
 # ── Tests ────────────────────────────────────────────────────────
 
 
+async def _drain_ack_task(loop: CommandLoop) -> None:
+    """Sprint Ω.13: the deferred-ACK task is fire-and-forget. Tests
+    that want to observe the spoken ack must await its completion
+    after ``submit`` returns."""
+    if loop._ack_task is not None:
+        try:
+            await loop._ack_task
+        except asyncio.CancelledError:
+            pass
+
+
 @pytest.mark.asyncio
 async def test_ack_task_spawned_before_router_call() -> None:
     bus = _BusStub()
@@ -118,16 +136,19 @@ async def test_ack_task_spawned_before_router_call() -> None:
     loop = CommandLoop(bus, state, router)
     loop.attach_ack_engine(_AckEngineStub("Got it, Boss."))
     loop.attach_tts(tts)
+    # Sprint Ω.13: tighten the deferral window so the ack fires inside
+    # the test's already-awaited router delay (50 ms) — that proves
+    # the ack and router run concurrently without flaking on slow CI.
+    loop._ack_deferral_s = 0.0
 
     await loop.submit("hello atom")
+    await _drain_ack_task(loop)
 
     assert tts.acks == ["Got it, Boss."], (
         f"speak_ack should have fired exactly once, got {tts.acks!r}"
     )
     assert router.calls == ["hello atom"]
     assert loop._ack_overlap_count == 1
-    # ack must have *started* before the router slept (proven by the
-    # ack start timestamp preceding the router's awaited completion).
     assert tts.ack_started_at, "ack timestamp not recorded"
 
 
@@ -141,8 +162,10 @@ async def test_voice_ack_bus_event_carries_spoken_inline_flag() -> None:
     loop = CommandLoop(bus, state, router)
     loop.attach_ack_engine(_AckEngineStub("Right away, Boss."))
     loop.attach_tts(tts)
+    loop._ack_deferral_s = 0.0  # speak immediately for this test
 
     await loop.submit("open chrome")
+    await _drain_ack_task(loop)
 
     voice_acks = bus.find("voice_ack")
     assert len(voice_acks) == 1
@@ -197,8 +220,10 @@ async def test_ack_failure_does_not_break_pipeline() -> None:
     loop = CommandLoop(bus, state, router)
     loop.attach_ack_engine(_AckEngineStub("Aye, Boss."))
     loop.attach_tts(_BoomTTS())
+    loop._ack_deferral_s = 0.0
 
     await loop.submit("ping")
+    await _drain_ack_task(loop)
 
     assert router.calls == ["ping"]
     # ack_task was created (then the inner coroutine threw); count
@@ -224,3 +249,88 @@ async def test_no_ack_text_skips_overlap_entirely() -> None:
     assert tts.acks == []
     assert bus.find("voice_ack") == []
     assert loop._ack_task is None
+
+
+# ── Sprint Ω.13: deferred ACK ────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_ack_suppressed_when_response_ready_within_window(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """When ``response_ready`` fires within ``_ack_deferral_s`` of
+    ``submit``, the spoken ACK is cancelled and ``PIPELINE_FAST_PATH:
+    skip ACK`` is logged. Mirrors the intent fast-path turns at
+    atomCurrentLogs L295/L338/L365 where the brain replied in ≤ 8 ms
+    but Boss still heard a useless 'On it.' preamble."""
+    import logging
+    bus = _BusStub()
+    state = _StateStub()
+    router = _RouterStub()
+    tts = _TTSRecorder()
+
+    loop = CommandLoop(bus, state, router)
+    loop.attach_ack_engine(_AckEngineStub("On it, Boss."))
+    loop.attach_tts(tts)
+    # Default 280 ms deferral. Submit is <1 ms; response_ready below
+    # therefore lands well inside the window.
+
+    caplog.set_level(logging.INFO, logger="atom.command_loop")
+    await loop.submit("ping")
+
+    # Simulate the brain returning a response immediately after submit
+    # — within the 280 ms deferral window.
+    await loop._on_response_ready(text="pong")
+
+    # Drain the (now cancelled) ACK task. CancelledError must not bubble.
+    await _drain_ack_task(loop)
+
+    assert tts.acks == [], (
+        "speak_ack must NOT fire when response_ready arrived within "
+        f"the deferral window, got {tts.acks!r}"
+    )
+    assert loop._ack_skipped_count == 1, (
+        f"expected _ack_skipped_count == 1, got {loop._ack_skipped_count}"
+    )
+    msgs = [r.getMessage() for r in caplog.records]
+    assert any("PIPELINE_FAST_PATH: skip ACK" in m for m in msgs), (
+        f"missing PIPELINE_FAST_PATH skip log; got {msgs!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_ack_spoken_when_response_ready_arrives_late() -> None:
+    """When ``response_ready`` fires AFTER the deferral window, the
+    ack must already have been spoken on its original schedule."""
+    bus = _BusStub()
+    state = _StateStub()
+    router = _RouterStub()
+    tts = _TTSRecorder()
+
+    loop = CommandLoop(bus, state, router)
+    loop.attach_ack_engine(_AckEngineStub("On it, Boss."))
+    loop.attach_tts(tts)
+    loop._ack_deferral_s = 0.02  # 20 ms — keeps the test fast
+
+    await loop.submit("hello atom")
+    await _drain_ack_task(loop)
+    await loop._on_response_ready(text="hi")
+
+    assert tts.acks == ["On it, Boss."], (
+        "speak_ack should have fired (deferral expired before "
+        f"response_ready arrived), got {tts.acks!r}"
+    )
+    assert loop._ack_skipped_count == 0
+
+
+@pytest.mark.asyncio
+async def test_ack_default_deferral_matches_spec() -> None:
+    """The plan fixes the deferral window at 280 ms — guard against
+    accidental drift in case someone tweaks the constant."""
+    bus = _BusStub()
+    state = _StateStub()
+    router = _RouterStub()
+    loop = CommandLoop(bus, state, router)
+    assert abs(loop._ack_deferral_s - 0.28) < 1e-6, (
+        f"deferral window must remain 280 ms (spec); got {loop._ack_deferral_s}"
+    )

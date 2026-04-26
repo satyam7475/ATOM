@@ -55,6 +55,9 @@ class RuntimeWatchdog:
         "_tts_max_dynamic_s",
         "_llm_pressure_extend_pct", "_llm_pressure_extend_bonus_s",
         "_llm_pressure_extend_max_s", "_memory_pct_recent",
+        # Sprint Ω.13: stuck-listening recovery tied to WhisperKit wedges.
+        "_listen_stuck_s", "_last_whisperkit_unresponsive_at",
+        "_last_force_listening_reset_at",
     )
 
     def __init__(
@@ -134,11 +137,34 @@ class RuntimeWatchdog:
         )
         self._memory_pct_recent: float = 0.0
 
+        # Sprint Ω.13: stuck-listening recovery. Default 90 s — long
+        # enough that a thoughtful user pause won't trigger it but
+        # short enough that a real wedge gets caught before Boss
+        # gives up.
+        voice_cfg = config.get("voice", {}) or {}
+        self._listen_stuck_s = float(
+            voice_cfg.get("listening_stuck_timeout_s", 90.0),
+        )
+        self._last_whisperkit_unresponsive_at: float = 0.0
+        self._last_force_listening_reset_at: float = 0.0
+
         self._bus.on("response_ready", self._on_tts_started)
         self._bus.on("partial_response", self._on_tts_started)
         self._bus.on("tts_complete", self._on_tts_complete)
         self._bus.on("response_complete", self._on_successful_turn)
         self._bus.on("response_emitted", self._on_successful_turn)
+        # Sprint Ω.13: track WhisperKit subprocess wedges. The state
+        # recovery check below only fires when LISTENING is stuck *and*
+        # we've seen a recent transcribe failure — that combo signals
+        # the audio path is dead, not just a thoughtful pause.
+        self._bus.on(
+            "whisperkit_serve_unresponsive",
+            self._on_whisperkit_unresponsive,
+        )
+        self._bus.on(
+            "whisperkit_serve_restarted",
+            self._on_whisperkit_restarted,
+        )
 
     def attach_local_brain(self, brain: Any) -> None:
         """Attach LocalBrainController so LLM timeouts can preempt/unload it."""
@@ -416,6 +442,18 @@ class RuntimeWatchdog:
         scaled = word_count * self._tts_per_word_s
         return min(self._tts_max_dynamic_s, max(floor, scaled))
 
+    async def _on_whisperkit_unresponsive(self, **_kw: Any) -> None:
+        """Record the most recent transcribe-timeout wedge so the loop
+        can correlate a stuck LISTENING dwell with a known bad subprocess
+        and only then trigger a STATE_RECOVERY (Sprint Ω.13)."""
+        self._last_whisperkit_unresponsive_at = time.monotonic()
+
+    async def _on_whisperkit_restarted(self, **_kw: Any) -> None:
+        """Subprocess came back up — clear the wedge tracker so the
+        watchdog doesn't re-trigger a state recovery on the next poll
+        from a stale signal."""
+        self._last_whisperkit_unresponsive_at = 0.0
+
     async def _on_successful_turn(self, **_kw: Any) -> None:
         """Clear consecutive-timeout counters when a turn actually lands."""
         if self._consecutive_llm_timeouts or self._consecutive_tts_timeouts:
@@ -612,3 +650,39 @@ class RuntimeWatchdog:
                 self._maybe_recover(f"THINKING stuck {elapsed:.0f}s")
             elif st is AtomState.SPEAKING and elapsed > self._speak_s:
                 self._maybe_recover(f"SPEAKING stuck {elapsed:.0f}s")
+            elif (
+                st is AtomState.LISTENING
+                and self._listen_stuck_s > 0
+                and elapsed > self._listen_stuck_s
+            ):
+                # Sprint Ω.13: only escalate when we have evidence the
+                # STT pipeline is wedged — a long thoughtful pause is
+                # legitimate. The 60 s correlation window matches the
+                # whisperkit-cli serve health-probe cadence so a fresh
+                # wedge is always still in scope.
+                now = time.monotonic()
+                wedge_age = now - self._last_whisperkit_unresponsive_at
+                if (
+                    self._last_whisperkit_unresponsive_at > 0
+                    and wedge_age < 60.0
+                    and (now - self._last_force_listening_reset_at) > 30.0
+                ):
+                    self._last_force_listening_reset_at = now
+                    reset_fn = getattr(
+                        self._state, "force_listening_reset", None,
+                    )
+                    if callable(reset_fn):
+                        try:
+                            await reset_fn(source="whisperkit_unresponsive")
+                        except Exception:
+                            logger.debug(
+                                "force_listening_reset raised",
+                                exc_info=True,
+                            )
+                    else:
+                        # Pre-Ω.13 builds without the helper still get a
+                        # generic recovery so the user isn't stuck.
+                        self._maybe_recover(
+                            f"LISTENING stuck {elapsed:.0f}s "
+                            "(whisperkit unresponsive)"
+                        )

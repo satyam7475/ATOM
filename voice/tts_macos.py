@@ -249,10 +249,36 @@ _SYSTEM_VOICE_ALIASES = frozenset({
     "system", "default", "siri", "apple", "apple_siri", "match_system", "",
 })
 
-# Preset voice requests with a stable quality order. ``jarvis`` intentionally
-# prefers a British voice family, falling back to Daniel compact on a stock macOS
-# install and auto-upgrading to enhanced/premium voices if the user installs them.
+# Preset voice requests with a stable quality order.
+#
+# ``friday`` is the canonical ATOM voice (Class: Friday, after Stark's
+# post-Jarvis assistant). FRIDAY in the MCU is voiced by Kerry Condon
+# (Irish), so the preset prefers Moira (en-IE) when available, then
+# falls through Ava / Allison / Samantha (American AI tonality), then
+# Karen (en-AU) as a steady alto fallback. Premium / enhanced first,
+# compact last — auto-upgrades the moment the user installs a higher-
+# quality variant via Spoken Content.
+#
+# ``jarvis`` is preserved as a backward-compat alias for Boss's older
+# British male preference; the regression test
+# ``tests/test_voice_pipeline_critical.py::test_tts_jarvis_preset_prefers_best_daniel_voice``
+# guards it.
 _VOICE_PRESETS: dict[str, tuple[str, ...]] = {
+    "friday": (
+        "com.apple.voice.premium.en-IE.Moira",
+        "com.apple.voice.enhanced.en-IE.Moira",
+        "com.apple.voice.compact.en-IE.Moira",
+        "com.apple.voice.premium.en-US.Ava",
+        "com.apple.voice.enhanced.en-US.Ava",
+        "com.apple.voice.premium.en-US.Allison",
+        "com.apple.voice.enhanced.en-US.Allison",
+        "com.apple.voice.premium.en-US.Samantha",
+        "com.apple.voice.enhanced.en-US.Samantha",
+        "com.apple.voice.compact.en-US.Samantha",
+        "com.apple.voice.premium.en-AU.Karen",
+        "com.apple.voice.enhanced.en-AU.Karen",
+        "com.apple.voice.compact.en-AU.Karen",
+    ),
     "jarvis": (
         "com.apple.voice.premium.en-GB.Daniel",
         "com.apple.voice.enhanced.en-GB.Daniel",
@@ -267,34 +293,42 @@ _VOICE_PRESETS: dict[str, tuple[str, ...]] = {
 }
 
 # When no explicit voice matches: premium neural first, then compact natural
-# voices, then Eloquence as last resort. Warm feminine voices are preferred
-# for the "Friday" assistant personality.
+# voices, then Eloquence as last resort. Female AI-class voices lead the list
+# because ATOM's runtime persona is FRIDAY (see config/atom_persona.md).
 _PREFERRED_VOICES = [
-    # Premium / enhanced neural (Siri-class, require download from Spoken Content settings)
-    "com.apple.voice.premium.en-GB.Daniel",
-    "com.apple.voice.enhanced.en-GB.Daniel",
+    # Premium / enhanced neural — Siri-class, require download from
+    # System Settings → Accessibility → Spoken Content → System Voice.
+    # Moira (Irish) matches Kerry Condon's FRIDAY in the MCU.
+    "com.apple.voice.premium.en-IE.Moira",
+    "com.apple.voice.enhanced.en-IE.Moira",
+    "com.apple.voice.premium.en-US.Ava",
+    "com.apple.voice.enhanced.en-US.Ava",
+    "com.apple.voice.premium.en-US.Allison",
+    "com.apple.voice.enhanced.en-US.Allison",
     "com.apple.voice.premium.en-US.Samantha",
     "com.apple.voice.enhanced.en-US.Samantha",
-    "com.apple.voice.premium.en-GB.Serena",
-    "com.apple.voice.enhanced.en-GB.Serena",
-    "com.apple.voice.premium.en-IN.Rani",
-    "com.apple.voice.enhanced.en-IN.Rani",
     "com.apple.voice.premium.en-AU.Karen",
     "com.apple.voice.enhanced.en-AU.Karen",
+    "com.apple.voice.premium.en-GB.Serena",
+    "com.apple.voice.enhanced.en-GB.Serena",
     "com.apple.voice.premium.en-GB.Kate",
     "com.apple.voice.enhanced.en-GB.Kate",
-    "com.apple.voice.premium.en-GB.Martha",
-    "com.apple.voice.enhanced.en-GB.Martha",
+    "com.apple.voice.premium.en-IN.Rani",
+    "com.apple.voice.enhanced.en-IN.Rani",
     "com.apple.voice.premium.en-US.Zoe",
     "com.apple.voice.enhanced.en-US.Zoe",
-    # Compact natural voices (pre-installed, decent quality)
-    "com.apple.voice.compact.en-US.Samantha",
-    "com.apple.voice.Tara",
-    "com.apple.voice.compact.en-AU.Karen",
+    "com.apple.voice.premium.en-GB.Martha",
+    "com.apple.voice.enhanced.en-GB.Martha",
+    "com.apple.voice.premium.en-GB.Daniel",
+    "com.apple.voice.enhanced.en-GB.Daniel",
+    # Compact natural voices (pre-installed, decent quality).
     "com.apple.voice.compact.en-IE.Moira",
+    "com.apple.voice.compact.en-US.Samantha",
+    "com.apple.voice.compact.en-AU.Karen",
     "com.apple.voice.compact.en-ZA.Tessa",
+    "com.apple.voice.Tara",
     "com.apple.voice.compact.en-GB.Daniel",
-    # Eloquence (robotic, avoid unless nothing else is available)
+    # Eloquence (robotic, avoid unless nothing else is available).
     "com.apple.eloquence.en-GB.Shelley",
     "com.apple.eloquence.en-US.Eddy",
 ]
@@ -460,9 +494,9 @@ def _pick_best_voice(requested: str) -> str:
 
     For ``system`` / ``siri`` / ``default``: try ``NSSpeechSynthesizer.defaultVoice()``,
     then ``com.apple.speech.voice.prefs`` (Accessibility → Spoken Content), then a
-    neural fallback list. For preset aliases like ``jarvis``, use a deterministic
-    quality-ordered list rather than whichever matching identifier happens to come
-    first from ``availableVoices()``.
+    neural fallback list. For preset aliases like ``friday`` / ``jarvis``, use a
+    deterministic quality-ordered list rather than whichever matching identifier
+    happens to come first from ``availableVoices()``.
     """
     if not _HAS_NATIVE:
         return requested
@@ -529,9 +563,10 @@ def _pick_best_voice(requested: str) -> str:
             if is_compact:
                 logger.warning(
                     "TTS UPGRADE TIP: You are using a compact voice (%s). "
-                    "For Jarvis-quality neural TTS, open System Settings → "
+                    "For FRIDAY-quality neural TTS, open System Settings → "
                     "Accessibility → Spoken Content → System Voice → Manage Voices "
-                    "and download 'Daniel', 'Samantha (Premium)', or 'Zoe (Premium)'. "
+                    "and download 'Moira (Enhanced)', 'Ava (Premium)', "
+                    "'Allison (Enhanced)', or 'Samantha (Premium)'. "
                     "ATOM will auto-detect and use it on next launch.",
                     vid.split(".")[-1],
                 )
@@ -1679,7 +1714,11 @@ class MacOSTTSAsync:
                         exc_info=True,
                     )
                 try:
-                    self._bus.emit("tts_complete", interrupted=True)
+                    self._bus.emit(
+                        "tts_complete",
+                        interrupted=True,
+                        backend=self._backend_label(),
+                    )
                 except Exception:
                     logger.debug(
                         "tts_complete (interrupt) emit failed",
@@ -1740,7 +1779,7 @@ class MacOSTTSAsync:
                 interrupt_count=self._tts_interrupt_count,
             )
             self._tts_interrupt_count = 0
-            self._bus.emit("tts_complete")
+            self._bus.emit("tts_complete", backend=self._backend_label())
 
     # ── Internal speak (no tts_complete emission) ──────────────────
 
@@ -1809,10 +1848,10 @@ class MacOSTTSAsync:
                 "TTS suppressed prompt-leak text (final guard): '%s'",
                 (text or "")[:80],
             )
-            self._bus.emit("tts_complete")
+            self._bus.emit("tts_complete", backend=self._backend_label())
             return
         await self._speak_internal(text, emotion)
-        self._bus.emit("tts_complete")
+        self._bus.emit("tts_complete", backend=self._backend_label())
 
     async def speak_ack(self, phrase: str) -> None:
         """Speak a short acknowledgement phrase."""
@@ -1980,11 +2019,24 @@ class MacOSTTSAsync:
                 # ended"; emit it so the state machine + listener return
                 # to LISTENING even when the normal finally-path was
                 # blocked.
-                self._bus.emit("tts_complete")
+                self._bus.emit(
+                    "tts_complete", backend=self._backend_label(),
+                )
             except Exception:
                 logger.debug("TTS deadman: emit failed", exc_info=True)
         except asyncio.CancelledError:
             pass
+
+    def _backend_label(self) -> str:
+        """Return the canonical backend label used in ``tts_complete``
+        kwargs (Sprint Ω.13). The STT side uses this to pick the right
+        post-TTS tail-mute window — ``say`` emits ~250 ms of audible
+        tail beyond process exit so it gets a longer mute than
+        ``NSSpeechSynthesizer``."""
+        be = (self._backend or "").lower()
+        if "say" in be:
+            return "say"
+        return "native"
 
     def tts_deadman_stats(self) -> dict[str, Any]:
         now = time.monotonic()
@@ -2118,7 +2170,9 @@ class MacOSTTSAsync:
                 self._bus.emit(
                     "text_display", text=f"[Response on screen] {text}",
                 )
-                self._bus.emit("tts_complete")
+                self._bus.emit(
+                    "tts_complete", backend=self._backend_label(),
+                )
             if is_exit:
                 self._bus.emit("shutdown_requested")
 

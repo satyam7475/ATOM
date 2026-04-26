@@ -94,6 +94,19 @@ class STTWatchdog:
         self._failover_pending: bool = False
         self._degraded_announced: bool = False
 
+        # Sprint Ω.13 (Apr 27 2026): WhisperKit subprocess signals. The
+        # ``WhisperKitSTT`` backend now emits ``whisperkit_serve_unresponsive``
+        # on transcribe timeouts and ``whisperkit_serve_restarted`` once
+        # ``serve`` is healthy again. We track the last restart so chain
+        # escalations triggered by the same wedge are suppressed for a
+        # short window — the subprocess restart already drained the
+        # audio path and an SF-style chain restart on top would just
+        # produce two cascading recoveries.
+        self._last_whisperkit_serve_unresponsive_at: float = 0.0
+        self._last_whisperkit_serve_restarted_at: float = 0.0
+        self._whisperkit_unresponsive_total: int = 0
+        self._whisperkit_restarted_total: int = 0
+
         self._task: asyncio.Task | None = None
         self._shutdown = asyncio.Event()
 
@@ -106,6 +119,38 @@ class STTWatchdog:
         self._last_partial_time = now
         self._last_final_time = now
         self._last_tap_count = 0
+
+    async def on_whisperkit_serve_unresponsive(
+        self, failures: int = 0, pid: int = 0, reason: str = "", **_kw: Any,
+    ) -> None:
+        """Mark the moment WhisperKit reported a transcribe failure so we
+        can correlate any same-cycle silent-restart with the subprocess
+        wedge instead of escalating the chain restart counter (Sprint Ω.13).
+        """
+        self._last_whisperkit_serve_unresponsive_at = time.monotonic()
+        self._whisperkit_unresponsive_total += 1
+        logger.warning(
+            "STT_WATCHDOG: subprocess unresponsive (failures=%d, pid=%d, reason=%s)",
+            int(failures), int(pid), str(reason)[:80],
+        )
+
+    async def on_whisperkit_serve_restarted(
+        self, pid: int = 0, reason: str = "", elapsed_ms: int = 0, **_kw: Any,
+    ) -> None:
+        """Bus handler for ``whisperkit_serve_restarted``. Resets local
+        liveness timers so the watchdog doesn't re-fire seconds after
+        the subprocess came back up (Sprint Ω.13)."""
+        now = time.monotonic()
+        self._last_whisperkit_serve_restarted_at = now
+        self._whisperkit_restarted_total += 1
+        self._last_partial_time = now
+        self._last_final_time = now
+        self._consecutive_chain_restarts = 0
+        logger.info(
+            "STT_WATCHDOG: subprocess restarted (pid=%d, reason=%s, %dms) — "
+            "suppressing chain escalation for 5s",
+            int(pid), str(reason)[:80], int(elapsed_ms),
+        )
 
     async def on_external_chain_restart(self, reason: str = "", **_kw: Any) -> None:
         """Called when the STT engine self-heals (e.g. reactive
@@ -185,18 +230,28 @@ class STTWatchdog:
         if self._task is not None and not self._task.done():
             return
         self._shutdown.clear()
-        # Subscribe to the bus event the STT engine emits when it
-        # self-heals from a benign 301 idle timeout. Done here rather
-        # than __init__ so we still construct cleanly in unit tests
-        # that pass a mock bus without ``on``.
-        try:
-            self._bus.on("stt_watchdog_restart", self.on_external_chain_restart)
-        except Exception:
-            logger.debug(
-                "STT Watchdog: bus.on(stt_watchdog_restart) not available "
-                "(test mock?); external 301 resets will not propagate.",
-                exc_info=True,
-            )
+        # Subscribe to the bus events emitted by the STT engines so the
+        # watchdog can correlate self-heal signals with its own restart
+        # counter. Done here rather than __init__ so we still construct
+        # cleanly in unit tests that pass a mock bus without ``on``.
+        for evt, handler in (
+            ("stt_watchdog_restart", self.on_external_chain_restart),
+            (
+                "whisperkit_serve_unresponsive",
+                self.on_whisperkit_serve_unresponsive,
+            ),
+            (
+                "whisperkit_serve_restarted",
+                self.on_whisperkit_serve_restarted,
+            ),
+        ):
+            try:
+                self._bus.on(evt, handler)
+            except Exception:
+                logger.debug(
+                    "STT Watchdog: bus.on(%s) not available (test mock?)",
+                    evt, exc_info=True,
+                )
         self._task = asyncio.create_task(self._monitor_loop())
         logger.info("STT Watchdog started (silent=%.0fs stuck=%.0fs)",
                      self._silent_timeout, self._stuck_timeout)
@@ -232,6 +287,14 @@ class STTWatchdog:
             return
 
         now = time.monotonic()
+        # Sprint Ω.13: if the WhisperKit subprocess just restarted itself,
+        # give the audio path a few seconds to settle before this watchdog
+        # also escalates a chain restart on top.
+        if (
+            self._last_whisperkit_serve_restarted_at > 0
+            and (now - self._last_whisperkit_serve_restarted_at) < 5.0
+        ):
+            return
         is_listening = getattr(stt, "_listening", False)
         is_running = getattr(stt, "_running_async", False)
 
@@ -678,6 +741,14 @@ class STTWatchdog:
             "full_restart_attempts": self._full_restart_attempts,
             "full_restart_failures": self._full_restart_failures,
             "failover_pending": self._failover_pending,
+            "whisperkit_unresponsive_total": (
+                self._whisperkit_unresponsive_total
+            ),
+            "whisperkit_restarted_total": self._whisperkit_restarted_total,
+            "since_last_whisperkit_restart_s": (
+                round(now - self._last_whisperkit_serve_restarted_at, 1)
+                if self._last_whisperkit_serve_restarted_at > 0 else None
+            ),
         }
 
 

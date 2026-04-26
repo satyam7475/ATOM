@@ -54,6 +54,14 @@ _FAST_INTENT_ACKS: dict[str, str] = {
     "thanks": "",
     "confirm": "",
     "deny": "",
+    # Sprint Ω.13 (Apr 27 2026): expand the synchronous suppression
+    # layer. The deferred-ACK timer in ``CommandLoop`` already cancels
+    # any ack whose response arrives in <280 ms, but for *known* fast
+    # intents (clock readouts, system status, info lookups) we never
+    # want to spawn the timer in the first place — both belt and braces.
+    "status": "",
+    "info": "",
+    "clock": "",
 }
 
 _MIN_QUERY_LEN_FOR_ACK = 3

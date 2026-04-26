@@ -222,3 +222,36 @@ class StateManager:
                 await asyncio.sleep(self._error_recovery_hold_s)
             await self.transition(AtomState.IDLE)
 
+    async def force_listening_reset(
+        self, source: str = "stuck_listening",
+    ) -> None:
+        """Sprint Ω.13: hard-reset a wedged LISTENING/THINKING state.
+
+        Called by the runtime watchdog (or any caller) when the state
+        machine has dwelled in LISTENING for longer than its budget AND
+        we have evidence the underlying STT pipeline is unresponsive.
+        Walks ERROR_RECOVERY → IDLE → LISTENING and emits
+        ``restart_listening`` so the voice loop reconnects the STT
+        backend rather than just reusing the wedged session.
+        """
+        was_in = self._state
+        held_for = self.time_in_current_state
+        logger.warning(
+            "STATE_RECOVERY: recovered stuck listening "
+            "(source=%s, was_in=%s for %.1fs)",
+            source, was_in.value, held_for,
+        )
+        if was_in in (AtomState.LISTENING, AtomState.THINKING):
+            await self.transition(AtomState.ERROR_RECOVERY)
+        if self._state is AtomState.ERROR_RECOVERY:
+            await self.transition(AtomState.IDLE)
+        if self._state is AtomState.IDLE:
+            await self.transition(AtomState.LISTENING)
+        try:
+            self._bus.emit("restart_listening", source=source)
+        except Exception:
+            logger.debug(
+                "force_listening_reset: restart_listening emit failed",
+                exc_info=True,
+            )
+

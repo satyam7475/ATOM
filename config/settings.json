@@ -180,13 +180,18 @@
             "port": 50060,
             "auto_download": true,
             "startup_timeout_s": 60.0,
-            "model_dir": null
-        }
+            "model_dir": null,
+            "health_probe_interval_s": 10.0,
+            "transcribe_failure_threshold": 2,
+            "restart_max_per_hour": 5
+        },
+        "tts_tail_mute_ms": 1200,
+        "tts_tail_mute_ms_say_backend": 1600
     },
     "tts": {
         "engine": "macos_native",
         "max_lines": 4,
-        "macos_voice": "jarvis",
+        "macos_voice": "friday",
         "macos_rate": 205,
         "macos_first_word_warmup_ms": 140,
         "macos_tail_drain_ms": 120,
@@ -209,7 +214,8 @@
             "volume": 0.45,
             "heartbeat_enabled": false,
             "heartbeat_interval_s": 600
-        }
+        },
+        "listening_stuck_timeout_s": 90.0
     },
     "context": {
         "enable_clipboard": true,

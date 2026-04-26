@@ -100,6 +100,11 @@ except Exception:  # pragma: no cover - defensive
     _get_owner_profile = None  # type: ignore[assignment]
     _get_owner_style = None  # type: ignore[assignment]
 
+# Sprint Ω.13 (Apr 27 2026): self-healing serve watchdog uses the shared
+# voice recovery lock so STT subprocess restarts don't race with
+# AudioIntelligenceEngine device switches or NativeSTT chain restarts.
+from voice.recovery_lock import voice_recovery_lock
+
 
 # ── Constants ─────────────────────────────────────────────────────
 
@@ -170,31 +175,63 @@ def _looks_like_atom_self_speech(text: str) -> bool:
     )
 
 
-def _normalize_atom_final_text(text: str) -> str:
-    """Remove ATOM speaker bleed while preserving a real owner suffix."""
+def _strip_atom_self_speech(text: str) -> tuple[str, list[str]]:
+    """Split ``text`` into (kept_text, dropped_self_speech_sentences).
+
+    Mirrors the legacy :func:`_normalize_atom_final_text` logic but
+    also surfaces the rejected fragments so the caller can emit a
+    ``SELF_AUDIO_FILTER`` log line (Sprint Ω.13). Whole-utterance
+    self-speech matches return ``("", [text])``.
+    """
     text = re.sub(r"\s+", " ", (text or "").strip())
     if not text:
-        return ""
+        return "", []
 
     text = _ATOM_WAKE_MISHEAR_RE.sub("atom", text)
     if _looks_like_atom_self_speech(text):
-        return ""
+        return "", [text]
 
+    dropped: list[str] = []
     parts = [
         p.strip()
         for p in re.split(r"(?<=[.!?])\s+", text)
         if p.strip()
     ]
     if len(parts) > 1:
-        kept = [p for p in parts if not _looks_like_atom_self_speech(p)]
-        if kept != parts:
-            text = " ".join(kept).strip()
+        kept_parts = []
+        for p in parts:
+            if _looks_like_atom_self_speech(p):
+                dropped.append(p)
+            else:
+                kept_parts.append(p)
+        if kept_parts:
+            text = " ".join(kept_parts).strip()
+        else:
+            return "", dropped or [text]
 
     if len(text.split()) > 3:
         text = _ATOM_TRAILING_ACK_RE.sub("", text).strip()
     if _looks_like_atom_self_speech(text):
-        return ""
-    return text
+        dropped.append(text)
+        return "", dropped
+    return text, dropped
+
+
+def _normalize_atom_final_text(text: str) -> str:
+    """Remove ATOM speaker bleed while preserving a real owner suffix.
+
+    Backwards-compatible wrapper around :func:`_strip_atom_self_speech`
+    — emits a ``SELF_AUDIO_FILTER`` log line for each dropped sentence
+    so we have visibility into self-echo events at INFO without changing
+    the public return type of this normaliser.
+    """
+    kept, dropped = _strip_atom_self_speech(text)
+    for d in dropped:
+        logger.info(
+            "SELF_AUDIO_FILTER: ignored self speech ('%s' matched ATOM_SELF_SPEECH)",
+            (d or "")[:140],
+        )
+    return kept
 
 
 # ── Sprint Ω.8: STT garbage filter ───────────────────────────────────
@@ -374,6 +411,41 @@ class WhisperKitSTT:
         # How long to wait for the serve subprocess to come up.
         self._serve_startup_timeout_s: float = float(
             wk_cfg.get("startup_timeout_s", 30.0),
+        )
+
+        # Sprint Ω.13 (Apr 27 2026) — self-healing serve watchdog.
+        # The whisperkit-cli serve subprocess wedges silently after
+        # memory pressure; previous builds had no recovery path so
+        # transcribe HTTP timeouts cascaded into a permanent listening
+        # freeze (atomCurrentLogs.txt L446-L447). Fields below drive
+        # the in-process health probe loop and the restart-on-timeout
+        # logic in ``_http_transcribe``.
+        self._health_probe_interval_s: float = float(
+            wk_cfg.get("health_probe_interval_s", 10.0),
+        )
+        self._transcribe_failure_threshold: int = max(
+            1, int(wk_cfg.get("transcribe_failure_threshold", 2)),
+        )
+        self._restart_max_per_hour: int = max(
+            1, int(wk_cfg.get("restart_max_per_hour", 5)),
+        )
+        self._transcribe_failure_count: int = 0
+        self._consecutive_health_probe_failures: int = 0
+        self._last_failed_audio: Any = None
+        self._restart_count_hour: list[float] = []
+        self._health_probe_task: asyncio.Task | None = None
+        self._restart_in_flight: bool = False
+        self._voice_module_restart_announced_at: float = 0.0
+        # Tail-mute (post-TTS) window — config-driven so the ``say``
+        # backend can use a longer grace than NSSpeechSynthesizer.
+        self._tts_tail_mute_ms: int = int(
+            self._config.get("tts_tail_mute_ms", 1200),
+        )
+        self._tts_tail_mute_ms_say_backend: int = int(
+            self._config.get(
+                "tts_tail_mute_ms_say_backend",
+                max(self._tts_tail_mute_ms, 1600),
+            ),
         )
 
         self._n_threads: int = int(self._config.get("whisper_n_threads", 4))
@@ -903,11 +975,21 @@ class WhisperKitSTT:
         self._listening = True
         if loop is not None:
             self._worker_task = loop.create_task(self._consume_loop())
+            # Sprint Ω.13: spawn the serve health probe alongside the
+            # consume loop so we detect a wedged whisperkit-cli even
+            # during long idle stretches when no transcribe traffic is
+            # flowing.
+            if self._health_probe_task is None or self._health_probe_task.done():
+                self._health_probe_task = loop.create_task(
+                    self._health_probe_loop(),
+                    name="atom_whisperkit_health_probe",
+                )
         logger.info(
             "WhisperKitSTT listening (%d Hz, %d-ms VAD, partial @%.1fs, "
-            "trail %.2fs)",
+            "trail %.2fs, health_probe=%.1fs)",
             _SAMPLE_RATE, _FRAME_MS,
             self._partial_interval_s, self._trailing_silence_s,
+            self._health_probe_interval_s,
         )
         return True
 
@@ -940,6 +1022,14 @@ class WhisperKitSTT:
                     "worker_task cancel raised", exc_info=True,
                 )
             self._worker_task = None
+        if self._health_probe_task is not None:
+            try:
+                self._health_probe_task.cancel()
+            except Exception:
+                logger.debug(
+                    "health_probe_task cancel raised", exc_info=True,
+                )
+            self._health_probe_task = None
 
         logger.info("WhisperKitSTT stopped")
         return self._last_final
@@ -1387,19 +1477,323 @@ class WhisperKitSTT:
                 or payload.get("result")
                 or ""
             )
+            if self._transcribe_failure_count or self._last_failed_audio is not None:
+                self._transcribe_failure_count = 0
+                self._last_failed_audio = None
             return str(text)
         except urllib.error.URLError as exc:
-            logger.warning(
-                "WhisperKitSTT: HTTP transcribe failed (%s) -- "
-                "is `whisperkit-cli serve` still running?",
-                exc,
-            )
+            self._record_transcribe_failure(audio_f32, partial=partial, reason=str(exc))
             return ""
-        except Exception:
+        except Exception as exc:
             logger.debug(
                 "WhisperKitSTT: HTTP transcribe parse failed", exc_info=True,
             )
+            self._record_transcribe_failure(audio_f32, partial=partial, reason=repr(exc))
             return ""
+
+    def _record_transcribe_failure(
+        self, audio_f32: Any, *, partial: bool, reason: str,
+    ) -> None:
+        """Bump the transcribe failure counter and trigger a watchdog
+        restart once the configured threshold has been hit.
+
+        Sprint Ω.13: WhisperKit ``serve`` was wedging on memory pressure
+        with no recovery path. We now cache the last *final* audio
+        buffer (partials are too noisy to retry) and schedule
+        :meth:`restart_serve_async` on the asyncio loop via
+        ``run_coroutine_threadsafe`` since this method runs on the
+        ``atom-stt`` worker thread.
+        """
+        self._transcribe_failure_count += 1
+        if not partial:
+            self._last_failed_audio = audio_f32
+        logger.warning(
+            "WhisperKitSTT: HTTP transcribe failed (%s) — failures=%d "
+            "(threshold=%d, partial=%s)",
+            reason, self._transcribe_failure_count,
+            self._transcribe_failure_threshold, partial,
+        )
+        try:
+            self._bus.emit_fast(
+                "whisperkit_serve_unresponsive",
+                failures=int(self._transcribe_failure_count),
+                pid=int(self._serve_proc.pid) if self._serve_proc else 0,
+                reason=str(reason)[:120],
+            )
+        except Exception:
+            logger.debug(
+                "whisperkit_serve_unresponsive emit failed", exc_info=True,
+            )
+
+        if self._transcribe_failure_count < self._transcribe_failure_threshold:
+            return
+
+        loop = self._loop
+        if loop is None or loop.is_closed():
+            logger.debug(
+                "WhisperKitSTT: cannot schedule restart, no event loop"
+            )
+            return
+        try:
+            asyncio.run_coroutine_threadsafe(
+                self.restart_serve_async("transcribe_timeout_threshold"),
+                loop,
+            )
+        except Exception:
+            logger.debug(
+                "WhisperKitSTT: failed to schedule restart_serve_async",
+                exc_info=True,
+            )
+
+    def _record_restart_attempt(self) -> bool:
+        """Track restart timestamps in a rolling 1h window. Returns True
+        if the caller is allowed to proceed, False if the per-hour cap
+        has been hit."""
+        now = time.monotonic()
+        cutoff = now - 3600.0
+        self._restart_count_hour = [
+            t for t in self._restart_count_hour if t >= cutoff
+        ]
+        if len(self._restart_count_hour) >= self._restart_max_per_hour:
+            return False
+        self._restart_count_hour.append(now)
+        return True
+
+    def _kill_serve_process(self) -> None:
+        """Best-effort SIGTERM → SIGKILL the current ``serve`` subprocess.
+
+        Idempotent. Used by :meth:`restart_serve_async` and
+        :meth:`_stop_serve` so both paths converge on the same shutdown
+        sequence.
+        """
+        proc = self._serve_proc
+        if proc is None:
+            return
+        try:
+            if proc.poll() is None:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=2.0)
+                except subprocess.TimeoutExpired:
+                    logger.warning(
+                        "WhisperKitSTT: SIGTERM ignored, escalating to SIGKILL (pid=%s)",
+                        proc.pid,
+                    )
+                    proc.kill()
+                    try:
+                        proc.wait(timeout=2.0)
+                    except subprocess.TimeoutExpired:
+                        logger.error(
+                            "WhisperKitSTT: SIGKILL did not reap pid=%s",
+                            proc.pid,
+                        )
+        except Exception:
+            logger.debug(
+                "WhisperKitSTT: kill_serve_process raised", exc_info=True,
+            )
+        finally:
+            self._serve_proc = None
+
+    async def restart_serve_async(self, reason: str) -> bool:
+        """Recover from a wedged ``whisperkit-cli serve`` by killing and
+        relaunching the subprocess, then re-running the most recent
+        failed transcription once.
+
+        Returns True if the subprocess is healthy at exit, False if the
+        per-hour restart cap was hit or the relaunch failed. Idempotent
+        under concurrent invocation — the in-flight flag plus the shared
+        :class:`VoiceRecoveryLock` serialise overlapping callers.
+        """
+        if self._restart_in_flight:
+            logger.debug(
+                "WhisperKitSTT: restart already in flight, skipping (reason=%s)",
+                reason,
+            )
+            return False
+        self._restart_in_flight = True
+        try:
+            async with voice_recovery_lock(
+                f"whisperkit.restart:{reason}", max_wait_s=3.0,
+            ) as got_lock:
+                if not got_lock:
+                    logger.info(
+                        "STT_WATCHDOG: deferring whisperkit restart "
+                        "(another recovery path holds the lock)",
+                    )
+                    return False
+                if not self._record_restart_attempt():
+                    logger.error(
+                        "STT_WATCHDOG: restart cap hit (%d/hour) — "
+                        "speaking recovery prompt and giving up this cycle",
+                        self._restart_max_per_hour,
+                    )
+                    self._announce_voice_module_recovery()
+                    return False
+
+                old_pid = self._serve_proc.pid if self._serve_proc else 0
+                logger.info(
+                    "STT_WATCHDOG: restarting whisperkit (reason=%s, pid=%d)",
+                    reason, old_pid,
+                )
+                t0 = time.monotonic()
+
+                loop = asyncio.get_running_loop()
+                await loop.run_in_executor(None, self._kill_serve_process)
+
+                cached_audio = self._last_failed_audio
+                self._last_failed_audio = None
+                self._consecutive_health_probe_failures = 0
+
+                try:
+                    await loop.run_in_executor(None, self._maybe_start_serve)
+                    await loop.run_in_executor(None, self._wait_for_serve_ready)
+                except Exception as exc:
+                    logger.error(
+                        "STT_WATCHDOG: relaunch failed (reason=%s): %s",
+                        reason, exc, exc_info=True,
+                    )
+                    self._announce_voice_module_recovery()
+                    return False
+
+                new_pid = self._serve_proc.pid if self._serve_proc else 0
+                elapsed_ms = (time.monotonic() - t0) * 1000.0
+                logger.info(
+                    "STT_WATCHDOG: whisperkit healthy (pid=%d, %dms)",
+                    new_pid, int(elapsed_ms),
+                )
+                try:
+                    self._bus.emit_fast(
+                        "whisperkit_serve_restarted",
+                        pid=int(new_pid),
+                        reason=str(reason)[:120],
+                        elapsed_ms=int(elapsed_ms),
+                    )
+                except Exception:
+                    logger.debug(
+                        "whisperkit_serve_restarted emit failed", exc_info=True,
+                    )
+
+                self._transcribe_failure_count = 0
+
+                if cached_audio is not None and self._listening:
+                    try:
+                        retry_text = await loop.run_in_executor(
+                            self._stt_io,
+                            lambda a=cached_audio: self._http_transcribe(
+                                a, partial=False,
+                            ),
+                        )
+                    except Exception:
+                        retry_text = ""
+                        logger.debug(
+                            "STT_WATCHDOG: retry transcribe raised",
+                            exc_info=True,
+                        )
+                    if retry_text:
+                        normalized = _normalize_atom_final_text(retry_text)
+                        if normalized:
+                            logger.info(
+                                "STT_WATCHDOG: retry transcription success: '%s'",
+                                normalized[:120],
+                            )
+                            try:
+                                await loop.run_in_executor(
+                                    None,
+                                    lambda t=normalized: self._emit_final(t),
+                                )
+                            except Exception:
+                                logger.debug(
+                                    "STT_WATCHDOG: retry emit raised",
+                                    exc_info=True,
+                                )
+                        else:
+                            logger.info(
+                                "STT_WATCHDOG: retry transcription returned empty after normalisation",
+                            )
+                    else:
+                        logger.warning(
+                            "STT_WATCHDOG: retry transcription failed; speaking recovery prompt",
+                        )
+                        self._announce_voice_module_recovery()
+                return True
+        finally:
+            self._restart_in_flight = False
+
+    def _announce_voice_module_recovery(self) -> None:
+        """Speak a one-shot recovery prompt so Boss isn't left guessing
+        why the mic just went silent. Throttled to once per minute."""
+        now = time.monotonic()
+        if now - self._voice_module_restart_announced_at < 60.0:
+            return
+        self._voice_module_restart_announced_at = now
+        try:
+            self._bus.emit(
+                "system_speak",
+                text="Voice module restarted. Please repeat.",
+            )
+        except Exception:
+            logger.debug(
+                "voice module recovery prompt emit failed", exc_info=True,
+            )
+
+    async def _health_probe_loop(self) -> None:
+        """Tick on ``_health_probe_interval_s``, pinging ``/health`` and
+        triggering :meth:`restart_serve_async` after two consecutive
+        failures.
+
+        Started by :meth:`start_listening` and cancelled by
+        :meth:`stop_listening` / :meth:`shutdown`. Logs ``STT_WATCHDOG:
+        ping failed`` whenever the probe fails so wedge events surface
+        even when no audio is in flight.
+        """
+        loop = asyncio.get_running_loop()
+        try:
+            while self._listening:
+                await asyncio.sleep(self._health_probe_interval_s)
+                if not self._listening:
+                    break
+                if self._serve_proc is None:
+                    continue
+                if self._restart_in_flight:
+                    continue
+                try:
+                    healthy = await loop.run_in_executor(
+                        None,
+                        lambda: self._serve_health_ok(timeout_s=2.0),
+                    )
+                except Exception:
+                    healthy = False
+                if healthy:
+                    if self._consecutive_health_probe_failures:
+                        logger.info(
+                            "STT_WATCHDOG: whisperkit /health recovered "
+                            "(after %d misses)",
+                            self._consecutive_health_probe_failures,
+                        )
+                    self._consecutive_health_probe_failures = 0
+                    continue
+                self._consecutive_health_probe_failures += 1
+                pid = self._serve_proc.pid if self._serve_proc else 0
+                logger.warning(
+                    "STT_WATCHDOG: ping failed (pid=%d, host=%s:%d, misses=%d)",
+                    pid, self._serve_host, self._serve_port,
+                    self._consecutive_health_probe_failures,
+                )
+                if self._consecutive_health_probe_failures >= 2:
+                    try:
+                        await self.restart_serve_async("health_probe_failed")
+                    except Exception:
+                        logger.debug(
+                            "restart_serve_async raised from health probe",
+                            exc_info=True,
+                        )
+                    self._consecutive_health_probe_failures = 0
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            logger.debug(
+                "WhisperKitSTT: health probe loop raised", exc_info=True,
+            )
 
     def _reset_utterance_state(self) -> None:
         self._utterance_frames = []
@@ -1563,6 +1957,20 @@ class WhisperKitSTT:
 
     # ── public attach surface (parity with NativeSTT/WhisperSTT) ─
 
+    def _tail_mute_seconds_for_backend(self, backend: str | None) -> float:
+        """Sprint Ω.13: pick the post-TTS tail-mute window based on the
+        active TTS backend. The ``say`` shell fallback emits ~250 ms of
+        audible tail beyond process exit so its window is configurably
+        longer than NSSpeechSynthesizer's. Falls back to the safer
+        ``say`` window when the backend is unknown.
+        """
+        be = (backend or "").strip().lower()
+        if be == "native" or be == "nsspeechsynthesizer":
+            ms = self._tts_tail_mute_ms
+        else:
+            ms = self._tts_tail_mute_ms_say_backend
+        return max(0.0, float(ms) / 1000.0)
+
     async def on_state_changed(self, old: Any = None, new: Any = None, **_kw: Any) -> None:
         try:
             new_value = getattr(new, "value", str(new)).lower()
@@ -1572,18 +1980,20 @@ class WhisperKitSTT:
                 return
             if old_value == "speaking":
                 self._clear_utterance_buffers()
+                tail_s = self._tail_mute_seconds_for_backend(None)
                 self._output_muted_until = max(
                     self._output_muted_until,
-                    time.monotonic() + 1.2,
+                    time.monotonic() + tail_s,
                 )
         except Exception:
             logger.debug("WhisperKitSTT.on_state_changed raised", exc_info=True)
 
-    async def on_tts_complete(self, **_kw: Any) -> None:
+    async def on_tts_complete(self, backend: str | None = None, **_kw: Any) -> None:
         self._clear_utterance_buffers()
+        tail_s = self._tail_mute_seconds_for_backend(backend)
         self._output_muted_until = max(
             self._output_muted_until,
-            time.monotonic() + 1.2,
+            time.monotonic() + tail_s,
         )
 
     def attach_echo_guard(

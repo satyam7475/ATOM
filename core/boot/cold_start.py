@@ -119,9 +119,15 @@ class ColdStartOptimizer:
         -----------------
         Boot has three Metal/GPU consumers that all attach
         ``addCompletedHandler:`` callbacks to the same Metal device queue:
-          1. ``_preload_fast_model`` -- MLX (Qwen3-8B-4bit, single-resident as of Sprint Ω.7)
-          2. ``_preload_embeddings`` -- torch.mps (SentenceTransformer)
-          3. ``_preload_vlm``        -- mlx-vlm   (SmolVLM-Instruct-4bit)
+          1. ``_preload_fast_model`` -- MLX chat brain (Qwen3 4B/0.6B
+             multi-tier as of Sprint Ω.10).
+          2. ``_preload_embeddings`` -- MLX embeddings provider
+             (``mlx-community/all-MiniLM-L6-v2-mlx``) when
+             ``embedding.backend=mlx_embeddings`` (the shipping default
+             on Apple Silicon), or torch.mps SentenceTransformer
+             otherwise. Both backends submit to the same Metal queue.
+          3. ``_preload_vlm``        -- mlx-vlm SmolVLM-Instruct-4bit
+             (lazy by default; see ``vision.vlm.warm_at_boot``).
 
         Running them concurrently triggers the Apple-internal assertion
         ``-[_MTLCommandBuffer addCompletedHandler:]:1011: failed
@@ -141,6 +147,16 @@ class ColdStartOptimizer:
         serialization on the wall clock; we only delay the Metal stages
         relative to one another. The total cold-start budget is unchanged
         in the typical case (CPU work finishes during the LLM warmup).
+
+        Sprint Ω.12 (Apr 27 2026) — between every Metal-using phase we
+        now call :py:meth:`_drain_metal_queue` (``mx.synchronize()``).
+        ``await``-ing the previous stage only guarantees the *Python*
+        call returned; MLX submits Metal command buffers asynchronously,
+        so a phase can hand control back while its last buffer is still
+        queued for the GPU. Without an explicit drain, the next phase
+        (loading a *different* MLX model) was racing those queued
+        buffers and re-tripping the ``addCompletedHandler:1011``
+        assertion seen in the Ω.11 boot logs (exit 134).
         """
         self._boot_time = time.monotonic()
         self._restored_snapshot = self._load_snapshot()
@@ -151,6 +167,7 @@ class ColdStartOptimizer:
                 fast_ok = bool(await self._preload_fast_model())
             except Exception as exc:
                 logger.debug("Cold start fast-model warmup raised: %s", exc)
+            await self._drain_metal_queue("fast_model")
             # Sprint Ω.10 — pin the persona on every loaded role
             # *inside* the Metal-serial chain. The MLX models just
             # landed on the GPU queue; pinning here means
@@ -169,11 +186,13 @@ class ColdStartOptimizer:
                     logger.debug(
                         "Cold start fast persona-pin raised", exc_info=True,
                     )
+                await self._drain_metal_queue("persona_pin_fast")
                 try:
                     if self._mlx_brain is not None and bool(
                         getattr(self._mlx_brain, "_ultra_tier_enabled", False)
                     ) and self._is_role_loaded("ultra"):
                         await self._pin_persona_in_chain("ultra")
+                        await self._drain_metal_queue("persona_pin_ultra")
                 except Exception:
                     logger.debug(
                         "Cold start ultra persona-pin raised", exc_info=True,
@@ -183,11 +202,13 @@ class ColdStartOptimizer:
                 emb_ok = bool(await self._preload_embeddings())
             except Exception as exc:
                 logger.debug("Cold start embeddings warmup raised: %s", exc)
+            await self._drain_metal_queue("embeddings")
             vlm_payload: tuple[bool, float] = (False, 0.0)
             try:
                 vlm_payload = await self._preload_vlm()
             except Exception as exc:
                 logger.debug("Cold start vlm warmup raised: %s", exc)
+            await self._drain_metal_queue("vlm")
             return fast_ok, emb_ok, vlm_payload
 
         metal_task = asyncio.create_task(_metal_serial_warmup())
@@ -342,6 +363,41 @@ class ColdStartOptimizer:
                 return {}
             logger.info("Cold start snapshot found (age %.0fs)", age_s)
         return loaded
+
+    async def _drain_metal_queue(self, phase: str) -> None:
+        """Block until every in-flight Metal command buffer completes.
+
+        Sprint Ω.12 (Apr 27 2026): the Metal-serial chain ``await``s
+        each phase, but MLX submits work to the GPU asynchronously —
+        a phase can return while its last command buffer is still
+        queued. The next phase (especially when it loads a *different*
+        MLX model) then races those queued buffers and the Metal
+        runtime fires
+        ``-[_MTLCommandBuffer addCompletedHandler:]:1011`` →
+        SIGABRT (exit 134) on cold boot. ``mx.synchronize()`` is the
+        canonical drain: blocks the calling thread until the GPU is
+        idle, after which the next phase owns the queue exclusively.
+
+        Defensive across environments: silent no-op when ``mlx`` is
+        not importable (test harness, non-Apple-Silicon CI). The
+        executor dispatch keeps the asyncio loop responsive even if
+        the GPU has 50–100 ms of work to drain.
+        """
+        try:
+            import mlx.core as _mx  # type: ignore[import-untyped]
+        except Exception:
+            return
+        sync = getattr(_mx, "synchronize", None)
+        if not callable(sync):
+            return
+        try:
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(None, sync)
+        except Exception:
+            logger.debug(
+                "Cold start: mx.synchronize raised after %s", phase,
+                exc_info=True,
+            )
 
     def _is_role_loaded(self, role: str) -> bool:
         """Return ``True`` when ``role`` is currently resident in MLXBrain.
