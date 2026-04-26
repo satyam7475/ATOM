@@ -11,8 +11,8 @@ M-series.
 
 Routing summary:
 
-  see_me / look_at_me / am_i_visible      -> action ``vision_describe``
-                                             (camera + on-device VLM)
+  see_me / look_at_me / am_i_visible      -> action ``vision_look``
+                                             (fast camera / face check)
   what_do_you_see                          -> action ``vision_look``
                                              (face count, fastest path)
   describe_screen / analyze_screen /
@@ -98,7 +98,7 @@ _SCREEN_DESCRIBE = re.compile(
 def quick_match(text: str) -> str | None:
     """Cheap intent name lookup for STT early-exit."""
     if _SEE_ME.search(text):
-        return "vision_describe"
+        return "vision_look"
     if _WHAT_DO_YOU_SEE.search(text):
         return "vision_look"
     if _SCREEN_DESCRIBE.search(text):
@@ -123,9 +123,9 @@ def check(text: str) -> IntentResult | None:
         )
     if _SEE_ME.search(text):
         return IntentResult(
-            "vision_describe",
-            action="vision_describe",
-            action_args={"prompt": "user-facing self-check"},
+            "vision_look",
+            action="vision_look",
+            action_args={"focus": "user-facing self-check"},
             confidence=0.95,
         )
     if _WHAT_DO_YOU_SEE.search(text):

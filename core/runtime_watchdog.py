@@ -53,6 +53,8 @@ class RuntimeWatchdog:
         "_boot_time_s", "_intent_boot_grace_s",
         "_tts_per_word_s", "_tts_active_word_count",
         "_tts_max_dynamic_s",
+        "_llm_pressure_extend_pct", "_llm_pressure_extend_bonus_s",
+        "_llm_pressure_extend_max_s", "_memory_pct_recent",
     )
 
     def __init__(
@@ -113,6 +115,25 @@ class RuntimeWatchdog:
             perf.get("watchdog_intent_boot_grace_s", 8.0),
         )
 
+        # Sprint Ω.8: memory-pressure aware LLM budget. When unified
+        # memory crosses ``llm_pressure_extend_threshold_pct`` the MLX
+        # prefill takes longer (KV may have just been evicted, or the
+        # OS is page-stealing). Rather than killing the turn at the
+        # static budget and triggering an unload + reload (which only
+        # makes the next turn worse), we extend the LLM budget by a
+        # bonus capped at ``_llm_pressure_extend_max_s``. The
+        # ``MemoryGovernor`` feeds us readings via ``record_memory_pct``.
+        self._llm_pressure_extend_pct = float(
+            perf.get("watchdog_llm_pressure_extend_threshold_pct", 80.0),
+        )
+        self._llm_pressure_extend_bonus_s = float(
+            perf.get("watchdog_llm_pressure_extend_bonus_s", 8.0),
+        )
+        self._llm_pressure_extend_max_s = float(
+            perf.get("watchdog_llm_pressure_extend_max_s", 25.0),
+        )
+        self._memory_pct_recent: float = 0.0
+
         self._bus.on("response_ready", self._on_tts_started)
         self._bus.on("partial_response", self._on_tts_started)
         self._bus.on("tts_complete", self._on_tts_complete)
@@ -137,15 +158,46 @@ class RuntimeWatchdog:
             elapsed = time.monotonic() - self._boot_time_s
             if elapsed < self._intent_boot_grace_s:
                 return 0.0
+        if stage == "llm_inference":
+            # Sprint Ω.8: extend the LLM budget when unified memory
+            # is over threshold. Capped so a runaway prefill still
+            # surfaces a real timeout eventually.
+            base = self._llm_s
+            if (
+                self._memory_pct_recent >= self._llm_pressure_extend_pct
+                and self._llm_pressure_extend_bonus_s > 0
+            ):
+                extended = min(
+                    self._llm_pressure_extend_max_s,
+                    base + self._llm_pressure_extend_bonus_s,
+                )
+                return float(extended)
+            return float(base)
         mapping = {
             "intent_engine": self._intent_s,
             "cache_lookup": self._cache_s,
             "rag_retrieval": self._rag_s,
-            "llm_inference": self._llm_s,
             "tts_synthesis": self._tts_s,
             "tool_execution": self._tool_s,
         }
         return float(mapping.get(stage, 0.0))
+
+    def record_memory_pct(self, memory_pct: float) -> None:
+        """Feed unified-memory pressure readings into the watchdog.
+
+        Called by :class:`core.memory_governor.MemoryGovernor` whenever
+        a fresh ``silicon_stats_update`` event lands. The watchdog uses
+        this single number to decide whether to extend the LLM
+        inference budget under pressure (Sprint Ω.8 R4). Cheap; safe to
+        call from the bus thread.
+        """
+        try:
+            value = float(memory_pct)
+        except (TypeError, ValueError):
+            return
+        if value < 0.0 or value > 100.0:
+            return
+        self._memory_pct_recent = value
 
     def cap_budget_ms(self, stage: str, budget_ms: float) -> float:
         timeout_s = self.timeout_s(stage)
@@ -450,15 +502,24 @@ class RuntimeWatchdog:
 
         if stage == "llm_inference":
             self._consecutive_llm_timeouts += 1
+            # Sprint Ω.8 (Apr 26 2026): non-destructive timeout. The
+            # previous handler unloaded the MLX model on EVERY single
+            # llm_inference timeout (atomCurrentLogs.txt L350-L353,
+            # L504-L506). On a memory-pressured M5 that means every
+            # cold-KV prefill that ran 1s past the 14s budget triggered
+            # a full model shutdown + reload — which alone took 3-4s,
+            # so the *next* turn started even further behind. The fix:
+            # on a single timeout we only ``request_preempt()`` (which
+            # cancels the in-flight stream cheaply) and let the model
+            # stay resident. If timeouts hit ``_timeout_demote_threshold``
+            # in a row, ``_maybe_demote_profile`` flips the brain to
+            # FAST mode AND unloads via ``request_profile_demote``;
+            # that is the only place we drop the model.
             if self._local_brain is not None:
                 try:
                     self._local_brain.request_preempt()
                 except Exception:
                     logger.debug("Watchdog could not preempt local brain", exc_info=True)
-                try:
-                    self._local_brain.unload_llm_for_power()
-                except Exception:
-                    logger.debug("Watchdog could not unload local brain", exc_info=True)
             try:
                 self._bus.emit("llm_error", source="watchdog", error="llm_timeout")
             except Exception:

@@ -115,6 +115,7 @@ class WebDashboard:
             "font-src 'self' https://fonts.gstatic.com; "
             "connect-src 'self' ws://127.0.0.1:*; "
             "img-src 'self' data:; "
+            "media-src 'self' blob:; "
         )
         return resp
 

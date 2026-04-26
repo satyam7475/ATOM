@@ -24,13 +24,24 @@ logger = logging.getLogger(__name__)
 GEMINI_FAST = "gemini_fast"
 GEMINI_PRO = "gemini_pro"
 
+# Sprint Ω.9 (Apr 26 2026): rotating OpenAI-compatible cloud lane.
+# Each provider stores its raw API key under one credential id; the
+# RotatingOpenAIClient pulls them on init via ``get_api_key(<id>)``.
+GROQ = "groq"
+NVIDIA_NIM = "nvidia"
+CEREBRAS = "cerebras"
+
+# Backward-compat: older callsites and ``main.py`` use ``groq_api_key``
+# for the single-provider Groq lane. We mirror it to the canonical id.
+GROQ_LEGACY_ID = "groq_api_key"
+
 # All available credential IDs
 AVAILABLE_CREDENTIALS = {
     "GEMINI_FAST": GEMINI_FAST,
     "GEMINI_PRO": GEMINI_PRO,
-    # Add more as needed:
-    # "ANTHROPIC_CLAUDE": "anthropic_claude",
-    # "OPENAI_GPT": "openai_gpt",
+    "GROQ": GROQ,
+    "NVIDIA_NIM": NVIDIA_NIM,
+    "CEREBRAS": CEREBRAS,
 }
 
 # Global credential manager instance. `_init_failed` short-circuits subsequent
@@ -106,6 +117,28 @@ def get_gemini_pro_key() -> Optional[str]:
         API key or None
     """
     return get_api_key(GEMINI_PRO)
+
+
+def get_groq_key() -> Optional[str]:
+    """Get Groq API key (Llama 3.x via LPU, fast OpenAI-compatible).
+
+    Falls back to the legacy ``groq_api_key`` id used by the
+    single-provider Groq client wired in ``main.py`` before Sprint Ω.9.
+    """
+    key = get_api_key(GROQ)
+    if key:
+        return key
+    return get_api_key(GROQ_LEGACY_ID)
+
+
+def get_nvidia_key() -> Optional[str]:
+    """Get NVIDIA NIM (build.nvidia.com) API key (``nvapi-...``)."""
+    return get_api_key(NVIDIA_NIM)
+
+
+def get_cerebras_key() -> Optional[str]:
+    """Get Cerebras Cloud API key (``csk-...``)."""
+    return get_api_key(CEREBRAS)
 
 
 def set_api_key(credential_id: str, value: str) -> bool:
@@ -197,11 +230,17 @@ __all__ = [
     "get_api_key",
     "get_gemini_fast_key",
     "get_gemini_pro_key",
+    "get_groq_key",
+    "get_nvidia_key",
+    "get_cerebras_key",
     "set_api_key",
     "list_available_keys",
     "has_credential",
     "delete_credential",
     "GEMINI_FAST",
     "GEMINI_PRO",
+    "GROQ",
+    "NVIDIA_NIM",
+    "CEREBRAS",
     "AVAILABLE_CREDENTIALS",
 ]

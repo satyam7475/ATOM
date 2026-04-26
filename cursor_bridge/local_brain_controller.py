@@ -977,6 +977,7 @@ class LocalBrainController:
             document_context=None,
             observations=None,
             rag_enrichment=None,
+            voice_mode=True,
         )
         return (
             f"{base_prompt}\n\n"
@@ -1482,11 +1483,23 @@ class LocalBrainController:
                     or "user-facing self-check"
                 )
                 try:
-                    result = self._vision_engine.look(
-                        reason=f"local_brain_perception:{str(prompt)[:40]}",
-                        detect_faces=True,
-                        detect_barcodes=False,
-                        describe=True,
+                    # Sprint Ω.8 (Apr 26 2026) R7: ``vision_engine.look``
+                    # may trigger a cold VLM load (~14s on the first
+                    # describe call after boot — atomCurrentLogs.txt
+                    # L269-L275). Calling it directly from the cognitive
+                    # loop pinned the event-loop thread for the entire
+                    # load and starved every other handler. Run the
+                    # whole call on the default executor so the bus
+                    # stays responsive.
+                    loop = asyncio.get_running_loop()
+                    result = await loop.run_in_executor(
+                        None,
+                        lambda: self._vision_engine.look(
+                            reason=f"local_brain_perception:{str(prompt)[:40]}",
+                            detect_faces=True,
+                            detect_barcodes=False,
+                            describe=True,
+                        ),
                     )
                     if getattr(result, "description", ""):
                         self._bus.emit_long(
@@ -1888,6 +1901,7 @@ class LocalBrainController:
                 observations=observations if observations else None,
                 rag_enrichment=rag_enrichment if react_step == 0 else None,
                 repeat_hint=repeat_hint and react_step == 0,
+                voice_mode=True,
             )
 
             raw_response, first_token_ms, preempted = await self._run_llm_streaming(

@@ -16,10 +16,23 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import time
 from typing import Any
 
 logger = logging.getLogger("atom.stt_watchdog")
+
+_DIAGNOSTIC_PARTIAL_RE = re.compile(
+    r"\b(rag|rack|memory|embedding|snippet|boot|diagnostic|watchdog|pressure)\b"
+    r".*\b(pressure mode|snippet budget|engine shut ?down|boot diagnostic|budget reduced)\b",
+    re.I,
+)
+_SELF_SPEECH_PARTIAL_RE = re.compile(
+    r"^\s*(?:what\s+do\s+you\s+need|one\s+moment|working\s+on\s+it|"
+    r"right\s+away|on\s+it(?:\s+boss)?|let\s+me\s+check|"
+    r"give\s+me\s+a\s+sec)\s*[.?!]?\s*$",
+    re.I,
+)
 
 _SILENT_TIMEOUT_S = 8.0
 _STUCK_TIMEOUT_S = 15.0
@@ -259,6 +272,24 @@ class STTWatchdog:
         last_partial_text = str(getattr(stt, "_last_partial", "") or "")
         recent_partial = since_partial < 3.0
 
+        def _should_salvage_partial(text: str) -> bool:
+            text = (text or "").strip()
+            if not text:
+                return False
+            if (
+                _DIAGNOSTIC_PARTIAL_RE.search(text)
+                or _SELF_SPEECH_PARTIAL_RE.search(text)
+            ):
+                return False
+            echo_guard = getattr(stt, "_echo_guard", None)
+            if callable(echo_guard):
+                try:
+                    if echo_guard(text):
+                        return False
+                except Exception:
+                    logger.debug("STT Watchdog: echo guard check failed", exc_info=True)
+            return True
+
         # After the first successful turn the recognizer is warmed up — a
         # silent stretch is a much stronger signal of a real stall, so we
         # drop the threshold from 8s to 5s. On the very first turn we keep
@@ -286,8 +317,9 @@ class STTWatchdog:
                 except Exception:
                     logger.debug("STT Watchdog: recognition starvation hook failed", exc_info=True)
             if self._can_restart():
-                # Preserve accumulated partial before restart
-                if last_partial_text.strip():
+                # Preserve accumulated partial before restart only when it
+                # is not ATOM's own delayed TTS captured by the mic.
+                if _should_salvage_partial(last_partial_text):
                     logger.info(
                         "STT Watchdog: salvaging partial '%s' before restart",
                         last_partial_text[:120],
@@ -326,7 +358,7 @@ class STTWatchdog:
                     "soft chain-restart (kLSRErrorDomain 301)" if is_soft_timeout else "restarting",
                 )
                 if self._can_restart():
-                    if last_partial_text.strip():
+                    if _should_salvage_partial(last_partial_text):
                         logger.info(
                             "STT Watchdog: salvaging partial '%s' before restart",
                             last_partial_text[:120],

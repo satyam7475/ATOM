@@ -180,6 +180,180 @@ def test_wait_for_serve_ready_succeeds_when_port_and_health_open(
     backend._wait_for_serve_ready()
 
 
+def test_maybe_start_serve_reaps_unhealthy_stale_listener(
+    stt: Any, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A bound but unhealthy stale serve must not cost the full boot timeout."""
+    m, bus_cls, state_cls = stt
+    backend = _make_stt(m, bus_cls, state_cls)
+    captured: dict[str, Any] = {}
+    port_checks = iter([True, False, False])
+
+    class _StubProc:
+        def __init__(self, cmd: list[str], **_: Any) -> None:
+            captured["cmd"] = cmd
+
+        def poll(self) -> int | None:
+            return None
+
+    monkeypatch.setattr(m, "_port_is_open", lambda *a, **k: next(port_checks))
+    monkeypatch.setattr(backend, "_serve_health_ok", lambda **k: False)
+    monkeypatch.setattr(backend, "_reap_stale_serve_on_port", lambda: True)
+    monkeypatch.setattr(subprocess, "Popen", _StubProc)
+
+    backend._maybe_start_serve()
+
+    assert captured["cmd"][:2] == ["/fake/whisperkit-cli", "serve"]
+
+
+def test_maybe_start_serve_attaches_to_healthy_listener(
+    stt: Any, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    m, bus_cls, state_cls = stt
+    backend = _make_stt(m, bus_cls, state_cls)
+
+    monkeypatch.setattr(m, "_port_is_open", lambda *a, **k: True)
+    monkeypatch.setattr(backend, "_serve_health_ok", lambda **k: True)
+    monkeypatch.setattr(
+        subprocess,
+        "Popen",
+        lambda *a, **k: pytest.fail("healthy existing serve should be reused"),
+    )
+
+    backend._maybe_start_serve()
+
+
+def test_diagnostic_self_input_is_not_routed(
+    stt: Any,
+) -> None:
+    m, bus_cls, state_cls = stt
+
+    class _Bus(bus_cls):
+        def __init__(self) -> None:
+            self.events: list[tuple[str, dict[str, Any]]] = []
+
+        def emit(self, event: str, **kw: Any) -> None:
+            self.events.append((event, kw))
+
+    bus = _Bus()
+    backend = m.WhisperKitSTT(bus, state_cls(), config={"stt": {"whisperkit": {}}})
+
+    backend._emit_final("rack pressure mode on at 82% snippet budget reduced to 1%")
+
+    assert bus.events == []
+
+
+def test_atom_self_speech_final_is_not_routed(
+    stt: Any,
+) -> None:
+    m, bus_cls, state_cls = stt
+
+    class _Bus(bus_cls):
+        def __init__(self) -> None:
+            self.events: list[tuple[str, dict[str, Any]]] = []
+
+        def emit(self, event: str, **kw: Any) -> None:
+            self.events.append((event, kw))
+
+    bus = _Bus()
+    backend = m.WhisperKitSTT(bus, state_cls(), config={"stt": {"whisperkit": {}}})
+
+    backend._emit_final("What do you need?")
+    backend._emit_final("One moment.")
+    backend._emit_final("Working on it.")
+
+    assert bus.events == []
+
+
+def test_atom_self_prefix_is_stripped_from_owner_suffix(
+    stt: Any,
+) -> None:
+    m, bus_cls, state_cls = stt
+
+    class _Bus(bus_cls):
+        def __init__(self) -> None:
+            self.events: list[tuple[str, dict[str, Any]]] = []
+
+        def emit(self, event: str, **kw: Any) -> None:
+            self.events.append((event, kw))
+
+    bus = _Bus()
+    backend = m.WhisperKitSTT(bus, state_cls(), config={"stt": {"whisperkit": {}}})
+
+    backend._emit_final(
+        "I'm it, boss. System is degraded, boss. Can you see me, Adtan? Okay."
+    )
+
+    assert bus.events == [
+        ("speech_final", {"text": "Can you see me, atom?", "language": "auto"}),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_tts_tail_mute_drops_delayed_final(
+    stt: Any,
+) -> None:
+    m, bus_cls, state_cls = stt
+
+    class _Bus(bus_cls):
+        def __init__(self) -> None:
+            self.events: list[tuple[str, dict[str, Any]]] = []
+
+        def emit(self, event: str, **kw: Any) -> None:
+            self.events.append((event, kw))
+
+    bus = _Bus()
+    backend = m.WhisperKitSTT(bus, state_cls(), config={"stt": {"whisperkit": {}}})
+
+    await backend.on_tts_complete()
+    backend._emit_final("I'm good, Boss. Ready for you.")
+
+    assert bus.events == []
+
+
+def test_noise_gate_blocks_quiet_whisperkit_frames(
+    stt: Any,
+) -> None:
+    m, bus_cls, state_cls = stt
+    backend = m.WhisperKitSTT(
+        bus_cls(),
+        state_cls(),
+        config={
+            "stt": {
+                "noise_floor_dbfs": -45.0,
+                "noise_gate_consecutive": 3,
+                "whisperkit": {},
+            },
+        },
+    )
+
+    assert backend._noise_gate_blocks(-60.0) is False
+    assert backend._noise_gate_blocks(-60.0) is False
+    assert backend._noise_gate_blocks(-60.0) is True
+    assert backend._noise_gate_dropped_total == 1
+    assert backend._noise_gate_blocks(-35.0) is False
+
+
+def test_whisperkit_min_utterance_uses_config(
+    stt: Any,
+) -> None:
+    m, bus_cls, state_cls = stt
+    backend = m.WhisperKitSTT(
+        bus_cls(),
+        state_cls(),
+        config={
+            "stt": {
+                "min_audio_duration_s": 0.55,
+                "whisperkit": {},
+            },
+        },
+    )
+
+    backend._utterance_frames = [b"\x00" * 960] * 10  # 300 ms
+
+    assert backend._flush_utterance(force=True) == ""
+
+
 @pytest.mark.asyncio
 async def test_async_start_listening_does_not_duplicate_speech_events(
     stt: Any, monkeypatch: pytest.MonkeyPatch,

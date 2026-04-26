@@ -340,6 +340,12 @@ CONFIG_SCHEMA: dict[str, Any] = {
                     "maximum": 60,
                     "description": "Phase E3: number of consecutive sub-floor frames required to close the noise gate. A single supra-floor frame reopens it.",
                 },
+                "speech_candidate_floor_dbfs": {
+                    "type": "number",
+                    "minimum": -96.0,
+                    "maximum": 0.0,
+                    "description": "WhisperKit speech-candidate dBFS floor. VAD-positive frames below this RMS do not refresh the trailing-silence timer, so quiet room hum that briefly trips webrtcvad cannot keep an utterance open. Should sit a few dB above noise_floor_dbfs (default: max(-42, noise_floor + 3)).",
+                },
                 "promotion_min_confidence": {
                     "type": "number",
                     "minimum": 0.0,
@@ -1601,6 +1607,24 @@ CONFIG_SCHEMA: dict[str, Any] = {
                     "minimum": 5,
                     "maximum": 300,
                     "description": "RuntimeWatchdog: LLM inference timeout before preempt + reset.",
+                },
+                "watchdog_llm_pressure_extend_threshold_pct": {
+                    "type": "number",
+                    "minimum": 0.0,
+                    "maximum": 100.0,
+                    "description": "Sprint Ω.8 R4: unified-memory pct above which the LLM inference budget extends by watchdog_llm_pressure_extend_bonus_s. Lets cold-KV prefills survive pressure spikes instead of timing out and triggering an unload+reload cascade.",
+                },
+                "watchdog_llm_pressure_extend_bonus_s": {
+                    "type": "number",
+                    "minimum": 0.0,
+                    "maximum": 60.0,
+                    "description": "Sprint Ω.8 R4: extra seconds added to llm_inference budget when memory_pct >= watchdog_llm_pressure_extend_threshold_pct.",
+                },
+                "watchdog_llm_pressure_extend_max_s": {
+                    "type": "number",
+                    "minimum": 5.0,
+                    "maximum": 120.0,
+                    "description": "Sprint Ω.8 R4: hard ceiling for the extended llm_inference budget; runaway prefills still fail eventually.",
                 },
                 "watchdog_tts_timeout_s": {
                     "type": "number",

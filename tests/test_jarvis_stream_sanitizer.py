@@ -239,6 +239,17 @@ def test_echo_guard_still_catches_self_echo_normal_speech() -> None:
     assert tts.is_echo("weather today sunny pleasant") is True
 
 
+def test_tts_cleaner_drops_internal_status_lines() -> None:
+    from voice.tts_macos import _clean_for_tts
+
+    assert _clean_for_tts("[SYSTEM] Initiating system diagnostics.") == ""
+    assert _clean_for_tts("Atom.localBrain.") == ""
+    assert (
+        _clean_for_tts("System is degraded, Boss. Issues: 2 readiness checks.")
+        == ""
+    )
+
+
 # ── Audio intelligence: benign-reason debounce ──────────────────────
 
 

@@ -49,7 +49,9 @@ import collections
 import json
 import logging
 import os
+import re
 import shutil
+import signal
 import socket
 import subprocess
 import threading
@@ -116,6 +118,162 @@ _MIN_UTTERANCE_MS = 250
 _DEFAULT_WHISPERKIT_MODEL = "whisper-large-v3-v20240930_turbo_632MB"
 _DEFAULT_SERVE_PORT = 50060
 _DEFAULT_SERVE_HOST = "127.0.0.1"
+
+_ATOM_DIAGNOSTIC_AUDIO_RE = re.compile(
+    r"\b("
+    r"rag|rack|memory|embedding|snippet|boot|diagnostic|watchdog|"
+    r"pressure|pipeline|governor"
+    r")\b.*\b("
+    r"pressure mode|snippet budget|engine shut ?down|boot diagnostic|"
+    r"budget reduced|memory pressure|watchdog|pipeline"
+    r")\b",
+    re.I,
+)
+_ATOM_SELF_SPEECH_RE = re.compile(
+    r"^\s*(?:"
+    r"what\s+do\s+you\s+need|"
+    r"one\s+moment|"
+    r"working\s+on\s+it|"
+    r"right\s+away|"
+    r"on\s+it(?:\s+boss)?|"
+    r"let\s+me\s+check|"
+    r"give\s+me\s+a\s+sec|"
+    r"i'?m\s+(?:good|here|it)\s*,?\s*boss(?:\s+ready\s+for\s+you)?|"
+    r"system\s+is\s+degraded\s*,?\s+boss.*|"
+    r"atom\.?\s*local\s*brain|"
+    r"atom\.?\s*localbrain|"
+    r"\[?\s*system\s*\]?\s+initiating\s+system\s+diagnostics|"
+    r"here\s+boss.*active\s+goals.*what\s+do\s+you\s+need"
+    r")[\s.?!]*$",
+    re.I,
+)
+_ATOM_WAKE_MISHEAR_RE = re.compile(
+    r"\b(?:adam|adom|adtan|adton|atan|atum|autumn|atam|attom|adum)\b",
+    re.I,
+)
+_ATOM_TRAILING_ACK_RE = re.compile(
+    r"\s+(?:okay|ok|mm-?|mm\s*hmm|uh\s*huh)[\s.?!]*$",
+    re.I,
+)
+
+
+def _looks_like_atom_self_speech(text: str) -> bool:
+    text = (text or "").strip()
+    return bool(
+        text
+        and (
+            _ATOM_SELF_SPEECH_RE.search(text)
+            or _ATOM_DIAGNOSTIC_AUDIO_RE.search(text)
+        )
+    )
+
+
+def _normalize_atom_final_text(text: str) -> str:
+    """Remove ATOM speaker bleed while preserving a real owner suffix."""
+    text = re.sub(r"\s+", " ", (text or "").strip())
+    if not text:
+        return ""
+
+    text = _ATOM_WAKE_MISHEAR_RE.sub("atom", text)
+    if _looks_like_atom_self_speech(text):
+        return ""
+
+    parts = [
+        p.strip()
+        for p in re.split(r"(?<=[.!?])\s+", text)
+        if p.strip()
+    ]
+    if len(parts) > 1:
+        kept = [p for p in parts if not _looks_like_atom_self_speech(p)]
+        if kept != parts:
+            text = " ".join(kept).strip()
+
+    if len(text.split()) > 3:
+        text = _ATOM_TRAILING_ACK_RE.sub("", text).strip()
+    if _looks_like_atom_self_speech(text):
+        return ""
+    return text
+
+
+# ── Sprint Ω.8: STT garbage filter ───────────────────────────────────
+# Whisper / WhisperKit are notorious for hallucinating filler text
+# during silence, music, or breath noise. atomCurrentLogs.txt L371,
+# L467, L509 show the exact failure modes we now reject:
+#   - "Продолжение следует..." (Russian "to be continued" — common
+#     youtube-trained hallucination)
+#   - "*cough*", "*spray the door*", "[Music]" (literal stage-direction
+#     markup leaking through as "speech")
+#   - "Thank you for watching" / "Subscribe to my channel" (youtube
+#     ad/end-card hallucinations)
+#   - Doubled wake words: "hey atom hey atom hey atom"
+# Anything that's mostly-asterisks or mostly-bracketed is rejected
+# unconditionally; any pure non-Latin transcription is rejected when
+# the configured STT language is English (the ATOM default).
+
+_HALLUCINATION_PHRASES: tuple[re.Pattern, ...] = (
+    re.compile(r"продолжен", re.I),
+    re.compile(r"^thank you for watching\b", re.I),
+    re.compile(r"^subscribe (?:to (?:my|the))? channel\b", re.I),
+    re.compile(r"^like and subscribe\b", re.I),
+    re.compile(r"^thanks for watching\b", re.I),
+    re.compile(r"\bMBE\.com\b", re.I),
+    re.compile(r"\bw{3}\.\S+\.com\b", re.I),
+)
+
+_STAGE_DIRECTION_RE = re.compile(r"^[\*\[\(<].+?[\*\]\)>]\s*$")
+_ALL_PUNCT_RE = re.compile(r"^[\W_]+$", re.UNICODE)
+_NON_LATIN_RE = re.compile(r"[^\x00-\x7F]")
+_LATIN_WORD_RE = re.compile(r"[A-Za-z]{2,}")
+_DOUBLED_WAKE_RE = re.compile(
+    r"^(?:hey\s+|hi\s+)?(?:atom|adam|atim|item)"
+    r"(?:[\s,.!?]+(?:hey\s+|hi\s+)?(?:atom|adam|atim|item)){2,}"
+    r"[\s,.!?]*$",
+    re.I,
+)
+
+
+def _is_stt_garbage(text: str, *, language: str = "en") -> str | None:
+    """Return a reason string if ``text`` is a known STT garbage
+    pattern, else None. Called from :meth:`_emit_final` before any
+    routing so hallucinations never reach the brain.
+
+    Sprint Ω.8 (Apr 26 2026): centralised garbage filter.
+    """
+    if not text:
+        return None
+    stripped = text.strip()
+    if not stripped:
+        return "empty"
+
+    # Pure stage direction: "*cough*", "[Music]", "(applause)"
+    if _STAGE_DIRECTION_RE.match(stripped):
+        return f"stage_direction:{stripped[:40]}"
+
+    # Almost no real letters — punctuation / asterisks / brackets only
+    if _ALL_PUNCT_RE.match(stripped):
+        return "punct_only"
+
+    # Doubled wake words: "hey atom hey atom hey atom"
+    if _DOUBLED_WAKE_RE.match(stripped):
+        return f"doubled_wake:{stripped[:40]}"
+
+    # Whisper hallucination corpus
+    for pat in _HALLUCINATION_PHRASES:
+        if pat.search(stripped):
+            return f"hallucination:{pat.pattern[:30]}"
+
+    # Pure non-Latin transcription on an English-configured pipeline.
+    # A Hindi / Hinglish phrase typed in Devanagari is rare and almost
+    # always a Whisper noise hallucination — Boss types Hinglish in
+    # Latin script. We allow short non-Latin tokens mixed with Latin
+    # words; pure-CJK / pure-Cyrillic finals are rejected.
+    if (language or "en").lower().startswith("en"):
+        non_latin = _NON_LATIN_RE.findall(stripped)
+        latin_words = _LATIN_WORD_RE.findall(stripped)
+        if non_latin and not latin_words:
+            return f"non_latin_only:{stripped[:40]}"
+
+    return None
 
 
 def _whisperkit_cli_path() -> str | None:
@@ -233,6 +391,21 @@ class WhisperKitSTT:
         self._noise_floor_dbfs: float = float(
             self._config.get("noise_floor_dbfs", -55.0),
         )
+        self._noise_gate_consecutive: int = max(
+            1, int(self._config.get("noise_gate_consecutive", 5)),
+        )
+        self._noise_gate_below_count: int = 0
+        self._noise_gate_dropped_total: int = 0
+        self._speech_candidate_floor_dbfs: float = float(
+            self._config.get(
+                "speech_candidate_floor_dbfs",
+                max(-42.0, self._noise_floor_dbfs + 3.0),
+            ),
+        )
+        self._min_utterance_ms: int = max(
+            _MIN_UTTERANCE_MS,
+            int(float(self._config.get("min_audio_duration_s", 0.42)) * 1000),
+        )
         self.mic_name: str = "sounddevice (PortAudio/CoreAudio)"
 
         # State
@@ -254,6 +427,7 @@ class WhisperKitSTT:
         self._last_speech_candidate_time: float = 0.0
         self._permanently_disabled: bool = False
         self._http_session: Any = None  # urllib3 / requests if available
+        self._output_muted_until: float = 0.0
 
         # Audio + VAD ring
         self._ring_lock = threading.Lock()
@@ -271,6 +445,22 @@ class WhisperKitSTT:
         # Echo guard + WhisperConfirmer (parity with WhisperSTT)
         self._echo_guard: Callable[[str], bool] | None = None
         self._whisper_confirmer: Any = None
+
+    def _clear_utterance_buffers(self) -> None:
+        self._utterance_frames.clear()
+        self._silence_frames = 0
+        self._utterance_started_at = 0.0
+        self._last_partial_emit_at = 0.0
+        self._last_partial = ""
+
+    def _is_output_muted(self) -> bool:
+        try:
+            from core.state_manager import AtomState
+            if self._state.current is AtomState.SPEAKING:
+                return True
+        except Exception:
+            pass
+        return time.monotonic() < self._output_muted_until
 
     # ── public properties ───────────────────────────────────────
 
@@ -346,20 +536,41 @@ class WhisperKitSTT:
             )
             return False
 
-    async def async_preload(self) -> None:
+    async def async_preload(self) -> bool:
         loop = asyncio.get_running_loop()
-        await loop.run_in_executor(None, self.preload)
+        return bool(await loop.run_in_executor(None, self.preload))
 
     # ── serve lifecycle ─────────────────────────────────────────
 
     def _maybe_start_serve(self) -> None:
         """Launch ``whisperkit-cli serve`` if not already running."""
         if _port_is_open(self._serve_host, self._serve_port):
-            logger.info(
-                "WhisperKit: serve already up on %s:%d -- attaching",
+            if self._serve_health_ok(timeout_s=0.5):
+                logger.info(
+                    "WhisperKit: healthy serve already up on %s:%d -- attaching",
+                    self._serve_host, self._serve_port,
+                )
+                return
+            logger.warning(
+                "WhisperKit: port %s:%d is bound but /health is unhealthy; "
+                "reaping stale whisperkit-cli before launch",
                 self._serve_host, self._serve_port,
             )
-            return
+            if not self._reap_stale_serve_on_port():
+                raise RuntimeError(
+                    f"WhisperKit port {self._serve_host}:{self._serve_port} "
+                    "is bound by an unhealthy non-owned process"
+                )
+            deadline = time.monotonic() + 3.0
+            while time.monotonic() < deadline:
+                if not _port_is_open(self._serve_host, self._serve_port):
+                    break
+                time.sleep(0.1)
+            if _port_is_open(self._serve_host, self._serve_port):
+                raise RuntimeError(
+                    f"WhisperKit stale serve on {self._serve_host}:"
+                    f"{self._serve_port} did not release its port"
+                )
         if self._cli_path is None:
             raise RuntimeError("whisperkit-cli not available")
 
@@ -396,6 +607,73 @@ class WhisperKitSTT:
             raise RuntimeError(
                 f"whisperkit-cli not executable at {self._cli_path}",
             ) from exc
+
+    def _serve_health_ok(self, *, timeout_s: float = 1.0) -> bool:
+        import urllib.request
+
+        health_url = f"http://{self._serve_host}:{self._serve_port}/health"
+        try:
+            with urllib.request.urlopen(health_url, timeout=timeout_s) as resp:
+                return bool(resp.status == 200)
+        except Exception:
+            return False
+
+    def _reap_stale_serve_on_port(self) -> bool:
+        """Terminate stale whisperkit-cli listeners that block our port."""
+        try:
+            proc = subprocess.run(
+                [
+                    "lsof",
+                    "-ti",
+                    f"TCP:{self._serve_port}",
+                    "-sTCP:LISTEN",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=2.0,
+                check=False,
+            )
+        except Exception:
+            logger.debug("WhisperKit: lsof port lookup failed", exc_info=True)
+            return False
+
+        pids = [p.strip() for p in proc.stdout.splitlines() if p.strip()]
+        if not pids:
+            return False
+
+        reaped = False
+        for pid_s in pids:
+            try:
+                pid = int(pid_s)
+            except ValueError:
+                continue
+            try:
+                ps = subprocess.run(
+                    ["ps", "-p", str(pid), "-o", "command="],
+                    capture_output=True,
+                    text=True,
+                    timeout=2.0,
+                    check=False,
+                )
+                command = ps.stdout.strip()
+            except Exception:
+                logger.debug("WhisperKit: ps lookup failed for pid=%s", pid)
+                continue
+            if "whisperkit-cli" not in command:
+                logger.warning(
+                    "WhisperKit: refusing to kill non-WhisperKit listener pid=%s cmd=%r",
+                    pid, command[:160],
+                )
+                continue
+            try:
+                os.kill(pid, signal.SIGTERM)
+                reaped = True
+                logger.warning("WhisperKit: terminated stale serve pid=%s", pid)
+            except ProcessLookupError:
+                reaped = True
+            except Exception:
+                logger.debug("WhisperKit: SIGTERM failed for pid=%s", pid, exc_info=True)
+        return reaped
 
     def _wait_for_serve_ready(self) -> None:
         # Sprint Ω.6.A (Apr 26 2026): two-stage readiness check.
@@ -638,15 +916,15 @@ class WhisperKitSTT:
             data = bytes(indata)
             if not data:
                 return
+            samples = _np.frombuffer(data, dtype=_np.int16) if _np else None
+            rms_db: float | None = None
+            if samples is not None and samples.size:
+                rms_db = self._rms_db_from_int16(samples)
+                self._last_audio_rms_db = rms_db
+            if self._noise_gate_blocks(rms_db):
+                return
             with self._ring_lock:
                 self._ring.append(data)
-            samples = _np.frombuffer(data, dtype=_np.int16) if _np else None
-            if samples is not None and samples.size:
-                rms = float(_np.sqrt(_np.mean(samples.astype(_np.float32) ** 2)))
-                if rms > 0.0:
-                    self._last_audio_rms_db = 20.0 * (
-                        _np.log10(max(rms, 1.0) / 32768.0)
-                    )
             wc = self._whisper_confirmer
             if (
                 wc is not None
@@ -696,7 +974,8 @@ class WhisperKitSTT:
                 self._utterance_frames.append(frame)
                 self._silence_frames = 0
                 self._last_speech_time = now
-                self._last_speech_candidate_time = now
+                if self._last_audio_rms_db >= self._speech_candidate_floor_dbfs:
+                    self._last_speech_candidate_time = now
             elif self._utterance_frames:
                 self._utterance_frames.append(frame)
                 self._silence_frames += 1
@@ -734,11 +1013,36 @@ class WhisperKitSTT:
         if not self._utterance_frames:
             return ""
         duration_ms = len(self._utterance_frames) * _FRAME_MS
-        if duration_ms < _MIN_UTTERANCE_MS and not force:
+        if duration_ms < self._min_utterance_ms:
             return ""
         text = self._transcribe(self._utterance_frames, partial=False)
         self._reset_utterance_state()
         return text
+
+    def _noise_gate_blocks(self, rms_db: float | None) -> bool:
+        if self._noise_floor_dbfs <= -96.0:
+            return False
+        if rms_db is None or rms_db >= self._noise_floor_dbfs:
+            self._noise_gate_below_count = 0
+            return False
+        self._noise_gate_below_count += 1
+        if self._noise_gate_below_count >= self._noise_gate_consecutive:
+            self._noise_gate_dropped_total += 1
+            return True
+        return False
+
+    @staticmethod
+    def _rms_db_from_int16(samples: Any) -> float:
+        try:
+            arr = samples.astype(_np.float32) if _np is not None else None
+            if arr is None or not getattr(arr, "size", 0):
+                return -96.0
+            rms = float(_np.sqrt(_np.mean(arr ** 2)))
+            if rms < 1.0:
+                return -96.0
+            return 20.0 * float(_np.log10(rms / 32768.0))
+        except Exception:
+            return -96.0
 
     def _transcribe(self, frames: list[bytes], *, partial: bool) -> str:
         """POST PCM bytes to whisperkit-cli serve and return text."""
@@ -814,6 +1118,21 @@ class WhisperKitSTT:
                             "OwnerProfile post-correct hook raised",
                             exc_info=True,
                         )
+                text = _normalize_atom_final_text(text)
+                if not text:
+                    return ""
+                if _ATOM_DIAGNOSTIC_AUDIO_RE.search(text):
+                    logger.warning(
+                        "WhisperKitSTT: rejected ATOM diagnostic self-input: '%s'",
+                        text[:120],
+                    )
+                    return ""
+                if _ATOM_SELF_SPEECH_RE.search(text):
+                    logger.info(
+                        "WhisperKitSTT: rejected ATOM self-speech final: '%s'",
+                        text[:120],
+                    )
+                    return ""
             return text
         except Exception:
             logger.exception("WhisperKitSTT transcribe raised")
@@ -935,6 +1254,20 @@ class WhisperKitSTT:
     # ── emit helpers (duck-compatible with NativeSTT/WhisperSTT) ─
 
     def _emit_partial(self, text: str) -> None:
+        if self._is_output_muted():
+            return
+        if _ATOM_SELF_SPEECH_RE.search(text or ""):
+            logger.debug(
+                "WhisperKitSTT: suppressed self-speech partial: '%s'",
+                (text or "")[:120],
+            )
+            return
+        if _ATOM_DIAGNOSTIC_AUDIO_RE.search(text or ""):
+            logger.debug(
+                "WhisperKitSTT: suppressed diagnostic partial: '%s'",
+                (text or "")[:120],
+            )
+            return
         if self._echo_guard is not None:
             try:
                 if self._echo_guard(text):
@@ -953,6 +1286,47 @@ class WhisperKitSTT:
             logger.debug("emit speech_partial raised", exc_info=True)
 
     def _emit_final(self, text: str) -> None:
+        text = _normalize_atom_final_text(text)
+        if not text:
+            return
+        # Sprint Ω.8 R6: drop common Whisper hallucination + stage-
+        # direction / non-Latin garbage finals before they hit the
+        # brain. atomCurrentLogs.txt L371, L467, L509 are textbook
+        # examples ("*spray the door*", "Продолжение следует...",
+        # bare asterisks). Cheap; runs only on finals.
+        garbage = _is_stt_garbage(
+            text, language=getattr(self, "_language", "en"),
+        )
+        if garbage is not None:
+            logger.info(
+                "WhisperKitSTT: dropped garbage final (%s): '%s'",
+                garbage, (text or "")[:120],
+            )
+            try:
+                self._bus.emit_fast(
+                    "metrics_event", counter="stt_garbage_dropped",
+                )
+            except Exception:
+                pass
+            return
+        if self._is_output_muted():
+            logger.info(
+                "WhisperKitSTT: dropped final during TTS tail mute: '%s'",
+                (text or "")[:120],
+            )
+            return
+        if _ATOM_SELF_SPEECH_RE.search(text or ""):
+            logger.info(
+                "WhisperKitSTT: dropped self-speech final before routing: '%s'",
+                (text or "")[:120],
+            )
+            return
+        if _ATOM_DIAGNOSTIC_AUDIO_RE.search(text or ""):
+            logger.warning(
+                "WhisperKitSTT: dropped diagnostic final before routing: '%s'",
+                (text or "")[:120],
+            )
+            return
         if self._echo_guard is not None:
             try:
                 if self._echo_guard(text):
@@ -1032,6 +1406,29 @@ class WhisperKitSTT:
 
     # ── public attach surface (parity with NativeSTT/WhisperSTT) ─
 
+    async def on_state_changed(self, old: Any = None, new: Any = None, **_kw: Any) -> None:
+        try:
+            new_value = getattr(new, "value", str(new)).lower()
+            old_value = getattr(old, "value", str(old)).lower()
+            if new_value == "speaking":
+                self._clear_utterance_buffers()
+                return
+            if old_value == "speaking":
+                self._clear_utterance_buffers()
+                self._output_muted_until = max(
+                    self._output_muted_until,
+                    time.monotonic() + 1.2,
+                )
+        except Exception:
+            logger.debug("WhisperKitSTT.on_state_changed raised", exc_info=True)
+
+    async def on_tts_complete(self, **_kw: Any) -> None:
+        self._clear_utterance_buffers()
+        self._output_muted_until = max(
+            self._output_muted_until,
+            time.monotonic() + 1.2,
+        )
+
     def attach_echo_guard(
         self, guard: Callable[[str], bool] | None,
     ) -> None:
@@ -1067,6 +1464,8 @@ class WhisperKitSTT:
             ),
             "tap_buffer_count": self._tap_buffer_count,
             "last_audio_rms_db": round(self._last_audio_rms_db, 1),
+            "noise_floor_dbfs": round(self._noise_floor_dbfs, 1),
+            "noise_gate_dropped_total": self._noise_gate_dropped_total,
             "since_last_speech_s": (
                 round(now - self._last_speech_time, 1)
                 if self._last_speech_time else None

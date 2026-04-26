@@ -247,6 +247,48 @@ INFO | MLX [optimal/fast]: 3549ms, 9 tokens, peak 5.22GB
 
 ---
 
+## PB-13 · WhisperKit port bound but `/health` unhealthy → STT never ready
+
+**Symptom**
+```
+WARNING | WhisperKit: port 127.0.0.1:50060 is bound but /health is unhealthy; reaping stale whisperkit-cli before launch
+WARNING | WhisperKitSTT preload failed: WhisperKit port 127.0.0.1:50060 is bound by an unhealthy non-owned process
+RuntimeError: WhisperKit port 127.0.0.1:50060 is bound by an unhealthy non-owned process
+WARNING | STT preload did not become ready (8789ms); voice input remains unavailable until restart succeeds
+WARNING | STT not ready after preload; ATOM running without reliable voice input
+```
+
+**Root cause** A previous ATOM (or another `whisperkit-cli serve` invocation) crashed without releasing its listening socket, or a non-WhisperKit process is squatting on `50060`. `_reap_stale_serve_on_port()` refuses to kill processes whose `ps -o command=` does not contain `whisperkit-cli`, so the preload raises and STT never arms.
+
+**Fix sites**
+1. `voice/stt_whisperkit.py` — `_maybe_start_serve()` must:
+   - Reap stale `whisperkit-cli` listeners (already wired).
+   - When the squatter is **not** WhisperKit, fall back to a free port from a configured range (`stt.whisperkit.port_fallback: [50061, 50062, 50063]`) instead of raising. Update `self._serve_port` and proceed with launch.
+2. `voice/stt_whisperkit.py` — on every successful preload, write the bound port + PID to a runtime sidecar (`data/runtime/whisperkit.pid`) so a clean shutdown / next boot can SIGTERM the previous owner before binding.
+3. `main.py` — STT preload must surface the failure mode in the boot timeline log, not just "preload did not become ready". The owner needs to see "WhisperKit port squatted by non-owned process" to act.
+4. Owner-side recovery: `lsof -nP -iTCP:50060 -sTCP:LISTEN` → identify squatter → `kill -TERM <pid>` (only if it is WhisperKit or a known dev process). Never auto-kill unknown listeners.
+
+**Verification** Boot log shows `WhisperKitSTT preloaded (model=…, serve=127.0.0.1:50060, vad=3)` within ~6 s. `STT ready -- ATOM fully operational` appears before the boot greeting completes. Scorecard `stt ready` < 6 000 ms.
+
+---
+
+## PB-14 · Ambient noise (AC, drops, keyboard, distant voices) routed as input
+
+**Symptom** ATOM responds without the owner speaking. STT finalizes 1–3 word "ghost" phrases (`"you"`, `"uh huh"`, `"okay"`, `"thank you"`) during quiet periods or while ATOM itself is speaking.
+
+**Root cause** Without a hard RMS gate, low-energy ambient frames flow into `webrtcvad` and the recognizer's internal turn-taker. Once enough sub-floor frames accumulate, WhisperKit/SFSpeechRecognizer promote them to a near-empty hypothesis and `_emit_final` routes them to the LLM.
+
+**Fix sites**
+1. `voice/stt_whisperkit.py` — `_audio_callback` computes RMS dBFS and calls `_noise_gate_blocks(rms_db)` before pushing the frame into the VAD ring buffer. Hysteresis-free: `noise_gate_consecutive` consecutive frames below `noise_floor_dbfs` close the gate; the first supra-floor frame reopens it.
+2. `voice/stt_macos.py` — same `_noise_gate_blocks()` is wired into both the AVAudioEngine tap and the sounddevice callback path.
+3. `config/settings.json` — sane room defaults: `stt.noise_floor_dbfs: -45.0`, `stt.noise_gate_consecutive: 3`, `stt.speech_candidate_floor_dbfs: -42.0`, `stt.min_audio_duration_s: 0.55`, `stt.whisper_vad_aggressiveness: 3`. Owners on noisier mics may go to `-40.0`; quiet booth users may relax to `-55.0`.
+4. `voice/stt_whisperkit.py` — `_min_utterance_ms` honors `stt.min_audio_duration_s`. Anything shorter is treated as a fragment and dropped.
+5. macOS native voice processing (`stt.native_voice_processing: true`) must remain enabled — it provides AEC + noise suppression at the CoreAudio layer, complementing our gate.
+
+**Verification** `WhisperKitSTT.get_diagnostics()` reports `noise_gate_dropped_total > 0` after a quiet session. No `speech_final` events while the owner is silent. Tests: `tests/test_stt_whisperkit_launch.py::test_noise_gate_blocks_quiet_whisperkit_frames` and the macOS counterpart in `tests/test_stt_noise_gate.py` must pass.
+
+---
+
 ## Adding a new playbook
 
 When you solve a novel symptom, append here with the same 5 fields. Next session saves 2+ hours of re-discovery. Commit message: `docs(skill): add playbook PB-NN for <symptom>`.

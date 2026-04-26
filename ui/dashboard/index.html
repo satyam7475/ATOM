@@ -171,6 +171,42 @@ html,body{
 }
 .response-line::-webkit-scrollbar{display:none;}
 
+.live-os-panel{
+  width:min(92vw,760px);margin-top:18px;
+  display:grid;grid-template-columns:160px minmax(0,1fr);gap:12px;
+}
+.camera-card,.turn-card{
+  border:1px solid rgba(129,140,248,0.14);
+  background:linear-gradient(180deg,rgba(129,140,248,0.08),rgba(4,4,10,0.42));
+  border-radius:18px;box-shadow:0 18px 60px rgba(0,0,0,0.22);
+  backdrop-filter:blur(18px);overflow:hidden;
+}
+.camera-card{height:124px;position:relative;}
+.camera-card video{
+  width:100%;height:100%;object-fit:cover;transform:scaleX(-1);
+  filter:saturate(1.05) contrast(1.05);
+}
+.camera-status{
+  position:absolute;left:10px;bottom:8px;
+  font-family:var(--font-mono);font-size:9px;letter-spacing:0.08em;
+  color:rgba(240,240,244,0.84);text-shadow:0 1px 8px rgba(0,0,0,0.8);
+}
+.turn-card{padding:12px 14px;text-align:left;min-height:124px;}
+.turn-title{
+  font-family:var(--font-mono);font-size:9px;letter-spacing:0.16em;
+  color:var(--text-muted);text-transform:uppercase;margin-bottom:8px;
+}
+.turn-row{margin-top:8px;}
+.turn-label{
+  font-family:var(--font-mono);font-size:9px;letter-spacing:0.14em;
+  color:var(--accent);text-transform:uppercase;margin-bottom:4px;
+}
+.turn-text{
+  min-height:20px;line-height:1.45;color:var(--text);
+  overflow:hidden;display:-webkit-box;line-clamp:2;-webkit-line-clamp:2;-webkit-box-orient:vertical;
+}
+.turn-text.muted{color:var(--text-muted);}
+
 .thinking-bar-wrap{
   width:140px;height:2px;background:rgba(255,255,255,0.06);
   border-radius:1px;margin:8px auto 0;overflow:hidden;
@@ -245,6 +281,8 @@ html,body{
   .orb-wrap{width:180px;height:180px;}
   .state-label{font-size:12px;letter-spacing:4px;}
   .heard-line,.response-line{font-size:13px;}
+  .live-os-panel{grid-template-columns:1fr;width:min(92vw,420px);}
+  .camera-card{height:150px;}
   .sys-strip{display:none;}
 }
 </style>
@@ -285,6 +323,24 @@ html,body{
       <div class="response-line" id="responseLine"></div>
       <div class="thinking-bar-wrap" id="thinkingWrap">
         <div class="thinking-bar-fill" id="thinkingBar" style="width:0%"></div>
+      </div>
+    </div>
+
+    <div class="live-os-panel" aria-label="Live owner and turn view">
+      <div class="camera-card">
+        <video id="ownerCamera" autoplay playsinline muted></video>
+        <div class="camera-status" id="cameraStatus">CAMERA STANDBY</div>
+      </div>
+      <div class="turn-card">
+        <div class="turn-title">REAL-TIME OWNER CHANNEL</div>
+        <div class="turn-row">
+          <div class="turn-label">FINAL INPUT</div>
+          <div class="turn-text muted" id="finalInputLine">Waiting for Boss...</div>
+        </div>
+        <div class="turn-row">
+          <div class="turn-label">ATOM RESPONSE</div>
+          <div class="turn-text muted" id="finalResponseLine">No response yet.</div>
+        </div>
       </div>
     </div>
 
@@ -462,6 +518,10 @@ const WS='ws://'+location.host+'/ws';
 let ws;
 let atomState=null;
 let bootSplashEnabled=true;
+let lastFinalInput='';
+let lastSpokenText='';
+let awaitingResponse=false;
+let acceptedLiveTurn=false;
 
 function dismissJarvisBoot(){
   const el=$('jarvisBoot');
@@ -521,6 +581,47 @@ function showResponse(text){
   el.textContent=clip(text,400);
   el.scrollTop=el.scrollHeight;
 }
+function setTurnInput(text){
+  const val=clip(text,220);
+  const el=$('finalInputLine');
+  if(!el)return;
+  el.textContent=val||'Waiting for Boss...';
+  el.classList.toggle('muted',!val);
+}
+function setTurnResponse(text){
+  const val=clip(text,260);
+  const el=$('finalResponseLine');
+  if(!el)return;
+  el.textContent=val||'Waiting for ATOM...';
+  el.classList.toggle('muted',!val);
+}
+function clearLiveTurn(){
+  lastFinalInput='';
+  lastSpokenText='';
+  awaitingResponse=false;
+  showHeard('');
+  showResponse('');
+  setTurnInput('');
+  setTurnResponse('');
+}
+
+async function startOwnerCamera(){
+  const video=$('ownerCamera'),status=$('cameraStatus');
+  if(!video||!navigator.mediaDevices||!navigator.mediaDevices.getUserMedia){
+    if(status)status.textContent='CAMERA UNAVAILABLE';
+    return;
+  }
+  try{
+    const stream=await navigator.mediaDevices.getUserMedia({
+      video:{facingMode:'user',width:{ideal:640},height:{ideal:480}},
+      audio:false
+    });
+    video.srcObject=stream;
+    if(status)status.textContent='MACBOOK CAMERA LIVE';
+  }catch(e){
+    if(status)status.textContent='CAMERA PERMISSION NEEDED';
+  }
+}
 
 /* ── System ────────────────────────────── */
 function updateSystem(d){
@@ -560,7 +661,7 @@ function syncVoiceRibbon(lc,v){
   else hint.textContent='ALWAYS-ON MIC — SPEAK NATURALLY';
 }
 
-function syncVoiceHealthStrip(lc,v,mode){
+function syncVoiceHealthStrip(lc,v,mode,exec){
   const eng=String(v.stt_engine||'');
   const elow=eng.toLowerCase();
   const sttReady=!!eng&&!elow.includes('disabled')&&elow!=='unavailable'&&!elow.includes('voice input unavailable');
@@ -580,7 +681,7 @@ function syncVoiceHealthStrip(lc,v,mode){
   const tier=String(mode.product_tier||'—');
   const cloud=mode.cloud_enabled===false?'local-only':'cloud OK';
   const lat=(v.perceived_latency_ms!=null&&v.perceived_latency_ms!=='')?(' · '+Math.round(Number(v.perceived_latency_ms))+'ms'):'';
-  const intent=exec.last_intent?(' · '+clipStr(String(exec.last_intent),28)):'';
+  const intent=(exec&&exec.last_intent)?(' · '+clipStr(String(exec.last_intent),28)):'';
   $('vhTier').textContent='Tier: '+tier+' · '+cloud+lat+intent;
   const errLine=v.error?('Err: '+clipStr(v.error,120)):'';
   $('vhErr').textContent=errLine;
@@ -597,7 +698,6 @@ function renderAtomState(){
   const exec=atomState.execution||{};
   const v=atomState.voice||{};
   const mode=atomState.mode||{};
-  const reason=atomState.reasoning||{};
 
   if(lc.state)setAppState(String(lc.state||'idle'),String(lc.label||'IDLE'),String(lc.status||''));
 
@@ -612,21 +712,56 @@ function renderAtomState(){
 
   setPerfUI(mode.effective||curPerfActive);
   syncVoiceRibbon(lc,v);
-  syncVoiceHealthStrip(lc,v,mode);
+  syncVoiceHealthStrip(lc,v,mode,exec);
+
+  const finalText=v.last_final||exec.last_query||'';
+  if(finalText&&finalText!==lastFinalInput){
+    lastFinalInput=finalText;
+    awaitingResponse=true;
+    setTurnInput(finalText);
+    setTurnResponse('');
+    showResponse('');
+  }
 
   const activeTask=exec.active_task||exec.label||exec.last_query||'';
   if(activeTask&&lc.state==='thinking')showHeard(activeTask);
 
-  const spoken=v.last_spoken||reason.last_report||'';
-  if(spoken)showResponse(spoken);
+  const spoken=v.last_spoken||'';
+  if(spoken&&acceptedLiveTurn&&spoken!==lastSpokenText){
+    lastSpokenText=spoken;
+    awaitingResponse=false;
+    showResponse(spoken);
+    setTurnResponse(spoken);
+  }else if(spoken&&acceptedLiveTurn&&!awaitingResponse){
+    showResponse(spoken);
+    setTurnResponse(spoken);
+  }
 
   const hearPrev=v.last_partial||'';
   if(hearPrev)showHeard(hearPrev);
 }
 
 /* ── State management ──────────────────── */
-function applySnapshot(s){atomState=deepClone(s||{});renderAtomState();}
-function applyDiff(d){if(!atomState)atomState={};deepMerge(atomState,d||{});renderAtomState();}
+function applySnapshot(s){
+  atomState=deepClone(s||{});
+  if(atomState.voice){
+    atomState.voice.last_partial='';
+    atomState.voice.last_final='';
+    atomState.voice.last_spoken='';
+  }
+  if(atomState.execution){
+    atomState.execution.last_query='';
+    atomState.execution.active_task='';
+  }
+  clearLiveTurn();
+  renderAtomState();
+}
+function applyDiff(d){
+  if(!atomState)atomState={};
+  acceptedLiveTurn=true;
+  deepMerge(atomState,d||{});
+  renderAtomState();
+}
 
 /* ── WebSocket ─────────────────────────── */
 function connect(){
@@ -697,6 +832,7 @@ function connect(){
   ws.onerror=()=>ws.close();
 }
 connect();
+startOwnerCamera();
 setTimeout(()=>{if($('jarvisBoot')&&!$('jarvisBoot').classList.contains('done'))dismissJarvisBoot();},3200);
 
 tickClock();

@@ -4,7 +4,7 @@ Pins five behaviours so the live-log defects (atomLogs.txt L419, L453)
 do not regress:
 
 1. "Can you see me" / "look at me" / "describe me" route to
-   ``vision_describe`` (camera + on-device VLM) and never fall through
+   ``vision_look`` (fast camera/face path) and never fall through
    to the LLM.
 2. "What do you see" routes to ``vision_look`` (face count, fastest
    path on the Neural Engine) so casual glances stay sub-300 ms.
@@ -48,11 +48,11 @@ from core.intent_engine import vision_intents
         "could you look at me please",
     ],
 )
-def test_see_me_routes_to_vision_describe(phrase: str) -> None:
+def test_see_me_routes_to_vision_look(phrase: str) -> None:
     result = vision_intents.check(phrase)
     assert result is not None, f"vision_intents missed: {phrase!r}"
-    assert result.intent == "vision_describe"
-    assert result.action == "vision_describe"
+    assert result.intent == "vision_look"
+    assert result.action == "vision_look"
     assert result.confidence >= 0.9
 
 
@@ -131,11 +131,11 @@ def test_unrelated_phrases_are_not_caught(phrase: str) -> None:
 # ── full IntentEngine integration ────────────────────────────────
 
 
-def test_engine_classifies_see_me_as_vision_describe() -> None:
+def test_engine_classifies_see_me_as_vision_look() -> None:
     engine = IntentEngine()
     result = engine.classify("can you see me")
-    assert result.action == "vision_describe"
-    assert result.intent == "vision_describe"
+    assert result.action == "vision_look"
+    assert result.intent == "vision_look"
 
 
 def test_engine_classifies_screen_phrase_as_screen_describe() -> None:
@@ -159,7 +159,7 @@ def test_engine_does_not_mistake_play_music_for_vision() -> None:
 
 
 def test_quick_match_returns_intent_names() -> None:
-    assert vision_intents.quick_match("can you see me") == "vision_describe"
+    assert vision_intents.quick_match("can you see me") == "vision_look"
     assert vision_intents.quick_match("what do you see") == "vision_look"
     assert vision_intents.quick_match("describe my screen") == "screen_describe"
     assert vision_intents.quick_match("xyz nonsense") is None

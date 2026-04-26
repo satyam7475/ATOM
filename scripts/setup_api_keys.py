@@ -115,14 +115,25 @@ def validate_api_key(api_key: str) -> Tuple[bool, str]:
     if api_key.startswith("AIza") and len(api_key) > 30:
         return True, f"✅ Valid Gemini key format (length: {len(api_key)})"
     
-    # Claude keys
-    if api_key.startswith("sk-") and len(api_key) > 30:
+    # Groq keys start with "gsk_"
+    if api_key.startswith("gsk_") and len(api_key) > 30:
+        return True, f"✅ Valid Groq key format (length: {len(api_key)})"
+
+    # NVIDIA NIM keys start with "nvapi-"
+    if api_key.startswith("nvapi-") and len(api_key) > 30:
+        return True, f"✅ Valid NVIDIA NIM key format (length: {len(api_key)})"
+
+    # Cerebras keys start with "csk-"
+    if api_key.startswith("csk-") and len(api_key) > 20:
+        return True, f"✅ Valid Cerebras key format (length: {len(api_key)})"
+
+    # Claude keys (Anthropic) and OpenAI both use "sk-"; we report
+    # Anthropic first since both prefixes overlap.
+    if api_key.startswith("sk-ant-") and len(api_key) > 30:
         return True, f"✅ Valid Anthropic key format (length: {len(api_key)})"
-    
-    # OpenAI keys
     if api_key.startswith("sk-") and len(api_key) > 30:
         return True, f"✅ Valid OpenAI key format (length: {len(api_key)})"
-    
+
     return False, f"⚠️  Warning: Unexpected API key format"
 
 
@@ -207,6 +218,9 @@ def setup_api_keys(master_password: str) -> bool:
     credentials_to_setup = [
         ("Gemini 1.5 Flash (Fast)", "gemini_fast", "GEMINI_FAST_API_KEY"),
         ("Gemini 2.0 Pro (Powerful)", "gemini_pro", "GEMINI_PRO_API_KEY"),
+        ("Groq (Llama 3.x via LPU)", "groq", "GROQ_API_KEY"),
+        ("NVIDIA NIM (build.nvidia.com)", "nvidia", "NVIDIA_API_KEY"),
+        ("Cerebras Cloud (Llama 3.3 70B)", "cerebras", "CEREBRAS_API_KEY"),
     ]
     
     for display_name, cred_id, env_var in credentials_to_setup:

@@ -283,7 +283,7 @@ class VoicePipeline:
             attach = getattr(stt, "attach_echo_guard", None)
             is_echo = getattr(tts, "is_echo", None)
             if callable(attach) and callable(is_echo):
-                attach(lambda text: bool(is_echo(text, window_s=12.0)))
+                attach(lambda text: bool(is_echo(text, window_s=30.0)))
                 logger.info("Voice pipeline: echo guard wired (TTS.is_echo -> STT finalization)")
         except Exception:
             logger.debug("echo guard wiring failed", exc_info=True)

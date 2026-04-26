@@ -105,6 +105,13 @@ _RE_NUMBERED = re.compile(r'^\s*\d+\.\s+', re.MULTILINE)
 _RE_BLOCKQUOTE = re.compile(r'^\s*>\s+', re.MULTILINE)
 _RE_TRANSCRIPT_LABEL = re.compile(r"\b(?:User|Boss|ATOM|Assistant):\s*", re.I)
 _RE_TRANSCRIPT_ONLY = re.compile(r"^(?:(?:User|Boss|ATOM|Assistant)\s*:?\s*)+$", re.I)
+_RE_INTERNAL_TTS_LINE = re.compile(
+    r"^\s*(?:\[?\s*system\s*\]?\s+initiating\s+system\s+diagnostics|"
+    r"atom\.?\s*local\s*brain|atom\.?\s*localbrain|"
+    r"system\s+is\s+degraded\s*,?\s+boss\.\s+issues?:\s*"
+    r".*readiness\s+checks?)\s*\.?\s*$",
+    re.I,
+)
 
 _RE_SENTENCE_SPLIT = re.compile(r'(?<=[.!?])\s+')
 # First grammatically complete sentence at buffer start (non-greedy up to first . ! ?)
@@ -126,6 +133,12 @@ ACK_PHRASES = [
 
 def _clean_for_tts(text: str) -> str:
     """Strip markdown so the synthesizer speaks clean prose."""
+    if _RE_INTERNAL_TTS_LINE.search(text or ""):
+        return ""
+    text = "\n".join(
+        line for line in str(text or "").splitlines()
+        if not _RE_INTERNAL_TTS_LINE.search(line)
+    )
     text = _RE_CODE_BLOCK.sub('', text)
     text = _RE_INLINE_CODE.sub(r'\1', text)
     text = _RE_BOLD.sub(r'\1', text)
@@ -648,8 +661,21 @@ class _NativeSynth:
         word_count = max(1, len(text.split()))
         effective_rate = max(60.0, float(self._rate or 180.0))
         est_finish_s = word_count / (effective_rate / 60.0)
-        progress_deadline_slack_s = 3.0
-        progress_budget_s = max(4.0, est_finish_s * 3.0 + progress_deadline_slack_s)
+        progress_deadline_slack_s = 1.5
+        progress_budget_s = max(3.5, est_finish_s * 2.0 + progress_deadline_slack_s)
+        # Sprint Ω.8 (Apr 26 2026) R9: tighten the wedge cap from 6s
+        # → 4s for short utterances. atomCurrentLogs.txt L400 showed
+        # the synth pinned at "isSpeaking=True for 6.0s" on a 10-word
+        # 2-sentence reply that should have finished in ~3s. Waiting
+        # the full 6s blocked Boss from getting a fallback ``say``
+        # voice — by the time we bailed and forked ``say``, ATOM had
+        # been silent for more than 9s. 4s is still well above the
+        # estimated finish time for any utterance ≤ 12 words at
+        # default 193 wpm, so we won't false-trigger on healthy synth.
+        if word_count <= 12:
+            progress_budget_s = min(progress_budget_s, 4.0)
+        elif word_count <= 24:
+            progress_budget_s = min(progress_budget_s, 6.5)
         speaking_since: float = 0.0
 
         ever_speaking = False
@@ -1108,7 +1134,11 @@ class MacOSTTSAsync:
             currently_speaking = False
         effective_window = float(window_s)
         if not currently_speaking:
-            effective_window = min(effective_window, 4.0)
+            # WhisperKit can return delayed finals several seconds after ATOM
+            # finishes speaking. Keep the caller's window so finalization can
+            # still reject our own previous sentence instead of treating it as
+            # Boss input.
+            effective_window = max(4.0, effective_window)
         if elapsed_since_speech > max(0.5, effective_window):
             return False
         key = self._chunk_key(partial_text)
@@ -1260,6 +1290,12 @@ class MacOSTTSAsync:
         """Apply word-cap + duplicate filtering, then speak one slice."""
         speak_text, overflow_text = self._split_stream_chunk(raw_segment)
         if speak_text and not self._cancel_requested:
+            if _RE_INTERNAL_TTS_LINE.search(speak_text):
+                logger.warning(
+                    "TTS stream slice suppressed (internal-status guard): '%s'",
+                    speak_text[:100],
+                )
+                return
             if _is_prompt_leak(speak_text):
                 logger.warning(
                     "TTS stream slice suppressed (prompt-leak guard): '%s'",

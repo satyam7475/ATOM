@@ -114,7 +114,7 @@ class WakeWordFilter:
     Apple's SFSpeechRecognizer regularly renders "atom" as the nearest
     in-vocabulary English word — especially under the en-IN locale
     which has no "atom" as a common word. Observed mishearings include
-    "adam", "atum", "autumn", "atam", "adom". We therefore accept all
+    "adam", "atum", "autumn", "atam", "adom", "atan", and "adtan". We therefore accept all
     of these as equivalent to "atom" for wake purposes. The tradeoff is
     a small false-positive risk if the user addresses a real person
     named Adam within earshot; in a personal-assistant context that is
@@ -124,6 +124,7 @@ class WakeWordFilter:
 
     _ATOM_VARIANTS: tuple[str, ...] = (
         "atom", "adam", "atum", "autumn", "atam", "adom",
+        "atan", "adtan", "adton", "attom", "adum",
         "ottam", "autam", "odum", "aadam", "aatom", "atam",
     )
 

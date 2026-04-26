@@ -54,7 +54,7 @@
         "playground_dir": "ui/playground"
     },
     "screen_perception_loop": {
-        "enabled": true,
+        "enabled": false,
         "interval_s": 30.0,
         "pause_during_speech": true,
         "pause_during_listen": true,
@@ -106,7 +106,7 @@
         "degradation_checks_before_switch": 4,
         "voice_feedback": true,
         "prefer_device": null,
-        "vad_aggressiveness": 2,
+        "vad_aggressiveness": 3,
         "set_system_default": true,
         "debug_logging": false,
         "context_aware": true,
@@ -127,7 +127,7 @@
         "whisper_partial_interval_s": 0.4,
         "whisper_trailing_silence_s": 0.5,
         "whisper_max_utterance_s": 20.0,
-        "whisper_vad_aggressiveness": 2,
+        "whisper_vad_aggressiveness": 3,
         "bilingual": true,
         "sample_rate": 16000,
         "chunk_size": 2048,
@@ -149,7 +149,7 @@
             "min_silence_duration_ms": 220,
             "threshold": 0.32
         },
-        "min_audio_duration_s": 0.42,
+        "min_audio_duration_s": 0.55,
         "audio_buffer_frames": 2048,
         "native_stop_audio_delay_ms": 120,
         "voice_debug": false,
@@ -158,8 +158,9 @@
         "native_requires_on_device": true,
         "native_voice_processing": true,
         "native_tap_sample_rate": 0,
-        "noise_floor_dbfs": -55.0,
-        "noise_gate_consecutive": 5,
+        "noise_floor_dbfs": -45.0,
+        "noise_gate_consecutive": 3,
+        "speech_candidate_floor_dbfs": -42.0,
         "promotion_min_confidence": 0.50,
         "promotion_min_confidence_no_wake": 0.65,
         "passive_revert_delay_s": 30.0,
@@ -186,7 +187,7 @@
         "engine": "macos_native",
         "max_lines": 4,
         "macos_voice": "jarvis",
-        "macos_rate": 182,
+        "macos_rate": 205,
         "macos_first_word_warmup_ms": 140,
         "macos_tail_drain_ms": 120,
         "macos_tail_drain_bluetooth_ms": 200,
@@ -246,13 +247,13 @@
     },
     "brain": {
         "enabled": true,
-        "mlx_model": "models/qwen3-8b-4bit",
-        "mlx_model_fallback": "models/qwen3-8b-4bit",
-        "n_ctx": 4096,
+        "mlx_model": "models/qwen3-4b-instruct-4bit",
+        "mlx_model_fallback": "models/qwen3-4b-instruct-4bit",
+        "n_ctx": 6144,
         "n_threads": 4,
         "n_gpu_layers": -1,
         "n_batch": 256,
-        "max_tokens": 320,
+        "max_tokens": 384,
         "temperature": 0.6,
         "top_p": 0.85,
         "repeat_penalty": 1.1,
@@ -301,7 +302,7 @@
         "profiles": {
             "optimal": {
                 "max_tokens": 256,
-                "n_ctx": 4096,
+                "n_ctx": 6144,
                 "n_threads": 4,
                 "n_gpu_layers": -1,
                 "n_batch": 256,
@@ -381,7 +382,10 @@
         "watchdog_intent_boot_grace_s": 20.0,
         "watchdog_cache_timeout_ms": 200,
         "watchdog_rag_timeout_ms": 750,
-        "watchdog_llm_timeout_s": 14,
+        "watchdog_llm_timeout_s": 18,
+        "watchdog_llm_pressure_extend_threshold_pct": 80.0,
+        "watchdog_llm_pressure_extend_bonus_s": 8.0,
+        "watchdog_llm_pressure_extend_max_s": 28.0,
         "watchdog_tts_timeout_s": 15,
         "watchdog_tts_per_word_s": 0.5,
         "watchdog_tts_max_dynamic_s": 45,
@@ -404,18 +408,18 @@
     "cognitive_loop": {
         "enabled": true,
         "reflective": {
-            "enabled": true,
+            "enabled": false,
             "cooldown_s": 180.0,
             "min_user_chars": 5,
             "max_tokens": 160
         },
         "presence": {
-            "enabled": true,
+            "enabled": false,
             "interval_s": 60.0,
             "min_interval_s": 15.0
         },
         "scene": {
-            "enabled": true,
+            "enabled": false,
             "cooldown_s": 600.0,
             "significance_min_seconds": 60.0
         },
@@ -740,29 +744,71 @@
         "simulation_mode": "hybrid"
     },
     "cloud": {
-        "enabled": false,
-        "provider": "gemini",
+        "enabled": true,
+        "provider": "rotating",
+        "api_base": "https://api.groq.com/openai/v1",
+        "api_key_env": "GROQ_API_KEY",
         "use_secure_credentials": true,
-        "buddy_model": "gemini-2.5-flash",
-        "reasoning_model": "gemini-2.5-flash",
-        "deep_model": "gemini-2.5-pro",
+        "buddy_model": "llama-3.1-8b-instant",
+        "reasoning_model": "llama-3.3-70b-versatile",
+        "deep_model": "llama-3.3-70b-versatile",
         "timeout_seconds": 8,
         "timeout_reasoning_seconds": 30,
         "max_tokens": 1024,
-        "max_tokens_reasoning": 8192,
+        "max_tokens_reasoning": 4096,
         "temperature": 0.7,
-        "max_requests_per_minute": 15,
-        "daily_budget_calls": 200,
+        "max_requests_per_minute": 25,
+        "daily_budget_calls": 400,
         "smart_route_keywords": [
             "latest", "news", "current", "today", "right now",
             "who won", "explain properly", "deep analysis", "research",
-            "recent", "current events"
+            "recent", "current events", "think hard", "deep:", "reason"
         ],
-        "smart_route_min_query_words": 25,
-        "smart_route_local_confidence_floor": 0.5
+        "smart_route_min_query_words": 18,
+        "smart_route_local_confidence_floor": 0.5,
+        "rotation": {
+            "enabled": true,
+            "cooldown_429_s": 60,
+            "cooldown_5xx_s": 30,
+            "cooldown_hard_s": 300,
+            "hard_failure_threshold": 3,
+            "soft_rpm_per_slot": 25,
+            "providers": [
+                {
+                    "name": "groq",
+                    "base_url": "https://api.groq.com/openai/v1",
+                    "credential_id": "groq",
+                    "fast_model": "llama-3.1-8b-instant",
+                    "deep_model": "llama-3.3-70b-versatile",
+                    "soft_rpm": 28,
+                    "timeout_seconds": 10,
+                    "timeout_reasoning_seconds": 25
+                },
+                {
+                    "name": "nvidia",
+                    "base_url": "https://integrate.api.nvidia.com/v1",
+                    "credential_id": "nvidia",
+                    "fast_model": "meta/llama-3.1-8b-instruct",
+                    "deep_model": "meta/llama-3.3-70b-instruct",
+                    "soft_rpm": 35,
+                    "timeout_seconds": 12,
+                    "timeout_reasoning_seconds": 30
+                },
+                {
+                    "name": "cerebras",
+                    "base_url": "https://api.cerebras.ai/v1",
+                    "credential_id": "cerebras",
+                    "fast_model": "llama3.1-8b",
+                    "deep_model": "llama-3.3-70b",
+                    "soft_rpm": 25,
+                    "timeout_seconds": 10,
+                    "timeout_reasoning_seconds": 20
+                }
+            ]
+        }
     },
     "cloud_brain_router": {
-        "enabled": false,
+        "enabled": true,
         "daily_quota": 60,
         "min_query_chars_for_auto_escalate": 80,
         "cooldown_after_failure_s": 30.0,

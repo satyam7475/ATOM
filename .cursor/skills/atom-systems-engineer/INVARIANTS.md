@@ -186,6 +186,34 @@ import foo
 
 ---
 
+## I-16 · WhisperKit `serve` lifecycle is recoverable, never fatal
+
+**Files:** `voice/stt_whisperkit.py` (`_maybe_start_serve`, `_reap_stale_serve_on_port`, `preload`), `main.py` (STT preload boot section)
+
+**Rule:** ATOM must survive a stale or squatted WhisperKit port. Specifically:
+1. If port `50060` is bound by an unhealthy `whisperkit-cli`, reap it (SIGTERM) and proceed.
+2. If port `50060` is bound by a non-WhisperKit process, fall back to the next port from a configured range and continue. Never `raise RuntimeError` and leave STT permanently unavailable.
+3. Boot must log the exact failure mode (`port-bound stale serve`, `port-bound non-owned`, `cli missing`, `download timeout`) in the boot timeline so the owner can diagnose without reading tracebacks.
+4. STT preload failures must not block the boot greeting or the brain warmup. The owner should always hear "Here, Boss." even on a degraded boot.
+
+Violating this rule produces the "ATOM stuck, can't hear me" outage class (see PB-13).
+
+---
+
+## I-17 · Self-echo path coverage on every STT engine
+
+**Files:** `voice/stt_macos.py`, `voice/stt_whisperkit.py`, any future STT backend
+
+**Rule:** Every STT engine in the pipeline must implement, in order:
+1. **Output mute window** during `state == SPEAKING` and for ≥ 1.2 s after `tts_complete` (see `_is_output_muted` / `_output_muted_until` in `stt_whisperkit.py`).
+2. **Echo guard consultation** via `tts.is_echo(text, window_s=30.0)` before emitting `speech_final`.
+3. **Self-speech text normalization** that strips known ATOM acks/diagnostics (`I'm good, Boss`, `On it, Boss`, `System is degraded`, `Atom.localBrain`) before routing.
+4. **Wake-mishear normalization** (`adam → atom`, `adtan → atom`, etc.) so Boss's intended wake variants reach the router but ATOM's own self-naming does not.
+
+If a new backend skips any of these, the self-echo loop returns within one boot.
+
+---
+
 ## When an invariant stops being true
 
 If the system evolves and an invariant is no longer correct, **do not silently remove it**. Update this file with the reason, date, and commit hash, so future agents can trace why the invariant changed.

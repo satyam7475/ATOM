@@ -165,13 +165,23 @@ class PipelineTimer:
             else 0.0
         )
         intent_ms = _ms(self._t_intent_done)
-        action_ms = (_ms(self._t_action_done) - intent_ms
-                     if self._t_action_done > 0 and self._t_intent_done > 0
-                     else _ms(self._t_action_done))
-        tts_ms = (_ms(self._t_tts_complete) - _ms(self._t_tts_start)
-                  if self._t_tts_start > 0
-                  else 0.0)
-        total_ms = _ms(self._t_tts_complete)
+        # Sprint Ω.8 (Apr 26 2026) R10: clamp every span to >= 0. The
+        # speech_final → intent_done → action_done → tts_start →
+        # tts_complete sequence can re-order across event-loop hops
+        # (e.g. cache hit emits action_done before intent_done from a
+        # parallel handler), and atomCurrentLogs.txt L390 + L405 had
+        # negative Action / TTS readings as a result. A negative span
+        # in a "PIPELINE" log line is just noise; we clamp instead of
+        # propagating ratio-of-totals lies into Prometheus.
+        if self._t_action_done > 0 and self._t_intent_done > 0:
+            action_ms = max(0.0, _ms(self._t_action_done) - intent_ms)
+        else:
+            action_ms = max(0.0, _ms(self._t_action_done))
+        if self._t_tts_start > 0 and self._t_tts_complete > 0:
+            tts_ms = max(0.0, _ms(self._t_tts_complete) - _ms(self._t_tts_start))
+        else:
+            tts_ms = 0.0
+        total_ms = max(0.0, _ms(self._t_tts_complete))
 
         parts = [
             f"PIPELINE | id={self._trace_id}",

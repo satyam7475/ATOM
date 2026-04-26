@@ -1107,6 +1107,8 @@ def wire_events(
             process_mgr.record_app_switch(app)
             return
         if kind == "resource_alert" and message:
+            # Always update the dashboard log + state bridge so the
+            # warning is visible even when we suppress the TTS.
             indicator.add_log("warning", message)
             if state_bridge is not None:
                 warnings = list(state_bridge.store.get_section("health").get("warnings", []))
@@ -1122,7 +1124,25 @@ def wire_events(
                     message=message,
                     kind=kind,
                 )
-            bus.emit_long("response_ready", text=message)
+            # Sprint Ω.8 (Apr 26 2026) R8: do NOT speak resource alerts
+            # over a user turn. atomCurrentLogs.txt L385-L390 shows the
+            # exact bug — Boss asked "where is my music atom?", ATOM
+            # said "Go ahead." (ack), and *while still THINKING* the
+            # RAM-watcher fired "Boss, RAM is at 85%..." which got
+            # spliced into the same TTS run. Result: Boss's actual
+            # question never gets answered. Resource alerts fire on a
+            # 5-min cooldown, so dropping the spoken alert during a
+            # user turn just means it'll either re-fire next minute
+            # (still 85%) or self-clear (memory came back). Either way
+            # is fine; talking over Boss is not.
+            if state.current in (AtomState.IDLE, AtomState.LISTENING):
+                bus.emit_long("response_ready", text=message)
+            else:
+                logger.info(
+                    "wiring.system_event: suppressed resource_alert TTS "
+                    "during state=%s; warning kept in dashboard only",
+                    getattr(state.current, "value", state.current),
+                )
             return
         if state.current not in (AtomState.IDLE, AtomState.LISTENING):
             return

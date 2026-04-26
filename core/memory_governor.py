@@ -105,8 +105,14 @@ class MemoryGovernor:
         self,
         bus: "AsyncEventBus | None" = None,
         config: dict | None = None,
+        *,
+        watchdog: Any | None = None,
     ) -> None:
         self._bus = bus
+        # Sprint Ω.8: optional watchdog hook so memory pressure can
+        # extend the llm_inference budget. Set via :meth:`attach_watchdog`
+        # at boot; absent in tests.
+        self._watchdog = watchdog
         cfg = (config or {}).get("memory_governor", {}) or {}
         self._enabled = bool(cfg.get("enabled", True))
         self._tier1 = float(cfg.get("tier1_threshold_pct", _DEFAULT_TIER1_PCT))
@@ -252,6 +258,15 @@ class MemoryGovernor:
         except Exception:
             logger.exception("MemoryGovernor: on_stats failed")
 
+    def attach_watchdog(self, watchdog: Any) -> None:
+        """Wire the runtime watchdog so LLM budgets can adapt to pressure.
+
+        Sprint Ω.8: the watchdog uses ``record_memory_pct`` to extend the
+        ``llm_inference`` budget when unified memory is high. Optional;
+        the governor still works without it.
+        """
+        self._watchdog = watchdog
+
     def on_stats(self, memory_pct: float) -> int:
         """Public driver: feed a memory-pressure reading.
 
@@ -261,6 +276,20 @@ class MemoryGovernor:
         if not self._enabled:
             return 0
         self._last_event_at = time.monotonic()
+        # Sprint Ω.8: forward every reading to the watchdog, even when
+        # the tier didn't change — the watchdog needs the *current*
+        # pressure on every poll, not just on tier transitions.
+        wd = self._watchdog
+        if wd is not None:
+            try:
+                hook = getattr(wd, "record_memory_pct", None)
+                if callable(hook):
+                    hook(memory_pct)
+            except Exception:
+                logger.debug(
+                    "MemoryGovernor: watchdog.record_memory_pct raised",
+                    exc_info=True,
+                )
         new_tier = self._classify_tier(memory_pct)
         if new_tier > self._current_tier:
             self._escalate(new_tier, memory_pct)

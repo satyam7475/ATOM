@@ -801,10 +801,20 @@ async def main() -> None:
                 logger.debug("pressure tier emit failed", exc_info=True)
             _last_pressure_tier = tier
 
-        # Level 2+: drop MLX prompt-prefix KV cache. Tier 1 is common during
-        # boot on 16 GB Apple Silicon and dropping the warm prefix there makes
-        # the first real answer slower right when Boss is waiting.
-        if tier >= 2:
+        # Sprint Ω.8 (Apr 26 2026) R3: only drop the persona / prompt-
+        # prefix KV cache at tier-3 (critical pressure). Previously
+        # this hook fired at tier 2 — but the MemoryGovernor already
+        # owns the per-role eviction order
+        # (smolvlm → whisper_confirmer → draft_model →
+        # embeddings_warm_cache → persona_kv_cache). Dropping the KV
+        # here at tier 2 was bypassing the governor's protection
+        # entirely, so atomCurrentLogs.txt L245 / L491 showed the
+        # cache evaporating at 83.5% memory and the next prefill had
+        # to recompute the entire persona prefix from scratch — which
+        # is exactly the LLM timeout cascade we're trying to fix. At
+        # tier 3 the governor would drop it anyway; we keep this hook
+        # as a belt-and-braces measure for that case only.
+        if tier >= 3:
             if (
                 not _prompt_kv_cache_dropped
                 and local_brain is not None
@@ -1336,6 +1346,8 @@ async def main() -> None:
     # ── v22: Hybrid Intelligence Layer (Security Gateway + Cloud + Confidence) ──
     from core.security_gateway import SecurityGateway
     from core.cloud.gemini_client import GeminiClient
+    from core.cloud.groq_client import GroqClient
+    from core.cloud.rotating_openai_client import RotatingOpenAIClient
     from core.confidence_engine import ConfidenceEngine
     from core.decision_engine import DecisionEngine
     from core.tools.search_tool import SearchTool
@@ -1356,27 +1368,121 @@ async def main() -> None:
     )
 
     cloud_enabled_cfg = bool(config.get("cloud", {}).get("enabled", True))
-    gemini_client: GeminiClient | None = None
+    cloud_provider = str(
+        (config.get("cloud", {}) or {}).get("provider", "gemini")
+    ).strip().lower()
+    # Sprint Ω.8 (Apr 26 2026): cloud is now provider-pluggable. The
+    # downstream code (Router, CloudBrainRouter, SearchTool,
+    # LocalBrainController, DesktopAgent) only consumes the duck-typed
+    # surface: ``is_available`` / ``ask`` / ``ask_buddy`` /
+    # ``ask_reasoning`` / ``configure_api_key`` / ``cancel_streaming``
+    # / ``ask_streaming``. ``GroqClient`` mirrors that surface, so the
+    # rest of the codebase still calls the binding ``gemini_client``
+    # — only this construction site cares which provider is live.
+    gemini_client: Any | None = None
     if cloud_enabled_cfg:
-        gemini_client = GeminiClient(config, security_gateway=security_gateway)
-        # Only probe the encrypted vault when the client hasn't already
-        # resolved a key from settings.json. This avoids loading the crypto
-        # stack on every boot when cloud is enabled-but-unkeyed, and keeps
-        # a bad vault (missing deps, wrong master pw) off the boot path.
-        if not gemini_client.is_available:
-            from core.secrets_manager import get_gemini_fast_key
-
-            _gemini_key = get_gemini_fast_key()
-            if _gemini_key:
-                gemini_client.configure_api_key(_gemini_key)
-                logger.info("Gemini API key loaded from secure storage")
+        if cloud_provider == "rotating":
+            # Sprint Ω.9 (Apr 26 2026): rotating multi-provider lane.
+            # ``RotatingOpenAIClient`` round-robins across the providers
+            # listed in ``cloud.rotation.providers`` (Groq, NVIDIA NIM,
+            # Cerebras by default) with per-slot circuit breakers and
+            # soft-RPM quarantine. It hydrates keys from
+            # ``secrets_manager`` on init; we top up any cold slots
+            # from env vars here for parity with the Groq lane.
+            gemini_client = RotatingOpenAIClient(
+                config, security_gateway=security_gateway,
+            )
+            from core.secrets_manager import (
+                get_groq_key,
+                get_nvidia_key,
+                get_cerebras_key,
+            )
+            for slot_name, vault_getter, env_var in (
+                ("groq",     get_groq_key,     "GROQ_API_KEY"),
+                ("nvidia",   get_nvidia_key,   "NVIDIA_API_KEY"),
+                ("cerebras", get_cerebras_key, "CEREBRAS_API_KEY"),
+            ):
+                key = ""
+                try:
+                    key = vault_getter() or ""
+                except Exception:
+                    logger.debug(
+                        "rotating slot %s vault lookup failed",
+                        slot_name, exc_info=True,
+                    )
+                if not key:
+                    key = os.environ.get(env_var, "")
+                if key:
+                    gemini_client.configure_slot_key(slot_name, key)
+            if gemini_client.is_available:
+                logger.info(
+                    "Cloud provider=rotating: %d slot(s) ready "
+                    "(round-robin with 429 quarantine + soft RPM)",
+                    sum(
+                        1
+                        for s in gemini_client.diagnostics().get("slots", [])
+                        if s.get("has_key")
+                    ),
+                )
             else:
                 logger.warning(
-                    "Gemini API key not found in settings.json or vault. "
-                    "Run: python scripts/setup_api_keys.py  (or set cloud.enabled=false)"
+                    "Cloud provider=rotating but no slot has a key. "
+                    "Run: python scripts/setup_api_keys.py  (or set "
+                    "GROQ_API_KEY / NVIDIA_API_KEY / CEREBRAS_API_KEY env "
+                    "vars). ATOM will run local-only until then."
                 )
+        elif cloud_provider == "groq":
+            gemini_client = GroqClient(config, security_gateway=security_gateway)
+            if not gemini_client.is_available:
+                # Try secrets_manager first (keychain / vault). Fall
+                # back to GROQ_API_KEY env var via the client itself.
+                groq_key = ""
+                try:
+                    from core.secrets_manager import get_groq_key
+                    groq_key = get_groq_key() or ""
+                except Exception:
+                    pass
+                if not groq_key:
+                    env_var = str(
+                        (config.get("cloud", {}) or {}).get(
+                            "api_key_env", "GROQ_API_KEY",
+                        ),
+                    )
+                    groq_key = os.environ.get(env_var, "")
+                if groq_key:
+                    gemini_client.configure_api_key(groq_key)
+                    logger.info(
+                        "Cloud provider=groq: API key loaded "
+                        "(buddy=llama-3.1-8b-instant, deep=llama-3.3-70b-versatile)"
+                    )
+                else:
+                    logger.warning(
+                        "Cloud provider=groq but GROQ_API_KEY not set. "
+                        "Export it (export GROQ_API_KEY=...) or store it "
+                        "via scripts/setup_api_keys.py to enable cloud "
+                        "fallback. ATOM will run local-only until then."
+                    )
+        else:
+            gemini_client = GeminiClient(config, security_gateway=security_gateway)
+            # Only probe the encrypted vault when the client hasn't
+            # already resolved a key from settings.json.
+            if not gemini_client.is_available:
+                from core.secrets_manager import get_gemini_fast_key
+
+                _gemini_key = get_gemini_fast_key()
+                if _gemini_key:
+                    gemini_client.configure_api_key(_gemini_key)
+                    logger.info("Gemini API key loaded from secure storage")
+                else:
+                    logger.warning(
+                        "Gemini API key not found in settings.json or vault. "
+                        "Run: python scripts/setup_api_keys.py  (or set cloud.enabled=false)"
+                    )
     else:
-        logger.info("Cloud/Gemini disabled in config (cloud.enabled=false) — local MLX only for LLM routing")
+        logger.info(
+            "Cloud disabled in config (cloud.enabled=false) — "
+            "local MLX only for LLM routing"
+        )
 
     search_tool = SearchTool(
         config, security_gateway=security_gateway, gemini_client=gemini_client,
@@ -1446,8 +1552,8 @@ async def main() -> None:
             ),
         )
         logger.info(
-            "Cloud brain router ready: providers=%s available=%s",
-            ",".join([n for n in ("gemini",) if gemini_client is not None]) or "none",
+            "Cloud brain router ready: provider=%s available=%s",
+            cloud_provider if gemini_client is not None else "none",
             cloud_brain_router.is_available,
         )
     except Exception as exc:
@@ -1455,9 +1561,10 @@ async def main() -> None:
         cloud_brain_router = None
 
     logger.info(
-        "v22 Hybrid Intelligence: SecurityGateway + GeminiClient(%s) + "
+        "v22 Hybrid Intelligence: SecurityGateway + Cloud[%s](%s) + "
         "ConfidenceEngine + DecisionEngine + SearchTool + PreferenceStore + "
         "SemanticCache(semantic=%s, threshold=%.2f)",
+        cloud_provider if gemini_client is not None else "none",
         "available" if (gemini_client and gemini_client.is_available) else "disabled",
         semantic_cache.is_semantic,
         float((config.get("semantic_cache", {}).get("threshold", 0.85))),
@@ -2128,13 +2235,15 @@ async def main() -> None:
         t0 = time.monotonic()
         logger.info("STT model loading in background...")
         preload_task: asyncio.Task | None = None
+        preload_ok = False
 
         try:
-            async def _run_stt_preload() -> None:
+            async def _run_stt_preload() -> bool:
                 if hasattr(stt, "async_preload"):
-                    await stt.async_preload()
+                    result = await stt.async_preload()
                 else:
-                    await stt.preload()
+                    result = await stt.preload()
+                return True if result is None else bool(result)
 
             stt_label = (
                 str(getattr(stt, "backend_name", "") or "")
@@ -2204,11 +2313,17 @@ async def main() -> None:
                         )
 
             if preload_task is not None:
-                await preload_task
+                preload_ok = bool(await preload_task)
             else:
-                await _run_stt_preload()
+                preload_ok = bool(await _run_stt_preload())
             elapsed = (time.monotonic() - t0) * 1000
-            logger.info("STT pipeline ready (%.0fms: devices + model + preprocessor)", elapsed)
+            if preload_ok:
+                logger.info("STT pipeline ready (%.0fms: devices + model + preprocessor)", elapsed)
+            else:
+                logger.warning(
+                    "STT preload did not become ready (%.0fms); voice input remains unavailable until restart succeeds",
+                    elapsed,
+                )
             _bt_mark("stt_preload", elapsed, parallel=True)
         except Exception:
             if preload_task is not None and not preload_task.done():
@@ -2221,6 +2336,7 @@ async def main() -> None:
                     logger.debug("STT preload task failed during cleanup", exc_info=True)
             logger.exception("STT preload failed")
         finally:
+            setattr(stt, "_boot_preload_ok", preload_ok)
             stt_preload_done.set()
 
     if config.get("stt", {}).get("preload", True):
@@ -2550,6 +2666,16 @@ async def main() -> None:
     router.attach_runtime_watchdog(runtime_watchdog)
     local_brain.attach_runtime_watchdog(runtime_watchdog)
     bus.on("state_changed", runtime_watchdog.on_state_changed)
+    # Sprint Ω.8 (Apr 26 2026): R4 — let MemoryGovernor feed unified
+    # memory pressure into the watchdog so the LLM inference budget can
+    # extend automatically when prefill is racing against page-stealing.
+    if memory_governor is not None and hasattr(memory_governor, "attach_watchdog"):
+        try:
+            memory_governor.attach_watchdog(runtime_watchdog)
+        except Exception:
+            logger.debug(
+                "MemoryGovernor.attach_watchdog failed", exc_info=True,
+            )
 
     try:
         from core.proactive.routine_engine import RoutineEngine
@@ -2564,7 +2690,7 @@ async def main() -> None:
         _is_echo = getattr(tts, "is_echo", None)
         if callable(_is_echo):
             router.attach_tts_echo_guard(
-                lambda _t: bool(_is_echo(_t, window_s=12.0)),
+                lambda _t: bool(_is_echo(_t, window_s=30.0)),
             )
     except Exception:
         logger.info("Router TTS echo guard wiring failed", exc_info=True)
@@ -3804,7 +3930,11 @@ async def main() -> None:
         )
 
         await stt_preload_done.wait()
-        logger.info("STT ready -- ATOM fully operational")
+        stt_boot_ok = bool(getattr(stt, "_boot_preload_ok", True))
+        if stt_boot_ok:
+            logger.info("STT ready -- ATOM fully operational")
+        else:
+            logger.warning("STT not ready after preload; ATOM running without reliable voice input")
         _bt_log_summary()
 
         # Once TTS has finished the boot greeting, ensure we land in
@@ -3821,10 +3951,11 @@ async def main() -> None:
                 )
         # Do NOT await async_start_listening() here: on_state_changed already create_task()s
         # exactly one listen loop when state is LISTENING/SPEAKING.
-        try:
-            bus.emit("restart_listening")
-        except Exception:
-            logger.debug("post-preload restart_listening emit failed", exc_info=True)
+        if stt_boot_ok:
+            try:
+                bus.emit("restart_listening")
+            except Exception:
+                logger.debug("post-preload restart_listening emit failed", exc_info=True)
 
     _bg_tasks.append(asyncio.create_task(_startup_greeting()))
 

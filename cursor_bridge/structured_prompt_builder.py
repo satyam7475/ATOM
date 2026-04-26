@@ -187,26 +187,60 @@ def _history_safe_text(text: str, max_len: int = 240) -> str:
 
 
 class ContextBudget:
-    """Allocates token budget across prompt layers to fit within n_ctx."""
+    """Allocates token budget across prompt layers to fit within n_ctx.
 
-    def __init__(self, n_ctx: int, max_response_tokens: int = 512) -> None:
+    Sprint Ω.8 (Apr 26 2026) adds a ``voice_mode`` profile. Voice turns
+    used to ship 1500-token prompts; on a memory-pressured M5 with the
+    persona KV freshly evicted (atomCurrentLogs.txt L245, L491) that
+    prefilled at >14s and the watchdog killed the turn at step 0 with
+    zero tokens (L350-L353, L504-L506). The voice profile cuts every
+    layer aggressively so the worst-case prefill is ~1800 tokens —
+    sub-second on Qwen3-4B even with cold KV.
+    """
+
+    def __init__(
+        self,
+        n_ctx: int,
+        max_response_tokens: int = 512,
+        *,
+        voice_mode: bool = False,
+    ) -> None:
         self._n_ctx = n_ctx
         self._max_response = max_response_tokens
         self._available = max(256, n_ctx - max_response_tokens)
+        self._voice_mode = voice_mode
 
-        self.system_budget = 900
-        self.tools_budget = 600
-        self.context_budget = 500
-        self.memory_budget = 1500
-        self.documents_budget = 800
-        self.emotion_budget = 200
-        self.query_budget = 500
+        if voice_mode:
+            # Tight per-layer budgets for spoken turns. Total worst case
+            # ≈ 1800 tokens; typical ≈ 700-1000.
+            self.system_budget = 380
+            self.tools_budget = 140
+            self.context_budget = 180
+            self.memory_budget = 280
+            self.documents_budget = 200
+            self.emotion_budget = 60
+            self.query_budget = 200
+            history_floor = 240
+        else:
+            self.system_budget = 900
+            self.tools_budget = 600
+            self.context_budget = 500
+            self.memory_budget = 1500
+            self.documents_budget = 800
+            self.emotion_budget = 200
+            self.query_budget = 500
+            history_floor = 500
+
         self.history_budget = max(
-            500,
+            history_floor,
             self._available - self.system_budget - self.tools_budget
             - self.context_budget - self.memory_budget - self.documents_budget
             - self.emotion_budget - self.query_budget,
         )
+
+    @property
+    def voice_mode(self) -> bool:
+        return self._voice_mode
 
     def trim_to_budget(self, text: str, budget_tokens: int) -> str:
         estimated = _estimate_tokens(text)
@@ -230,7 +264,12 @@ class StructuredPromptBuilder:
         n_ctx = brain_cfg.get("n_ctx", 8192)
         max_tokens = brain_cfg.get("max_tokens", 512)
         self._budget = ContextBudget(n_ctx, max_tokens)
+        # Sprint Ω.8: voice turns get a tighter budget profile so a
+        # cold-KV prefill on Qwen3-4B stays under ~1s even when memory
+        # pressure has just dropped the persona cache.
+        self._voice_budget = ContextBudget(n_ctx, max_tokens, voice_mode=True)
         self._max_history_turns = 10
+        self._voice_max_history_turns = 4
 
         self._system_prompt_cache: str | None = None
         self._system_prompt_hash: int | None = None
@@ -700,14 +739,22 @@ class StructuredPromptBuilder:
         ctx_lines = "\n".join(f"- {s}" for s in document_context[:5])
         return f"RELEVANT DOCUMENT KNOWLEDGE:\n{ctx_lines}\n"
 
-    def _build_history_layer(self, history: list[tuple[str, str]]) -> str:
+    def _build_history_layer(
+        self,
+        history: list[tuple[str, str]],
+        *,
+        voice_mode: bool = False,
+    ) -> str:
         """Layer 6: Conversation History."""
         if not history:
             return ""
 
-        turns = history[-self._max_history_turns:]
+        max_turns = (
+            self._voice_max_history_turns if voice_mode else self._max_history_turns
+        )
+        turns = history[-max_turns:]
 
-        budget = self._budget
+        budget = self._voice_budget if voice_mode else self._budget
         lines: list[str] = []
         total_chars = 0
         max_chars = budget.history_budget * _APPROX_CHARS_PER_TOKEN
@@ -780,6 +827,7 @@ class StructuredPromptBuilder:
         observations: list[str] | None = None,
         rag_enrichment: str | None = None,
         repeat_hint: bool = False,
+        voice_mode: bool = False,
     ) -> str:
         """Assemble the full 9-layer prompt (+ observations for ReAct).
 
@@ -788,6 +836,11 @@ class StructuredPromptBuilder:
         ``repeat_hint`` — internal steer (NOT shown to the user) that nudges the
         model to give a different reply than last time. Lives in the system layer
         so the model cannot quote it back during TTS.
+        ``voice_mode`` — Sprint Ω.8: when True every layer is allocated a
+        much smaller token budget so the prompt stays sub-1800 tokens.
+        Voice callers (LocalBrainController) pass True; chat / dashboard
+        / benchmark callers leave it False so they retain the full
+        context budget for written replies.
         """
         query = _compress_text(query)
 
@@ -799,12 +852,12 @@ class StructuredPromptBuilder:
         if rag_enrichment:
             block = f"RAG CONTEXT (structured):\n{rag_enrichment.strip()}\n"
             layer5 = f"{block}\n{layer5}" if layer5 else block
-        layer6 = self._build_history_layer(history or [])
+        layer6 = self._build_history_layer(history or [], voice_mode=voice_mode)
         layer7 = self._build_emotion_layer(emotion, energy)
         layer_obs = self._build_observations_layer(observations)
         layer8 = self._build_query_layer(query)
 
-        budget = self._budget
+        budget = self._voice_budget if voice_mode else self._budget
         layer1 = budget.trim_to_budget(layer1, budget.system_budget)
         layer2 = budget.trim_to_budget(layer2, budget.tools_budget)
         layer3 = budget.trim_to_budget(layer3, budget.context_budget)
@@ -831,8 +884,10 @@ class StructuredPromptBuilder:
         )
 
         prompt = _redact_sensitive(prompt)
-        logger.debug("Prompt built (%d chars, ~%d tokens, 9 layers)",
-                      len(prompt), _estimate_tokens(prompt))
+        logger.debug(
+            "Prompt built (%d chars, ~%d tokens, 9 layers, voice=%s)",
+            len(prompt), _estimate_tokens(prompt), voice_mode,
+        )
         return prompt
 
     def precompile(self, query: str = "", *, prompt_hint: str = "") -> dict[str, object]:

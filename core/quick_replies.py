@@ -22,6 +22,33 @@ logger = logging.getLogger("atom.quick_replies")
 _MAX_REPLY_LEN = 500
 _MAX_KEY_LEN = 80
 _QUICK_REPLY_CLEAN_RE = re.compile(r"[^a-z0-9\s]")
+
+# ── Sprint Ω.8: quick-reply gating ───────────────────────────────────
+# Pattern-tier "filler" replies must not fire when the query has *real*
+# content beyond the matched greeting / acknowledgement. The bug we're
+# fixing (atomCurrentLogs.txt L351-L354): "what's up? can you play
+# some music for me?" → "All good here, Boss." — the music question
+# never reached the brain.
+#
+# We only gate FILLER patterns (greetings, "what's up", "thanks",
+# acknowledgements). Specific domain replies (joke, "what time is it",
+# "who are you" etc.) stay open because their regex is already keyed
+# to a substantive concept. The action-verb gate is only consulted
+# when ``_PATTERN_REPLIES_FILLER_INDEXES`` says the matching pattern
+# is a filler, so "tell me a joke" still matches the joke pattern
+# even though "tell" is in the action set.
+_FILLER_ACTION_TOKENS: frozenset[str] = frozenset({
+    "play", "open", "close", "find", "search", "where",
+    "calculate", "compute", "remind", "remember", "schedule", "set",
+    "create", "make", "build", "write", "send", "email", "message",
+    "translate", "summarize",
+    "weather", "news", "headlines", "battery", "cpu",
+    "ram", "disk", "memory", "process", "kill", "start", "stop",
+    "music", "song", "video", "youtube", "spotify", "browser",
+    "bolo", "kholo", "chalao", "khol", "dikhao", "lao",
+    "kaha", "kab", "kyun",
+})
+_FILLER_MAX_WORDS = 6
 _COMPARE_SAFARI_ARC_RE = re.compile(r"\bcompare\b.*\bsafari\b.*\barc\b|\barc\b.*\bsafari\b", re.I)
 _UNIFIED_MEMORY_RE = re.compile(r"\bunified memory\b", re.I)
 _MODE_DIFF_RE = re.compile(
@@ -134,17 +161,86 @@ _PATTERN_REPLIES: list[tuple[re.Pattern, list[str]]] = [
 ]
 
 
+def _query_has_filler_action_intent(norm: str) -> bool:
+    """True when a query that *also* matched a filler pattern still
+    carries a real action verb (so the filler match is misleading).
+
+    Sprint Ω.8 R5: only consulted for filler-tagged patterns; specific
+    domain patterns (joke / who-are-you / time / etc.) bypass this.
+    """
+    if not norm:
+        return False
+    tokens = re.findall(r"[a-z0-9']+", norm)
+    if not tokens:
+        return False
+    return any(tok in _FILLER_ACTION_TOKENS for tok in tokens)
+
+
+# Indexes into ``_PATTERN_REPLIES`` whose matches should be gated by
+# the filler-action check. The 0th entry is the bare greetings pattern;
+# index 3 is the "what's up / how are you" pattern; thanks/bye/ack/yes
+# are also filler. Computed lazily so the literal indices stay close
+# to the table for review.
+def _filler_indexes() -> frozenset[int]:
+    out: set[int] = set()
+    for i, (pat, _) in enumerate(_PATTERN_REPLIES):
+        src = pat.pattern
+        if any(
+            marker in src
+            for marker in (
+                "^(hi|hello|hey",
+                "^(namaste|namaskar",
+                "^good\\s*(morning",
+                "how are you",
+                "^(thanks?",
+                "^(bye|goodbye",
+                "^(ok|okay|alright",
+                "^(yes|yeah|yep",
+                "^(never\\s*mind",
+            )
+        ):
+            out.add(i)
+    return frozenset(out)
+
+
+_PATTERN_REPLIES_FILLER_INDEXES: frozenset[int] | None = None
+
+
 def _try_pattern_reply(norm: str) -> str | None:
-    """Check Tier 1 pattern-based replies. Returns response or None."""
-    for pattern, responses in _PATTERN_REPLIES:
+    """Check Tier 1 pattern-based replies. Returns response or None.
+
+    Sprint Ω.8 (Apr 26 2026) R5: a query that combines a greeting with
+    a real ask ("hey atom, where's my music?", "what's up? can you
+    play something?") used to short-circuit to a chatty filler reply.
+    We now identify which patterns are conversational filler (greetings,
+    acknowledgements, etc.) and require those matches to also pass a
+    word-count cap + action-verb veto. Specific domain patterns
+    (joke, time, who-are-you) are unaffected.
+    """
+    if not norm:
+        return None
+
+    global _PATTERN_REPLIES_FILLER_INDEXES
+    if _PATTERN_REPLIES_FILLER_INDEXES is None:
+        _PATTERN_REPLIES_FILLER_INDEXES = _filler_indexes()
+
+    word_count = len(norm.split())
+
+    for idx, (pattern, responses) in enumerate(_PATTERN_REPLIES):
         m = pattern.search(norm)
-        if m:
-            resp = random.choice(responses)
-            if resp is None:
-                return None
-            if "{0}" in resp and m.groups():
-                resp = resp.format(m.group(1).lower())
-            return resp
+        if not m:
+            continue
+        if idx in _PATTERN_REPLIES_FILLER_INDEXES:
+            if word_count > _FILLER_MAX_WORDS:
+                continue
+            if _query_has_filler_action_intent(norm):
+                continue
+        resp = random.choice(responses)
+        if resp is None:
+            return None
+        if "{0}" in resp and m.groups():
+            resp = resp.format(m.group(1).lower())
+        return resp
     return None
 
 
