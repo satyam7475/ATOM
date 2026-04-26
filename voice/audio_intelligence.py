@@ -1353,6 +1353,19 @@ class AudioIntelligenceEngine:
         await self._watchdog.start()
         logger.info("AudioWatchdog started (interval=%ds)", interval)
 
+    # Sprint Ω.6.B (Apr 26 2026): reasons where dropping the switch leaves
+    # the user stranded on a dead device (BT disconnect, repeated STT
+    # failure, stuck-with-audio-flowing). For those, retry once after a
+    # short backoff if the recovery lock is currently held by the STT
+    # watchdog. For non-critical reasons (quality, predictive) we keep
+    # the original "give up immediately" behaviour to avoid piling
+    # retries on top of the watchdog.
+    _CRITICAL_SWITCH_REASONS: frozenset[str] = frozenset({
+        "bt_disconnect",
+        "repeated_failure",
+        "stt_stuck_audio_flowing",
+    })
+
     async def seamless_switch(
         self,
         new_device: AudioDeviceProfile,
@@ -1361,26 +1374,78 @@ class AudioIntelligenceEngine:
         reason: str = "quality",
         old_device_name: str = "",
     ) -> bool:
-        """Pause STT, switch device, resume STT without crashing the pipeline."""
+        """Pause STT, switch device, resume STT without crashing the pipeline.
+
+        Sprint Ω.6.B: if the voice recovery lock is held by another path
+        when the call arrives, critical reasons (``bt_disconnect`` etc.)
+        get a single retry after a 1.5s backoff so the user isn't
+        stranded on the dead device. Non-critical reasons keep the
+        original "skip this cycle" behaviour.
+        """
         if not self._can_switch():
             logger.info("Seamless switch blocked by cooldown (reason=%s, target=%s)", reason, new_device.name)
             return False
 
-        from voice.recovery_lock import voice_recovery_lock, stream_drain_delay
-
         old_name = old_device_name or (self._selected_input.name if self._selected_input else "none")
         logger.info("Seamless switch: '%s' -> '%s' (reason=%s, conf=%.2f)", old_name, new_device.name, reason, confidence)
 
+        is_critical = reason in self._CRITICAL_SWITCH_REASONS
+        attempts = 2 if is_critical else 1
+
+        for attempt in range(attempts):
+            outcome = await self._attempt_switch_once(
+                new_device,
+                confidence=confidence,
+                reason=reason,
+                old_name=old_name,
+                attempt_index=attempt,
+                lock_wait_s=2.0 if attempt == 0 else 4.0,
+            )
+            if outcome is not None:
+                return outcome
+            # outcome is None  ->  lock deferred; only retry on critical
+            if attempt + 1 < attempts:
+                logger.info(
+                    "Seamless switch retrying after backoff (reason=%s, attempt=%d/%d)",
+                    reason, attempt + 2, attempts,
+                )
+                await asyncio.sleep(1.5)
+            else:
+                logger.info(
+                    "Seamless switch deferred after %d attempt(s) — STT watchdog still busy (reason=%s)",
+                    attempts, reason,
+                )
+        return False
+
+    async def _attempt_switch_once(
+        self,
+        new_device: AudioDeviceProfile,
+        *,
+        confidence: float,
+        reason: str,
+        old_name: str,
+        attempt_index: int,
+        lock_wait_s: float,
+    ) -> bool | None:
+        """One acquire-then-switch attempt.
+
+        Returns ``True`` on success, ``False`` on switch failure inside
+        the locked region, and ``None`` if the recovery lock could not be
+        acquired (caller decides whether to retry).
+        """
+        from voice.recovery_lock import voice_recovery_lock, stream_drain_delay
+
         async with voice_recovery_lock(
             f"audio_intelligence:{reason}",
-            max_wait_s=2.0,
+            max_wait_s=lock_wait_s,
         ) as got_lock:
             if not got_lock:
-                logger.info(
-                    "Seamless switch deferred — STT watchdog is restarting (reason=%s)",
-                    reason,
-                )
-                return False
+                if attempt_index == 0:
+                    logger.info(
+                        "Seamless switch waiting on watchdog (reason=%s, lock_wait=%.1fs)",
+                        reason, lock_wait_s,
+                    )
+                return None
 
             self._switch_in_progress = True
 

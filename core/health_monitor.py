@@ -5,9 +5,14 @@ Periodically checks the health of critical ATOM subsystems:
     - Event bus (pending task count, stuck detection)
     - State machine (stuck-state detection + auto-recovery)
     - System resources (CPU, RAM)
-    - Mic stream (if available)
+    - Mic stream attached (if available)
     - TTS (mixer initialized, consecutive failures)
-    - STT (mic attached, not stuck)
+    - STT activity (since_last_partial_s / since_last_final_s) via STTWatchdog
+
+Sprint Ω.6.B (Apr 26 2026): The STT-stuck check is now a real
+delegation to STTWatchdog.get_diagnostics() rather than the docstring
+lie it used to be. Wire the watchdog with ``set_stt_watchdog()`` after
+voice_pipeline.start_voice_loop() runs.
 
 CPU Governor:
     When system CPU exceeds the configured threshold, the watchdog
@@ -49,6 +54,10 @@ DEFAULT_CHECK_INTERVAL_S = 60.0
 STUCK_STATE_THRESHOLD_DEFAULT_S = 75.0
 ERROR_RECOVERY_TIMEOUT_S = 180.0
 MAX_PENDING_TASKS = 50
+# Sprint Ω.6.B: STT-stuck detection threshold (seconds without a
+# partial/final while in LISTENING). Only used when set_stt_watchdog()
+# has been wired and STTWatchdog.get_diagnostics() is available.
+STT_STUCK_THRESHOLD_DEFAULT_S = 45.0
 
 _GOVERNOR_THROTTLE_MULTIPLIER = 2.5
 _GOVERNOR_COOLDOWN_CHECKS = 3
@@ -88,7 +97,7 @@ class HealthMonitor:
         "_bus", "_state", "_interval", "_base_interval",
         "_task", "_shutdown_event",
         "_last_state_change", "_last_state",
-        "_stt", "_tts", "_consecutive_warnings",
+        "_stt", "_tts", "_stt_watchdog", "_consecutive_warnings",
         "_bt_check_counter", "_degraded_components",
         "_governor_enabled", "_governor_threshold",
         "_governor_throttled", "_governor_hot_count",
@@ -96,6 +105,8 @@ class HealthMonitor:
         "_last_user_activity", "_idle_timeout_min",
         "_idle_notified", "_last_cpu",
         "_stuck_state_threshold_s",
+        "_stt_stuck_threshold_s",
+        "_stt_stuck_cycles",
     )
 
     def __init__(
@@ -111,6 +122,7 @@ class HealthMonitor:
         self._state = state
         self._stt = stt
         self._tts = tts
+        self._stt_watchdog: Any = None
         self._base_interval = check_interval
         self._interval = check_interval
         self._task: asyncio.Task | None = None
@@ -125,6 +137,10 @@ class HealthMonitor:
         self._stuck_state_threshold_s: float = float(
             perf.get("stuck_state_threshold_s", STUCK_STATE_THRESHOLD_DEFAULT_S)
         )
+        self._stt_stuck_threshold_s: float = float(
+            perf.get("stt_stuck_threshold_s", STT_STUCK_THRESHOLD_DEFAULT_S)
+        )
+        self._stt_stuck_cycles: int = 0
         self._governor_enabled: bool = perf.get("cpu_governor", True)
         self._governor_threshold: int = perf.get("cpu_governor_threshold", 75)
         self._governor_throttled: bool = False
@@ -209,6 +225,7 @@ class HealthMonitor:
         issues.extend(await self._check_state_machine())
         issues.extend(self._check_system_resources())
         issues.extend(self._check_mic())
+        issues.extend(self._check_stt_activity())
         issues.extend(self._check_tts())
 
         self._bt_check_counter += 1
@@ -414,6 +431,11 @@ class HealthMonitor:
     # ── Subsystem Checks ─────────────────────────────────────────────
 
     def _check_mic(self) -> list[str]:
+        """Mic-attached check (does the STT engine see a microphone?).
+
+        This is intentionally narrow: stuck-detection is delegated to
+        STTWatchdog via ``_check_stt_activity``.
+        """
         issues: list[str] = []
         if self._stt is None:
             return issues
@@ -426,6 +448,86 @@ class HealthMonitor:
             issues.append("STT: no microphone detected")
             self._degraded_components.add("stt")
 
+        return issues
+
+    def set_stt_watchdog(self, watchdog: Any) -> None:
+        """Plug the STTWatchdog in for activity-based stuck detection.
+
+        Called from main.py after ``voice_pipeline.start_voice_loop()``
+        because the watchdog is constructed there, not at HealthMonitor
+        init time.
+        """
+        self._stt_watchdog = watchdog
+
+    def _check_stt_activity(self) -> list[str]:
+        """STT-stuck check using STTWatchdog diagnostics.
+
+        Sprint Ω.6.B (Apr 26 2026): Closes the docstring lie that has
+        been there since early ATOM — the docstring claimed an STT-stuck
+        check existed; the code only inspected mic-attach. We now read
+        ``since_last_partial_s`` from the watchdog and warn (not crash —
+        the watchdog itself owns the actual restart).
+
+        Logic:
+          * If no STT watchdog wired -> skip silently (boot path or tests).
+          * If state is not LISTENING -> skip (THINKING/SPEAKING legitimately
+            consume the mic without producing partials).
+          * If user has been idle longer than the stuck threshold -> skip
+            (no one is talking, watchdog activity timer is naturally cold).
+          * Otherwise: warn if ``since_last_partial_s`` exceeds threshold
+            for two consecutive cycles. Two cycles avoids flapping on a
+            single 45s gap inside a long pause.
+        """
+        from core.state_manager import AtomState
+
+        issues: list[str] = []
+        if self._stt is None or self._stt_watchdog is None:
+            return issues
+
+        if self._state.current is not AtomState.LISTENING:
+            self._stt_stuck_cycles = 0
+            return issues
+
+        diag_fn = getattr(self._stt_watchdog, "get_diagnostics", None)
+        if not callable(diag_fn):
+            return issues
+
+        try:
+            diag = diag_fn() or {}
+        except Exception:
+            logger.debug("HEALTH stt: get_diagnostics failed", exc_info=True)
+            return issues
+
+        since_partial_s = float(diag.get("since_last_partial_s", 0.0) or 0.0)
+        since_final_s = float(diag.get("since_last_final_s", 0.0) or 0.0)
+
+        # Idle gate: if the user genuinely stopped talking, the activity
+        # timer cooling off is expected — don't false-positive.
+        idle_s = time.monotonic() - self._last_user_activity
+        if idle_s > self._stt_stuck_threshold_s:
+            self._stt_stuck_cycles = 0
+            return issues
+
+        if since_partial_s < self._stt_stuck_threshold_s:
+            self._stt_stuck_cycles = 0
+            return issues
+
+        self._stt_stuck_cycles += 1
+        if self._stt_stuck_cycles < 2:
+            logger.debug(
+                "HEALTH stt: since_partial=%.1fs > %.1fs (cycle %d) -- watching",
+                since_partial_s, self._stt_stuck_threshold_s,
+                self._stt_stuck_cycles,
+            )
+            return issues
+
+        issues.append(
+            f"STT activity stuck: no partial for {since_partial_s:.0f}s "
+            f"(final {since_final_s:.0f}s ago, threshold "
+            f"{self._stt_stuck_threshold_s:.0f}s, "
+            f"watchdog_restarts={int(diag.get('total_restarts', 0))})"
+        )
+        self._degraded_components.add("stt")
         return issues
 
     def _check_tts(self) -> list[str]:

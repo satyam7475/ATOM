@@ -22,18 +22,22 @@
 | **Self-Improving** | SelfEvolutionEngine + SelfOptimizer + BehaviorTracker. |
 | **Modular Organs** | Every subsystem can be replaced without touching others. |
 
-## Tech Stack
+## Tech Stack (Sprint Ω.7, 2026-04-26)
 
 | Layer | Technology |
 |-------|-----------|
-| Language | Python 3.11+ (async/await) |
-| Concurrency | asyncio + ThreadPoolExecutor(3 workers) |
-| STT | faster-whisper small (offline, bilingual en+hi, CPU/GPU) |
-| TTS | Edge Neural TTS (primary), Windows SAPI (offline fallback) |
-| LLM | llama-cpp-python with GGUF models (1B + 3B dual routing) |
+| Language | Python 3.11+ (async/await) — `dataclass(slots=True)` + PEP 604 unions; pinned via `.python-version` |
+| Concurrency | asyncio + ThreadPoolExecutor (CPU/Metal/MLX work runs via `loop.run_in_executor`) |
+| STT (primary) | **WhisperKit CoreML on Apple Neural Engine** (`whisperkit-cli serve`, OpenAI-compat `/v1/audio/transcriptions`, model: `whisper-large-v3-v20240930_turbo_632MB`) |
+| STT (fallbacks) | `whisper.cpp` Metal (pywhispercpp) → SFSpeechRecognizer (macos_native) |
+| TTS | macOS native `NSSpeechSynthesizer` (`voice/tts_macos.py`); Kokoro + Edge are opt-in only |
+| LLM | **MLX single-resident Qwen3-8B-4bit** (Apple Silicon, `brain.single_resident=true`, no draft, no whisper-confirmer); Gemini cloud via `cognitive_kernel` Path 2.65 (off by default) |
+| VLM | mlx-vlm SmolVLM-Instruct-4bit (lazy-loaded, `vision.vlm.warm_at_boot=false`) |
+| Embeddings | SentenceTransformer on torch.mps (Phase B.2) |
+| RAG | ChromaDB (local, no network) |
 | UI | aiohttp WebSocket + Three.js JARVIS dashboard |
-| Monitoring | psutil, custom MetricsCollector, HealthMonitor |
-| Persistence | JSON files (logs/, config/) — no database dependency |
+| Monitoring | `core/health_monitor.py` (CPU/RAM/STT-watchdog), `core/runtime_watchdog.py`, `voice/stt_watchdog.py`, `voice/audio_intelligence.py` |
+| Persistence | JSON files (`logs/`, `config/`, `data/`) — no DB dependency |
 
 ## The 8 Rings (Architecture Layers)
 
@@ -61,6 +65,13 @@ BACKBONE:             — AsyncEventBus (connects ALL rings)
 | `config/commands.json` | Action registry (27 commands) |
 | `config/skills.json` | Phrase expansion skills |
 
-## Module Count
+## Module Count (live as of 2026-04-26)
 
-~80 source files, ~45 events, 27+ commands, 200+ intent patterns.
+~155 Python source files in `core/`, `brain/`, `voice/`, `vision/`, `cognitive_kernel/`, `device/`, plus 1929 passing tests in `tests/`.
+
+## Verified Working End-to-End (Sprint Ω.6.B / Ω.7 demo gate)
+
+- Voice: WhisperKit STT → MLX Qwen3-8B-4bit (single-resident, no speculative) → macOS native TTS, with barge-in and audio-device hot-swap.
+- Brain: prompt cache persistence, Metal-serial cold start, ~7-8 GB peak RAM on M-series 16 GB.
+- Test suite: 1929 passed, 2 skipped, 0 failed on `.venv/bin/python` (3.11.15).
+- Disabled-by-default for stability: `cloud.enabled`, `cloud_brain_router.enabled`, `whisper_confirm.enabled`, `speculative.enabled`, `vision.vlm.warm_at_boot`.

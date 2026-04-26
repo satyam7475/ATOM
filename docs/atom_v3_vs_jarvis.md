@@ -1,6 +1,19 @@
 # ATOM v3 vs Jarvis — Scorecard
 
-_Last updated: 2026-04-21_
+_Last updated: 2026-04-21 (v3.1). For the live runtime scorecard see the
+canvas `atom-vs-jarvis-friday-scorecard.canvas.tsx` and
+`logs/JARVIS_EVAL_REPORT.md`._
+
+> **Current state (Sprint Ω.7, 2026-04-26):** the brain has moved from
+> the v3-era dual-model layout described below (Phi-3.5-mini, Qwen2.5-7B,
+> draft+main speculative decoding) to a **single-resident MLX
+> Qwen3-8B-4bit** with speculative decoding and the WhisperConfirmer
+> second-pass STT both intentionally **disabled** for stability. STT is
+> WhisperKit-CoreML on the Apple Neural Engine via `whisperkit-cli serve`,
+> not faster-whisper. Treat the Phase 2 / Phase 4 sections of this
+> document as historical context — `core/boot/wiring.py`,
+> `brain/mlx_llm.py`, and `voice/stt_whisperkit.py` are the source of
+> truth for what actually loads at boot.
 
 This document is the v3 release scorecard produced after the
 "Jarvis-Grade ATOM v3 — End-to-End Enhancement Plan" landed.

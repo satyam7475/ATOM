@@ -1749,11 +1749,24 @@ class MacOSTTSAsync:
         if not has_audio:
             return
         if t in ("Listening...", "Processing..."):
-            logger.info("Barge-in detected (status placeholder), stopping TTS")
+            logger.info(
+                "Barge-in: confirmer status indicator '%s' "
+                "(playing=%s, stream_active=%s, buffered_chunks=%d) -- stopping TTS",
+                t,
+                self._playing,
+                self._stream_task is not None or self._stream_queue is not None,
+                len(self._chunk_buffer),
+            )
             await self.stop()
             return
         if self._state.current is AtomState.SPEAKING and len(t) >= 2:
-            logger.info("Barge-in: user speech during TTS, stopping (%s)", t[:56])
+            logger.info(
+                "Barge-in: user speech during TTS "
+                "(text='%s', playing=%s, buffered_chunks=%d) -- stopping",
+                t[:56],
+                self._playing,
+                len(self._chunk_buffer),
+            )
             await self.stop()
 
     async def on_response(self, text: str, is_exit: bool = False,

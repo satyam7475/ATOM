@@ -108,7 +108,7 @@ class ColdStartOptimizer:
         -----------------
         Boot has three Metal/GPU consumers that all attach
         ``addCompletedHandler:`` callbacks to the same Metal device queue:
-          1. ``_preload_fast_model`` -- MLX (Qwen3-4B-Instruct-2507-4bit)
+          1. ``_preload_fast_model`` -- MLX (Qwen3-8B-4bit, single-resident as of Sprint Ω.7)
           2. ``_preload_embeddings`` -- torch.mps (SentenceTransformer)
           3. ``_preload_vlm``        -- mlx-vlm   (SmolVLM-Instruct-4bit)
 

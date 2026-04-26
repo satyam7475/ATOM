@@ -26,7 +26,9 @@
 ## Requirements
 
 - **macOS** on Apple Silicon (M1/M2/M3/M4/M5)
-- **Python 3.11+**
+- **Python 3.11+** (pinned to `3.11.15` via `.python-version`; ATOM uses
+  `dataclass(slots=True)`, PEP 604 union syntax, and other 3.10+ features —
+  Apple’s stock `/usr/bin/python3` (3.9.6) **will not work**)
 - **Microphone** for voice
 
 ---
@@ -35,11 +37,16 @@
 
 ```bash
 cd ATOM
-python3 -m venv .venv
+python3.11 -m venv .venv         # explicitly use 3.11; do NOT use /usr/bin/python3
 source .venv/bin/activate
-python3 -m pip install --upgrade pip
+python -m pip install --upgrade pip
 pip install -r requirements-desktop.txt
 ```
+
+> **Always run ATOM through `.venv/bin/python`.** The launch scripts
+> (`Run ATOM.command`, `scripts/atom_run.sh`, `ATOM.app`) already do this —
+> only humans / agents calling `python3` directly trip on the system 3.9.
+> For tests: `.venv/bin/python -m pytest tests/` (1929 currently passing).
 
 ---
 

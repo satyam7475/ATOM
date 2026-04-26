@@ -360,7 +360,24 @@ CONFIG_SCHEMA: dict[str, Any] = {
                 },
                 "whisper_confirm": {
                     "type": "object",
-                    "description": "v3 Phase 4 second-pass STT. Re-decodes suspect streaming finals with faster-whisper for materially lower WER on short, low-confidence utterances.",
+                    "description": (
+                        "v3 Phase 4 second-pass STT. Re-decodes suspect "
+                        "streaming finals with faster-whisper for materially "
+                        "lower WER on short, low-confidence utterances. "
+                        "Sprint Ω.7 (2026-04-26): kept disabled in shipped "
+                        "settings — when last enabled in production, the "
+                        "synchronous faster-whisper transcribe call (~1-3s) "
+                        "blocked the asyncio loop from inside _emit_final, "
+                        "producing 5-7s 'Slow handler' bus warnings across "
+                        "every speech_partial / speech_final / fs_event "
+                        "subscriber. Before flipping enabled=true again, "
+                        "refactor voice/stt_*.py::_consume_once / _emit_final "
+                        "to dispatch the WhisperConfirmer.confirm() call via "
+                        "loop.run_in_executor (or convert _emit_final to "
+                        "async); otherwise the demo-stable bus will stall "
+                        "exactly as logged on 2026-04-26 13:22 (lines "
+                        "6883-6893 of logs/atom.log)."
+                    ),
                     "properties": {
                         "enabled": {"type": "boolean"},
                         "model_size": {

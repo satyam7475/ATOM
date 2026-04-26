@@ -37,22 +37,47 @@ These are **not broken** — leave them alone unless they actively block a P1/P2
 
 ### 1.2 What is broken or wrong (verified in current tree)
 
-These are the things this plan fixes. Each row maps to an entry in §3.
+> **Ω.6 update (2026-04-26):** the original B1–B12 list below is the
+> P1–P4 baseline and is now fully shipped or intentionally deferred —
+> see §1.2.1 for the post-P1–P4 status. The current Ω.6 baseline of
+> "what's still rough end-to-end" lives in §1.2.2.
 
-| # | Problem | Evidence (file:line) | Phase |
-|---|---|---|---|
-| B1 | English-only Whisper model wired even though `bilingual=true` | `settings.json:109,116` | **P1.1** |
-| B2 | `whisper_language="en"` forced, no auto-detect | `settings.json:111` | **P1.2** |
-| B3 | `WhisperSTT` ignores `bilingual` flag entirely | `voice/stt_whisper.py:159` | **P1.3** |
-| B4 | `correct_text()` (auto-correction) wired into `STTAsync`/`STTGoogle` only, **not** `WhisperSTT` | `voice/stt_whisper.py:644–674` vs `voice/stt_async.py:746–757` | **P2.1** |
-| B5 | `WhisperConfirmer` attaches only to `NativeSTT` (`hasattr` check), so with `engine=whisper_cpp` it never fires | `main.py:326–348` | **P2.2** |
-| B6 | Embedding device hard-coded to `"cpu"` instead of `"auto"` (MPS unused → ~7s load) | `settings.json:486` | **P2.3** |
-| B7 | MLX imports at module scope — every Python startup pays MLX import cost even when brain is disabled | `brain/mlx_llm.py:30–41` | **P2.6** |
-| B8 | `vlm.warm_at_boot` code default is `True` while config says `False` (config wins, but defaults are misaligned) | `core/boot/cold_start.py:374` vs `settings.json:76` | **P2.7** |
-| B9 | Whisper.cpp Metal init is the single biggest cold-start cost (~14 s on M5 Air per prior boot trace) | `voice/stt_whisper.py:295–311` | **P3.3** |
-| B10 | No Apple Neural Engine usage anywhere in the hot path (LLM + embed + STT all on Metal/CPU, not ANE) | architecture-wide | **P3.4 / P3.5** |
-| B11 | `cognitive_loop.enabled=true` runs reflective + presence + scene + suggester on every boot | `settings.json:373–404` | **P1.5** (optional) |
-| B12 | Persona / owner-style adaptation is rule-based, not learned per-owner | — | **P4** |
+#### 1.2.1 Original P1–P4 baseline — final status (2026-04-26)
+
+These are the items the original P1–P4 plan was written against. All
+shipped except B11/B12 which were intentionally deferred.
+
+| # | Problem | Evidence (file:line) | Phase | Status |
+|---|---|---|---|---|
+| B1 | English-only Whisper model wired even though `bilingual=true` | `settings.json:109,116` | **P1.1** | ✅ shipped |
+| B2 | `whisper_language="en"` forced, no auto-detect | `settings.json:111` | **P1.2** | ✅ shipped |
+| B3 | `WhisperSTT` ignores `bilingual` flag entirely | `voice/stt_whisper.py:159` | **P1.3** | ✅ shipped |
+| B4 | `correct_text()` (auto-correction) wired into `STTAsync`/`STTGoogle` only, **not** `WhisperSTT` | `voice/stt_whisper.py:644–674` vs `voice/stt_async.py:746–757` | **P2.1** | ✅ shipped |
+| B5 | `WhisperConfirmer` attaches only to `NativeSTT` (`hasattr` check), so with `engine=whisper_cpp` it never fires | `main.py:326–348` | **P2.2** | ✅ shipped |
+| B6 | Embedding device hard-coded to `"cpu"` instead of `"auto"` (MPS unused → ~7s load) | `settings.json:486` | **P2.3** | ✅ shipped (now ANE via mlx-embeddings, Phase B.2) |
+| B7 | MLX imports at module scope — every Python startup pays MLX import cost even when brain is disabled | `brain/mlx_llm.py:30–41` | **P2.6** | ✅ shipped |
+| B8 | `vlm.warm_at_boot` code default is `True` while config says `False` | `core/boot/cold_start.py:374` vs `settings.json:76` | **P2.7** | ✅ shipped |
+| B9 | Whisper.cpp Metal init is the single biggest cold-start cost (~14s on M5 Air) | `voice/stt_whisper.py:295–311` | **P3.3** | ✅ shipped via Ω.6.A — WhisperKit ANE live (Apr 26 2026) |
+| B10 | No Apple Neural Engine usage anywhere in the hot path | architecture-wide | **P3.4 / P3.5** | ✅ shipped — STT (WhisperKit) + embeddings (mlx-embeddings) both on ANE |
+| B11 | `cognitive_loop.enabled=true` runs reflective + presence + scene + suggester on every boot | `settings.json:373–404` | **P1.5** (optional) | ⬜ deferred — cognitive loop kept on; Phase G monitors it |
+| B12 | Persona / owner-style adaptation is rule-based, not learned per-owner | — | **P4** | ⬜ deferred — long-term roadmap (P4.5 / Ω.7+) |
+
+#### 1.2.2 Current Ω.6 baseline (post-P1–P4, post-Ω.4/Ω.5/Ω.6.A)
+
+These are the things still rough on the path to a 9/10 user experience.
+Sprint **Ω.6.B** (this fix sprint) closes the code/config gaps. iPhone
+bridge work and cloud activation are intentionally out of scope.
+
+| # | Area | Problem | Evidence | Phase | Status |
+|---|---|---|---|---|---|
+| Ω1 | Voice activation | Silent `activation_mode=always_on` + `wake_word.enabled=true` contradiction — wake-word engine is bypassed but config still says it should run | `config/settings.json` + `voice/voice_pipeline.py:build_wake_word` | **Ω.6.B** | ✅ fixed (warning + `wake_word.enabled=false`) |
+| Ω2 | Self-healing | `HealthMonitor` docstring claims STT-stuck check; code only inspects mic-attach | `core/health_monitor.py:_check_mic` | **Ω.6.B** | ✅ fixed (`_check_stt_activity` reads `STTWatchdog.get_diagnostics()`) |
+| Ω3 | Voice observability | TTS barge-in log says "(status placeholder)" with no payload | `voice/tts_macos.py:on_speech_partial` | **Ω.6.B** | ✅ fixed (real payload: `playing`, `stream_active`, `buffered_chunks`) |
+| Ω4 | MCP integration | Image / resource fall-through emits bare `[ImageContent]` — leaks nothing to the LLM | `core/mcp/atom_mcp_client.py:_flatten_tool_response` | **Ω.6.B** | ✅ fixed (mime + approx size; VLM bridge deferred) |
+| Ω5 | Audio recovery | Critical-reason `seamless_switch` (BT disconnect / repeated STT failure) returns False on first lock-defer → user stranded on dead device | `voice/audio_intelligence.py:seamless_switch` | **Ω.6.B** | ✅ fixed (single 1.5 s backoff retry on critical reasons) |
+| Ω6 | Documentation | This very §1.2 baseline was stale — listed B1–B12 as if open | `docs/ATOM_NEXT_STEPS_PLAN.md` | **Ω.6.B** | ✅ fixed (this commit) |
+| Ω7 | Cloud escalation | `cloud.enabled=false` by default — intentional privacy posture, not a bug. Flipping requires `GEMINI_API_KEY` | `config/settings.json:cloud` | **Boss decision** | ⬜ off-by-default by design |
+| Ω8 | iPhone bridge | `iphone_bridge.bind_host=127.0.0.1` blocks LAN clients | `core/iphone_bridge.py` | **deferred** | ⬜ out of scope this sprint |
 
 ### 1.3 Boot timeline (prior trace, M5 Air, 16 GB)
 

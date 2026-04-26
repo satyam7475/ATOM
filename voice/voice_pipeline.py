@@ -874,10 +874,31 @@ class VoicePipeline:
             self.tts_runtime_label = f"Edge ({tts_cfg.get('edge_voice')})"
 
     def build_wake_word(self) -> Any:
-        """Build and preload the optional wake word engine."""
+        """Build and preload the optional wake word engine.
+
+        Sprint Ω.6.B (Apr 26 2026): Surface the
+        ``activation_mode=always_on`` + ``wake_word.enabled=true``
+        contradiction at WARNING level so operators stop wondering why
+        ``Hey ATOM`` does nothing — always_on routes STT continuously and
+        intentionally bypasses OpenWakeWord. The fix is one of:
+          (a) set ``wake_word.enabled=false`` in ``config/settings.json``
+              (recommended for the always-on Jarvis default), or
+          (b) set ``voice.activation_mode="wake_word"`` to actually use
+              the wake-word gating.
+        """
         self._wake_word = None
         if self._voice_activation_mode() == "always_on":
-            logger.info("WakeWordEngine bypassed: voice.activation_mode=always_on")
+            if self._wake_word_requested():
+                logger.warning(
+                    "Wake-word config contradiction: voice.activation_mode="
+                    "'always_on' supersedes wake_word.enabled=true (the wake "
+                    "word engine will NOT run). Set wake_word.enabled=false "
+                    "in config/settings.json to silence this warning, or "
+                    "switch voice.activation_mode to 'wake_word' to actually "
+                    "use the wake gate.",
+                )
+            else:
+                logger.info("WakeWordEngine bypassed: voice.activation_mode=always_on")
             return None
         if not self._wake_word_requested():
             logger.info("WakeWordEngine disabled in config")

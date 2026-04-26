@@ -385,7 +385,16 @@ class AtomMCPClient:
 
 
 def _flatten_tool_response(response: Any) -> str:
-    """Squash an MCP CallToolResult into a single string for ATOM."""
+    """Squash an MCP CallToolResult into a single string for ATOM.
+
+    Sprint Ω.6.B (Apr 26 2026): Non-text MCP content (ImageContent,
+    EmbeddedResource, AudioContent) used to fall through as the bare
+    type name (``[ImageContent]``), which leaked nothing useful into the
+    LLM context. We now surface ``mimeType`` and an approximate payload
+    size so the brain at least knows it received an image-of-png-256KB
+    rather than a magic word. Bridging into the VLM caption pipe is a
+    separate Ω.6 follow-up; this is the placeholder-stops-lying fix.
+    """
     if response is None:
         return "[MCP] (no response)"
     parts: list[str] = []
@@ -395,11 +404,55 @@ def _flatten_tool_response(response: Any) -> str:
         if text:
             parts.append(str(text))
             continue
-        # Image / resource contents: emit a compact placeholder.
-        kind = type(item).__name__
-        parts.append(f"[{kind}]")
+        parts.append(_describe_non_text_item(item))
     body = "\n".join(parts).strip() or "(empty)"
     return f"[MCP ERROR] {body}" if is_err else body
+
+
+def _describe_non_text_item(item: Any) -> str:
+    """Render a non-text MCP content item as an informative placeholder.
+
+    The MCP Python SDK emits dataclass-like objects:
+      * ``ImageContent``  -> ``data`` (base64 str), ``mimeType``
+      * ``AudioContent``  -> ``data`` (base64 str), ``mimeType``
+      * ``EmbeddedResource`` -> ``resource`` (TextResourceContents | BlobResourceContents)
+
+    All we promise is "type, mime, approx size" — enough for the LLM
+    to reason about the response without us having to download/decode
+    arbitrary blobs on the hot path.
+    """
+    kind = type(item).__name__
+    mime = getattr(item, "mimeType", None) or ""
+
+    data = getattr(item, "data", None)
+    if isinstance(data, (bytes, bytearray)):
+        approx_kb = max(1, len(data) // 1024)
+        return f"[{kind} mime={mime or 'application/octet-stream'} ~{approx_kb}KB]"
+    if isinstance(data, str) and data:
+        # base64-encoded payloads decode to ~3/4 of the encoded length.
+        approx_bytes = (len(data) * 3) // 4
+        approx_kb = max(1, approx_bytes // 1024)
+        return f"[{kind} mime={mime or 'application/octet-stream'} ~{approx_kb}KB]"
+
+    resource = getattr(item, "resource", None)
+    if resource is not None:
+        uri = str(getattr(resource, "uri", "") or "")
+        rmime = str(getattr(resource, "mimeType", "") or mime or "")
+        text = getattr(resource, "text", None)
+        blob = getattr(resource, "blob", None)
+        if isinstance(text, str) and text:
+            head = text.strip().splitlines()[0][:120] if text.strip() else ""
+            return f"[{kind} uri={uri} mime={rmime or 'text/plain'} text='{head}']"
+        if isinstance(blob, (bytes, bytearray)):
+            approx_kb = max(1, len(blob) // 1024)
+            return f"[{kind} uri={uri} mime={rmime or 'application/octet-stream'} blob~{approx_kb}KB]"
+        if isinstance(blob, str) and blob:
+            approx_bytes = (len(blob) * 3) // 4
+            approx_kb = max(1, approx_bytes // 1024)
+            return f"[{kind} uri={uri} mime={rmime or 'application/octet-stream'} blob~{approx_kb}KB]"
+        return f"[{kind} uri={uri} mime={rmime}]" if rmime else f"[{kind} uri={uri}]"
+
+    return f"[{kind} mime={mime}]" if mime else f"[{kind}]"
 
 
 __all__ = [
