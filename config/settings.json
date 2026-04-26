@@ -164,7 +164,7 @@
         "promotion_min_confidence_no_wake": 0.65,
         "passive_revert_delay_s": 30.0,
         "whisper_confirm": {
-            "enabled": true,
+            "enabled": false,
             "model_size": "tiny",
             "ring_seconds": 5.0,
             "decode_seconds": 4.0,
@@ -247,7 +247,7 @@
     "brain": {
         "enabled": true,
         "mlx_model": "models/qwen3-8b-4bit",
-        "mlx_model_fallback": "models/qwen3-4b-instruct-4bit",
+        "mlx_model_fallback": "models/qwen3-8b-4bit",
         "n_ctx": 4096,
         "n_threads": 4,
         "n_gpu_layers": -1,
@@ -267,9 +267,11 @@
         "kv_group_size": 64,
         "kv_quant_warmup_tokens": 512,
         "mx_compile_enabled": true,
+        "single_resident": true,
+        "role_switch_min_interval_s": 8.0,
         "speculative_decoding": {
-            "enabled": true,
-            "draft_model_path": "models/qwen3-4b-instruct-4bit",
+            "enabled": false,
+            "draft_model_path": "models/qwen3-8b-4bit",
             "num_draft_tokens": 3
         }
     },
@@ -553,7 +555,7 @@
         "max_steps_per_workflow": 30
     },
     "wake_word": {
-        "enabled": true,
+        "enabled": false,
         "sensitivity": 0.5,
         "model": "ATOM/Buddy/hey_atom/atom"
     },
@@ -584,7 +586,7 @@
         ]
     },
     "cognitive_kernel": {
-        "quick_model": "qwen3-4b-instruct-4bit",
+        "quick_model": "qwen3-8b-4bit",
         "full_model": "qwen3-8b-4bit",
         "simple_query_max_chars": 48,
         "deep_query_min_chars": 140,

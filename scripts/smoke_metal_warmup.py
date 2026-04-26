@@ -74,10 +74,8 @@ async def _make_real_brain() -> object:
 
     cfg = {
         "brain": {
-            "model_paths": {
-                "fast": "models/qwen3-4b-instruct-4bit",
-                "primary": "models/qwen3-4b-instruct-4bit",
-            },
+            "mlx_model": "models/qwen3-8b-4bit",
+            "single_resident": True,
             "max_tokens": 64,
             "temperature": 0.7,
         },
@@ -112,7 +110,7 @@ async def _make_real_brain() -> object:
 async def _main() -> int:
     print("== ATOM Metal warmup smoke ==")
     print(f"  cwd          : {os.getcwd()}")
-    print(f"  models LLM   : {(ROOT / 'models/qwen3-4b-instruct-4bit').exists()}")
+    print(f"  models LLM   : {(ROOT / 'models/qwen3-8b-4bit').exists()}")
     print(f"  models VLM   : {(ROOT / 'models/smolvlm-instruct-4bit').exists()}")
     warm_vlm = os.environ.get("SMOKE_WARM_VLM", "0") in {"1", "true", "yes"}
     print(f"  warm_vlm     : {warm_vlm}")

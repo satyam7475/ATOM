@@ -3316,8 +3316,8 @@ async def main() -> None:
         # the legacy model directory ``qwen2.5-7b-instruct-4bit`` would
         # otherwise be truncated to "qwen2" because ``stem`` treats every
         # dot after the first as an extension boundary. The current
-        # ``qwen3-4b-instruct-4bit`` directory has no dots so it's safe
-        # either way, but keeping ``.name`` future-proofs the path.
+        # ``qwen3-8b-4bit`` directory has no dots so it's safe either
+        # way, but keeping ``.name`` future-proofs the path.
         model_name = Path(model_raw).name.replace("-mlx", "")
         brain_label = f"Intent Engine + Agentic MLX LLM ({model_name})"
     elif brain_enabled:
@@ -3392,6 +3392,16 @@ async def main() -> None:
     # ── Start perception + governance modules ──────────────────────
     system_state_engine.start()
     await voice_pipeline.start_voice_loop(running_loop)
+
+    # Sprint Ω.6.B (Apr 26 2026): wire STTWatchdog into HealthMonitor for
+    # real activity-based stuck detection. Has to happen after start_voice_loop
+    # because the watchdog is built inside it.
+    try:
+        if voice_pipeline.stt_watchdog is not None:
+            health_monitor.set_stt_watchdog(voice_pipeline.stt_watchdog)
+            logger.info("HealthMonitor: STT watchdog wired (activity-based stuck check active)")
+    except Exception:
+        logger.debug("HealthMonitor: STT watchdog wiring failed", exc_info=True)
 
     if silicon_governor is not None and silicon_governor.is_available:
         silicon_governor.start()

@@ -317,8 +317,8 @@ class CognitiveKernel:
         self._latency = LatencyController(self._config)
 
         ck = self._config.get("cognitive_kernel", {})
-        self._quick_model = ck.get("quick_model", "qwen3-4b-instruct")
-        self._full_model = ck.get("full_model", "qwen3-4b-instruct")
+        self._quick_model = ck.get("quick_model", "qwen3-8b-4bit")
+        self._full_model = ck.get("full_model", "qwen3-8b-4bit")
         self._deep_query_min_chars = int(ck.get("deep_query_min_chars", 120))
         self._simple_query_max_chars = int(ck.get("simple_query_max_chars", 50))
         self._battery_degrade = bool(ck.get("battery_degrade", True))

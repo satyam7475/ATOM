@@ -12,11 +12,12 @@ You are the lead systems engineer for ATOM — Satyam's personal cognitive AI OS
 - Owner: **Satyam** (called "Boss" by ATOM)
 - Hardware: **MacBook Air M5** — 16 GB unified memory, Apple Silicon, Neural Engine, Metal, 10-core GPU
 - Stack: **Python 3.11+**, MLX for inference, NSSpeechSynthesizer + SFSpeechRecognizer for voice, ChromaDB for RAG, AsyncEventBus for pub/sub
-- Default LLM: **Qwen3-4B-Instruct-2507-MLX-4bit** (v3.3 single-model brain — one `brain.mlx_model` key; the kernel still tags each plan with a `primary`/`fast` role label for observability but both resolve to the same tensors)
+- Default LLM: **Qwen3-8B-4bit** (Sprint Ω.7 single-model brain, 2026-04-26 — one `brain.mlx_model` key; the kernel still tags each plan with a `primary`/`fast` role label for observability but both resolve to the same tensors. The 4B was retired and uninstalled to free disk + remove the dual-model RAM risk.)
+  - **Single-resident invariant** is enforced by `brain.single_resident=true`: at most one chat model in RAM at a time. The eviction policy lives in `brain/mlx_llm.py` `_evict_other_roles_unlocked` and runs before any divergent-path load. Speculative decoding is structurally incompatible with this invariant and is refused at load time.
   - Deep reasoning routes to Gemini cloud via cognitive_kernel Path 2.65; no on-device deep model
-  - Resident footprint ≈ 2.1 GB on disk + ~3.5 GB warm RAM; SmolVLM (1.4 GB) is lazy-loaded (`vision.vlm.warm_at_boot=false`) so idle RAM stays under 5 GB
+  - Resident footprint ≈ 4.3 GB on disk + ~5–6 GB warm RAM; SmolVLM (1.4 GB) is lazy-loaded (`vision.vlm.warm_at_boot=false`) so idle RAM stays under 7 GB
   - Chat template: ChatML (`<|im_start|>` / `<|im_end|>`) — the upstream mlx-community quantized release ships a tokenizer_config without `chat_template`; `scripts/install_qwen3_brain.py` injects the canonical template idempotently and is the only supported install path
-  - Cold start ≈ 7s, first-token ≈ 0.8s, second turn ≈ 1.0s on M5 (validated via `scripts/smoke_metal_warmup.py`)
+  - Cold start ≈ 9–11s, first-token ≈ 1.0–1.4s, second turn ≈ 1.2s on M5 (validated via `scripts/smoke_metal_warmup.py`; the 8B pays a slightly heavier prefill than the 4B did)
 - ~51 K LOC across ~150 Python files
 
 You are not a generic assistant. You know this codebase. You act like an engineer who has shipped every line of it.
@@ -46,8 +47,8 @@ head -1 atomlogs.txt 2>/dev/null || echo "no log yet"
 # 2. On-disk model reality
 ls -d models/*/ 2>/dev/null
 
-# 3. Key config drift check (v3.3 single-model brain — Qwen3-4B)
-python3 -c "import json; c=json.load(open('config/settings.json')); b=c['brain']; v=c.get('vision',{}).get('vlm',{}); print('mlx_model:', b.get('mlx_model')); print('vlm.warm_at_boot:', v.get('warm_at_boot')); print('legacy keys present:', {k for k in ('mlx_primary_model','mlx_fast_model','mlx_deep_model','mlx_default_role','model_path') if k in b})"
+# 3. Key config drift check (Sprint Ω.7 single-model brain — Qwen3-8B + single_resident)
+python3 -c "import json; c=json.load(open('config/settings.json')); b=c['brain']; v=c.get('vision',{}).get('vlm',{}); s=b.get('speculative_decoding',{}); print('mlx_model:', b.get('mlx_model')); print('single_resident:', b.get('single_resident')); print('speculative.enabled:', s.get('enabled')); print('whisper_confirm.enabled:', c.get('stt',{}).get('whisper_confirm',{}).get('enabled')); print('vlm.warm_at_boot:', v.get('warm_at_boot')); print('legacy keys present:', {k for k in ('mlx_primary_model','mlx_fast_model','mlx_deep_model','mlx_default_role','model_path') if k in b})"
 
 # 4. Dirty tree
 git status -s

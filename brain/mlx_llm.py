@@ -384,19 +384,22 @@ def _looks_like_wrapper_preface(text: str) -> bool:
 class MLXBrain:
     """Single-model MLX wrapper with MiniLLM-compatible behavior.
 
-    ATOM runs ONE local MLX model (Qwen3-4B-Instruct-2507-4bit by default).
-    The cognitive kernel still tags each ``QueryPlan`` with a role label
-    (``primary`` | ``fast``) for logs + telemetry so we can see which
-    routing path picked the brain; both labels resolve to the same
-    weights here, so the state dicts are keyed by role purely for
-    observability -- not for separate loads.
+    ATOM runs ONE local MLX model (Qwen3-8B-4bit by default since
+    Sprint Ω.7, 2026-04-26). The cognitive kernel still tags each
+    ``QueryPlan`` with a role label (``primary`` | ``fast``) for logs +
+    telemetry so we can see which routing path picked the brain; with
+    the single-model profile both labels resolve to the same weights
+    here, so the state dicts are keyed by role purely for observability
+    -- not for separate loads. When ``brain.single_resident`` is true
+    (default), even an explicitly dual-tier ``mlx_fast_model`` setting
+    is enforced one-tier-at-a-time via per-role eviction.
     """
 
     # Role labels emitted by the kernel. Kept as a tuple (not frozenset)
     # to make the enumeration order explicit for the per-role state dicts.
     _ROLES: tuple[str, ...] = ("primary", "fast")
 
-    _DEFAULT_MODEL_PATH = "models/qwen3-4b-instruct-4bit"
+    _DEFAULT_MODEL_PATH = "models/qwen3-8b-4bit"
 
     @classmethod
     def _resolve_model_path(cls, brain_cfg: dict) -> str:
@@ -475,11 +478,35 @@ class MLXBrain:
         self._top_p = float(brain_cfg.get("top_p", 0.9))
         self._timeout = float(brain_cfg.get("timeout_seconds", 30))
 
+        # Sprint Ω.7 (Apr 26 2026): Single-resident invariant. On a 16 GB
+        # M5 we cannot afford 4B + 8B co-resident -- speculative decoding
+        # and naive dual-tier both violate the "one model in RAM" rule
+        # the owner asked for. When ``brain.single_resident`` is true
+        # (default), ``_ensure_loaded`` evicts any other role whose
+        # loaded path differs from the requested path before bringing
+        # the new weights in. The cognitive kernel still picks
+        # ``primary`` (8B) vs ``fast`` (4B) per query; we just guarantee
+        # the *other* tier is gone before the chosen one loads. A
+        # hysteresis interval prevents tier ping-pong every turn.
+        self._single_resident: bool = bool(
+            brain_cfg.get("single_resident", True),
+        )
+        self._role_switch_min_interval: float = float(
+            brain_cfg.get("role_switch_min_interval_s", 8.0),
+        )
+        self._last_role_switch_ts: float = 0.0
+
         # Sprint P3.2 (Apr 26 2026): Speculative decoding (4B drafts 8B).
         # mlx-lm's stream_generate accepts `draft_model=...` and the kwarg
         # `num_draft_tokens` for the verification window. With Qwen3-4B
         # drafting Qwen3-8B we expect 1.5-2x tokens/s on warm runs. Off
         # by default; enable with `brain.speculative_decoding.enabled=true`.
+        # Sprint Ω.7: speculative decoding is incompatible with
+        # ``single_resident`` (target + draft = two models in RAM by
+        # design). When both flags are set, ``_ensure_draft_loaded``
+        # refuses to load the draft regardless of other gates. Speculative
+        # is therefore opt-in *only* on a config that explicitly disables
+        # single-resident -- a deliberate, documented trade.
         spec_cfg = brain_cfg.get("speculative_decoding", {}) or {}
         self._speculative_enabled: bool = bool(spec_cfg.get("enabled", False))
         self._speculative_draft_path: str | None = spec_cfg.get("draft_model_path")
@@ -794,6 +821,45 @@ class MLXBrain:
         self._tokenizers[key] = None
         self._fingerprints[key] = None
         self._loaded_roles[key] = False
+        # Drop the per-role prompt KV cache. Its tensors reference the
+        # model we just unloaded; keeping them around is unsafe and
+        # wastes memory until the next swap-back paid the prefill again.
+        with self._prompt_cache_lock:
+            self._prompt_caches.pop(key, None)
+        # Persona pin lives on a single role (default "fast"); if that
+        # role just got evicted, clear the pin so the next load re-warms
+        # the persona prefix instead of trusting stale token counts.
+        if self._pinned_persona_role == key:
+            with self._pinned_persona_lock:
+                self._pinned_persona_path = None
+                self._pinned_persona_mtime = 0.0
+                self._pinned_persona_token_count = 0
+
+    def _evict_other_roles_unlocked(self, keep_role: str, keep_path: str) -> int:
+        """Single-resident eviction (Sprint Ω.7).
+
+        Drop every other role whose loaded path differs from
+        ``keep_path``. We deliberately spare same-path siblings because
+        ``_ensure_loaded`` uses tensor aliasing for the single-tier
+        case -- two roles can share *one* set of weights without paying
+        double RAM, and unloading one of those would also poison the
+        other. Returns the number of roles actually unloaded so callers
+        can log a single line if eviction happened.
+        """
+        evicted = 0
+        for other in self._ROLES:
+            if other == keep_role:
+                continue
+            if not self._loaded_roles[other]:
+                continue
+            other_path = self._fingerprints[other]
+            if other_path == keep_path:
+                continue
+            self._unload_role_unlocked(other)
+            evicted += 1
+        if evicted:
+            self._clear_mlx_cache()
+        return evicted
 
     def _clear_mlx_cache(self) -> None:
         if not _HAS_MLX or mx is None:
@@ -847,6 +913,22 @@ class MLXBrain:
                     )
                     return True
 
+            # Sprint Ω.7: single-resident eviction. The chosen role's
+            # path differs from any sibling that's currently loaded, so
+            # drop those siblings *before* we bring the new weights in.
+            # On a 16 GB box this is the difference between "8B + 4B
+            # both resident" (the audited bug) and "exactly one tier
+            # resident at a time" (the contract).
+            if self._single_resident:
+                evicted = self._evict_other_roles_unlocked(role, str(model_path))
+                if evicted:
+                    self._last_role_switch_ts = time.monotonic()
+                    logger.info(
+                        "MLX single-resident: evicted %d sibling role(s) "
+                        "before loading role=%s path=%s",
+                        evicted, role, model_path.name,
+                    )
+
             self._load_failed[role] = False
             self._unload_role_unlocked(role)
             try:
@@ -876,9 +958,19 @@ class MLXBrain:
 
     def preload(self, *, model_role: str | None = None, load_all: bool = False) -> bool:
         if load_all:
-            # Single model: loading primary is sufficient, fast aliases
-            # the same tensors on first request. Kept as a loop so a
-            # future multi-model profile only needs _ROLES expanded.
+            # Sprint Ω.7: single-resident respects the invariant even at
+            # boot. Warm only the requested role (default "fast" / 4B)
+            # and let the smart router lazy-load the heavier tier on
+            # the first deep query. Loading both roles when their paths
+            # differ would re-introduce the 4B+8B co-resident regression
+            # the policy is designed to prevent.
+            if self._single_resident:
+                role = self._normalize_role(model_role or "fast")
+                return self._ensure_loaded(role)
+            # Single-model profile (paths aliased): loading primary is
+            # sufficient, fast aliases the same tensors on first
+            # request. Kept as a loop so a future multi-model profile
+            # only needs _ROLES expanded.
             ok = True
             for role in self._ROLES:
                 ok = self._ensure_loaded(role) and ok
@@ -894,8 +986,26 @@ class MLXBrain:
         call. mlx-lm's speculative path requires the draft and target
         models to share a tokenizer; we log a warning if vocabs disagree
         and disable speculation for safety.
+
+        Sprint Ω.7: speculative decoding is *structurally* incompatible
+        with the single-resident invariant -- target + draft are two
+        models in RAM by definition. When ``brain.single_resident`` is
+        true we refuse to load the draft regardless of whether the
+        speculative flag is on, and log once so an operator who left
+        both flags enabled can see why no speedup is happening.
         """
         if not self._speculative_enabled:
+            return False
+        if self._single_resident:
+            if not self._draft_load_failed:
+                logger.info(
+                    "MLX speculative decoding requested but "
+                    "single_resident=true -- draft model NOT loaded "
+                    "(speculative needs target+draft co-resident). "
+                    "Disable single_resident or speculative_decoding.enabled "
+                    "to resolve.",
+                )
+            self._draft_load_failed = True
             return False
         if self._draft_loaded:
             return True

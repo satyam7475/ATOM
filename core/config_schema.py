@@ -952,7 +952,7 @@ CONFIG_SCHEMA: dict[str, Any] = {
                 },
                 "mlx_model_fallback": {
                     "type": "string",
-                    "description": "Sprint Ω1c -- secondary MLX model directory used when ``mlx_model`` cannot be loaded (e.g. half-downloaded weights, OOM under thermal pressure). Lets ATOM degrade from Qwen3-8B-4bit to Qwen3-4B-Instruct-4bit instead of going silent.",
+                    "description": "Sprint Ω1c -- secondary MLX model directory used when ``mlx_model`` cannot be loaded (e.g. half-downloaded weights, OOM under thermal pressure). Sprint Ω.7 (Apr 26 2026): ATOM ships with the same path as ``mlx_model`` so the fallback is a no-op; the dual-model story (4B-as-fallback) was retired to keep RAM constant under any condition. Set to a separate model directory only if you have profiled and want a degraded brain to keep speaking when the primary fails to load.",
                 },
                 "mx_compile_enabled": {
                     "type": "boolean",
@@ -960,7 +960,7 @@ CONFIG_SCHEMA: dict[str, Any] = {
                 },
                 "speculative_decoding": {
                     "type": "object",
-                    "description": "Sprint P3.2 (Apr 26 2026): MLX speculative decoding. Use a small draft model (e.g. Qwen3-4B-Instruct-4bit) to predict candidate tokens that the target model verifies in parallel. 1.5-2x tokens/s on warm runs per Apple's MLX-LM examples. Off by default; enable after profiling.",
+                    "description": "Sprint P3.2 (Apr 26 2026): MLX speculative decoding. Use a small draft model (e.g. Qwen3-4B-Instruct-4bit) to predict candidate tokens that the target model verifies in parallel. 1.5-2x tokens/s on warm runs per Apple's MLX-LM examples. Off by default; enable after profiling. Sprint Ω.7 (Apr 26 2026): structurally incompatible with ``single_resident=true`` (target+draft are co-resident by definition); the brain refuses the draft load when both flags are set.",
                     "properties": {
                         "enabled": {
                             "type": "boolean",
@@ -978,6 +978,16 @@ CONFIG_SCHEMA: dict[str, Any] = {
                         },
                     },
                     "additionalProperties": False,
+                },
+                "single_resident": {
+                    "type": "boolean",
+                    "description": "Sprint Ω.7 (Apr 26 2026): exactly one MLX chat model in RAM at a time. When true, ``_ensure_loaded`` evicts any sibling role whose loaded path differs from the requested one before bringing the new weights in, and the speculative-decoding draft load is refused. Default true on 16 GB Apple Silicon (M1-M5) where co-resident 4B+8B causes thermal throttle. Set false only on machines with >=24 GB unified memory that explicitly trade RAM for throughput.",
+                },
+                "role_switch_min_interval_s": {
+                    "type": "number",
+                    "minimum": 0.0,
+                    "maximum": 600.0,
+                    "description": "Sprint Ω.7 (Apr 26 2026): hysteresis floor (seconds) between two single-resident model swaps. Prevents the cognitive kernel's `primary` <-> `fast` decision from ping-ponging on borderline system-context readings (e.g. memory_pct hovering around the threshold) and paying full model-load cost every turn.",
                 },
             },
             "additionalProperties": False,

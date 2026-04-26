@@ -31,11 +31,12 @@ def test_mlx_model_directory_exists() -> None:
 
 
 def test_mlx_brain_has_single_model_path() -> None:
-    """ATOM v3.3 runs ONE local MLX model (Qwen3-4B-Instruct-2507-4bit by
-    default). MLXBrain still tags each request with a role label
-    (``primary`` | ``fast``) for telemetry, but both resolve to the
-    same on-disk path and the same in-memory tensors. Heavy reasoning
-    is delegated to Gemini cloud via cognitive_kernel Path 2.65.
+    """ATOM ships with ONE local MLX model (Qwen3-8B-4bit since
+    Sprint Ω.7, 2026-04-26). MLXBrain still tags each request with a
+    role label (``primary`` | ``fast``) for telemetry, but both
+    resolve to the same on-disk path and the same in-memory tensors
+    in the shipped single-model profile. Heavier reasoning is
+    delegated to Gemini cloud via cognitive_kernel Path 2.65.
     """
     from brain.mlx_llm import MLXBrain
 

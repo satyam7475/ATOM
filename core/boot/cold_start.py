@@ -313,11 +313,16 @@ class ColdStartOptimizer:
             return False
 
         try:
-            # ``load_all=True`` aliases the ``primary`` role off the
-            # same loaded weights after ``fast`` is materialised (zero
-            # extra memory, ~0 ms). Previously ``primary`` was loaded
-            # lazily on the first non-fast request, adding ~2 s to the
-            # first streaming turn's first-token latency.
+            # Sprint Ω.7 (Apr 26 2026): with ``brain.single_resident``
+            # on (the default for 16 GB Apple Silicon), ``load_all=True``
+            # is honoured by ``MLXBrain.preload`` to warm only the
+            # requested role (``fast``) -- whose path now aliases the
+            # primary 8B in the single-model profile. The heavier tier
+            # is JIT-loaded by the cognitive kernel only if a query
+            # genuinely warrants it, and at most one tier is resident
+            # at any time. Older codepaths kept this as ``load_all`` so
+            # an explicit dual-tier profile still gets both roles
+            # warmed when the operator opts out of single_resident.
             try:
                 result = await warm_up(load_all=True)
             except TypeError:

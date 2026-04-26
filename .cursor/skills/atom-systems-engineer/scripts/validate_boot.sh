@@ -96,15 +96,34 @@ def ok(msg):   print(f"  \033[32mPASS\033[0m  {msg}")
 def bad(msg):  print(f"  \033[31mFAIL\033[0m  {msg}")
 def warn(msg): print(f"  \033[33mWARN\033[0m  {msg}")
 
-primary = brain.get('mlx_primary_model', '')
+primary = brain.get('mlx_model') or brain.get('mlx_primary_model', '')
 fast = brain.get('mlx_fast_model', '')
+fallback = brain.get('mlx_model_fallback', '')
 legacy = brain.get('model_path', '')
-if primary: ok(f"brain.mlx_primary_model = {primary}")
-else:       bad("brain.mlx_primary_model not set")
-if fast:    ok(f"brain.mlx_fast_model    = {fast}")
-else:       warn("brain.mlx_fast_model not set — will fall back to primary")
+single_resident = brain.get('single_resident')
+if primary: ok(f"brain.mlx_model        = {primary}")
+else:       bad("brain.mlx_model not set (also no legacy mlx_primary_model)")
+if fast and fast != primary:
+    if single_resident:
+        ok(f"brain.mlx_fast_model   = {fast} (single_resident on -> evicted on swap)")
+    else:
+        warn(f"brain.mlx_fast_model = {fast} (single_resident off -> 4B+8B can co-reside)")
+elif not fast:
+    ok("brain.mlx_fast_model not set (single-model profile, fast aliases primary)")
+if fallback and fallback != primary:
+    warn(f"brain.mlx_model_fallback = {fallback} -- only used if primary fails to load")
+if single_resident is True:
+    ok("brain.single_resident = true (one chat model in RAM at a time)")
+elif single_resident is False:
+    warn("brain.single_resident = false -- siblings can co-reside; verify RAM headroom")
+spec = brain.get('speculative_decoding', {}) or {}
+if spec.get('enabled') and single_resident:
+    bad("speculative_decoding.enabled=true with single_resident=true -- "
+        "draft load will be refused, no speedup")
+elif spec.get('enabled'):
+    warn("speculative_decoding.enabled = true -- target+draft will co-reside")
 if legacy and legacy != primary:
-    warn(f"brain.model_path (legacy GGUF) = {legacy} — diverges from primary")
+    warn(f"brain.model_path (legacy GGUF) = {legacy} -- diverges from mlx_model")
 
 locale = stt.get('locale', '')
 if locale == 'en-US': ok(f"stt.locale = {locale}")
